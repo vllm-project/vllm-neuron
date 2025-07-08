@@ -1,24 +1,22 @@
-"""
-VllmNeuronPlugin packaging setup.
 
-For more details on how to operate this file, check
-https://w.amazon.com/index.php/Python/Brazil
-"""
+from setuptools import find_packages, setup
 
-import os
-
-from setuptools import setup
-
-# Declare your non-python data files:
-# Files underneath configuration/ will be copied into the build preserving the
-# subdirectory structure if they exist.
-data_files = []
-for root, dirs, files in os.walk("configuration"):
-    data_files.append(
-        (os.path.relpath(root, "configuration"), [os.path.join(root, f) for f in files])
-    )
-
+# TODO: validate the package name with team
 setup(
-    # include data files
-    data_files=data_files,
+    name="vllm_neuron",
+    version="0.1",
+    author="AWS Neuron team",
+    license="Apache 2.0",
+    description=("vLLM Neuron backend plugin"),
+    classifiers=[
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+    ],
+    packages=find_packages(exclude=("docs", "examples", "tests*", "csrc")),
+    python_requires=">=3.9",
+    install_requires=[],
+    entry_points={
+        "vllm.platform_plugins": ["neuron = vllm_neuron:register"],
+    },
 )
