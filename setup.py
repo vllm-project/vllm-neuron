@@ -1,5 +1,16 @@
-
 from setuptools import find_packages, setup
+import brazilpython_base.release
+import os
+
+class NeuronReleaseCommand(brazilpython_base.release.Release):
+    def run(self):
+        print("brazil-build release Pass!")
+
+data_files = []
+for root, dirs, files in os.walk("configuration"):
+    data_files.append(
+        (os.path.relpath(root, "configuration"), [os.path.join(root, f) for f in files])
+    )
 
 # TODO: validate the package name with team
 setup(
