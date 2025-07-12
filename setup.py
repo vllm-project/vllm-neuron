@@ -12,9 +12,8 @@ for root, dirs, files in os.walk("configuration"):
         (os.path.relpath(root, "configuration"), [os.path.join(root, f) for f in files])
     )
 
-# TODO: validate the package name with team
 setup(
-    name="vllm_neuron",
+    name="neuronx-vllm-plugin",
     version="0.1",
     author="AWS Neuron team",
     license="Apache 2.0",
@@ -28,6 +27,6 @@ setup(
     python_requires=">=3.9",
     install_requires=[],
     entry_points={
-        "vllm.platform_plugins": ["neuron = vllm_neuron:register"],
+        "vllm.platform_plugins": ["neuron = neuronx_vllm_plugin:register"],
     },
 )
