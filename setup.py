@@ -1,10 +1,5 @@
 from setuptools import find_packages, setup
-import brazilpython_base.release
 import os
-
-class NeuronReleaseCommand(brazilpython_base.release.Release):
-    def run(self):
-        print("brazil-build release Pass!")
 
 data_files = []
 for root, dirs, files in os.walk("configuration"):
