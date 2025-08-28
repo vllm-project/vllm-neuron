@@ -1,5 +1,3 @@
 [build-system]
 requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
-[mypy]
-ignore_missing_imports = True
