@@ -16,7 +16,7 @@ class TestNeuronScheduler:
     def test_can_schedule_empty_queues(self, scheduler):
         """Test scheduling when queues are empty"""
         mock_request = Mock()
-        assert scheduler.can_schedule(mock_request) == True
+        assert scheduler.can_schedule(mock_request)
 
     def test_can_schedule_with_running_requests(self, scheduler):
         """Test scheduling with existing running requests"""
@@ -80,7 +80,7 @@ class TestNeuronScheduler:
         ]
         mock_request = Mock()
         result = scheduler.can_schedule(mock_request)
-        assert result == False
+        assert not result
 
     def test_batch_scheduling_logic(self, scheduler):
         """Test batch scheduling logic"""

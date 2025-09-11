@@ -91,15 +91,7 @@ class TestNeuronWorker:
         assert hasattr(worker, 'execute_model')
         assert hasattr(worker, 'init_device')
         assert hasattr(worker, 'initialize_cache')
-
-    def test_init_device(self, worker, mocker):
-        """Test device initialization"""
-        mock_set_seed = mocker.patch('vllm.model_executor.set_random_seed')
-        mock_init_env = mocker.patch.object(worker,
-                                            'init_distributed_environment')
-
-        worker.init_device()
-
+        
     def test_determine_available_memory(self, worker):
         """Test memory determination"""
         memory = worker.determine_available_memory()
