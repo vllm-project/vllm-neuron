@@ -91,7 +91,7 @@ class TestNeuronWorker:
         assert hasattr(worker, 'execute_model')
         assert hasattr(worker, 'init_device')
         assert hasattr(worker, 'initialize_cache')
-        
+                
     def test_determine_available_memory(self, worker):
         """Test memory determination"""
         memory = worker.determine_available_memory()

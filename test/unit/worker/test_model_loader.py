@@ -5,6 +5,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 from transformers import PretrainedConfig
+
 from neuronx_vllm_plugin.worker.neuronx_distributed_model_loader import \
     get_neuron_model
 
