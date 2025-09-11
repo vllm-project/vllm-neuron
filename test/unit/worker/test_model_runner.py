@@ -8,7 +8,7 @@ import torch
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 
 from neuronx_vllm_plugin.worker.neuronx_distributed_model_runner import (
-    NeuronxDistributedModelRunner, ModelInputForNeuron)
+    ModelInputForNeuron, NeuronxDistributedModelRunner)
 
 
 @dataclass

@@ -57,7 +57,8 @@ def cache_config():
 @pytest.fixture
 def scheduler(scheduler_config, cache_config):
     """Create a properly initialized scheduler instance"""
-    from neuronx_vllm_plugin.core.scheduler import ContinuousBatchingNeuronScheduler
+    from neuronx_vllm_plugin.core.scheduler import \
+        ContinuousBatchingNeuronScheduler
     scheduler = ContinuousBatchingNeuronScheduler(
         scheduler_config=scheduler_config, cache_config=cache_config)
     # Set required attributes
