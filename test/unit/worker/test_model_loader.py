@@ -5,6 +5,7 @@ import torch
 from transformers import PretrainedConfig
 from neuronx_vllm_plugin.worker.neuronx_distributed_model_loader import get_neuron_model
 
+
 @pytest.fixture
 def base_configs():
     scheduler_config = Mock()
@@ -23,17 +24,17 @@ def base_configs():
 
     return scheduler_config, cache_config, parallel_config
 
+
 def test_get_neuron_model(mocker, base_configs):
     scheduler_config, cache_config, parallel_config = base_configs
-    
+
     model_config = Mock()
     model_config.hf_config = PretrainedConfig(
         architectures=["LlamaForCausalLM"],
         num_key_value_heads=32,
         head_dim=64,
         vocab_size=32000,
-        model_type="llama"
-    )
+        model_type="llama")
     model_config.model = "meta-llama/Llama-2-7b-hf"
     model_config.dtype = torch.float32
     model_config.override_neuron_config = None
@@ -43,28 +44,26 @@ def test_get_neuron_model(mocker, base_configs):
     mock_model.config.neuron_config = Mock()
     mock_causal_lm = Mock()
     mock_causal_lm.model = mock_model
-    
-    mocker.patch('neuronx_vllm_plugin.worker.neuronx_distributed_model_loader.NeuronCausalLM',
-                 return_value=mock_causal_lm)
 
-    model = get_neuron_model(
-        model_config,
-        cache_config,
-        parallel_config,
-        scheduler_config,
-        Mock()
-    )
-    
+    mocker.patch(
+        'neuronx_vllm_plugin.worker.neuronx_distributed_model_loader.NeuronCausalLM',
+        return_value=mock_causal_lm)
+
+    model = get_neuron_model(model_config, cache_config, parallel_config,
+                             scheduler_config, Mock())
+
     assert model is not None
+
 
 @pytest.mark.parametrize("model_type,architecture", [
     ("llama", "LlamaForCausalLM"),
     ("llava", "LlavaForConditionalGeneration"),
     ("mixtral", "MixtralForCausalLM"),
 ])
-def test_get_neuron_model_different_architectures(mocker, base_configs, model_type, architecture):
+def test_get_neuron_model_different_architectures(mocker, base_configs,
+                                                  model_type, architecture):
     scheduler_config, cache_config, parallel_config = base_configs
-    
+
     # Create text config for LLaVA
     text_config = PretrainedConfig(
         num_key_value_heads=32,
@@ -72,24 +71,21 @@ def test_get_neuron_model_different_architectures(mocker, base_configs, model_ty
         vocab_size=32000,
         model_type="llama"  # LLaVA uses LLaMA as base
     )
-    
+
     # Create the main config
     model_config = Mock()
     if model_type == "llava":
         model_config.hf_config = PretrainedConfig(
             architectures=[architecture],
             text_config=text_config,  # Add text_config for LLaVA
-            model_type=model_type
-        )
+            model_type=model_type)
     else:
-        model_config.hf_config = PretrainedConfig(
-            architectures=[architecture],
-            num_key_value_heads=32,
-            head_dim=64,
-            vocab_size=32000,
-            model_type=model_type
-        )
-    
+        model_config.hf_config = PretrainedConfig(architectures=[architecture],
+                                                  num_key_value_heads=32,
+                                                  head_dim=64,
+                                                  vocab_size=32000,
+                                                  model_type=model_type)
+
     model_config.model = f"test/{model_type}-model"
     model_config.dtype = torch.float32
     model_config.override_neuron_config = None
@@ -99,22 +95,19 @@ def test_get_neuron_model_different_architectures(mocker, base_configs, model_ty
     mock_model.config.neuron_config = Mock()
     mock_causal_lm = Mock()
     mock_causal_lm.model = mock_model
-    
-    if architecture == "LlavaForConditionalGeneration":
-        mocker.patch('neuronx_vllm_plugin.worker.neuronx_distributed_model_loader.NeuronPixtralForCausalLM',
-                    return_value=mock_causal_lm)
-    else:
-        mocker.patch('neuronx_vllm_plugin.worker.neuronx_distributed_model_loader.NeuronCausalLM',
-                    return_value=mock_causal_lm)
 
-    model = get_neuron_model(
-        model_config,
-        cache_config,
-        parallel_config,
-        scheduler_config,
-        Mock()
-    )
-    
+    if architecture == "LlavaForConditionalGeneration":
+        mocker.patch(
+            'neuronx_vllm_plugin.worker.neuronx_distributed_model_loader.NeuronPixtralForCausalLM',
+            return_value=mock_causal_lm)
+    else:
+        mocker.patch(
+            'neuronx_vllm_plugin.worker.neuronx_distributed_model_loader.NeuronCausalLM',
+            return_value=mock_causal_lm)
+
+    model = get_neuron_model(model_config, cache_config, parallel_config,
+                             scheduler_config, Mock())
+
     assert model is not None
     if model_type == "llava":
         # Add specific assertions for LLaVA model
@@ -122,57 +115,22 @@ def test_get_neuron_model_different_architectures(mocker, base_configs, model_ty
         assert model_config.hf_config.text_config.num_key_value_heads == 32
         assert model_config.hf_config.text_config.head_dim == 64
 
+
 def test_get_neuron_model_with_prefix_caching(mocker, base_configs):
     scheduler_config, cache_config, parallel_config = base_configs
     cache_config.enable_prefix_caching = True
-    
+
     model_config = Mock()
     model_config.hf_config = PretrainedConfig(
         architectures=["LlamaForCausalLM"],
         num_key_value_heads=32,
         head_dim=64,
         vocab_size=32000,
-        model_type="llama"
-    )
-    model_config.model = "meta-llama/Llama-2-7b-hf"
-    model_config.dtype = torch.float32
-    model_config.override_neuron_config = {"is_prefix_caching": True, "is_block_kv_layout": True}
-
-    mock_model = Mock()
-    mock_model.config.neuron_config = Mock()
-    mock_causal_lm = Mock()
-    mock_causal_lm.model = mock_model
-    
-    mocker.patch('neuronx_vllm_plugin.worker.neuronx_distributed_model_loader.NeuronCausalLM',
-                 return_value=mock_causal_lm)
-
-    model = get_neuron_model(
-        model_config,
-        cache_config,
-        parallel_config,
-        scheduler_config,
-        Mock()
-    )
-    
-    assert model is not None
-    assert model.model.config.neuron_config.is_prefix_caching
-
-def test_get_neuron_model_with_chunked_prefill(mocker, base_configs):
-    scheduler_config, cache_config, parallel_config = base_configs
-    scheduler_config.chunked_prefill_enabled = True
-    
-    model_config = Mock()
-    model_config.hf_config = PretrainedConfig(
-        architectures=["LlamaForCausalLM"],
-        num_key_value_heads=32,
-        head_dim=64,
-        vocab_size=32000,
-        model_type="llama"
-    )
+        model_type="llama")
     model_config.model = "meta-llama/Llama-2-7b-hf"
     model_config.dtype = torch.float32
     model_config.override_neuron_config = {
-        "chunked_prefill_config": {"enabled": True},
+        "is_prefix_caching": True,
         "is_block_kv_layout": True
     }
 
@@ -180,41 +138,68 @@ def test_get_neuron_model_with_chunked_prefill(mocker, base_configs):
     mock_model.config.neuron_config = Mock()
     mock_causal_lm = Mock()
     mock_causal_lm.model = mock_model
-    
-    mocker.patch('neuronx_vllm_plugin.worker.neuronx_distributed_model_loader.NeuronCausalLM',
-                 return_value=mock_causal_lm)
 
-    model = get_neuron_model(
-        model_config,
-        cache_config,
-        parallel_config,
-        scheduler_config,
-        Mock()
-    )
-    
+    mocker.patch(
+        'neuronx_vllm_plugin.worker.neuronx_distributed_model_loader.NeuronCausalLM',
+        return_value=mock_causal_lm)
+
+    model = get_neuron_model(model_config, cache_config, parallel_config,
+                             scheduler_config, Mock())
+
+    assert model is not None
+    assert model.model.config.neuron_config.is_prefix_caching
+
+
+def test_get_neuron_model_with_chunked_prefill(mocker, base_configs):
+    scheduler_config, cache_config, parallel_config = base_configs
+    scheduler_config.chunked_prefill_enabled = True
+
+    model_config = Mock()
+    model_config.hf_config = PretrainedConfig(
+        architectures=["LlamaForCausalLM"],
+        num_key_value_heads=32,
+        head_dim=64,
+        vocab_size=32000,
+        model_type="llama")
+    model_config.model = "meta-llama/Llama-2-7b-hf"
+    model_config.dtype = torch.float32
+    model_config.override_neuron_config = {
+        "chunked_prefill_config": {
+            "enabled": True
+        },
+        "is_block_kv_layout": True
+    }
+
+    mock_model = Mock()
+    mock_model.config.neuron_config = Mock()
+    mock_causal_lm = Mock()
+    mock_causal_lm.model = mock_model
+
+    mocker.patch(
+        'neuronx_vllm_plugin.worker.neuronx_distributed_model_loader.NeuronCausalLM',
+        return_value=mock_causal_lm)
+
+    model = get_neuron_model(model_config, cache_config, parallel_config,
+                             scheduler_config, Mock())
+
     assert model is not None
     assert hasattr(model.model.config.neuron_config, 'chunked_prefill_config')
 
+
 def test_get_neuron_model_error_handling(mocker, base_configs):
     scheduler_config, cache_config, parallel_config = base_configs
-    
+
     model_config = Mock()
     model_config.hf_config = PretrainedConfig(
         architectures=["UnsupportedModel"],
         num_key_value_heads=32,
         head_dim=64,
         vocab_size=32000,
-        model_type="unsupported"
-    )
+        model_type="unsupported")
     model_config.model = "unsupported/model"
     model_config.dtype = torch.float32
     model_config.override_neuron_config = None
 
     with pytest.raises(ValueError, match="Model .* is not supported"):
-        get_neuron_model(
-            model_config,
-            cache_config,
-            parallel_config,
-            scheduler_config,
-            Mock()
-        )
+        get_neuron_model(model_config, cache_config, parallel_config,
+                         scheduler_config, Mock())

@@ -3,7 +3,9 @@ import pytest
 from unittest.mock import Mock, patch
 from collections import deque
 
+
 class TestNeuronScheduler:
+
     def test_scheduler_initialization(self, scheduler):
         """Test basic scheduler initialization"""
         assert hasattr(scheduler, 'holdback_queue')
@@ -35,7 +37,7 @@ class TestNeuronScheduler:
         mock_request = Mock()
         scheduler.holdback_queue.append(mock_request)
         output = scheduler.schedule()
-        
+
         # Verify the scheduling behavior
         assert output is not None
         # Verify that request was processed
@@ -48,15 +50,15 @@ class TestNeuronScheduler:
         mock_requests = [Mock() for _ in range(3)]
         for req in mock_requests:
             scheduler.holdback_queue.append(req)
-        
+
         # Verify initial state
         assert len(scheduler.holdback_queue) == 3
         assert len(scheduler.waiting) == 0
-        
+
         # Schedule
         output = scheduler.schedule()
         assert output is not None
-        
+
         # Verify queue transitions
         total_requests = len(scheduler.waiting) + len(scheduler.holdback_queue)
         assert total_requests == 3
@@ -73,7 +75,9 @@ class TestNeuronScheduler:
     def test_max_capacity_constraints(self, scheduler):
         """Test scheduler respects maximum capacity constraints"""
         # Fill up to max capacity
-        scheduler.running = [Mock() for _ in range(scheduler.max_num_running_reqs)]
+        scheduler.running = [
+            Mock() for _ in range(scheduler.max_num_running_reqs)
+        ]
         mock_request = Mock()
         result = scheduler.can_schedule(mock_request)
         assert result == False
@@ -85,35 +89,32 @@ class TestNeuronScheduler:
         initial_holdback = [Mock() for _ in range(3)]
         scheduler.running = initial_running
         scheduler.holdback_queue.extend(initial_holdback)
-        
+
         # Execute scheduling
         output = scheduler.schedule()
         assert output is not None
-        
+
         # Verify scheduling behavior
-        total_requests = (len(scheduler.running) + 
-                        len(scheduler.waiting) + 
-                        len(scheduler.holdback_queue))
+        total_requests = (len(scheduler.running) + len(scheduler.waiting) +
+                          len(scheduler.holdback_queue))
         assert total_requests >= len(initial_running) + len(initial_holdback)
 
     def verify_scheduler_state(self, scheduler, expected_total_requests):
         """Helper method to verify scheduler state"""
-        actual_total = (len(scheduler.running) + 
-                       len(scheduler.waiting) + 
-                       len(scheduler.holdback_queue))
+        actual_total = (len(scheduler.running) + len(scheduler.waiting) +
+                        len(scheduler.holdback_queue))
         assert actual_total == expected_total_requests, \
             f"Expected {expected_total_requests} total requests, but found {actual_total}"
-            
+
     def test_schedule_with_running_and_waiting(self, scheduler):
         """Test scheduling with both running and waiting requests"""
         # Setup initial state
         scheduler.running = [Mock() for _ in range(2)]
         scheduler.waiting = deque([Mock() for _ in range(2)])
-        
+
         # Execute scheduling
         output = scheduler.schedule()
-        
+
         # Verify that requests were processed
         assert output is not None
         assert len(scheduler.holdback_queue) >= 0
-

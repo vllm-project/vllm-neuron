@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch
 from neuronx_vllm_plugin.worker.neuron_worker import NeuronWorker
 
+
 @dataclass
 class MockVllmConfig:
     model_config: Mock
@@ -14,7 +15,9 @@ class MockVllmConfig:
     scheduler_config: Mock = None
     load_config: Mock = None
 
+
 class TestNeuronWorker:
+
     @pytest.fixture
     def vllm_config(self):
         parallel_config = Mock()
@@ -24,24 +27,17 @@ class TestNeuronWorker:
         # Set data_parallel_size as an integer
         parallel_config.data_parallel_size = 1
 
-        return MockVllmConfig(
-            model_config=Mock(
-                trust_remote_code=True,
-                seed=42,
-                max_model_len=2048
-            ),
-            cache_config=Mock(
-                block_size=8,
-                enable_prefix_caching=False
-            ),
-            device_config=Mock(device="cpu"),
-            parallel_config=parallel_config,
-            scheduler_config=Mock(
-                scheduler_cls="auto",
-                chunked_prefill_enabled=True
-            ),
-            load_config=Mock()
-        )
+        return MockVllmConfig(model_config=Mock(trust_remote_code=True,
+                                                seed=42,
+                                                max_model_len=2048),
+                              cache_config=Mock(block_size=8,
+                                                enable_prefix_caching=False),
+                              device_config=Mock(device="cpu"),
+                              parallel_config=parallel_config,
+                              scheduler_config=Mock(
+                                  scheduler_cls="auto",
+                                  chunked_prefill_enabled=True),
+                              load_config=Mock())
 
     @pytest.fixture
     def worker(self, vllm_config, mocker):
@@ -52,32 +48,32 @@ class TestNeuronWorker:
             self.cache_config = vllm_config.cache_config
             self.device_config = vllm_config.device_config
             self.scheduler_config = vllm_config.scheduler_config
-        
+
         # Mock vLLM config
         mock_vllm_config = Mock()
         mock_vllm_config.model_config = vllm_config.model_config
         mock_vllm_config.cache_config = vllm_config.cache_config
         mock_vllm_config.parallel_config = vllm_config.parallel_config
         mock_vllm_config.scheduler_config = vllm_config.scheduler_config
-        
+
         # Set up the get_current_vllm_config mock
-        mocker.patch('vllm.config.get_current_vllm_config', return_value=mock_vllm_config)
+        mocker.patch('vllm.config.get_current_vllm_config',
+                     return_value=mock_vllm_config)
         mocker.patch('vllm.worker.worker.WorkerBase.__init__', mock_init)
         mocker.patch('vllm.distributed.init_distributed_environment')
         mocker.patch('vllm.distributed.ensure_model_parallel_initialized')
-        
+
         # Mock model runner
         mock_model_runner = Mock()
-        mocker.patch('neuronx_vllm_plugin.worker.neuron_worker.NeuronWorker.get_neuronx_distributed_model_runner',
-                    return_value=mock_model_runner)
-        
-        worker = NeuronWorker(
-            vllm_config=vllm_config,
-            local_rank=0,
-            rank=0,
-            distributed_init_method="tcp://localhost:1234",
-            is_driver_worker=True
-        )
+        mocker.patch(
+            'neuronx_vllm_plugin.worker.neuron_worker.NeuronWorker.get_neuronx_distributed_model_runner',
+            return_value=mock_model_runner)
+
+        worker = NeuronWorker(vllm_config=vllm_config,
+                              local_rank=0,
+                              rank=0,
+                              distributed_init_method="tcp://localhost:1234",
+                              is_driver_worker=True)
         return worker
 
     def test_worker_initialization(self, worker):
@@ -97,8 +93,9 @@ class TestNeuronWorker:
     def test_init_device(self, worker, mocker):
         """Test device initialization"""
         mock_set_seed = mocker.patch('vllm.model_executor.set_random_seed')
-        mock_init_env = mocker.patch.object(worker, 'init_distributed_environment')
-        
+        mock_init_env = mocker.patch.object(worker,
+                                            'init_distributed_environment')
+
         worker.init_device()
 
     def test_determine_available_memory(self, worker):
@@ -110,11 +107,11 @@ class TestNeuronWorker:
         """Test model execution"""
         mock_output = Mock()
         worker.model_runner.execute_model.return_value = mock_output
-        
+
         # Test driver worker
         output = worker.execute_model(Mock())
         assert output == mock_output
-        
+
         # Test non-driver worker
         worker.is_driver_worker = False
         output = worker.execute_model(Mock())
@@ -142,7 +139,8 @@ class TestNeuronWorker:
         """Test initialization from config"""
         mock_config = Mock()
         worker.initialize_from_config(mock_config)
-        worker.model_runner.initialize_kv_cache.assert_called_once_with(mock_config)
+        worker.model_runner.initialize_kv_cache.assert_called_once_with(
+            mock_config)
 
     def test_check_health(self, worker):
         """Test health check"""
@@ -151,33 +149,36 @@ class TestNeuronWorker:
     def test_init_distributed_environment(self, worker, mocker):
         """Test distributed environment initialization"""
         # Patch at the correct import path
-        mock_init = mocker.patch('neuronx_vllm_plugin.worker.neuron_worker.init_distributed_environment')
-        mock_ensure = mocker.patch('neuronx_vllm_plugin.worker.neuron_worker.ensure_model_parallel_initialized')
-        
+        mock_init = mocker.patch(
+            'neuronx_vllm_plugin.worker.neuron_worker.init_distributed_environment'
+        )
+        mock_ensure = mocker.patch(
+            'neuronx_vllm_plugin.worker.neuron_worker.ensure_model_parallel_initialized'
+        )
+
         # Mock get_current_vllm_config to return a config with proper parallel settings
         mock_config = Mock()
         mock_config.parallel_config = Mock()
         mock_config.parallel_config.data_parallel_size = 1
         mock_config.parallel_config.tensor_parallel_size = 1
         mock_config.parallel_config.pipeline_parallel_size = 1
-        mocker.patch('vllm.config.get_current_vllm_config', return_value=mock_config)
-        
+        mocker.patch('vllm.config.get_current_vllm_config',
+                     return_value=mock_config)
+
         # Call the method
         worker.init_distributed_environment()
-        
+
         # Verify the calls
         mock_init.assert_called_once_with(
             world_size=1,
             rank=0,
             local_rank=0,
             distributed_init_method="tcp://localhost:1234",
-            backend="gloo"
-        )
+            backend="gloo")
         mock_ensure.assert_called_once_with(1, 1)
 
         # Verify that the distributed environment was initialized correctly
         assert worker.parallel_config.data_parallel_size == 1
-
 
     def test_lora_operations(self, worker):
         """Test LoRA-related operations"""
