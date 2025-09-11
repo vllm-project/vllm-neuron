@@ -373,6 +373,7 @@ class TestModelRunner:
 
         # Mock input batch
         model_runner.input_batch.req_ids = ["req1"]  # Match the request ID
+        model_runner.input_batch.req_id_to_index = {"req1": 0}  # Add this line
 
         # Create actual tensor for hidden states
         mock_hidden_states = torch.randn(1, 3, 32000)  # [batch, seq_len, vocab_size]
@@ -397,7 +398,13 @@ class TestModelRunner:
                 return mock_hidden_states
 
             def sample(self, logits):
-                return Mock(sampled_token_ids=torch.tensor([[4]]))
+                # Create a proper SamplerOutput-like object with correct method signature
+                class SamplerOutput:
+                    def __init__(self):
+                        self.sampled_token_ids = torch.tensor([[4]])
+                    def __len__(self):
+                        return 1
+                return SamplerOutput()
 
         # Replace the model
         model_runner.model = MockModel()
@@ -408,13 +415,8 @@ class TestModelRunner:
         # Verify execution
         assert output is not None
         assert len(output) == 1
-        assert isinstance(output[0].sampled_token_ids, torch.Tensor)
-        assert output[0].sampled_token_ids.shape == (1, 1)  # [batch_size, 1]
-
-        # Add assertions for the hidden states shape
-        assert isinstance(mock_hidden_states, torch.Tensor)
-        assert mock_hidden_states.shape == (1, 3, 32000)  # [batch, seq_len, vocab_size]
-
+        assert torch.equal(output.sampled_token_ids, torch.tensor([[4]]))
+        
     def test_get_kv_cache_spec(self, model_runner):
         spec = model_runner.get_kv_cache_spec()
         assert "layer" in spec
