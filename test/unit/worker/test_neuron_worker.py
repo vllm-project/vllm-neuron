@@ -1,8 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
 # test/unit/worker/test_neuron_worker.py
-import pytest
-from unittest.mock import Mock, patch
 from dataclasses import dataclass
-import torch
+from unittest.mock import Mock
+
+import pytest
+
 from neuronx_vllm_plugin.worker.neuron_worker import NeuronWorker
 
 

@@ -1,7 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
 # test/unit/core/test_scheduler.py
-import pytest
-from unittest.mock import Mock, patch
 from collections import deque
+from unittest.mock import Mock, patch
 
 
 class TestNeuronScheduler:

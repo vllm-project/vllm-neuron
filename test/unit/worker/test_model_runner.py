@@ -1,10 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
 # test/unit/worker/test_model_runner.py
-import pytest
-from unittest.mock import Mock, patch
 from dataclasses import dataclass
+from unittest.mock import Mock
+
+import pytest
 import torch
-from neuronx_vllm_plugin.worker.neuronx_distributed_model_runner import NeuronxDistributedModelRunner, ModelInputForNeuron
-from vllm.v1.core.sched.output import SchedulerOutput, NewRequestData, CachedRequestData
+from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
+
+from neuronx_vllm_plugin.worker.neuronx_distributed_model_runner import (
+    NeuronxDistributedModelRunner, ModelInputForNeuron)
 
 
 @dataclass

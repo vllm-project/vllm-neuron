@@ -1,9 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
 # test/unit/worker/test_model_loader.py
-import pytest
 from unittest.mock import Mock
+
+import pytest
 import torch
 from transformers import PretrainedConfig
-from neuronx_vllm_plugin.worker.neuronx_distributed_model_loader import get_neuron_model
+from neuronx_vllm_plugin.worker.neuronx_distributed_model_loader import \
+    get_neuron_model
 
 
 @pytest.fixture

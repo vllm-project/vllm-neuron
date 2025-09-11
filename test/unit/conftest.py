@@ -1,8 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
 # test/unit/conftest.py
 import sys
-import pytest
-from unittest.mock import Mock
 from collections import deque
+from unittest.mock import Mock
+
+import pytest
 
 
 @pytest.fixture
