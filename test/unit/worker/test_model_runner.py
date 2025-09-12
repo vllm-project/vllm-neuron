@@ -1,15 +1,62 @@
 # SPDX-License-Identifier: Apache-2.0
 # test/unit/worker/test_model_runner.py
 from dataclasses import dataclass
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
+import sys
 import torch
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 
-from neuronx_vllm_plugin.worker.neuronx_distributed_model_runner import (
-    ModelInputForNeuron, NeuronxDistributedModelRunner)
+# Create mock sampling params that return tensors
+class MockSamplingModule(MagicMock):
+    def prepare_sampling_params(self, *args, **kwargs):
+        return torch.ones(1, dtype=torch.float32)
+    
+    def __getitem__(self, *args, **kwargs):
+        return torch.ones(1, dtype=torch.float32)
 
+# Create a base mock module
+mock_base = MagicMock()
+mock_base.utils = MagicMock()
+mock_base.utils.constants = MagicMock()
+mock_base.utils.constants.MODEL_TYPES = {
+    'llama': 'llama',
+    'llava': 'llava',
+    'mixtral': 'mixtral'
+}
+mock_base.utils.hf_adapter = MagicMock()
+mock_base.models = MagicMock()
+mock_base.models.config = MagicMock()
+mock_base.modules = MagicMock()
+mock_base.modules.lora_serving = MagicMock()
+mock_base.modules.generation = MagicMock()
+# Use the custom sampling mock
+mock_base.modules.generation.sampling = MockSamplingModule()
+mock_base.modules.padding = MagicMock()
+
+# Install the mock module
+sys.modules['neuronx_distributed_inference'] = mock_base
+sys.modules['neuronx_distributed_inference.utils'] = mock_base.utils
+sys.modules[
+    'neuronx_distributed_inference.utils.constants'] = mock_base.utils.constants
+sys.modules[
+    'neuronx_distributed_inference.utils.hf_adapter'] = mock_base.utils.hf_adapter
+sys.modules['neuronx_distributed_inference.models'] = mock_base.models
+sys.modules[
+    'neuronx_distributed_inference.models.config'] = mock_base.models.config
+sys.modules['neuronx_distributed_inference.modules'] = mock_base.modules
+sys.modules[
+    'neuronx_distributed_inference.modules.lora_serving'] = mock_base.modules.lora_serving
+sys.modules[
+    'neuronx_distributed_inference.modules.generation'] = mock_base.modules.generation
+sys.modules[
+    'neuronx_distributed_inference.modules.generation.sampling'] = mock_base.modules.generation.sampling
+sys.modules[
+    'neuronx_distributed_inference.modules.padding'] = mock_base.modules.padding
+
+from neuronx_vllm_plugin.worker.neuronx_distributed_model_runner import \
+    ModelInputForNeuron, NeuronxDistributedModelRunner
 
 @dataclass
 class MockVllmConfig:
@@ -22,7 +69,6 @@ class MockVllmConfig:
     speculative_config: Mock = None
     observability_config: Mock = None
     device_config: Mock = None
-
 
 class TestModelRunner:
 
