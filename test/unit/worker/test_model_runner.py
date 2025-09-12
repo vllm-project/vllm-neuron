@@ -9,6 +9,9 @@ import torch
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
+from neuronx_vllm_plugin.worker.neuronx_distributed_model_runner import (
+    ModelInputForNeuron, NeuronxDistributedModelRunner)
+
 
 # Create mock sampling params that return tensors
 class MockSamplingModule(MagicMock):
@@ -58,9 +61,6 @@ sys.modules[
     'neuronx_distributed_inference.modules.generation.sampling'] = mock_base.modules.generation.sampling
 sys.modules[
     'neuronx_distributed_inference.modules.padding'] = mock_base.modules.padding
-
-from neuronx_vllm_plugin.worker.neuronx_distributed_model_runner import (
-    ModelInputForNeuron, NeuronxDistributedModelRunner)
 
 
 @dataclass

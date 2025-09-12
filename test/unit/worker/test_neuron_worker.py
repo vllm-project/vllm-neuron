@@ -6,6 +6,8 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
+from neuronx_vllm_plugin.worker.neuron_worker import NeuronWorker
+
 
 # Mock CUDA-related modules
 class MockWorkerBase:
@@ -178,8 +180,6 @@ sys.modules[
 sys.modules[
     'neuronx_distributed_inference.modules.padding'] = mock_base.modules.padding
 
-from neuronx_vllm_plugin.worker.neuron_worker import NeuronWorker
-
 
 @dataclass
 class MockVllmConfig:
@@ -215,25 +215,6 @@ class TestNeuronWorker:
 
     @pytest.fixture
     def worker(self, vllm_config, mocker):
-        # # Mock WorkerBase initialization
-        # def mock_init(self, *args, **kwargs):
-        #     self.parallel_config = vllm_config.parallel_config
-        #     self.model_config = vllm_config.model_config
-        #     self.cache_config = vllm_config.cache_config
-        #     self.device_config = vllm_config.device_config
-        #     self.scheduler_config = vllm_config.scheduler_config
-
-        # # Mock vLLM config
-        # mock_vllm_config = Mock()
-        # mock_vllm_config.model_config = vllm_config.model_config
-        # mock_vllm_config.cache_config = vllm_config.cache_config
-        # mock_vllm_config.parallel_config = vllm_config.parallel_config
-        # mock_vllm_config.scheduler_config = vllm_config.scheduler_config
-
-        # # Set up the get_current_vllm_config mock
-        # mocker.patch('vllm.config.get_current_vllm_config',
-        #              return_value=mock_vllm_config)
-        # mocker.patch('vllm.worker.worker.WorkerBase.__init__', mock_init)
         mocker.patch('vllm.distributed.init_distributed_environment')
         mocker.patch('vllm.distributed.ensure_model_parallel_initialized')
 
