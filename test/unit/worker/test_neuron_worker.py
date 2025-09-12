@@ -23,6 +23,11 @@ class MockWorkerBase:
         self.cache_config = vllm_config.cache_config
         self.device_config = vllm_config.device_config
         self.scheduler_config = vllm_config.scheduler_config
+        self.lora_config = vllm_config.lora_config
+        self.speculative_config = vllm_config.speculative_config
+        self.observability_config = vllm_config.observability_config
+        self.kv_transfer_config = vllm_config.kv_transfer_config
+        self.compilation_config = vllm_config.compilation_config
         self.local_rank = local_rank
         self.rank = rank
         self.distributed_init_method = distributed_init_method
@@ -189,6 +194,11 @@ class MockVllmConfig:
     parallel_config: Mock
     scheduler_config: Mock = None
     load_config: Mock = None
+    lora_config: Mock = None
+    speculative_config: Mock = None
+    observability_config: Mock = None
+    kv_transfer_config: Mock = None
+    compilation_config: Mock = None
 
 
 class TestNeuronWorker:
@@ -201,6 +211,39 @@ class TestNeuronWorker:
         parallel_config.worker_cls = "auto"
         parallel_config.data_parallel_size = 1
 
+        # Create lora_config mock
+        lora_config = Mock()
+        lora_config.lora_module_names = []
+        lora_config.lora_model_dir = None
+        lora_config.max_lora_rank = None
+        lora_config.max_cpu_loras = None
+        lora_config.max_gpu_loras = None
+        lora_config.max_num_seqs = 32
+        lora_config.max_num_batched_tokens = 4096
+
+        # Create speculative_config mock
+        speculative_config = Mock()
+        speculative_config.enabled = False
+        speculative_config.model_config = None
+        speculative_config.cache_config = None
+        speculative_config.device_config = None
+
+        # Create observability_config mock
+        observability_config = Mock()
+        observability_config.enable_metrics = False
+        observability_config.metrics_port = None
+
+        # Create kv_transfer_config mock
+        kv_transfer_config = Mock()
+        kv_transfer_config.enabled = False
+        kv_transfer_config.mode = None
+
+        # Create compilation_config mock
+        compilation_config = Mock()
+        compilation_config.enable_compilation = False
+        compilation_config.cache_dir = None
+        compilation_config.force_recompile = False
+
         return MockVllmConfig(model_config=Mock(trust_remote_code=True,
                                                 seed=42,
                                                 max_model_len=2048),
@@ -211,7 +254,12 @@ class TestNeuronWorker:
                               scheduler_config=Mock(
                                   scheduler_cls="auto",
                                   chunked_prefill_enabled=True),
-                              load_config=Mock())
+                              load_config=Mock(),
+                              lora_config=lora_config,
+                              speculative_config=speculative_config,
+                              observability_config=observability_config,
+                              kv_transfer_config=kv_transfer_config,
+                              compilation_config=compilation_config)
 
     @pytest.fixture
     def worker(self, vllm_config, mocker):
