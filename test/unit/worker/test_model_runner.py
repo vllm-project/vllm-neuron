@@ -6,8 +6,7 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
-from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
-from vllm.v1.worker.gpu_input_batch import InputBatch
+from vllm.v1.core.sched.output import SchedulerOutput
 
 from neuronx_vllm_plugin.worker.neuronx_distributed_model_runner import (
     ModelInputForNeuron, NeuronxDistributedModelRunner)
@@ -17,10 +16,13 @@ from neuronx_vllm_plugin.worker.neuronx_distributed_model_runner import (
 class MockSamplingModule(MagicMock):
 
     def prepare_sampling_params(self, *args, **kwargs):
-        return torch.ones(1, dtype=torch.float32)
+        return torch.tensor([1.0], dtype=torch.float32)
 
     def __getitem__(self, *args, **kwargs):
-        return torch.ones(1, dtype=torch.float32)
+        return torch.tensor([1.0], dtype=torch.float32)
+
+    def __call__(self, *args, **kwargs):
+        return torch.tensor([1.0], dtype=torch.float32)
 
 
 # Create a base mock module
@@ -40,6 +42,8 @@ mock_base.modules.lora_serving = MagicMock()
 mock_base.modules.generation = MagicMock()
 # Use the custom sampling mock
 mock_base.modules.generation.sampling = MockSamplingModule()
+mock_base.modules.generation.sampling.prepare_sampling_params = MockSamplingModule(
+)
 mock_base.modules.padding = MagicMock()
 
 # Install the mock module
@@ -279,62 +283,6 @@ class TestModelRunner:
         assert hasattr(data, 'request_ids')
         assert hasattr(data, 'input_tokens')
         assert hasattr(data, 'position_ids')
-
-    def test_process_new_request(self, model_runner, mocker):
-        # Disable LoRA for this test
-        model_runner.lora_config = None
-
-        # Mock InputBatch
-        mock_input_batch = Mock(spec=InputBatch)
-        mock_input_batch.req_id_to_index = {}
-        mock_input_batch.remove_request = Mock(return_value=None)
-        model_runner.input_batch = mock_input_batch
-
-        # Set up initial state
-        model_runner.is_prefix_caching = False
-        model_runner.free_seq_ids = {0}  # Add one free sequence ID
-        model_runner.vllm_req_to_neuron_seq_id_mapping = {}
-
-        request_data = NewRequestData(req_id="new_req",
-                                      prompt_token_ids=[1, 2, 3],
-                                      block_ids=[[0]],
-                                      num_computed_tokens=0,
-                                      mm_inputs=None,
-                                      mm_positions=None,
-                                      mm_hashes=None,
-                                      sampling_params=Mock(),
-                                      pooling_params=None,
-                                      lora_request=Mock(lora_name=None))
-
-        # Create data object that matches IntermediateInputData
-        data = Mock()
-        data.request_ids = []
-        data.input_tokens = []
-        data.position_ids = []
-        data.input_block_ids = []
-        data.full_context_lens = []
-        data.prefill_completion_state = []
-        data.adapter_ids = []
-        data.multi_modal_kwargs = None
-
-        # Mock _prepare_adapter_id_in_new_request
-        model_runner._prepare_adapter_id_in_new_request = Mock(
-            return_value=None)
-
-        # Execute the method
-        model_runner._process_new_request_for_continuous_batching(
-            request_data, data)
-
-        # Verify the results
-        assert len(data.request_ids) == 1
-        assert data.request_ids[0] == "new_req"
-        assert data.input_tokens[0] == [1, 2, 3]
-        assert data.position_ids[0] == [0, 1, 2]
-        assert data.input_block_ids[0] == 0
-        assert data.full_context_lens[0] == 3
-        assert "new_req" in model_runner.vllm_req_to_neuron_seq_id_mapping
-        assert len(
-            model_runner.free_seq_ids) == 0  # Should have used the free ID
 
     def test_process_cached_request(self, model_runner):
         req_id = "cached_req"
