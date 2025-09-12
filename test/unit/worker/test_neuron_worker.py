@@ -6,9 +6,16 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
+
 # Mock CUDA-related modules
 class MockWorkerBase:
-    def __init__(self, vllm_config, local_rank, rank, distributed_init_method, is_driver_worker=False):
+
+    def __init__(self,
+                 vllm_config,
+                 local_rank,
+                 rank,
+                 distributed_init_method,
+                 is_driver_worker=False):
         self.parallel_config = vllm_config.parallel_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -19,12 +26,15 @@ class MockWorkerBase:
         self.distributed_init_method = distributed_init_method
         self.is_driver_worker = is_driver_worker
 
+
 # Create vllm mock structure
 vllm_mock = MagicMock()
+
 
 # Mock utils functions
 def mock_init_cached_hf_modules():
     pass
+
 
 # Create vllm structure
 vllm_mock.config = MagicMock()
@@ -50,13 +60,18 @@ vllm_mock.v1.worker = MagicMock()
 vllm_mock.v1.worker.worker_base = MagicMock()
 vllm_mock.v1.worker.worker_base.WorkerBase = MockWorkerBase
 
+
 class MockLoRARequest:
+
     def __init__(self, lora_name=None):
         self.lora_name = lora_name
 
+
 class MockSchedulerOutput:
+
     def __init__(self):
         pass
+
 
 lora_module = MagicMock()
 lora_module.request = MagicMock()
@@ -73,14 +88,19 @@ vllm_mock.v1.core = core_module
 vllm_mock.v1.core.sched = sched_module
 vllm_mock.v1.core.sched.output = output_module
 
+
 # Mock v1.kv_cache_interface module
 class MockKVCacheConfig:
+
     def __init__(self):
         pass
 
+
 class MockKVCacheSpec:
+
     def __init__(self):
         pass
+
 
 kv_cache_interface_module = MagicMock()
 kv_cache_interface_module.KVCacheConfig = MockKVCacheConfig
@@ -88,10 +108,13 @@ kv_cache_interface_module.KVCacheSpec = MockKVCacheSpec
 
 vllm_mock.v1.kv_cache_interface = kv_cache_interface_module
 
+
 # Mock v1.outputs module
 class MockModelRunnerOutput:
+
     def __init__(self):
         pass
+
 
 outputs_module = MagicMock()
 outputs_module.ModelRunnerOutput = MockModelRunnerOutput
@@ -109,9 +132,9 @@ sys.modules['vllm.worker.worker'] = worker_module
 sys.modules['vllm.v1'] = vllm_mock.v1
 sys.modules['vllm.v1.worker'] = vllm_mock.v1.worker
 sys.modules['vllm.v1.worker.worker_base'] = vllm_mock.v1.worker.worker_base
-sys.modules['vllm.lora'] = lora_module  
-sys.modules['vllm.lora.request'] = lora_module.request  
-sys.modules['vllm.model_executor'] = model_executor_module  
+sys.modules['vllm.lora'] = lora_module
+sys.modules['vllm.lora.request'] = lora_module.request
+sys.modules['vllm.model_executor'] = model_executor_module
 sys.modules['vllm.v1.core'] = core_module
 sys.modules['vllm.v1.core.sched'] = sched_module
 sys.modules['vllm.v1.core.sched.output'] = output_module

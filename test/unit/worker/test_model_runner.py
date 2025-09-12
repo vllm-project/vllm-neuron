@@ -7,7 +7,8 @@ from unittest.mock import MagicMock, Mock
 import pytest
 import torch
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
-from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+from vllm.v1.worker.gpu_input_batch import InputBatch
+
 
 # Create mock sampling params that return tensors
 class MockSamplingModule(MagicMock):
@@ -294,18 +295,16 @@ class TestModelRunner:
         model_runner.free_seq_ids = {0}  # Add one free sequence ID
         model_runner.vllm_req_to_neuron_seq_id_mapping = {}
 
-        request_data = NewRequestData(
-            req_id="new_req",
-            prompt_token_ids=[1, 2, 3],
-            block_ids=[[0]],
-            num_computed_tokens=0,
-            mm_inputs=None,
-            mm_positions=None,
-            mm_hashes=None,
-            sampling_params=Mock(),
-            pooling_params=None,
-            lora_request=Mock(lora_name=None)
-        )
+        request_data = NewRequestData(req_id="new_req",
+                                      prompt_token_ids=[1, 2, 3],
+                                      block_ids=[[0]],
+                                      num_computed_tokens=0,
+                                      mm_inputs=None,
+                                      mm_positions=None,
+                                      mm_hashes=None,
+                                      sampling_params=Mock(),
+                                      pooling_params=None,
+                                      lora_request=Mock(lora_name=None))
 
         # Create data object that matches IntermediateInputData
         data = Mock()
@@ -319,7 +318,8 @@ class TestModelRunner:
         data.multi_modal_kwargs = None
 
         # Mock _prepare_adapter_id_in_new_request
-        model_runner._prepare_adapter_id_in_new_request = Mock(return_value=None)
+        model_runner._prepare_adapter_id_in_new_request = Mock(
+            return_value=None)
 
         # Execute the method
         model_runner._process_new_request_for_continuous_batching(
@@ -333,8 +333,9 @@ class TestModelRunner:
         assert data.input_block_ids[0] == 0
         assert data.full_context_lens[0] == 3
         assert "new_req" in model_runner.vllm_req_to_neuron_seq_id_mapping
-        assert len(model_runner.free_seq_ids) == 0  # Should have used the free ID
-        
+        assert len(
+            model_runner.free_seq_ids) == 0  # Should have used the free ID
+
     def test_process_cached_request(self, model_runner):
         req_id = "cached_req"
         model_runner.vllm_req_to_neuron_seq_id_mapping[req_id] = 0
