@@ -6,6 +6,118 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
+# Mock CUDA-related modules
+class MockWorkerBase:
+    def __init__(self, vllm_config, local_rank, rank, distributed_init_method, is_driver_worker=False):
+        self.parallel_config = vllm_config.parallel_config
+        self.model_config = vllm_config.model_config
+        self.cache_config = vllm_config.cache_config
+        self.device_config = vllm_config.device_config
+        self.scheduler_config = vllm_config.scheduler_config
+        self.local_rank = local_rank
+        self.rank = rank
+        self.distributed_init_method = distributed_init_method
+        self.is_driver_worker = is_driver_worker
+
+# Create vllm mock structure
+vllm_mock = MagicMock()
+
+# Mock utils functions
+def mock_init_cached_hf_modules():
+    pass
+
+# Create vllm structure
+vllm_mock.config = MagicMock()
+vllm_mock.config.VllmConfig = MagicMock()
+
+vllm_mock.distributed = MagicMock()
+vllm_mock.distributed.init_distributed_environment = MagicMock()
+vllm_mock.distributed.ensure_model_parallel_initialized = MagicMock()
+
+vllm_mock.logger = MagicMock()
+vllm_mock.logger.init_logger = MagicMock(return_value=MagicMock())
+
+vllm_mock.utils = MagicMock()
+vllm_mock.utils.init_cached_hf_modules = mock_init_cached_hf_modules
+
+worker_module = MagicMock()
+worker_module.WorkerBase = MockWorkerBase
+vllm_mock.worker = MagicMock()
+vllm_mock.worker.worker = worker_module
+
+vllm_mock.v1 = MagicMock()
+vllm_mock.v1.worker = MagicMock()
+vllm_mock.v1.worker.worker_base = MagicMock()
+vllm_mock.v1.worker.worker_base.WorkerBase = MockWorkerBase
+
+class MockLoRARequest:
+    def __init__(self, lora_name=None):
+        self.lora_name = lora_name
+
+class MockSchedulerOutput:
+    def __init__(self):
+        pass
+
+lora_module = MagicMock()
+lora_module.request = MagicMock()
+lora_module.request.LoRARequest = MockLoRARequest
+vllm_mock.lora = lora_module
+model_executor_module = MagicMock()
+model_executor_module.set_random_seed = MagicMock()
+vllm_mock.model_executor = model_executor_module
+core_module = MagicMock()
+sched_module = MagicMock()
+output_module = MagicMock()
+output_module.SchedulerOutput = MockSchedulerOutput
+vllm_mock.v1.core = core_module
+vllm_mock.v1.core.sched = sched_module
+vllm_mock.v1.core.sched.output = output_module
+
+# Mock v1.kv_cache_interface module
+class MockKVCacheConfig:
+    def __init__(self):
+        pass
+
+class MockKVCacheSpec:
+    def __init__(self):
+        pass
+
+kv_cache_interface_module = MagicMock()
+kv_cache_interface_module.KVCacheConfig = MockKVCacheConfig
+kv_cache_interface_module.KVCacheSpec = MockKVCacheSpec
+
+vllm_mock.v1.kv_cache_interface = kv_cache_interface_module
+
+# Mock v1.outputs module
+class MockModelRunnerOutput:
+    def __init__(self):
+        pass
+
+outputs_module = MagicMock()
+outputs_module.ModelRunnerOutput = MockModelRunnerOutput
+
+vllm_mock.v1.outputs = outputs_module
+
+# Install vllm mock modules
+sys.modules['vllm'] = vllm_mock
+sys.modules['vllm.config'] = vllm_mock.config
+sys.modules['vllm.distributed'] = vllm_mock.distributed
+sys.modules['vllm.logger'] = vllm_mock.logger
+sys.modules['vllm.utils'] = vllm_mock.utils
+sys.modules['vllm.worker'] = vllm_mock.worker
+sys.modules['vllm.worker.worker'] = worker_module
+sys.modules['vllm.v1'] = vllm_mock.v1
+sys.modules['vllm.v1.worker'] = vllm_mock.v1.worker
+sys.modules['vllm.v1.worker.worker_base'] = vllm_mock.v1.worker.worker_base
+sys.modules['vllm.lora'] = lora_module  
+sys.modules['vllm.lora.request'] = lora_module.request  
+sys.modules['vllm.model_executor'] = model_executor_module  
+sys.modules['vllm.v1.core'] = core_module
+sys.modules['vllm.v1.core.sched'] = sched_module
+sys.modules['vllm.v1.core.sched.output'] = output_module
+sys.modules['vllm.v1.kv_cache_interface'] = kv_cache_interface_module
+sys.modules['vllm.v1.outputs'] = outputs_module
+
 mock_base = MagicMock()
 mock_base.utils = MagicMock()
 mock_base.utils.constants = MagicMock()
@@ -64,7 +176,6 @@ class TestNeuronWorker:
         parallel_config.rank = 0
         parallel_config.world_size = 1
         parallel_config.worker_cls = "auto"
-        # Set data_parallel_size as an integer
         parallel_config.data_parallel_size = 1
 
         return MockVllmConfig(model_config=Mock(trust_remote_code=True,
@@ -81,25 +192,25 @@ class TestNeuronWorker:
 
     @pytest.fixture
     def worker(self, vllm_config, mocker):
-        # Mock WorkerBase initialization
-        def mock_init(self, *args, **kwargs):
-            self.parallel_config = vllm_config.parallel_config
-            self.model_config = vllm_config.model_config
-            self.cache_config = vllm_config.cache_config
-            self.device_config = vllm_config.device_config
-            self.scheduler_config = vllm_config.scheduler_config
+        # # Mock WorkerBase initialization
+        # def mock_init(self, *args, **kwargs):
+        #     self.parallel_config = vllm_config.parallel_config
+        #     self.model_config = vllm_config.model_config
+        #     self.cache_config = vllm_config.cache_config
+        #     self.device_config = vllm_config.device_config
+        #     self.scheduler_config = vllm_config.scheduler_config
 
-        # Mock vLLM config
-        mock_vllm_config = Mock()
-        mock_vllm_config.model_config = vllm_config.model_config
-        mock_vllm_config.cache_config = vllm_config.cache_config
-        mock_vllm_config.parallel_config = vllm_config.parallel_config
-        mock_vllm_config.scheduler_config = vllm_config.scheduler_config
+        # # Mock vLLM config
+        # mock_vllm_config = Mock()
+        # mock_vllm_config.model_config = vllm_config.model_config
+        # mock_vllm_config.cache_config = vllm_config.cache_config
+        # mock_vllm_config.parallel_config = vllm_config.parallel_config
+        # mock_vllm_config.scheduler_config = vllm_config.scheduler_config
 
-        # Set up the get_current_vllm_config mock
-        mocker.patch('vllm.config.get_current_vllm_config',
-                     return_value=mock_vllm_config)
-        mocker.patch('vllm.worker.worker.WorkerBase.__init__', mock_init)
+        # # Set up the get_current_vllm_config mock
+        # mocker.patch('vllm.config.get_current_vllm_config',
+        #              return_value=mock_vllm_config)
+        # mocker.patch('vllm.worker.worker.WorkerBase.__init__', mock_init)
         mocker.patch('vllm.distributed.init_distributed_environment')
         mocker.patch('vllm.distributed.ensure_model_parallel_initialized')
 

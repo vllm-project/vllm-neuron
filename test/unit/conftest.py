@@ -2,10 +2,36 @@
 # test/unit/conftest.py
 import sys
 from collections import deque
-from unittest.mock import Mock
+from unittest.mock import Mock, MagicMock
 
 import pytest
 
+# Mock vLLM modules and classes
+class MockRequest:
+    def __init__(self, *args, **kwargs):
+        self.prompt_len = kwargs.get('prompt_len', 0)
+        self.max_output_len = kwargs.get('max_output_len', 0)
+        self.arrival_time = kwargs.get('arrival_time', 0)
+
+# Create mock modules
+mock_request = MagicMock()
+mock_request.Request = MockRequest
+
+class MockBaseScheduler:
+    def __init__(self, *args, **kwargs):
+        self.waiting = deque()
+        self.running = []
+
+    def schedule(self):
+        return Mock(name="SchedulerOutput")
+
+# Mock vllm scheduler
+mock_vllm_scheduler = Mock()
+mock_vllm_scheduler.Scheduler = MockBaseScheduler
+
+# Add to sys.modules before any imports
+sys.modules['vllm.v1.core.sched.scheduler'] = mock_vllm_scheduler
+sys.modules['vllm.v1.request'] = mock_request
 
 @pytest.fixture
 def mock_config():
