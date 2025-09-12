@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # test/unit/worker/test_neuron_worker.py
+import sys
 from dataclasses import dataclass
 from unittest.mock import MagicMock, Mock
 
 import pytest
-import sys
 
 mock_base = MagicMock()
 mock_base.utils = MagicMock()
@@ -44,6 +44,7 @@ sys.modules[
     'neuronx_distributed_inference.modules.padding'] = mock_base.modules.padding
 
 from neuronx_vllm_plugin.worker.neuron_worker import NeuronWorker
+
 
 @dataclass
 class MockVllmConfig:

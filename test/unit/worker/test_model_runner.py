@@ -1,20 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # test/unit/worker/test_model_runner.py
+import sys
 from dataclasses import dataclass
 from unittest.mock import MagicMock, Mock
 
 import pytest
-import sys
 import torch
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 
+
 # Create mock sampling params that return tensors
 class MockSamplingModule(MagicMock):
+
     def prepare_sampling_params(self, *args, **kwargs):
         return torch.ones(1, dtype=torch.float32)
-    
+
     def __getitem__(self, *args, **kwargs):
         return torch.ones(1, dtype=torch.float32)
+
 
 # Create a base mock module
 mock_base = MagicMock()
@@ -55,8 +58,8 @@ sys.modules[
 sys.modules[
     'neuronx_distributed_inference.modules.padding'] = mock_base.modules.padding
 
-from neuronx_vllm_plugin.worker.neuronx_distributed_model_runner import \
-    ModelInputForNeuron, NeuronxDistributedModelRunner
+from neuronx_vllm_plugin.worker.neuronx_distributed_model_runner import (
+    ModelInputForNeuron, NeuronxDistributedModelRunner)
 
 @dataclass
 class MockVllmConfig:
@@ -69,6 +72,7 @@ class MockVllmConfig:
     speculative_config: Mock = None
     observability_config: Mock = None
     device_config: Mock = None
+
 
 class TestModelRunner:
 
