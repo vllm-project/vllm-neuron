@@ -7,6 +7,9 @@ import pytest
 import torch
 from transformers import PretrainedConfig
 
+from neuronx_vllm_plugin.worker.neuronx_distributed_model_loader import \
+    get_neuron_model
+
 # Create a base mock module
 mock_base = MagicMock()
 mock_base.utils = MagicMock()
@@ -44,9 +47,6 @@ sys.modules[
     'neuronx_distributed_inference.modules.generation.sampling'] = mock_base.modules.generation.sampling
 sys.modules[
     'neuronx_distributed_inference.modules.padding'] = mock_base.modules.padding
-
-from neuronx_vllm_plugin.worker.neuronx_distributed_model_loader import \
-    get_neuron_model
 
 
 @pytest.fixture
