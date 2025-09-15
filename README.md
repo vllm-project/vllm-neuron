@@ -4,10 +4,10 @@
 
 ## Quick Start Guide
 
-Install the public vllm (latest release tag v0.10.0) from source:
+Install the public vllm (latest release tag v0.10.2) from source:
 
 ```
-git clone -b v0.10.0 https://github.com/vllm-project/vllm.git
+git clone -b v0.10.2 https://github.com/vllm-project/vllm.git
 cd vllm
 pip install -e .
 ```
