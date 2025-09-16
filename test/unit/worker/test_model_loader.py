@@ -252,6 +252,13 @@ def test_get_neuron_model_with_chunked_prefill(mocker, base_configs):
 
 
 def test_get_neuron_model_error_handling(mocker, base_configs):
+    # Mock the compilation config
+    mock_compilation_config = Mock()
+    mock_compilation_config.level = 0  # Set to a numeric value
+    mock_compilation_config.use_inductor = False
+    mocker.patch('vllm.model_executor.custom_op.get_cached_compilation_config',
+                 return_value=mock_compilation_config)
+
     scheduler_config, cache_config, parallel_config = base_configs
 
     model_config = Mock()
