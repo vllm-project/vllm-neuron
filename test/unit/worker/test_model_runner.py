@@ -14,7 +14,7 @@ from neuronx_vllm_plugin.worker.neuronx_distributed_model_runner import (
 
 # Create mock sampling params that return tensors
 class MockSamplingModule(MagicMock):
-
+    
     def prepare_sampling_params(self, *args, **kwargs):
         return torch.tensor([1.0], dtype=torch.float32)
 
@@ -41,9 +41,8 @@ mock_base.modules = MagicMock()
 mock_base.modules.lora_serving = MagicMock()
 mock_base.modules.generation = MagicMock()
 # Use the custom sampling mock
-mock_base.modules.generation.sampling = MockSamplingModule()
-mock_base.modules.generation.sampling.prepare_sampling_params = MockSamplingModule(
-)
+sampling_mock = MockSamplingModule()
+mock_base.modules.generation.sampling = sampling_mock
 mock_base.modules.padding = MagicMock()
 
 # Install the mock module
@@ -138,6 +137,19 @@ class TestModelRunner:
                                structured_output_request_ids=[],
                                grammar_bitmask=None,
                                kv_connector_metadata=None)
+    @pytest.fixture
+    def mock_sampling_module(self):
+        return MockSamplingModule()
+
+    @pytest.fixture
+    def model_runner(self, vllm_config, mock_model, mock_sampling_module):
+        runner = NeuronxDistributedModelRunner(vllm_config=vllm_config,
+                                            device="cpu")
+        runner.model = mock_model
+        runner.input_batch = Mock()
+        runner.input_batch.req_ids = ["req1"]
+        runner.sampling_module = mock_sampling_module
+        return runner
 
     def test_prepare_model_input(self, model_runner, mock_scheduler_output):
         # Disable LoRA for this test
@@ -164,6 +176,10 @@ class TestModelRunner:
         model_runner.input_batch.req_id_to_index = {}
         model_runner.input_batch.remove_request = Mock(return_value=None)
         model_runner.input_batch.req_ids = [req_id]
+        # Mock the get_nxd_sampling_params method to return a proper tensor
+        model_runner.get_nxd_sampling_params = Mock(
+            return_value=torch.ones((1, 3), dtype=torch.float32)
+        )
 
         # Setup scheduler output
         mock_scheduler_output.scheduled_cached_reqs.req_ids = [req_id]
@@ -176,6 +192,19 @@ class TestModelRunner:
 
         # Test continuous batching input preparation
         model_input = model_runner._prepare_model_input(mock_scheduler_output)
+
+        # Debug prints
+        print("\nDEBUG test_prepare_model_input:")
+        print(f"model_input type: {type(model_input)}")
+        print(f"model_input.request_ids: {model_input.request_ids}")
+        print(f"model_input.input_tokens type: {type(model_input.input_tokens)}")
+        print(f"model_input.input_tokens: {model_input.input_tokens}")
+        print(f"model_input.position_ids type: {type(model_input.position_ids)}")
+        print(f"model_input.position_ids: {model_input.position_ids}")
+        print(f"model_input.input_block_ids type: {type(model_input.input_block_ids)}")
+        print(f"model_input.input_block_ids: {model_input.input_block_ids}")
+        print(f"model_input.sampling_params type: {type(model_input.sampling_params)}")
+        print(f"model_input.sampling_params: {model_input.sampling_params}")
 
         # Verify the output
         assert isinstance(model_input, ModelInputForNeuron)
@@ -451,6 +480,36 @@ class TestModelRunner:
 
     def test_sampling_params(self, model_runner):
         input_ids = torch.tensor([[1, 2, 3]])
+
+        # Setup the mock model's neuron config
+        model_runner.model.neuron_config.on_device_sampling_config = None
+        model_runner.model.neuron_config.vocab_size = 32000
+
+        # Setup requests with sampling parameters
+        model_runner.requests = {
+            "req1": Mock(
+                sampling_params=Mock(
+                    top_k=10,
+                    top_p=0.9,
+                    temperature=1.0
+                )
+            )
+        }
+
         sampling_params = model_runner.get_nxd_sampling_params(input_ids)
+        # Debug prints
+        print("\nDEBUG test_sampling_params:")
+        print(f"sampling_params type: {type(sampling_params)}")
+        print(f"sampling_params: {sampling_params}")
+        if hasattr(sampling_params, 'shape'):
+            print(f"sampling_params shape: {sampling_params.shape}")
+        print(f"Is tensor?: {isinstance(sampling_params, torch.Tensor)}")
+        if isinstance(sampling_params, MagicMock):
+            print(f"MagicMock details: {sampling_params._mock_return_value}")
+            print(f"MagicMock methods: {dir(sampling_params)}")
+
         assert sampling_params is not None
         assert isinstance(sampling_params, torch.Tensor)
+        assert sampling_params.shape == torch.Size([1])
+        assert torch.allclose(sampling_params, torch.tensor([1.0], dtype=torch.float32))
+
