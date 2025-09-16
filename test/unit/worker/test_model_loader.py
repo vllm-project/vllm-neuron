@@ -252,6 +252,11 @@ def test_get_neuron_model_with_chunked_prefill(mocker, base_configs):
 
 
 def test_get_neuron_model_error_handling(mocker, base_configs):
+    # Mock CompilationLevel
+    mock_compilation_level = Mock()
+    mock_compilation_level.PIECEWISE = 1
+    mocker.patch('vllm.config.CompilationLevel', mock_compilation_level)
+    
     # Mock the compilation config
     mock_compilation_config = Mock()
     mock_compilation_config.level = 0  # Set to a numeric value
