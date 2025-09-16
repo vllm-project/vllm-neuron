@@ -112,29 +112,41 @@ class TestModelRunner:
 
     @pytest.fixture
     def mock_scheduler_output(self):
-        cached_reqs = Mock(req_ids=["req1"],
-                           num_computed_tokens=[0],
-                           new_block_ids=[[0]],
-                           resumed_from_preemption=[False],
-                           new_token_ids=[])  # Added from CachedRequestData
+        # Create a proper CachedRequestData mock
+        cached_reqs = Mock(
+            req_ids=["req1"],
+            num_computed_tokens=[0],
+            new_block_ids=[[0]],  # This should be tuple[list[int], ...] type
+            resumed_from_preemption=[False],
+            new_token_ids=[[]]  # list[list[int]] type
+        )
 
-        # Create base arguments matching the exact class definition
         scheduler_args = {
-            # Required fields from the dataclass
-            'scheduled_new_reqs': [],
-            'scheduled_cached_reqs': cached_reqs,
+            # Requests
+            'scheduled_new_reqs': [],  # list[NewRequestData]
+            'scheduled_cached_reqs': cached_reqs,  # CachedRequestData
+
+            # Token scheduling info
             'num_scheduled_tokens': {
                 "req1": 1
-            },
-            'total_num_scheduled_tokens': 1,
-            'scheduled_spec_decode_tokens': {},
-            'scheduled_encoder_inputs': {},
-            'num_common_prefix_blocks': [],
-            'finished_req_ids': set(),  # Note: this should be a set
-            'free_encoder_input_ids': [],  # List of tuples (str, int)
-            'structured_output_request_ids': {},
-            'grammar_bitmask': None,
-            'kv_connector_metadata': None  # Optional field with default None
+            },  # dict[str, int]
+            'total_num_scheduled_tokens': 1,  # int
+            'scheduled_spec_decode_tokens': {},  # dict[str, list[int]]
+
+            # Encoder related
+            'scheduled_encoder_inputs': {},  # dict[str, list[int]]
+            'num_common_prefix_blocks': [],  # list[int]
+            'free_encoder_input_ids': [],  # list[tuple[str, int]]
+
+            # Request management
+            'finished_req_ids': set(),  # set[str]
+
+            # Structured output
+            'structured_output_request_ids': {},  # dict[str, int]
+            'grammar_bitmask': None,  # Optional[npt.NDArray[np.int32]]
+
+            # KV Cache
+            'kv_connector_metadata': None  # Optional[KVConnectorMetadata]
         }
 
         try:
@@ -549,7 +561,6 @@ class TestModelRunner:
         # This will help us see exactly what arguments are needed
         try:
             minimal_args = {arg: [] for arg in required_args}
-            output = SchedulerOutput(**minimal_args)
             print("\nSuccessfully created SchedulerOutput with minimal args")
         except Exception as e:
             print(f"\nError creating SchedulerOutput: {e}")
