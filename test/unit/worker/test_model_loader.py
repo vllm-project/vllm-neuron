@@ -92,8 +92,12 @@ def test_get_neuron_model(mocker, base_configs):
         'neuronx_vllm_plugin.worker.neuronx_distributed_model_loader.NeuronCausalLM',
         return_value=mock_causal_lm)
 
-    model = get_neuron_model(model_config, cache_config, parallel_config,
-                             scheduler_config, Mock())
+    model = get_neuron_model(model_config,
+                             cache_config,
+                             parallel_config,
+                             scheduler_config,
+                             Mock(),
+                             additional_config={})
 
     assert model is not None
 
@@ -148,8 +152,12 @@ def test_get_neuron_model_different_architectures(mocker, base_configs,
             'neuronx_vllm_plugin.worker.neuronx_distributed_model_loader.NeuronCausalLM',
             return_value=mock_causal_lm)
 
-    model = get_neuron_model(model_config, cache_config, parallel_config,
-                             scheduler_config, Mock())
+    model = get_neuron_model(model_config,
+                             cache_config,
+                             parallel_config,
+                             scheduler_config,
+                             Mock(),
+                             additional_config={})
 
     assert model is not None
     if model_type == "llava":
@@ -186,8 +194,12 @@ def test_get_neuron_model_with_prefix_caching(mocker, base_configs):
         'neuronx_vllm_plugin.worker.neuronx_distributed_model_loader.NeuronCausalLM',
         return_value=mock_causal_lm)
 
-    model = get_neuron_model(model_config, cache_config, parallel_config,
-                             scheduler_config, Mock())
+    model = get_neuron_model(model_config,
+                             cache_config,
+                             parallel_config,
+                             scheduler_config,
+                             Mock(),
+                             additional_config={})
 
     assert model is not None
     assert model.model.config.neuron_config.is_prefix_caching
@@ -206,12 +218,18 @@ def test_get_neuron_model_with_chunked_prefill(mocker, base_configs):
         model_type="llama")
     model_config.model = "meta-llama/Llama-2-7b-hf"
     model_config.dtype = torch.float32
-    model_config.override_neuron_config = {
-        "chunked_prefill_config": {
-            "enabled": True
-        },
-        "is_block_kv_layout": True
+
+    # Define additional_config before using it
+    additional_config = {
+        "override_neuron_config": {
+            "chunked_prefill_config": {
+                "enabled": True
+            },
+            "is_block_kv_layout": True
+        }
     }
+    model_config.override_neuron_config = additional_config[
+        "override_neuron_config"]
 
     mock_model = Mock()
     mock_model.config.neuron_config = Mock()
@@ -222,8 +240,12 @@ def test_get_neuron_model_with_chunked_prefill(mocker, base_configs):
         'neuronx_vllm_plugin.worker.neuronx_distributed_model_loader.NeuronCausalLM',
         return_value=mock_causal_lm)
 
-    model = get_neuron_model(model_config, cache_config, parallel_config,
-                             scheduler_config, Mock())
+    model = get_neuron_model(model_config,
+                             cache_config,
+                             parallel_config,
+                             scheduler_config,
+                             Mock(),
+                             additional_config=additional_config)
 
     assert model is not None
     assert hasattr(model.model.config.neuron_config, 'chunked_prefill_config')
@@ -244,5 +266,9 @@ def test_get_neuron_model_error_handling(mocker, base_configs):
     model_config.override_neuron_config = None
 
     with pytest.raises(ValueError, match="Model .* is not supported"):
-        get_neuron_model(model_config, cache_config, parallel_config,
-                         scheduler_config, Mock())
+        get_neuron_model(model_config,
+                         cache_config,
+                         parallel_config,
+                         scheduler_config,
+                         Mock(),
+                         additional_config={})

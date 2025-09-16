@@ -111,15 +111,6 @@ class TestModelRunner:
         return model
 
     @pytest.fixture
-    def model_runner(self, vllm_config, mock_model):
-        runner = NeuronxDistributedModelRunner(vllm_config=vllm_config,
-                                               device="cpu")
-        runner.model = mock_model
-        runner.input_batch = Mock()
-        runner.input_batch.req_ids = ["req1"]
-        return runner
-
-    @pytest.fixture
     def mock_scheduler_output(self):
         cached_reqs = Mock(req_ids=["req1"],
                            num_computed_tokens=[0],
