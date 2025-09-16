@@ -115,37 +115,34 @@ class TestModelRunner:
         cached_reqs = Mock(req_ids=["req1"],
                            num_computed_tokens=[0],
                            new_block_ids=[[0]],
-                           resumed_from_preemption=[False])
+                           resumed_from_preemption=[False],
+                           new_token_ids=[])  # Added from CachedRequestData
 
-        # Create base arguments
+        # Create base arguments matching the exact class definition
         scheduler_args = {
+            # Required fields from the dataclass
             'scheduled_new_reqs': [],
             'scheduled_cached_reqs': cached_reqs,
             'num_scheduled_tokens': {
                 "req1": 1
             },
-            'finished_req_ids': [],
             'total_num_scheduled_tokens': 1,
             'scheduled_spec_decode_tokens': {},
-            'scheduled_encoder_inputs': [],
-            'num_common_prefix_blocks': 0,
-            'structured_output_request_ids': [],
+            'scheduled_encoder_inputs': {},
+            'num_common_prefix_blocks': [],
+            'finished_req_ids': set(),  # Note: this should be a set
+            'free_encoder_input_ids': [],  # List of tuples (str, int)
+            'structured_output_request_ids': {},
             'grammar_bitmask': None,
-            'kv_connector_metadata': None
+            'kv_connector_metadata': None  # Optional field with default None
         }
 
         try:
-            # Try with free_encoder_input_ids
-            return SchedulerOutput(**scheduler_args, free_encoder_input_ids=[])
-        except TypeError:
-            # If that fails, try without it
-            try:
-                return SchedulerOutput(**scheduler_args)
-            except TypeError as e:
-                # If both fail, print helpful debug info
-                print(f"SchedulerOutput init error: {e}")
-                print(f"Available arguments: {dir(SchedulerOutput)}")
-                raise
+            return SchedulerOutput(**scheduler_args)
+        except TypeError as e:
+            print(f"\nError creating SchedulerOutput: {e}")
+            print("Current args:", scheduler_args.keys())
+            raise
 
     @pytest.fixture
     def mock_sampling_module(self):
@@ -523,3 +520,37 @@ class TestModelRunner:
     #     assert sampling_params.shape == torch.Size([1])
     #     assert torch.allclose(sampling_params,
     #                           torch.tensor([1.0], dtype=torch.float32))
+
+    def test_scheduler_output_args(self):  # Added as method of TestModelRunner
+        import inspect
+
+        from vllm.v1.core.sched.output import SchedulerOutput
+
+        def get_required_args():
+            try:
+                SchedulerOutput()
+            except TypeError as e:
+                print(f"Initial error: {e}")
+
+            sig = inspect.signature(SchedulerOutput.__init__)
+            required_args = {
+                name: param.default
+                for name, param in sig.parameters.items()
+                if param.default == inspect.Parameter.empty and name != 'self'
+            }
+            print(f"Required arguments: {required_args}")
+            return required_args
+
+        required_args = get_required_args()
+        print("\nAll required arguments for SchedulerOutput:")
+        for arg in required_args:
+            print(f"- {arg}")
+
+        # This will help us see exactly what arguments are needed
+        try:
+            minimal_args = {arg: [] for arg in required_args}
+            output = SchedulerOutput(**minimal_args)
+            print("\nSuccessfully created SchedulerOutput with minimal args")
+        except Exception as e:
+            print(f"\nError creating SchedulerOutput: {e}")
+            print("Current args:", minimal_args)
