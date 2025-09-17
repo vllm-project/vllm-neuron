@@ -252,20 +252,30 @@ def test_get_neuron_model_with_chunked_prefill(mocker, base_configs):
 
 
 def test_get_neuron_model_error_handling(mocker, base_configs):
+    print("\nDEBUG: Starting test_get_neuron_model_error_handling")
+    
     # Mock CompilationLevel
     mock_compilation_level = Mock()
     mock_compilation_level.PIECEWISE = 1
     mocker.patch('vllm.config.CompilationLevel', mock_compilation_level)
 
-    # Mock the compilation config
-    mock_compilation_config = Mock()
-    mock_compilation_config.level = 0  # Set to a numeric value
-    mock_compilation_config.use_inductor = False
-    mocker.patch('vllm.model_executor.custom_op.get_cached_compilation_config',
-                 return_value=mock_compilation_config)
+    # Mock vLLM config
+    mock_config = Mock()
+    mock_config.compilation_config = Mock()
+    mock_config.compilation_config.level = 0
+    mock_config.compilation_config.use_inductor = False
+    mock_config.compilation_config.custom_ops = []
+    mock_config.compilation_config.enabled_custom_ops = set()
+    mock_config.compilation_config.disabled_custom_ops = set()
+    
+    # Mock get_current_vllm_config
+    mocker.patch('vllm.config.get_current_vllm_config', 
+                 return_value=mock_config)
 
+    print("\nDEBUG: Setting up test configs")
     scheduler_config, cache_config, parallel_config = base_configs
 
+    print("\nDEBUG: Creating model config")
     model_config = Mock()
     model_config.hf_config = PretrainedConfig(
         architectures=["UnsupportedModel"],
@@ -277,10 +287,19 @@ def test_get_neuron_model_error_handling(mocker, base_configs):
     model_config.dtype = torch.float32
     model_config.override_neuron_config = None
 
-    with pytest.raises(ValueError, match="Model .* is not supported"):
-        get_neuron_model(model_config,
-                         cache_config,
-                         parallel_config,
-                         scheduler_config,
-                         Mock(),
-                         additional_config={})
+    print("\nDEBUG: Testing error handling")
+    try:
+        with pytest.raises(ValueError, match="Model .* is not supported"):
+            get_neuron_model(model_config,
+                            cache_config,
+                            parallel_config,
+                            scheduler_config,
+                            Mock(),
+                            additional_config={})
+        print("DEBUG: Successfully caught expected ValueError")
+    except Exception as e:
+        print(f"DEBUG: Unexpected error during test: {e}")
+        raise
+
+    print("DEBUG: Test completed successfully")
+
