@@ -253,7 +253,7 @@ def test_get_neuron_model_with_chunked_prefill(mocker, base_configs):
 
 def test_get_neuron_model_error_handling(mocker, base_configs):
     print("\nDEBUG: Starting test_get_neuron_model_error_handling")
-    
+
     # Mock CompilationLevel
     mock_compilation_level = Mock()
     mock_compilation_level.PIECEWISE = 1
@@ -267,9 +267,9 @@ def test_get_neuron_model_error_handling(mocker, base_configs):
     mock_config.compilation_config.custom_ops = []
     mock_config.compilation_config.enabled_custom_ops = set()
     mock_config.compilation_config.disabled_custom_ops = set()
-    
+
     # Mock get_current_vllm_config
-    mocker.patch('vllm.config.get_current_vllm_config', 
+    mocker.patch('vllm.config.get_current_vllm_config',
                  return_value=mock_config)
 
     print("\nDEBUG: Setting up test configs")
@@ -291,15 +291,14 @@ def test_get_neuron_model_error_handling(mocker, base_configs):
     try:
         with pytest.raises(ValueError, match="Model .* is not supported"):
             get_neuron_model(model_config,
-                            cache_config,
-                            parallel_config,
-                            scheduler_config,
-                            Mock(),
-                            additional_config={})
+                             cache_config,
+                             parallel_config,
+                             scheduler_config,
+                             Mock(),
+                             additional_config={})
         print("DEBUG: Successfully caught expected ValueError")
     except Exception as e:
         print(f"DEBUG: Unexpected error during test: {e}")
         raise
 
     print("DEBUG: Test completed successfully")
-
