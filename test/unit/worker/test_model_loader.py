@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# test/unit/worker/test_model_loader.py
+import logging
 import sys
 from unittest.mock import MagicMock, Mock
 
@@ -9,6 +9,8 @@ from transformers import PretrainedConfig
 
 from neuronx_vllm_plugin.worker.neuronx_distributed_model_loader import \
     get_neuron_model
+
+logger = logging.getLogger(__name__)
 
 # Create a base mock module
 mock_base = MagicMock()
@@ -69,6 +71,20 @@ def base_configs():
 
 
 def test_get_neuron_model(mocker, base_configs):
+    """Test basic neuron model initialization.
+
+    This test verifies that a basic LLaMA model can be properly initialized
+    with default configurations. It checks:
+    1. Model configuration is correctly processed
+    2. Model is successfully loaded with neuron backend
+    3. Required model attributes and configurations are present
+
+    Args:
+        mocker: PyTest mocker fixture for mocking dependencies
+        base_configs: Fixture providing basic configuration objects
+
+    The test ensures the fundamental model loading pathway works correctly.
+    """
     scheduler_config, cache_config, parallel_config = base_configs
 
     model_config = Mock()
@@ -109,6 +125,20 @@ def test_get_neuron_model(mocker, base_configs):
 ])
 def test_get_neuron_model_different_architectures(mocker, base_configs,
                                                   model_type, architecture):
+    """Test model initialization across different architectures.
+
+    This test verifies that:
+    1. Different model architectures are properly supported
+    2. Architecture-specific configurations are correctly applied
+    3. LLaVA models have proper text configuration
+    4. Model type specific features are properly initialized
+
+    Args:
+        mocker: PyTest mocker fixture
+        base_configs: Base configuration fixture
+        model_type: Type of model to test
+        architecture: Model architecture class name
+    """
     scheduler_config, cache_config, parallel_config = base_configs
 
     # Create text config for LLaVA
@@ -168,6 +198,17 @@ def test_get_neuron_model_different_architectures(mocker, base_configs,
 
 
 def test_get_neuron_model_with_prefix_caching(mocker, base_configs):
+    """Test model initialization with prefix caching enabled.
+
+    This test verifies that:
+    1. Prefix caching configuration is properly applied
+    2. Block KV layout is correctly configured
+    3. Model loads successfully with caching enabled
+
+    Args:
+        mocker: PyTest mocker fixture
+        base_configs: Base configuration fixture
+    """
     scheduler_config, cache_config, parallel_config = base_configs
     cache_config.enable_prefix_caching = True
 
@@ -206,6 +247,17 @@ def test_get_neuron_model_with_prefix_caching(mocker, base_configs):
 
 
 def test_get_neuron_model_with_chunked_prefill(mocker, base_configs):
+    """Test model initialization with chunked prefill enabled.
+
+    This test verifies that:
+    1. Chunked prefill configuration is properly applied
+    2. Block KV layout is correctly configured
+    3. Additional config overrides are properly handled
+
+    Args:
+        mocker: PyTest mocker fixture
+        base_configs: Base configuration fixture
+    """
     scheduler_config, cache_config, parallel_config = base_configs
     scheduler_config.chunked_prefill_enabled = True
 
@@ -252,7 +304,17 @@ def test_get_neuron_model_with_chunked_prefill(mocker, base_configs):
 
 
 def test_get_neuron_model_error_handling(mocker, base_configs):
-    print("\nDEBUG: Starting test_get_neuron_model_error_handling")
+    """Test error handling for unsupported model types.
+
+    This test verifies that:
+    1. Unsupported model architectures are properly detected
+    2. Appropriate ValueError is raised
+    3. Error message matches expected pattern
+
+    Args:
+        mocker: PyTest mocker fixture
+        base_configs: Base configuration fixture
+    """
 
     # Mock CompilationLevel
     mock_compilation_level = Mock()
@@ -272,10 +334,8 @@ def test_get_neuron_model_error_handling(mocker, base_configs):
     mocker.patch('vllm.config.get_current_vllm_config',
                  return_value=mock_config)
 
-    print("\nDEBUG: Setting up test configs")
     scheduler_config, cache_config, parallel_config = base_configs
 
-    print("\nDEBUG: Creating model config")
     model_config = Mock()
     model_config.hf_config = PretrainedConfig(
         architectures=["UnsupportedModel"],
@@ -287,18 +347,10 @@ def test_get_neuron_model_error_handling(mocker, base_configs):
     model_config.dtype = torch.float32
     model_config.override_neuron_config = None
 
-    print("\nDEBUG: Testing error handling")
-    try:
-        with pytest.raises(ValueError, match="Model .* is not supported"):
-            get_neuron_model(model_config,
-                             cache_config,
-                             parallel_config,
-                             scheduler_config,
-                             Mock(),
-                             additional_config={})
-        print("DEBUG: Successfully caught expected ValueError")
-    except Exception as e:
-        print(f"DEBUG: Unexpected error during test: {e}")
-        raise
-
-    print("DEBUG: Test completed successfully")
+    with pytest.raises(ValueError, match="Model .* is not supported"):
+        get_neuron_model(model_config,
+                         cache_config,
+                         parallel_config,
+                         scheduler_config,
+                         Mock(),
+                         additional_config={})

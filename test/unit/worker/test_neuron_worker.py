@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# test/unit/worker/test_neuron_worker.py
 import sys
 from dataclasses import dataclass
 from unittest.mock import MagicMock, Mock
@@ -280,26 +279,62 @@ class TestNeuronWorker:
         return worker
 
     def test_worker_initialization(self, worker):
-        """Test basic worker initialization"""
+        """Test basic worker initialization and configuration.
+
+        This test verifies that:
+        1. Worker is properly instantiated
+        2. Required attributes are present
+        3. Device configuration is correct
+
+        Args:
+            worker: Fixture providing configured NeuronWorker instance
+        """
         assert worker is not None
         assert hasattr(worker, 'model_runner')
         assert hasattr(worker, 'model_config')
         assert worker.device == "cpu"
 
     def test_worker_methods(self, worker):
-        """Test presence of required methods"""
+        """Test presence and accessibility of required worker methods.
+
+        This test verifies that:
+        1. All required methods are present
+        2. Methods are properly inherited
+        3. Core functionality methods exist
+
+        Args:
+            worker: Fixture providing configured NeuronWorker instance
+        """
         assert hasattr(worker, 'load_model')
         assert hasattr(worker, 'execute_model')
         assert hasattr(worker, 'init_device')
         assert hasattr(worker, 'initialize_cache')
 
     def test_determine_available_memory(self, worker):
-        """Test memory determination"""
+        """Test worker's memory determination functionality.
+
+        This test verifies that:
+        1. Memory calculation is performed correctly
+        2. Expected default memory size is returned
+        3. Memory size matches device configuration
+
+        Args:
+            worker: Fixture providing configured NeuronWorker instance
+        """
         memory = worker.determine_available_memory()
         assert memory == 1024 * 1024 * 1024  # 1GB
 
     def test_execute_model(self, worker):
-        """Test model execution"""
+        """Test model execution functionality.
+
+        This test verifies that:
+        1. Driver worker correctly executes model and returns output
+        2. Non-driver worker returns None
+        3. Model runner is called with correct parameters
+
+        Args:
+            worker: Fixture providing configured NeuronWorker instance
+        """
         mock_output = Mock()
         worker.model_runner.execute_model.return_value = mock_output
 
@@ -313,36 +348,92 @@ class TestNeuronWorker:
         assert output is None
 
     def test_initialize_cache(self, worker):
-        """Test cache initialization"""
+        """Test cache initialization configuration.
+
+        This test verifies that:
+        1. Cache blocks are correctly allocated
+        2. GPU and CPU block counts are properly set
+        3. Cache configuration is updated
+
+        Args:
+            worker: Fixture providing configured NeuronWorker instance
+        """
         worker.initialize_cache(num_gpu_blocks=10, num_cpu_blocks=20)
         assert worker.cache_config.num_gpu_blocks == 10
         assert worker.cache_config.num_cpu_blocks == 20
 
     def test_load_model(self, worker):
-        """Test model loading"""
+        """Test model loading process.
+
+        This test verifies that:
+        1. Model loading is triggered
+        2. Model runner's load_model method is called
+        3. Loading process completes successfully
+
+        Args:
+            worker: Fixture providing configured NeuronWorker instance
+        """
         worker.load_model()
         worker.model_runner.load_model.assert_called_once()
 
     def test_get_kv_cache_spec(self, worker):
-        """Test getting KV cache spec"""
+        """Test KV cache specification retrieval.
+
+        This test verifies that:
+        1. KV cache specification is correctly returned
+        2. Model runner's get_kv_cache_spec is called
+        3. Specification format is correct
+
+        Args:
+            worker: Fixture providing configured NeuronWorker instance
+        """
         mock_spec = {'key': 'value'}
         worker.model_runner.get_kv_cache_spec.return_value = mock_spec
         result = worker.get_kv_cache_spec()
         assert result == mock_spec
 
     def test_initialize_from_config(self, worker):
-        """Test initialization from config"""
+        """Test worker initialization from configuration.
+
+        This test verifies that:
+        1. Configuration is properly applied
+        2. KV cache is initialized with config
+        3. Model runner receives correct configuration
+
+        Args:
+            worker: Fixture providing configured NeuronWorker instance
+        """
         mock_config = Mock()
         worker.initialize_from_config(mock_config)
         worker.model_runner.initialize_kv_cache.assert_called_once_with(
             mock_config)
 
     def test_check_health(self, worker):
-        """Test health check"""
+        """Test worker health check functionality.
+
+        This test verifies that:
+        1. Health check returns expected result
+        2. No errors are raised during check
+        3. Worker state is valid
+
+        Args:
+            worker: Fixture providing configured NeuronWorker instance
+        """
         assert worker.check_health() is None
 
     def test_init_distributed_environment(self, worker, mocker):
-        """Test distributed environment initialization"""
+        """Test distributed environment initialization.
+
+        This test verifies that:
+        1. Distributed environment is properly initialized
+        2. Correct parameters are passed to initialization
+        3. Model parallel settings are properly configured
+        4. Backend selection is correct
+
+        Args:
+            worker: Fixture providing configured NeuronWorker instance
+            mocker: PyTest mocker fixture
+        """
         # Patch at the correct import path
         mock_init = mocker.patch(
             'neuronx_vllm_plugin.worker.neuron_worker.init_distributed_environment'
@@ -376,7 +467,17 @@ class TestNeuronWorker:
         assert worker.parallel_config.data_parallel_size == 1
 
     def test_lora_operations(self, worker):
-        """Test LoRA-related operations"""
+        """Test LoRA adapter operations.
+
+        This test verifies that:
+        1. LoRA adapters can be added and removed
+        2. Adapter pinning works correctly
+        3. Adapter listing returns correct set
+        4. All LoRA operations call appropriate model runner methods
+
+        Args:
+            worker: Fixture providing configured NeuronWorker instance
+        """
         # Test add_lora
         mock_request = Mock()
         worker.add_lora(mock_request)
@@ -397,7 +498,16 @@ class TestNeuronWorker:
         assert result == mock_loras
 
     def test_unsupported_operations(self, worker):
-        """Test operations that raise NotImplementedError"""
+        """Test handling of unsupported operations.
+
+        This test verifies that:
+        1. Unsupported methods raise NotImplementedError
+        2. Profile method is properly blocked
+        3. Get model method is properly blocked
+
+        Args:
+            worker: Fixture providing configured NeuronWorker instance
+        """
         with pytest.raises(NotImplementedError):
             worker.profile()
 
