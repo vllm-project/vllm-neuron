@@ -300,7 +300,6 @@ class TestModelRunner:
         )
         logger.debug(f"mock_cached_reqs[0]: {mock_cached_reqs[0]}")
 
-        # Debug prints and assertions
         test_block_ids = mock_req_state.block_ids[0]
         test_new_ids = mock_scheduler_output.scheduled_cached_reqs.new_block_ids[
             0]
@@ -448,7 +447,6 @@ class TestModelRunner:
 
         The test ensures proper integration of LoRA adapters with the model runner.
         """
-        # Test LoRA adapter handling
         model_runner.lora_config = Mock()
         model_runner.lora_manager = Mock()
 
