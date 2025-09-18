@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# test/unit/core/test_scheduler.py
 from collections import deque
 from unittest.mock import Mock, patch
 

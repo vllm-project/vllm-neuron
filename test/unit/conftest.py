@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# test/unit/conftest.py
 import logging
 import sys
 from collections import deque

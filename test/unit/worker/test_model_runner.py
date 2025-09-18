@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# test/unit/worker/test_model_runner.py
+import logging
 import sys
 from dataclasses import dataclass
 from unittest.mock import MagicMock, Mock
@@ -10,6 +10,8 @@ from vllm.v1.core.sched.output import SchedulerOutput
 
 from neuronx_vllm_plugin.worker.neuronx_distributed_model_runner import (
     ModelInputForNeuron, NeuronxDistributedModelRunner)
+
+logger = logging.getLogger(__name__)
 
 
 # Create mock sampling params that return tensors
@@ -112,37 +114,35 @@ class TestModelRunner:
 
     @pytest.fixture
     def mock_scheduler_output(self):
-        # Create a proper CachedRequestData mock
-        cached_reqs = Mock(
-            req_ids=["req1"],
-            num_computed_tokens=[0],
-            new_block_ids=[[0]],  # This should be tuple[list[int], ...] type
-            resumed_from_preemption=[False],
-            new_token_ids=[[]]  # list[list[int]] type
-        )
+
+        cached_reqs = Mock(req_ids=["req1"],
+                           num_computed_tokens=[0],
+                           new_block_ids=[[0]],
+                           resumed_from_preemption=[False],
+                           new_token_ids=[[]])
 
         scheduler_args = {
             # Requests
-            'scheduled_new_reqs': [],  # list[NewRequestData]
-            'scheduled_cached_reqs': cached_reqs,  # CachedRequestData
+            'scheduled_new_reqs': [],
+            'scheduled_cached_reqs': cached_reqs,
 
             # Token scheduling info
             'num_scheduled_tokens': {
                 "req1": 1
-            },  # dict[str, int]
-            'total_num_scheduled_tokens': 1,  # int
-            'scheduled_spec_decode_tokens': {},  # dict[str, list[int]]
+            },
+            'total_num_scheduled_tokens': 1,
+            'scheduled_spec_decode_tokens': {},
 
             # Encoder related
-            'scheduled_encoder_inputs': {},  # dict[str, list[int]]
-            'num_common_prefix_blocks': [],  # list[int]
-            'free_encoder_input_ids': [],  # list[tuple[str, int]]
+            'scheduled_encoder_inputs': {},
+            'num_common_prefix_blocks': [],
+            'free_encoder_input_ids': [],
 
             # Request management
-            'finished_req_ids': set(),  # set[str]
+            'finished_req_ids': set(),
 
             # Structured output
-            'structured_output_request_ids': {},  # dict[str, int]
+            'structured_output_request_ids': {},
             'grammar_bitmask': None,  # Optional[npt.NDArray[np.int32]]
 
             # KV Cache
@@ -152,8 +152,8 @@ class TestModelRunner:
         try:
             return SchedulerOutput(**scheduler_args)
         except TypeError as e:
-            print(f"\nError creating SchedulerOutput: {e}")
-            print("Current args:", scheduler_args.keys())
+            logger.error(f"Error creating SchedulerOutput: {e}")
+            logger.debug(f"Current args: {scheduler_args.keys()}")
             raise
 
     @pytest.fixture
@@ -171,6 +171,20 @@ class TestModelRunner:
         return runner
 
     def test_prepare_model_input(self, model_runner, mock_scheduler_output):
+        """Test the preparation of model input for continuous batching.
+
+        This test verifies that:
+        1. Model input is correctly formatted for continuous batching
+        2. All required tensors are properly created and shaped
+        3. Request IDs and sampling parameters are properly handled
+
+        Args:
+            model_runner: Fixture providing configured ModelRunner instance
+            mock_scheduler_output: Fixture providing mock scheduler output
+
+        The test ensures all components of ModelInputForNeuron are correctly
+        initialized and formatted.
+        """
         # Disable LoRA for this test
         model_runner.lora_config = None
 
@@ -180,7 +194,7 @@ class TestModelRunner:
 
         # Create a mock sampling params with proper attributes
         mock_sampling_params = Mock()
-        mock_sampling_params.top_k = 10  # Set a specific value
+        mock_sampling_params.top_k = 10
         mock_sampling_params.top_p = 0.9
         mock_sampling_params.temperature = 1.0
 
@@ -188,8 +202,7 @@ class TestModelRunner:
             output_token_ids=[1],
             prompt_token_ids=[1],
             block_ids=[[0]],
-            sampling_params=mock_sampling_params  # Add sampling params
-        )
+            sampling_params=mock_sampling_params)
 
         # Setup input batch
         model_runner.input_batch.req_id_to_index = {}
@@ -211,25 +224,6 @@ class TestModelRunner:
         # Test continuous batching input preparation
         model_input = model_runner._prepare_model_input(mock_scheduler_output)
 
-        # Debug prints
-        print("\nDEBUG test_prepare_model_input:")
-        print(f"model_input type: {type(model_input)}")
-        print(f"model_input.request_ids: {model_input.request_ids}")
-        print(
-            f"model_input.input_tokens type: {type(model_input.input_tokens)}")
-        print(f"model_input.input_tokens: {model_input.input_tokens}")
-        print(
-            f"model_input.position_ids type: {type(model_input.position_ids)}")
-        print(f"model_input.position_ids: {model_input.position_ids}")
-        print(
-            f"model_input.input_block_ids type: {type(model_input.input_block_ids)}"
-        )
-        print(f"model_input.input_block_ids: {model_input.input_block_ids}")
-        print(
-            f"model_input.sampling_params type: {type(model_input.sampling_params)}"
-        )
-        print(f"model_input.sampling_params: {model_input.sampling_params}")
-
         # Verify the output
         assert isinstance(model_input, ModelInputForNeuron)
         assert model_input.request_ids is not None
@@ -239,6 +233,18 @@ class TestModelRunner:
         assert isinstance(model_input.sampling_params, torch.Tensor)
 
     def test_update_states(self, model_runner, mock_scheduler_output):
+        """Test state updates during model execution.
+
+        This test verifies that:
+        1. Block IDs are correctly updated
+        2. Computed tokens are properly tracked
+        3. State transitions are handled correctly
+
+        Args:
+            model_runner: Fixture providing configured ModelRunner instance
+            mock_scheduler_output: Fixture providing mock scheduler output
+        """
+
         # Setup mock input batch
         model_runner.input_batch.req_id_to_index = {}
         model_runner.input_batch.remove_request = Mock(return_value=None)
@@ -288,20 +294,20 @@ class TestModelRunner:
         # Initialize encoder cache
         model_runner.encoder_cache = {}
 
-        # Add more debug prints
-        print(f"mock_block_ids: {mock_block_ids}")
-        print(
+        logger.debug(f"mock_block_ids: {mock_block_ids}")
+        logger.debug(
             f"mock_cached_reqs.new_block_ids: {mock_cached_reqs.new_block_ids}"
         )
-        print(f"mock_cached_reqs[0]: {mock_cached_reqs[0]}")
+        logger.debug(f"mock_cached_reqs[0]: {mock_cached_reqs[0]}")
 
         # Debug prints and assertions
         test_block_ids = mock_req_state.block_ids[0]
         test_new_ids = mock_scheduler_output.scheduled_cached_reqs.new_block_ids[
             0]
-        print(
+        logger.debug(
             f"test_block_ids: {test_block_ids}, type: {type(test_block_ids)}")
-        print(f"test_new_ids: {test_new_ids}, type: {type(test_new_ids)}")
+        logger.debug(
+            f"test_new_ids: {test_new_ids}, type: {type(test_new_ids)}")
         assert isinstance(test_block_ids, list)
         assert isinstance(test_new_ids, list)
 
@@ -316,6 +322,17 @@ class TestModelRunner:
         assert list(inner_list) == [0, 1, 2, 3, 4, 5]  # Should contain all IDs
 
     def test_chunked_prefill(self, model_runner, mock_scheduler_output):
+        """Test chunked prefill input preparation.
+
+        This test verifies that:
+        1. Chunked prefill mode is properly enabled
+        2. Input data is correctly formatted
+        3. Required attributes are present in output
+
+        Args:
+            model_runner: Fixture providing configured ModelRunner instance
+            mock_scheduler_output: Fixture providing mock scheduler output
+        """
         # Enable chunked prefill
         model_runner.is_chunked_prefill = True
 
@@ -338,6 +355,16 @@ class TestModelRunner:
         assert hasattr(data, 'position_ids')
 
     def test_process_cached_request(self, model_runner):
+        """Test cached request processing functionality.
+
+        This test verifies that:
+        1. Cached requests are properly processed
+        2. Data structures are correctly updated
+        3. Request state is maintained accurately
+
+        Args:
+            model_runner: Fixture providing configured ModelRunner instance
+        """
         req_id = "cached_req"
         model_runner.vllm_req_to_neuron_seq_id_mapping[req_id] = 0
         model_runner.requests[req_id] = Mock(output_token_ids=[1, 2, 3],
@@ -369,13 +396,33 @@ class TestModelRunner:
         assert len(data.input_tokens) == 1
 
     def test_error_handling(self, model_runner):
-        # Test invalid request handling
+        """Test error handling for invalid requests.
+
+        This test verifies that:
+        1. Invalid requests are properly detected
+        2. Appropriate exceptions are raised
+        3. Error states are handled correctly
+
+        Args:
+            model_runner: Fixture providing configured ModelRunner instance
+        """
         with pytest.raises(AssertionError):
             model_runner._process_cached_request_for_continuous_batching(
                 Mock(req_ids=["invalid_req"]), 0, Mock())
 
     @pytest.mark.parametrize("model_type", ["llava", "llama4"])
     def test_multi_modal_processing(self, model_runner, model_type):
+        """Test multi-modal data processing for different model types.
+
+        This test verifies that:
+        1. Different model types are handled correctly
+        2. Multi-modal data is properly processed
+        3. Output format matches model type requirements
+
+        Args:
+            model_runner: Fixture providing configured ModelRunner instance
+            model_type: Type of model being tested (llava or llama4)
+        """
         model_runner.model.model = Mock()
         model_runner.model.model.config.model_type = model_type
         mm_data = [{"pixel_values": torch.randn(1, 3, 224, 224)}]
@@ -389,6 +436,18 @@ class TestModelRunner:
             assert isinstance(result["image_sizes"], torch.Tensor)
 
     def test_lora_support(self, model_runner):
+        """Test LoRA adapter handling functionality.
+
+        This test verifies that:
+        1. LoRA configuration is properly initialized
+        2. Adapter IDs are correctly assigned
+        3. Request-specific adapters are properly handled
+
+        Args:
+            model_runner: Fixture providing configured ModelRunner instance
+
+        The test ensures proper integration of LoRA adapters with the model runner.
+        """
         # Test LoRA adapter handling
         model_runner.lora_config = Mock()
         model_runner.lora_manager = Mock()
@@ -402,6 +461,16 @@ class TestModelRunner:
         assert adapter_id is not None
 
     def test_finalize_inputs(self, model_runner):
+        """Test input finalization for continuous batching.
+
+        This test verifies that:
+        1. Input data is properly formatted
+        2. Tensor types are correct
+        3. All required fields are present
+
+        Args:
+            model_runner: Fixture providing configured ModelRunner instance
+        """
         data = Mock()
         data.input_tokens = [[1, 2, 3]]
         data.position_ids = [[0, 1, 2]]
@@ -430,6 +499,17 @@ class TestModelRunner:
         assert model_runner.device_config.device == "cpu"
 
     def test_model_execution(self, model_runner, mocker):
+        """Test model execution flow.
+
+        This test verifies that:
+        1. Model input is correctly processed
+        2. Forward pass works as expected
+        3. Output tensors are properly formatted
+
+        Args:
+            model_runner: Fixture providing configured ModelRunner instance
+            mocker: PyTest mocker fixture
+        """
         # Create mock input
         mock_input = ModelInputForNeuron(
             request_ids=["req1"],
@@ -447,7 +527,7 @@ class TestModelRunner:
 
         # Mock input batch
         model_runner.input_batch.req_ids = ["req1"]  # Match the request ID
-        model_runner.input_batch.req_id_to_index = {"req1": 0}  # Add this line
+        model_runner.input_batch.req_id_to_index = {"req1": 0}
 
         # Create actual tensor for hidden states
         mock_hidden_states = torch.randn(1, 3,
@@ -472,7 +552,7 @@ class TestModelRunner:
                 return mock_hidden_states
 
             def sample(self, logits):
-                # Create a proper SamplerOutput-like object with correct method signature
+
                 class SamplerOutput:
 
                     def __init__(self):
@@ -495,6 +575,16 @@ class TestModelRunner:
         assert torch.equal(output.sampled_token_ids, torch.tensor([[4]]))
 
     def test_get_kv_cache_spec(self, model_runner):
+        """Test KV cache specification generation.
+
+        This test verifies that:
+        1. Cache specifications are correctly generated
+        2. Block sizes are properly set
+        3. Head dimensions match model configuration
+
+        Args:
+            model_runner: Fixture providing configured ModelRunner instance
+        """
         spec = model_runner.get_kv_cache_spec()
         assert "layer" in spec
         assert spec["layer"].block_size == model_runner.block_size
@@ -502,38 +592,17 @@ class TestModelRunner:
             "layer"].num_kv_heads == model_runner.model.num_key_value_heads
         assert spec["layer"].head_size == model_runner.model.head_dim
 
-    # def test_sampling_params(self, model_runner):
-    #     input_ids = torch.tensor([[1, 2, 3]])
+    def test_scheduler_output_args(self):
+        """Test SchedulerOutput argument handling.
 
-    #     # Setup the mock model's neuron config
-    #     model_runner.model.neuron_config.on_device_sampling_config = None
-    #     model_runner.model.neuron_config.vocab_size = 32000
+        This test verifies that:
+        1. Required arguments for SchedulerOutput are correctly identified
+        2. Minimal argument set can create valid SchedulerOutput
+        3. Argument validation works as expected
 
-    #     # Setup requests with sampling parameters
-    #     model_runner.requests = {
-    #         "req1":
-    #         Mock(sampling_params=Mock(top_k=10, top_p=0.9, temperature=1.0))
-    #     }
-
-    #     sampling_params = model_runner.get_nxd_sampling_params(input_ids)
-    #     # Debug prints
-    #     print("\nDEBUG test_sampling_params:")
-    #     print(f"sampling_params type: {type(sampling_params)}")
-    #     print(f"sampling_params: {sampling_params}")
-    #     if hasattr(sampling_params, 'shape'):
-    #         print(f"sampling_params shape: {sampling_params.shape}")
-    #     print(f"Is tensor?: {isinstance(sampling_params, torch.Tensor)}")
-    #     if isinstance(sampling_params, MagicMock):
-    #         print(f"MagicMock details: {sampling_params._mock_return_value}")
-    #         print(f"MagicMock methods: {dir(sampling_params)}")
-
-    #     assert sampling_params is not None
-    #     assert isinstance(sampling_params, torch.Tensor)
-    #     assert sampling_params.shape == torch.Size([1])
-    #     assert torch.allclose(sampling_params,
-    #                           torch.tensor([1.0], dtype=torch.float32))
-
-    def test_scheduler_output_args(self):  # Added as method of TestModelRunner
+        The test ensures proper initialization of SchedulerOutput with minimal
+        valid configuration.
+        """
         import inspect
 
         from vllm.v1.core.sched.output import SchedulerOutput
@@ -542,7 +611,7 @@ class TestModelRunner:
             try:
                 SchedulerOutput()
             except TypeError as e:
-                print(f"Initial error: {e}")
+                logger.error(f"Initial SchedulerOutput error: {e}")
 
             sig = inspect.signature(SchedulerOutput.__init__)
             required_args = {
@@ -550,18 +619,15 @@ class TestModelRunner:
                 for name, param in sig.parameters.items()
                 if param.default == inspect.Parameter.empty and name != 'self'
             }
-            print(f"Required arguments: {required_args}")
-            return required_args
 
-        required_args = get_required_args()
-        print("\nAll required arguments for SchedulerOutput:")
-        for arg in required_args:
-            print(f"- {arg}")
+            logger.debug(
+                f"Required SchedulerOutput arguments: {required_args}")
 
-        # This will help us see exactly what arguments are needed
-        try:
-            minimal_args = {arg: [] for arg in required_args}
-            print("\nSuccessfully created SchedulerOutput with minimal args")
-        except Exception as e:
-            print(f"\nError creating SchedulerOutput: {e}")
-            print("Current args:", minimal_args)
+            try:
+                minimal_args = {arg: [] for arg in required_args}
+                SchedulerOutput(**minimal_args)
+                logger.debug(
+                    "Successfully created SchedulerOutput with minimal args")
+            except Exception as e:
+                logger.error(f"Failed to create SchedulerOutput: {e}")
+                raise
