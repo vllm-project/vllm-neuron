@@ -113,7 +113,7 @@ def test_get_neuron_model(mocker, base_configs):
                              cache_config,
                              parallel_config,
                              scheduler_config,
-                             Mock(),
+                             None,
                              additional_config={})
 
     assert model is not None
@@ -187,7 +187,7 @@ def test_get_neuron_model_different_architectures(mocker, base_configs,
                              cache_config,
                              parallel_config,
                              scheduler_config,
-                             Mock(),
+                             None,
                              additional_config={})
 
     assert model is not None
@@ -240,7 +240,7 @@ def test_get_neuron_model_with_prefix_caching(mocker, base_configs):
                              cache_config,
                              parallel_config,
                              scheduler_config,
-                             Mock(),
+                             None,
                              additional_config={})
 
     assert model is not None
@@ -297,7 +297,7 @@ def test_get_neuron_model_with_chunked_prefill(mocker, base_configs):
                              cache_config,
                              parallel_config,
                              scheduler_config,
-                             Mock(),
+                             None,
                              additional_config=additional_config)
 
     assert model is not None
@@ -325,7 +325,7 @@ def test_get_neuron_model_error_handling_and_validation(mocker, base_configs):
                          cache_config,
                          parallel_config,
                          scheduler_config,
-                         Mock(),
+                         None,
                          additional_config={})
 
     # Test missing required fields
@@ -336,7 +336,7 @@ def test_get_neuron_model_error_handling_and_validation(mocker, base_configs):
                          cache_config,
                          parallel_config,
                          scheduler_config,
-                         Mock(),
+                         None,
                          additional_config={})
 
 
@@ -386,7 +386,7 @@ def test_get_neuron_model_with_speculative_config(mocker, base_configs):
                              cache_config,
                              parallel_config,
                              scheduler_config,
-                             Mock(),
+                             None,
                              speculative_config=spec_config,
                              additional_config={})
 
@@ -449,7 +449,7 @@ def test_image_to_text_model_config_validation(mocker, base_configs):
                              cache_config,
                              parallel_config,
                              scheduler_config,
-                             Mock(),
+                             None,
                              additional_config=additional_config)
 
     assert model is not None
@@ -525,7 +525,7 @@ def test_get_default_neuron_config(mocker):
     scheduler_config.max_num_batched_tokens = 4096
     scheduler_config.chunked_prefill_enabled = False
 
-    lora_config = Mock()
+    lora_config = None
     spec_config = Mock()
     spec_config.num_speculative_tokens = 5
     spec_config.method = "eagle"
