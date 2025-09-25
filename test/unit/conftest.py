@@ -142,4 +142,5 @@ def scheduler(scheduler_config, cache_config):
     scheduler.waiting = deque()
     scheduler.running = []
     scheduler.holdback_queue = deque()
+    scheduler.max_model_len = scheduler_config.max_model_len
     return scheduler

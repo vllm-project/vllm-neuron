@@ -2,6 +2,8 @@
 from collections import deque
 from unittest.mock import Mock, patch
 
+import pytest
+
 
 class TestNeuronScheduler:
 
@@ -224,4 +226,75 @@ class TestNeuronScheduler:
 
         # Verify that requests were processed
         assert output is not None
-        assert len(scheduler.holdback_queue) >= 0
+
+    # Min-tokens fix tests
+    @pytest.fixture
+    def mock_request_with_min_tokens(self):
+        """Create a mock request with configurable min_tokens parameters."""
+        request = Mock()
+        request.num_tokens = 10
+        request.num_output_tokens = 5
+        request.max_tokens = 50
+        request.output_token_ids = [1, 2, 3, 4, 5]
+        request.eos_token_id = 2  # EOS token
+        request.pooling_params = None
+
+        # Mock sampling params
+        sampling_params = Mock()
+        sampling_params.min_tokens = 0
+        sampling_params.ignore_eos = False
+        sampling_params.stop_token_ids = [999]  # Stop token
+        request.sampling_params = sampling_params
+
+        return request
+
+    def test_min_tokens_prevents_eos_stop(self, scheduler,
+                                          mock_request_with_min_tokens):
+        """Test that EOS token doesn't stop generation when min_tokens not satisfied."""
+        mock_request_with_min_tokens.sampling_params.min_tokens = 10
+        mock_request_with_min_tokens.num_output_tokens = 5
+        mock_request_with_min_tokens.output_token_ids = [1, 2, 3, 4, 2]
+
+        new_token_ids = [2]  # EOS token
+        result_tokens, stopped = scheduler._update_request_with_output(
+            mock_request_with_min_tokens, new_token_ids)
+
+        # Should NOT stop because min_tokens (10) > current output (5)
+        assert not stopped, "Request should not stop due to EOS when min_tokens not satisfied"
+        assert result_tokens == [
+            2
+        ], "Token should not be trimmed when not stopping"
+
+    def test_min_tokens_prevents_stop_token_stop(self, scheduler,
+                                                 mock_request_with_min_tokens):
+        """Test that stop tokens don't stop generation when min_tokens not satisfied."""
+        mock_request_with_min_tokens.sampling_params.min_tokens = 10
+        mock_request_with_min_tokens.num_output_tokens = 5
+        mock_request_with_min_tokens.output_token_ids = [1, 2, 3, 4, 999]
+        new_token_ids = [999]  # Stop token
+        result_tokens, stopped = scheduler._update_request_with_output(
+            mock_request_with_min_tokens, new_token_ids)
+
+        # Should NOT stop because min_tokens not satisfied
+        assert not stopped, "Request should not stop due to stop token when min_tokens not satisfied"
+        assert result_tokens == [
+            999
+        ], "Token should not be trimmed when not stopping"
+
+    def test_eos_stops_when_min_tokens_satisfied(self, scheduler,
+                                                 mock_request_with_min_tokens):
+        """Test that EOS token stops generation when min_tokens is satisfied."""
+        mock_request_with_min_tokens.sampling_params.min_tokens = 5
+        mock_request_with_min_tokens.num_output_tokens = 10
+        mock_request_with_min_tokens.output_token_ids = [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 2
+        ]
+
+        new_token_ids = [2]  # EOS token
+        result_tokens, stopped = scheduler._update_request_with_output(
+            mock_request_with_min_tokens, new_token_ids)
+
+        # Should stop because min_tokens (5) <= current output (10)
+        assert stopped, "Request should stop due to EOS when min_tokens satisfied"
+        assert hasattr(mock_request_with_min_tokens,
+                       'status'), "Request status should be set"
