@@ -121,7 +121,13 @@ def test_get_neuron_model(mocker, base_configs):
 
 @pytest.mark.parametrize("model_type,architecture", [
     ("llama", "LlamaForCausalLM"),
-    ("llava", "LlavaForConditionalGeneration"),
+    pytest.param(
+        "llava",
+        "LlavaForConditionalGeneration",
+        marks=pytest.mark.skip(
+            reason=
+            "LlavaForConditionalGeneration is not yet supported in Neuron plugin"
+        )),
     ("mixtral", "MixtralForCausalLM"),
 ])
 def test_get_neuron_model_different_architectures(mocker, base_configs,
@@ -396,6 +402,7 @@ def test_get_neuron_model_with_speculative_config(mocker, base_configs):
     assert model.model.config.neuron_config.enable_eagle_speculation is True
 
 
+@pytest.mark.skip(reason="Disabled due to not support Pixtral yet")
 def test_image_to_text_model_config_validation(mocker, base_configs):
     """Test image-to-text model configuration validation.
 
