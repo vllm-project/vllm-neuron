@@ -69,8 +69,8 @@ python3 -m vllm.entrypoints.openai.api_server \
     --max-model-len 2048 \
     --max-num-seqs 32 \
     --block-size 32 \
-    --additional-config '{"override_neuron_config": {"skip_warmup": true}}'
-    --port 8000 
+    --additional-config '{"override_neuron_config": {"skip_warmup": true}}' \
+    --port 8000
 ```
 ## Feature Support
 
