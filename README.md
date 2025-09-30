@@ -42,8 +42,15 @@ llm = LLM(
     additional_config={
         "override_neuron_config": {
             "skip_warmup": True,
+            "enable_bucketing": True,
+            "context_encoding_buckets": [
+                256, 512, 1024, 2048, 4096, 8192, 10240, 16384
+            ],
+            "token_generation_buckets": [
+                256, 512, 1024, 2048, 4096, 8192, 10240, 16384
+            ],
         },
-    }
+    },
 )
 
 # Generate text
@@ -69,8 +76,8 @@ python3 -m vllm.entrypoints.openai.api_server \
     --max-model-len 2048 \
     --max-num-seqs 32 \
     --block-size 32 \
-    --additional-config '{"override_neuron_config": {"skip_warmup": true}}' \
-    --port 8000
+    --additional-config '{"override_neuron_config": {"skip_warmup": true, "enable_bucketing": true, "context_encoding_buckets": [256, 512, 1024, 2048, 4096, 8192, 10240, 16384], "token_generation_buckets": [256, 512, 1024, 2048, 4096, 8192, 10240, 16384]}}' \
+    --port 8000 
 ```
 ## Feature Support
 
