@@ -11,24 +11,22 @@ High-performance inference engine for AWS Neuron accelerators, built on vLLM v1 
 - **Production Ready**: Optimized for high-throughput inference on AWS Trainium and Inferentia instances
 - **Advanced Features**: Chunked prefill, prefix caching, speculative decoding, and Quantization support
 
-## Feature Support
+## Feature/Model Support
 
-| Feature | Status | Notes |
+| Feature/Model | Status | Notes |
 |:--------|:------:|-------|
-| Prefix Caching | ✅ | Accelerated inference for repeated prompts |
-| Eagle Speculation | ✅ | Speculative decoding for faster generation |
-| Quantization | ✅ | INT8/FP8 quantization support |
-| Chunked Prefill | ⚠️ | Beta - Optimized memory usage for long sequences |
-| Multimodal | ⚠️ | Beta - Only support Llama 4 |
-| Prefix Caching + Eagle Speculation | ✅ | |
+| Prefix Caching | 🟢 |  |
+| Eagle Speculation | 🟢 |   |
+| Quantization | 🟢 | INT8/FP8 quantization support |
+| Chunked Prefill | 🚧 |  |
+| Multimodal | 🚧 |  Only support Llama 4 |
+| Llama 3.1/3.3 | 🟢 | 8B, 70B, 405B |
+| Llama 4 | 🚧 | Scout, Maverick |
+| Qwen 2 | 🟢 | 7B|
 
-## Model Support
-
-| Model Family | Status | Supported Sizes | Notes |
-|:-------------|:------:|:----------------|-------|
-| Llama 3.1/3.3 | ✅ | 8B, 70B, 405B | Full production support |
-| Llama 4 | ⚠️ | Scout, Maverick | Beta release |
-| Qwen 2 | ✅ | 7B| Optimized for Neuron |
+- 🚀 Optimized: Nearly fully optimized, with no further work currently planned.
+- 🟢 Functional: Fully operational, with ongoing optimizations.
+- 🚧 WIP: Under active development.
 
 ## Installation
 
@@ -164,15 +162,6 @@ prompts = [
 sampling_params = SamplingParams(top_k=50, max_tokens=100)
 outputs = llm.generate(prompts, sampling_params)
 ```
-
-## Benchmarking
-
-### Performance Results
-
-| Model | Instance | Throughput (tok/s) | Latency (ms) |
-|:------|:---------|:-------------------|:-------------|
-| Llama-3.1-8B | trn1.2xlarge |  |  |
-| Llama-3.1-70B | trn1.32xlarge |  |  |
 
 ## Support
 
