@@ -12,7 +12,7 @@ python_classes = "Test*"
 python_functions = "test_*"
 
 [tool.coverage.run]
-source = ["neuronx_vllm_plugin"]
+source = ["vllm_neuron"]
 omit = [
     "test/*",
     "ci/*",
