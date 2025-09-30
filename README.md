@@ -13,7 +13,7 @@ The vLLM Neuron plugin (vllm-neuron) is a backend extension that integrates AWS 
 
 ## Quickstart Guide
 
-Install the plug-in from GitHub sources using the following commands. The plugin will automatically install the correct version of vLLM along with other required dependencies.
+Install the plugin from GitHub sources using the following commands. The plugin will automatically install the correct version of vLLM along with other required dependencies.
 
 ```bash
 git clone https://github.com/vllm-project/vllm-neuron.git
