@@ -1,4 +1,6 @@
-# vLLM Neuron Plugin
+# vLLM Neuron Plugin (Beta)
+
+> **⚠️ Beta Release**: This is a beta version of the vLLM Neuron Plugin. Features and APIs may change in future releases.
 
 High-performance inference engine for AWS Neuron accelerators, built on vLLM v1 architecture with AWS Neuron SDK 2.26.
 
@@ -13,11 +15,12 @@ High-performance inference engine for AWS Neuron accelerators, built on vLLM v1 
 
 | Feature | Status | Notes |
 |:--------|:------:|-------|
-| Chunked Prefill | ✅ | Optimized memory usage for long sequences |
 | Prefix Caching | ✅ | Accelerated inference for repeated prompts |
 | Eagle Speculation | ✅ | Speculative decoding for faster generation |
 | Quantization | ✅ | INT8/FP8 quantization support |
+| Chunked Prefill | ⚠️ | Beta - Optimized memory usage for long sequences |
 | Multimodal | ⚠️ | Beta - Only support Llama 4 |
+| Prefix Caching + Eagle Speculation | ✅ | |
 
 ## Model Support
 
@@ -52,13 +55,6 @@ pip install -e .
 git clone https://github.com/aws-neuron/vllm-neuron.git
 cd vllm-neuron
 pip install -e .
-```
-
-### Environment Setup
-
-```bash
-# Required for V1 engine
-export VLLM_USE_V1=1
 ```
 
 ## Quick Start
