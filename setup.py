@@ -25,7 +25,7 @@ for root, dirs, files in os.walk("configuration"):
                        [os.path.join(root, f) for f in files]))
 
 setup(
-    name="neuronx-vllm-plugin",
+    name="vllm-neuron",
     version="0.1",
     author="AWS Neuron team",
     license="Apache 2.0",
@@ -39,7 +39,7 @@ setup(
     python_requires=">=3.9",
     install_requires=read_requirements(),
     entry_points={
-        "vllm.platform_plugins": ["neuron = neuronx_vllm_plugin:register"],
+        "vllm.platform_plugins": ["neuron = vllm_neuron:register"],
     },
     include_package_data=True,
 )

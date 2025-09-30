@@ -8,7 +8,7 @@ import pytest
 import torch
 from vllm.v1.core.sched.output import SchedulerOutput
 
-from neuronx_vllm_plugin.worker.neuronx_distributed_model_runner import (
+from vllm_neuron.worker.neuronx_distributed_model_runner import (
     ModelInputForNeuron, NeuronxDistributedModelRunner)
 
 logger = logging.getLogger(__name__)

@@ -120,7 +120,7 @@ class TestNeuronScheduler:
         total_requests = len(scheduler.waiting) + len(scheduler.holdback_queue)
         assert total_requests == 3
 
-    @patch('neuronx_vllm_plugin.core.scheduler.logger')
+    @patch('vllm_neuron.core.scheduler.logger')
     def test_logging_behavior(self, mock_logger, scheduler):
         """Test scheduler logging functionality.
 

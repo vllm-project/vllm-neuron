@@ -7,7 +7,7 @@ import pytest
 import torch
 from transformers import PretrainedConfig
 
-from neuronx_vllm_plugin.worker.neuronx_distributed_model_loader import (
+from vllm_neuron.worker.neuronx_distributed_model_loader import (
     _get_default_neuron_config, _validate_image_to_text_override_neuron_config,
     _validate_neuron_config, get_neuron_model)
 
@@ -106,7 +106,7 @@ def test_get_neuron_model(mocker, base_configs):
     mock_causal_lm.model = mock_model
 
     mocker.patch(
-        'neuronx_vllm_plugin.worker.neuronx_distributed_model_loader.NeuronCausalLM',
+        'vllm_neuron.worker.neuronx_distributed_model_loader.NeuronCausalLM',
         return_value=mock_causal_lm)
 
     model = get_neuron_model(model_config,
@@ -176,11 +176,11 @@ def test_get_neuron_model_different_architectures(mocker, base_configs,
 
     if architecture == "LlavaForConditionalGeneration":
         mocker.patch(
-            'neuronx_vllm_plugin.worker.neuronx_distributed_model_loader.NeuronPixtralForCausalLM',
+            'vllm_neuron.worker.neuronx_distributed_model_loader.NeuronPixtralForCausalLM',
             return_value=mock_causal_lm)
     else:
         mocker.patch(
-            'neuronx_vllm_plugin.worker.neuronx_distributed_model_loader.NeuronCausalLM',
+            'vllm_neuron.worker.neuronx_distributed_model_loader.NeuronCausalLM',
             return_value=mock_causal_lm)
 
     model = get_neuron_model(model_config,
@@ -233,7 +233,7 @@ def test_get_neuron_model_with_prefix_caching(mocker, base_configs):
     mock_causal_lm.model = mock_model
 
     mocker.patch(
-        'neuronx_vllm_plugin.worker.neuronx_distributed_model_loader.NeuronCausalLM',
+        'vllm_neuron.worker.neuronx_distributed_model_loader.NeuronCausalLM',
         return_value=mock_causal_lm)
 
     model = get_neuron_model(model_config,
@@ -290,7 +290,7 @@ def test_get_neuron_model_with_chunked_prefill(mocker, base_configs):
     mock_causal_lm.model = mock_model
 
     mocker.patch(
-        'neuronx_vllm_plugin.worker.neuronx_distributed_model_loader.NeuronCausalLM',
+        'vllm_neuron.worker.neuronx_distributed_model_loader.NeuronCausalLM',
         return_value=mock_causal_lm)
 
     model = get_neuron_model(model_config,
@@ -379,7 +379,7 @@ def test_get_neuron_model_with_speculative_config(mocker, base_configs):
     mock_causal_lm.eval = Mock(return_value=mock_causal_lm)
 
     mocker.patch(
-        'neuronx_vllm_plugin.worker.neuronx_distributed_model_loader.NeuronCausalLM',
+        'vllm_neuron.worker.neuronx_distributed_model_loader.NeuronCausalLM',
         return_value=mock_causal_lm)
 
     model = get_neuron_model(model_config,
@@ -442,7 +442,7 @@ def test_image_to_text_model_config_validation(mocker, base_configs):
     mock_pixtral.model = mock_model
 
     mocker.patch(
-        'neuronx_vllm_plugin.worker.neuronx_distributed_model_loader.NeuronPixtralForCausalLM',
+        'vllm_neuron.worker.neuronx_distributed_model_loader.NeuronPixtralForCausalLM',
         return_value=mock_pixtral)
 
     model = get_neuron_model(model_config,

@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from neuronx_vllm_plugin.platform import NeuronFramework, NeuronPlatform
+from vllm_neuron.platform import NeuronFramework, NeuronPlatform
 
 
 @pytest.fixture(autouse=True)
@@ -183,12 +183,12 @@ def test_check_and_update_config(disable_scheduler):
 
         # Verify worker class update
         assert mock_config.parallel_config.worker_cls == \
-            "neuronx_vllm_plugin.worker.neuron_worker.NeuronWorker"
+            "vllm_neuron.worker.neuron_worker.NeuronWorker"
 
         # Verify scheduler configuration based on environment variable
         if disable_scheduler == "0":
             assert mock_config.scheduler_config.scheduler_cls == \
-                "neuronx_vllm_plugin.core.scheduler.ContinuousBatchingNeuronScheduler"
+                "vllm_neuron.core.scheduler.ContinuousBatchingNeuronScheduler"
             assert not mock_config.scheduler_config.chunked_prefill_enabled
 
 

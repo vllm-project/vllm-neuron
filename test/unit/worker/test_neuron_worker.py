@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
-from neuronx_vllm_plugin.worker.neuron_worker import NeuronWorker
+from vllm_neuron.worker.neuron_worker import NeuronWorker
 
 
 # Mock CUDA-related modules
@@ -268,7 +268,7 @@ class TestNeuronWorker:
         # Mock model runner
         mock_model_runner = Mock()
         mocker.patch(
-            'neuronx_vllm_plugin.worker.neuron_worker.NeuronWorker.get_neuronx_distributed_model_runner',
+            'vllm_neuron.worker.neuron_worker.NeuronWorker.get_neuronx_distributed_model_runner',
             return_value=mock_model_runner)
 
         worker = NeuronWorker(vllm_config=vllm_config,
@@ -436,10 +436,9 @@ class TestNeuronWorker:
         """
         # Patch at the correct import path
         mock_init = mocker.patch(
-            'neuronx_vllm_plugin.worker.neuron_worker.init_distributed_environment'
-        )
+            'vllm_neuron.worker.neuron_worker.init_distributed_environment')
         mock_ensure = mocker.patch(
-            'neuronx_vllm_plugin.worker.neuron_worker.ensure_model_parallel_initialized'
+            'vllm_neuron.worker.neuron_worker.ensure_model_parallel_initialized'
         )
 
         # Mock get_current_vllm_config to return a config with proper parallel settings
