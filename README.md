@@ -4,28 +4,17 @@
 
 ## Quick Start Guide
 
-Install the public vllm (latest release tag v0.10.2) from source:
+Install this plugin (includes vLLM v0.10.2):
 
-```
-git clone -b v0.10.2 https://github.com/vllm-project/vllm.git
-cd vllm
-pip install -e .
-```
+\`\`\`bash
+git clone https://github.com/aws-neuron/private-neuronx-vllm.git vllm-neuron
+cd vllm-neuron
+pip install --extra-index-url=https://pip.repos.neuron.amazonaws.com -e .
+\`\`\`
 
-Install this plugin repo:
+That's it! The plugin will automatically install vLLM version pinned and all required dependencies.
 
-```
-git clone https://github.com/aws-neuron/private-neuronx-vllm.git
-cd private-neuronx-vllm
-pip install -e .
-```
-
-Call vllm APIs as usual. Neuron plugin discovery takes place automatically.
-
-## Documentation
-
-Generated documentation for the latest released version can be accessed here:
-<https://devcentral.amazon.com/ac/brazil/package-master/package/go/documentation?name=VllmNeuronPlugin&interface=1.0&versionSet=live>
+Call vLLM APIs as usual. Neuron plugin discovery takes place automatically.
 
 ## Development
 

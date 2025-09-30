@@ -1,0 +1,8 @@
+torch
+numpy
+transformers>=4.55.2
+pytest
+pytest-cov
+pytest-mock
+coverage[toml]
+vllm==0.10.2
