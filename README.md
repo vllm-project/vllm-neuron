@@ -4,10 +4,11 @@
 
 The vLLM Neuron plugin (vllm-neuron) is a backend extension that integrates AWS Neuron accelerators with vLLM. Built on [vLLM's Plugin System](https://docs.vllm.ai/en/latest/design/plugin_system.html), it enables the optimization of existing vLLM workflows on AWS Neuron.
 
+* vLLM v0.10.2 is automatically installed as part of this installation. Refer to the Quickstart Guide below.
+
 ## Prerequisites
 
 - AWS Neuron SDK 2.26 ([Release Notes](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/release-notes/2.26.0/))
-- vLLM v0.10.2 ([vLLM Release Notes](https://github.com/vllm-project/vllm/releases))
 - Python 3.8+ (compatible with vLLM requirements)
 - Supported AWS instances: Inf2, Trn1/Trn1n, Trn2
 
@@ -70,18 +71,15 @@ python3 -m vllm.entrypoints.openai.api_server \
     --additional-config '{"override_neuron_config": {"skip_warmup": true}}'
     --port 8000 
 ```
-## Feature/Model Support
+## Feature Support
 
-| Feature/Model | Status | Notes |
+| Feature | Status | Notes |
 |:--------|:------:|-------|
 | Prefix Caching | 🟢 |  |
-| Eagle Speculation | 🟢 |   |
+| Speculative Decoding | 🟢 | Only Eagle V1 is supported  |
 | Quantization | 🟢 | INT8/FP8 quantization support |
 | Chunked Prefill | 🚧 |  |
-| Multimodal | 🚧 |  Llama 4 support |
-| Llama 3.1/3.3 | 🟢 | 8B, 70B, 405B |
-| Llama 4 | 🚧 | Scout, Maverick |
-| Qwen 2 | 🟢 | 7B|
+| Multimodal | 🚧 | Only Llama 4 is supported |
 
 - 🟢 Functional: Fully operational, with ongoing optimizations.
 - 🚧 WIP: Under active development.
@@ -92,7 +90,11 @@ You configure Neuron-specific features using the [NxD Inference library](https:/
 
 The vLLM V1 scheduler enforces chunked prefill. Currently, the best performance on Neuron is achieved **without** enabling chunked prefill. As a result, we added a custom scheduler extension on top of the V1 scheduler to fallback to continuous batching without chunked prefill (such that it mimics V0 behavior). This scheduler override is enabled by default. To turn off the Neuron custom scheduler, set the environment variable `DISABLE_NEURON_CUSTOM_SCHEDULER="1"`.
 
-
+## Models Supported 
+* Llama 3.1/3.3 8B, 70B, 405B
+* Llama 4 Scout, Maverick
+* Qwen2 7B
+  
 ## Known Issues
 1. The chunked prefill feature is currently a work-in-progress. Users are required to provide a `num_gpu_blocks_override` arg calculated as `ceil(max_model_len // block_size) * max_num_seqs` when invoking vllm to avoid a potential OOB error.
 
