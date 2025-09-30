@@ -1,9 +1,8 @@
 # vLLM Neuron Plugin (Beta)
 
-> **⚠️ Important**: This is beta preview of the vLLM Neuron plugin. For a more stable experience, consider using the [AWS Neuron vllm fork](https://github.com/aws-neuron/upstreaming-to-vllm/releases/tag/2.26.0)
+> **⚠️ Important**: This is beta preview of the vLLM Neuron plug-in. For a more stable experience, consider using the [AWS Neuron vllm fork](https://github.com/aws-neuron/upstreaming-to-vllm/releases/tag/2.26.0).
 
-The vLLM Neuron plugin (vllm-neuron) is a backend extension that integrates AWS Neuron accelerators with vLLM. Built on [vLLM's Plugin System](https://docs.vllm.ai/en/latest/design/plugin_system.html)
-, it enables the optimization of existing vLLM workflows on AWS Neuron.
+The vLLM Neuron plug-in (vllm-neuron) is a backend extension that integrates AWS Neuron accelerators with vLLM. Built on [vLLM's Plugin System](https://docs.vllm.ai/en/latest/design/plugin_system.html), it enables the optimization of existing vLLM workflows on AWS Neuron.
 
 ## Prerequisites
 
@@ -12,9 +11,9 @@ The vLLM Neuron plugin (vllm-neuron) is a backend extension that integrates AWS 
 - Python 3.8+ (compatible with vLLM requirements)
 - Supported AWS instances: Inf2, Trn1/Trn1n, Trn2
 
-## Quick Start Guide
+## Quickstart Guide
 
-Install from source using the following commands. The plugin will automatically install the correct version of vLLM along with other required dependencies.
+Install the plug-in from GitHub sources using the following commands. The plug-in will automatically install the correct version of vLLM along with other required dependencies.
 
 ```bash
 git clone https://github.com/vllm-project/vllm-neuron.git
@@ -89,13 +88,13 @@ python3 -m vllm.entrypoints.openai.api_server \
   
 ## Feature Configuration
 
-Neuron-specific features are configured via the [NxD Inference library](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/nxd-inference/nxdi-overview.html). Use the `additional_config` field to provide an `override_neuron_config` dict that specifies desired NxD Inference configurations. 
+You configure Neuron-specific features using the [NxD Inference library](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/nxd-inference/nxdi-overview.html). Use the `additional_config` field to provide an `override_neuron_config` dict that specifies your desired NxD Inference configurations. 
 
-The vLLM V1 scheduler enforces chunked prefill; currently the best performance on Neuron is achieved without enabling chunked prefill. Thus we added a custom scheduler extension on top of the V1 scheduler to fallback to continuous batching without chunked prefill (i.e. mimics V0 behavior). This scheduler override is enabled by default. To turn off the Neuron custom scheduler, set environment variable `DISABLE_NEURON_CUSTOM_SCHEDULER="1"`.
+The vLLM V1 scheduler enforces chunked prefill. Currently, the best performance on Neuron is achieved **without** enabling chunked prefill. As a result, we added a custom scheduler extension on top of the V1 scheduler to fallback to continuous batching without chunked prefill (such that it mimics V0 behavior). This scheduler override is enabled by default. To turn off the Neuron custom scheduler, set the environment variable `DISABLE_NEURON_CUSTOM_SCHEDULER="1"`.
 
 
 ## Known Issues
-1. The chunked prefill feature is currently work in progress. Users are required to provide a `num_gpu_blocks_override` arg calculated as `ceil(max_model_len // block_size) * max_num_seqs` when invoking vllm to avoid a potential OOB error.
+1. The chunked prefill feature is currently a work-in-progress. Users are required to provide a `num_gpu_blocks_override` arg calculated as `ceil(max_model_len // block_size) * max_num_seqs` when invoking vllm to avoid a potential OOB error.
 
 ## Support
 
