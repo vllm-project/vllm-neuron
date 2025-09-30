@@ -3,7 +3,7 @@
 > **⚠️ Important**: This is beta preview of the vLLM Neuron plugin. For a more stable experience, consider using the [AWS Neuron vllm fork](https://github.com/aws-neuron/upstreaming-to-vllm/releases/tag/2.26.0)
 
 The vLLM Neuron plugin (vllm-neuron) is a backend extension that integrates AWS Neuron accelerators with vLLM. Built on [vLLM's Plugin System](https://docs.vllm.ai/en/latest/design/plugin_system.html)
-, it enables optimizing existing vLLM workflows on AWS Neuron.
+, it enables the optimization of existing vLLM workflows on AWS Neuron.
 
 ## Prerequisites
 
