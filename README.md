@@ -5,44 +5,24 @@
 The vLLM Neuron plugin (vllm-neuron) is a backend extension that integrates AWS Neuron accelerators with vLLM. Built on [vLLM's Plugin System](https://docs.vllm.ai/en/latest/design/plugin_system.html)
 , it enables optimizing existing vLLM workflows on AWS Neuron.
 
-## Feature/Model Support
-
-| Feature/Model | Status | Notes |
-|:--------|:------:|-------|
-| Prefix Caching | 🟢 |  |
-| Eagle Speculation | 🟢 |   |
-| Quantization | 🟢 | INT8/FP8 quantization support |
-| Chunked Prefill | 🚧 |  |
-| Multimodal | 🚧 |  Llama 4 support |
-| Llama 3.1/3.3 | 🟢 | 8B, 70B, 405B |
-| Llama 4 | 🚧 | Scout, Maverick |
-| Qwen 2 | 🟢 | 7B|
-
-- 🟢 Functional: Fully operational, with ongoing optimizations.
-- 🚧 WIP: Under active development.
-
-## Installation
-
-### Prerequisites
+## Prerequisites
 
 - AWS Neuron SDK 2.26 ([Release Notes](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/release-notes/2.26.0/))
 - vLLM v0.10.2 ([vLLM Release Notes](https://github.com/vllm-project/vllm/releases))
 - Python 3.8+ (compatible with vLLM requirements)
 - Supported AWS instances: Inf2, Trn1/Trn1n, Trn2
 
-### Quick Start Guide
+## Quick Start Guide
 
-Install this vLLM plugin:
+Install from source using the following commands. The plugin will automatically install the correct version of vLLM along with other required dependencies.
 
 ```bash
-git clone https://github.com/aws-neuron/private-vllm-neuron.git vllm-neuron
+git clone https://github.com/vllm-project/vllm-neuron.git
 cd vllm-neuron
 pip install --extra-index-url=https://pip.repos.neuron.amazonaws.com -e .
 ```
-
-That's it! The plugin will automatically install vLLM version pinned and all required dependencies.
-
-### Basic Usage
+## Basic Usage
+### Offline Inference
 
 ```python
 import os
@@ -88,35 +68,34 @@ python3 -m vllm.entrypoints.openai.api_server \
     --tensor-parallel-size 32 \
     --max-model-len 2048 \
     --max-num-seqs 32 \
+    --additional-config '{"override_neuron_config": {"skip_warmup": true}}'
     --port 8000 
 ```
+## Feature/Model Support
 
-## Configuration
+| Feature/Model | Status | Notes |
+|:--------|:------:|-------|
+| Prefix Caching | 🟢 |  |
+| Eagle Speculation | 🟢 |   |
+| Quantization | 🟢 | INT8/FP8 quantization support |
+| Chunked Prefill | 🚧 |  |
+| Multimodal | 🚧 |  Llama 4 support |
+| Llama 3.1/3.3 | 🟢 | 8B, 70B, 405B |
+| Llama 4 | 🚧 | Scout, Maverick |
+| Qwen 2 | 🟢 | 7B|
 
-### Neuron-Specific Parameters
+- 🟢 Functional: Fully operational, with ongoing optimizations.
+- 🚧 WIP: Under active development.
+  
+## Feature Configuration
 
-| Parameter | Description | Default |
-|:----------|:------------|:--------|
-| `tensor_parallel_size` | Number of Neuron cores | 1 |
-| `max_model_len` | Maximum sequence length | 128 |
-| `enable_chunked_prefill` | Enable chunked prefill | False |
-| `enable_prefix_caching` | Enable prefix caching | False |
-| `additional_config` | Custom Neuron configuration | {} |
+Neuron-specific features are configured via the [NxD Inference library](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/nxd-inference/nxdi-overview.html). Use the `additional_config` field to provide an `override_neuron_config` dict that specifies desired NxD Inference configurations. 
 
-### Performance Tuning
+The vLLM V1 scheduler enforces chunked prefill; currently the best performance on Neuron is achieved without enabling chunked prefill. Thus we added a custom scheduler extension on top of the V1 scheduler to fallback to continuous batching without chunked prefill (i.e. mimics V0 behavior). This scheduler override is enabled by default. To turn off the Neuron custom scheduler, set environment variable `DISABLE_NEURON_CUSTOM_SCHEDULER="1"`.
 
-```python
-llm = LLM(
-    model="meta-llama/Llama-3.1-70B-Instruct",
-    tensor_parallel_size=8,
-    max_model_len=8192,
-    enable_chunked_prefill=True,
-    enable_prefix_caching=True,
-    max_num_seqs=64,
-    additional_config={"override_neuron_config": "skip_warmup": True},
-)
-```
 
+## Known Issues
+1. The chunked prefill feature is currently work in progress. Users are required to provide a `num_gpu_blocks_override` arg calculated as `ceil(max_model_len // block_size) * max_num_seqs` when invoking vllm to avoid a potential OOB error.
 
 ## Support
 
