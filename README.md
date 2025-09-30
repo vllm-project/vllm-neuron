@@ -7,7 +7,7 @@ High-performance inference engine for AWS Neuron accelerators, built on vLLM v1 
 - **vLLM V1 Engine Support**: Full compatibility with vLLM's next-generation V1 engine architecture
 - **AWS Neuron SDK 2.26**: Built on the latest Neuron SDK with enhanced performance and stability
 - **Production Ready**: Optimized for high-throughput inference on AWS Trainium and Inferentia instances
-- **Advanced Features**: Chunked prefill, prefix caching, speculative decoding, and LoRA support
+- **Advanced Features**: Chunked prefill, prefix caching, speculative decoding, and Quantization support
 
 ## Feature Support
 
@@ -25,8 +25,6 @@ High-performance inference engine for AWS Neuron accelerators, built on vLLM v1 
 |:-------------|:------:|:----------------|-------|
 | Llama 3.1/3.3 | ✅ | 8B, 70B, 405B | Full production support |
 | Llama 4 | ⚠️ | Scout, Maverick | Beta release |
-| Mistral | ✅ | 7B| Optimized for Neuron |
-| Mixtral | ✅ | 8x22B | Optimized for Neuron |
 | Qwen 2 | ✅ | 7B| Optimized for Neuron |
 
 ## Installation
