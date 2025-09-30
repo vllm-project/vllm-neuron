@@ -97,9 +97,11 @@ python3 -m vllm.entrypoints.openai.api_server \
 You configure Neuron-specific features using the [NxD Inference library](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/nxd-inference/nxdi-overview.html). Use the `additional_config` field to provide an `override_neuron_config` dict that specifies your desired NxD Inference configurations. 
 
 ## Models Supported 
-* Llama 3.1/3.3 8B, 70B, 405B
+We support a subset of [models supported on NxDI](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/nxd-inference/developer_guides/model-reference.html#supported-model-architectures), including
+* Llama 2/3.1/3.3
 * Llama 4 Scout, Maverick
-* Qwen2 7B
+* Qwen 2.5
+* Qwen 3
   
 ## Known Issues
 1. Chunked prefill is disabled by default on Neuron for optimal performance. To enable chunked prefill, set the environment variable `DISABLE_NEURON_CUSTOM_SCHEDULER="1"`. Users are required to provide a `num_gpu_blocks_override` arg calculated as `ceil(max_model_len // block_size) * max_num_seqs` when invoking vllm to avoid a potential OOB error.
