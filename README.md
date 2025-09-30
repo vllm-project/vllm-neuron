@@ -1,15 +1,9 @@
 # vLLM Neuron Plugin (Beta)
 
-> **⚠️ Beta Release**: This is a beta version of the vLLM Neuron Plugin. Features and APIs may change in future releases.
+> **⚠️ Important**: This is beta preview of the vLLM Neuron plugin. For a more stable experience, consider using the [AWS Neuron vllm fork](https://github.com/aws-neuron/upstreaming-to-vllm/releases/tag/2.26.0)
 
-High-performance inference engine for AWS Neuron accelerators, built on vLLM v1 architecture with AWS Neuron SDK 2.26.
-
-## Highlights
-
-- **vLLM V1 Engine Support**: Full compatibility with vLLM's next-generation V1 engine architecture
-- **AWS Neuron SDK 2.26**: Built on the latest Neuron SDK with enhanced performance and stability
-- **Production Ready**: Optimized for high-throughput inference on AWS Trainium and Inferentia instances
-- **Advanced Features**: Chunked prefill, prefix caching, speculative decoding, and Quantization support
+The vLLM Neuron plugin (vllm-neuron) is a backend extension that integrates AWS Neuron accelerators with vLLM. Built on [vLLM's Plugin System](https://docs.vllm.ai/en/latest/design/plugin_system.html)
+, it enables optimizing existing vLLM workflows on AWS Neuron.
 
 ## Feature/Model Support
 
@@ -19,12 +13,11 @@ High-performance inference engine for AWS Neuron accelerators, built on vLLM v1 
 | Eagle Speculation | 🟢 |   |
 | Quantization | 🟢 | INT8/FP8 quantization support |
 | Chunked Prefill | 🚧 |  |
-| Multimodal | 🚧 |  Only support Llama 4 |
+| Multimodal | 🚧 |  Llama 4 support |
 | Llama 3.1/3.3 | 🟢 | 8B, 70B, 405B |
 | Llama 4 | 🚧 | Scout, Maverick |
 | Qwen 2 | 🟢 | 7B|
 
-- 🚀 Optimized: Nearly fully optimized, with no further work currently planned.
 - 🟢 Functional: Fully operational, with ongoing optimizations.
 - 🚧 WIP: Under active development.
 
@@ -37,25 +30,17 @@ High-performance inference engine for AWS Neuron accelerators, built on vLLM v1 
 - Python 3.8+ (compatible with vLLM requirements)
 - Supported AWS instances: Inf2, Trn1/Trn1n, Trn2
 
-### Install vLLM
+### Quick Start Guide
+
+Install this vLLM plugin:
 
 ```bash
-# Install vLLM from source (v0.10.2+)
-git clone -b v0.10.2 https://github.com/vllm-project/vllm.git
-cd vllm
-pip install -e .
-```
-
-### Install Neuron Plugin
-
-```bash
-# Install the Neuron plugin
-git clone https://github.com/aws-neuron/vllm-neuron.git
+git clone https://github.com/aws-neuron/private-vllm-neuron.git vllm-neuron
 cd vllm-neuron
-pip install -e .
+pip install --extra-index-url=https://pip.repos.neuron.amazonaws.com -e .
 ```
 
-## Quick Start
+That's it! The plugin will automatically install vLLM version pinned and all required dependencies.
 
 ### Basic Usage
 
@@ -103,8 +88,7 @@ python3 -m vllm.entrypoints.openai.api_server \
     --tensor-parallel-size 32 \
     --max-model-len 2048 \
     --max-num-seqs 32 \
-    --port 8000 \
-    --disable-log-requests
+    --port 8000 
 ```
 
 ## Configuration
@@ -133,40 +117,11 @@ llm = LLM(
 )
 ```
 
-## Advanced Features
-
-### Speculative Decoding (Eagle)
-
-```python
-from vllm import LLM, SamplingParams
-
-llm = LLM(
-    model="llama-2/Llama-2-7b-chat-hf",
-    tensor_parallel_size=32,
-    max_num_seqs=2,
-    max_model_len=256,
-    enable_prefix_caching=True,
-    block_size=32,
-    speculative_config={
-        "model": "llama-2/EAGLE-llama2-chat-7B",
-        "num_speculative_tokens": 5,
-        "max_model_len": 256,
-        "method": "eagle",
-    },
-)
-
-prompts = [
-    "I believe the meaning of life is",
-    "I believe Artificial Intelligence will",
-]
-sampling_params = SamplingParams(top_k=50, max_tokens=100)
-outputs = llm.generate(prompts, sampling_params)
-```
 
 ## Support
 
 - **Documentation**: [AWS Neuron Documentation](https://awsdocs-neuron.readthedocs-hosted.com/)
-- **Issues**: [GitHub Issues](https://github.com/aws-neuron/vllm-neuron/issues)
+- **Issues**: [GitHub Issues](https://github.com/vllm-project/vllm-neuron/issues)
 - **Community**: [AWS Neuron Forum](https://forums.aws.amazon.com/forum.jspa?forumID=355)
 
 ## License
