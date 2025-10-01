@@ -28,29 +28,26 @@ pip install --extra-index-url=https://pip.repos.neuron.amazonaws.com -e .
 import os
 from vllm import LLM, SamplingParams
 
-# Enable V1 engine
-os.environ["VLLM_USE_V1"] = "1"
-
 # Initialize the model
 llm = LLM(
-    model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    tensor_parallel_size=32,
+    model=f"TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     max_num_seqs=4,
-    max_model_len=1024,
-    enable_prefix_caching=False,
-    enable_chunked_prefill=False,
-    additional_config={
-        "override_neuron_config": {
-            "skip_warmup": True,
-            "enable_bucketing": True,
-            "context_encoding_buckets": [
-                256, 512, 1024, 2048, 4096, 8192, 10240, 16384
-            ],
-            "token_generation_buckets": [
-                256, 512, 1024, 2048, 4096, 8192, 10240, 16384
-            ],
-        },
-    },
+    max_model_len=2048,
+    tensor_parallel_size=32,
+    num_gpu_blocks_override=4096,
+    block_size=32,
+    enable_prefix_caching=True,
+    additional_config=dict(
+        override_neuron_config=dict(
+            async_mode=False,
+            is_prefix_caching=True,
+            is_block_kv_layout=True,
+            pa_num_blocks=4096,
+            pa_block_size=32,
+            skip_warmup=True,
+            save_sharded_checkpoint=True,
+        )
+    ),
 )
 
 # Generate text
@@ -74,10 +71,17 @@ python3 -m vllm.entrypoints.openai.api_server \
     --model "TinyLlama/TinyLlama-1.1B-Chat-v1.0" \
     --tensor-parallel-size 32 \
     --max-model-len 2048 \
-    --max-num-seqs 32 \
-    --block-size 32 \
-    --additional-config '{"override_neuron_config": {"skip_warmup": true, "enable_bucketing": true, "context_encoding_buckets": [256, 512, 1024, 2048, 4096, 8192, 10240, 16384], "token_generation_buckets": [256, 512, 1024, 2048, 4096, 8192, 10240, 16384]}}' \
-    --port 8000 
+    --max-num-seqs 4 \
+    --no-enable-prefix-caching \
+    --additional-config '{
+        "override_neuron_config": {
+            "skip_warmup": true,
+            "enable_bucketing": true,
+            "context_encoding_buckets": [256, 512, 1024, 2048],
+            "token_generation_buckets": [256, 512, 1024, 2048]
+        }
+    }' \
+    --port 8000
 ```
 ## Feature Support
 
