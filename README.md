@@ -114,4 +114,4 @@ We support a subset of [models supported on NxDI](https://awsdocs-neuron.readthe
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the Apache License 2.0 - see the [LICENSE](https://github.com/vllm-project/vllm-neuron/blob/main/LICENSE) file for details.
