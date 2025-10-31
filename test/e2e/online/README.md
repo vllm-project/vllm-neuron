@@ -18,7 +18,8 @@ test/
 ├── tiny/
 │   └── test_vanilla_inference_tiny.py   # Tiny/smoke test for PR suite
 └── utils/
-    ├── model_path.py                 # resolve_model_dir(): FSX → SSD (if writable) path resolver
+    ├── fsx_utils/
+    │   └── model_path.py             # resolve_model_dir(): FSX → SSD (if writable) path resolver
     └── server/
         ├── server.py        # Defines VllmServer (server spin-up logic)
         └── start_server.sh # Thin wrapper around vllm.entrypoints.openai.api_server
@@ -47,7 +48,7 @@ flowchart TD
   end
 
   subgraph UTILS["Utilities"]
-    MP["test/utils/model_path.py<br/>• resolve_model_dir()"]
+    MP["test/utils/fsx_utils/model_path.py<br/>• resolve_model_dir()"]
   end
 
   subgraph SHELL["Launcher script"]
@@ -73,13 +74,12 @@ flowchart TD
 
 1. **Test file** (`test/e2e/online/test_online_e2e.py`)  
    Loads a config (from `configs.py`) specifying:
-   - `model` (logical FSx path or absolute path)
+   - `model` (model path or identifier)
    - `tp_degree`, `batch_size`, `max_tokens`, ports
    - Optional online features: prefix caching, chunked prefill, LoRA, etc.
 
 2. **Server runner** (`online_server_runner.py`)  
-   - Resolves model directory (`resolve_model_dir()` in `model_path.py`)
-   - Copies to SSD if `SSD_RW` is available/writable
+   - Resolves model directory (`resolve_model_dir()` in `fsx_utils/model_path.py`)
    - Builds CLI flags & environment
    - Launches `start_server.sh` in a subprocess
 
@@ -114,32 +114,6 @@ flowchart TD
 
 ---
 
-## Model Path Resolution
-
-- **Logical path** (recommended):  
-  `"llama-3.2/llama-3.2-1b"` →  
-  `$FSX_SHARED_RO/neuronx-distributed/inference/llama-3.2/llama-3.2-1b`
-- **SSD acceleration**: If `$SSD_RW` is set and writable, contents are mirrored to SSD under the same relative path, with `.copy_complete` marker for idempotency.
-- **Absolute path**: Used directly; no FSx/SSD routing applied.
-
----
-
-## Environment Variables
-
-| Variable         | Required | Description |
-|------------------|----------|-------------|
-| `FSX_SHARED_RO`  | Yes      | Base FSx mount (read-only) |
-| `SSD_RW`         | No       | Writable SSD mount for model mirroring |
-
-Example:
-
-```bash
-export FSX_SHARED_RO=/fsx-shared-ro
-export SSD_RW=/local-ssd
-```
-
----
-
 ## Running Tests
 
 ### Local
@@ -161,7 +135,7 @@ ONLINE_CONFIG=autotest pytest -s test/e2e/online/test_online_e2e.py
 - Add new configs in `test/e2e/online/configs.py`
 - Add new test functions to `test/e2e/online/test_online_e2e.py`
 - Use `VllmServer` helper to avoid duplicating server lifecycle logic
-- Keep model resolution via `model_path.py` to ensure FSx/SSD routing stays consistent
+- Keep model resolution via `fsx_utils/model_path.py` to ensure FSx/SSD routing stays consistent
 
 ---
 
