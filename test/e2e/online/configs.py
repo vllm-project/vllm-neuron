@@ -43,7 +43,7 @@ INTEGRATION_CONFIGS = [
         accuracy_check=True,
     ),
     OnlineCfg(
-        name="llama-32-1B_integration_bs8",
+        name="open_llama_7b_bs8",
         model="openlm-research/open_llama_7b",
         tp_degree=32,
         batch_size=8,
@@ -53,7 +53,7 @@ INTEGRATION_CONFIGS = [
         accuracy_check=False,
     ),
     OnlineCfg(
-        name="llama-32-1B_integration_bs16",
+        name="Qwen3-8B_bs16",
         model="Qwen/Qwen3-8B",
         tp_degree=32,
         batch_size=16,
