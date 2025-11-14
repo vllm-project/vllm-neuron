@@ -1,0 +1,23 @@
+[build-system]
+requires = [
+    "setuptools>=77.0.3,<80.0.0",
+    "wheel"
+]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest]
+testpaths = ["test/unit"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+
+[tool.coverage.run]
+source = ["vllm_neuron"]
+omit = [
+    "test/*",
+    "ci/*",
+    ".github/*",
+    "doc/*",
+    "*.md",
+    "setup.py"
+]

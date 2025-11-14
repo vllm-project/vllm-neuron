@@ -1,0 +1,50 @@
+# HuggingFace ID -> FSx path mappings
+mappings:
+
+  # Llama 2
+  meta-llama/Llama-2-7b-chat-hf: llama-2/Llama-2-7b-chat-hf
+
+  # Llama 3.1
+  meta-llama/Llama-3.1-8B: llama-3.1/llama-3.1-8b
+  meta-llama/Llama-3.1-8B-Instruct: llama-3.1/llama-3.1-8b-instruct
+  meta-llama/Llama-3.1-70B: llama-3.1/llama-3.1-70b
+  meta-llama/Llama-3.1-70B-Instruct: llama-3.1/llama-3.1-70b-instruct
+  meta-llama/Llama-3.1-405B: llama-3.1/llama-3.1-405b
+  meta-llama/Llama-3.1-405B-Instruct: llama-3.1/llama-3.1-405b-instruct
+  
+  # Llama 3.3
+  meta-llama/Llama-3.3-70B-Instruct: llama-3.3/llama-3.3-70b-instruct
+
+  # Llama 4
+  meta-llama/Llama-4-Scout-17B-16E-Instruct: llama-4/Llama-4-Scout-17B-16E-Instruct
+  meta-llama/Llama-4-Maverick-17B-128E-Instruct: llama-4/Llama-4-Maverick-17B-128E-Instruct
+
+  
+  # TinyLlama
+  TinyLlama/TinyLlama-1.1B-Chat-v1.0: tinyllama/TinyLlama-1.1B-Chat-v1.0
+  
+  # Qwen
+  Qwen/Qwen2.5-7B-Instruct: qwen/qwen-2.5-7b-instruct
+  Qwen/Qwen2.5-32B-Instruct: qwen/qwen2.5-32b-instruct
+  Qwen/Qwen2.5-72B-Instruct: qwen/qwen-2.5-72b-instruct
+  Qwen/Qwen3-4B: qwen/qwen-3-4b
+  Qwen/Qwen3-8B: qwen/qwen-3-8b
+  Qwen/Qwen3-14B: qwen/qwen-3-14b
+  Qwen/Qwen3-32B: qwen/qwen-3-32b
+  
+  # Mistral
+  mistralai/Mistral-7B-Instruct-v0.2: mistral/Mistral-7B-Instruct-v0.2
+  mistralai/Pixtral-Large-Instruct-2411: Pixtral-Large-Instruct-2411
+
+  # DBRX
+  databricks/dbrx-instruct: dbrx/dbrx-instruct
+  
+  # Eagle models
+  yuhuili/EAGLE-llama2-chat-7B: llama-2/EAGLE-llama2-chat-7B
+  yuhuili/EAGLE-LLaMA3-Instruct-8B: llama-3.1/EAGLE-LLaMA3.1-Instruct-8B
+
+  # GPT-OSS
+  openai/gpt-oss-20b: gpt-oss/gpt-oss-20b
+  
+  # Note: FSx-only paths like "llama-3.3/llama-3.3-70B-Instruct-eagle-draft-phase-3-20250130/"
+  # don't need mappings - they'll be used as-is and can be passed as-is
