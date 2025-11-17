@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """A Neuron worker class."""
-from typing import Optional, Set
+from typing import Set
 
 import torch.nn as nn
 from vllm.config import VllmConfig
@@ -49,12 +49,22 @@ class NeuronWorker(WorkerBase):
         set_random_seed(self.model_config.seed)
 
     def determine_available_memory(self):
-        # TODO: implement this
-        return 1024 * 1024 * 1024  # 1GB
+        import torch
+        try:
+            rt = torch.classes.neuron.Runtime()
+            bytes_used, bytes_free = rt.get_vnc_memory_stats()
+            logger.debug("Device memory stats: %s bytes used, %s bytes free",
+                         bytes_used, bytes_free)
+            if bytes_used == -1 and bytes_free == -1:
+                raise RuntimeError("Failed to initialize neuron runtime")
+            return bytes_free
+        except Exception as e:
+            logger.debug("Failed to get memory stats: %s", e)
+            return 1024 * 1024 * 1024 * 20  # 20GB
 
     def execute_model(
-            self, scheduler_output: "SchedulerOutput"
-    ) -> Optional[ModelRunnerOutput]:
+            self,
+            scheduler_output: "SchedulerOutput") -> ModelRunnerOutput | None:
         output = self.model_runner.execute_model(scheduler_output)
         return output if self.is_driver_worker else None
 
@@ -132,5 +142,5 @@ class NeuronWorker(WorkerBase):
         supported_tasks.append("generate")
         return supported_tasks
 
-    def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
+import importlib
 import logging
 import os
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 
@@ -177,7 +178,9 @@ def test_check_and_update_config(disable_scheduler):
         mock_config.parallel_config.world_size = 1
         mock_config.parallel_config.worker_cls = "auto"
         mock_config.cache_config = Mock()
+        mock_config.cache_config.num_gpu_blocks_override = None
         mock_config.scheduler_config = Mock()
+        mock_config.lora_config = None
 
         NeuronPlatform.check_and_update_config(mock_config)
 
@@ -208,12 +211,15 @@ def test_check_and_update_config_cache_settings():
     mock_config.model_config = Mock(max_model_len=2048)
     mock_config.parallel_config = Mock(world_size=1, worker_cls="auto")
     mock_config.cache_config = Mock(enable_prefix_caching=False)
+    mock_config.cache_config.num_gpu_blocks_override = 1
     mock_config.scheduler_config = Mock()
+    mock_config.lora_config = None
 
     NeuronPlatform.check_and_update_config(mock_config)
 
     # Verify cache block size is set to max_model_len when prefix caching is disabled
     assert mock_config.cache_config.block_size == 2048
+    assert mock_config.cache_config.num_gpu_blocks_override == 2
 
 
 def test_check_and_update_config_distributed():
@@ -232,7 +238,9 @@ def test_check_and_update_config_distributed():
     mock_config.model_config = Mock()
     mock_config.parallel_config = Mock(world_size=2, worker_cls="auto")
     mock_config.cache_config = Mock()
+    mock_config.cache_config.num_gpu_blocks_override = None
     mock_config.scheduler_config = Mock()
+    mock_config.lora_config = None
 
     NeuronPlatform.check_and_update_config(mock_config)
 
@@ -288,7 +296,8 @@ def test_check_and_update_config_cache_validation():
     mock_config.model_config = Mock()
     mock_config.parallel_config = Mock(world_size=1, worker_cls="auto")
     mock_config.cache_config = Mock(enable_prefix_caching=True,
-                                    block_size=None)
+                                    block_size=None,
+                                    num_gpu_blocks_override=None)
     mock_config.scheduler_config = Mock()
 
     with pytest.raises(
@@ -395,8 +404,10 @@ def test_check_and_update_config_edge_cases():
     mock_config = Mock()
     mock_config.model_config = None
     mock_config.parallel_config = Mock(worker_cls="auto", world_size=1)
-    mock_config.cache_config = Mock(enable_prefix_caching=False)
+    mock_config.cache_config = Mock(enable_prefix_caching=False,
+                                    num_gpu_blocks_override=None)
     mock_config.scheduler_config = Mock()
+    mock_config.lora_config = None
 
     NeuronPlatform.check_and_update_config(mock_config)
 
@@ -405,7 +416,8 @@ def test_check_and_update_config_edge_cases():
         mock_config = Mock()
         mock_config.model_config = Mock()
         mock_config.parallel_config = Mock(worker_cls="auto", world_size=1)
-        mock_config.cache_config = Mock(block_size=None)
+        mock_config.cache_config = Mock(block_size=None,
+                                        num_gpu_blocks_override=None)
         mock_config.scheduler_config = Mock()
 
         with pytest.raises(
@@ -514,3 +526,237 @@ def test_pre_register_and_update_pipeline_async():
         if original_verify:
             setattr(ModelConfig, 'verify_with_parallel_config',
                     original_verify)
+
+
+def test_check_and_update_config_scheduler_defaults():
+    """Test scheduler configuration defaults in check_and_update_config."""
+    mock_config = Mock()
+    mock_config.model_config = Mock()
+    mock_config.parallel_config = Mock(world_size=1, worker_cls="auto")
+    mock_config.cache_config = Mock(enable_prefix_caching=False,
+                                    num_gpu_blocks_override=None)
+    mock_config.scheduler_config = Mock(max_num_seqs=None)
+    mock_config.lora_config = None
+
+    with patch.dict(os.environ, {'DISABLE_NEURON_CUSTOM_SCHEDULER': "0"}):
+        NeuronPlatform.check_and_update_config(mock_config)
+
+        # Verify scheduler defaults
+        assert mock_config.scheduler_config.max_num_batched_tokens == 131072
+        assert mock_config.scheduler_config.max_num_seqs == 32
+        assert mock_config.scheduler_config.scheduler_cls == \
+            "vllm_neuron.core.scheduler.ContinuousBatchingNeuronScheduler"
+        assert not mock_config.scheduler_config.chunked_prefill_enabled
+
+
+def test_multiple_config_override_calls():
+    """Test multiple calls to _ensure_config_overrides_applied."""
+    platform = NeuronPlatform()
+
+    # Reset the class flag
+    NeuronPlatform._config_overrides_applied = False
+
+    mock_logger = Mock()
+
+    # First call
+    with patch('vllm_neuron.platform.logger', mock_logger):
+        platform._ensure_config_overrides_applied()
+
+    # Check both log messages
+    assert mock_logger.info.call_args_list == [
+        call("Applying Neuron config overrides"),
+        call("Neuron config overrides applied successfully")
+    ]
+
+    # Reset mock and verify second call
+    mock_logger.reset_mock()
+
+    # Second call
+    with patch('vllm_neuron.platform.logger', mock_logger):
+        platform._ensure_config_overrides_applied()
+
+    mock_logger.debug.assert_called_once_with(
+        "Neuron config overrides already applied, skipping")
+
+
+def test_ensure_config_overrides_applied_error(monkeypatch):
+    """Test error handling in _ensure_config_overrides_applied."""
+    platform = NeuronPlatform()
+
+    # Reset the class flag
+    NeuronPlatform._config_overrides_applied = False
+
+    mock_logger = Mock()
+
+    def mock_import(*args, **kwargs):
+        if 'vllm.config' in args:
+            raise Exception("Test error")
+        return importlib.__import__(*args, **kwargs)
+
+    monkeypatch.setattr('vllm_neuron.platform.logger', mock_logger)
+    monkeypatch.setattr('builtins.__import__', mock_import)
+
+    with pytest.raises(Exception, match="Test error"):
+        platform._ensure_config_overrides_applied()
+
+    mock_logger.error.assert_called_once_with(
+        "Error applying Neuron config overrides: Test error")
+
+
+def test_config_overrides_methods():
+    """Test the overridden config methods."""
+    platform = NeuronPlatform()
+
+    # Create a mock ModelConfig class with the methods we want to test
+    class MockModelConfig:
+
+        def __init__(self):
+            self.spec_target_max_model_len = None
+
+        def _verify_quantization(self):
+            pass
+
+        def _verify_cuda_graph(self):
+            pass
+
+        def get_and_verify_max_len(self, max_model_len):
+            if self.spec_target_max_model_len is not None:
+                return self.spec_target_max_model_len
+            return max_model_len
+
+    # Reset the class flag to ensure we can apply overrides
+    NeuronPlatform._config_overrides_applied = False
+
+    with patch('vllm_neuron.platform.logger'):
+        with patch('vllm.config.ModelConfig', MockModelConfig):
+            # Apply overrides
+            platform._ensure_config_overrides_applied()
+
+            # Create instance and test
+            model_config = MockModelConfig()
+
+            # Test skip_verify_quantization and skip_verify_cuda_graph
+            model_config._verify_quantization()  # Should pass without error
+            model_config._verify_cuda_graph()  # Should pass without error
+
+            # Test get_and_verify_max_len
+            model_config.spec_target_max_model_len = 1024
+            assert model_config.get_and_verify_max_len(2048) == 1024
+
+            model_config.spec_target_max_model_len = None
+            assert model_config.get_and_verify_max_len(2048) == 2048
+
+
+def test_check_and_update_config_worker_settings():
+    """Test worker class and world size configuration."""
+    mock_config = Mock()
+    mock_config.model_config = Mock()
+    mock_config.parallel_config = Mock()
+    mock_config.cache_config = Mock(enable_prefix_caching=False,
+                                    num_gpu_blocks_override=None)
+    mock_config.scheduler_config = Mock()
+    mock_config.lora_config = None
+
+    # Test auto worker class setting
+    mock_config.parallel_config.worker_cls = "auto"
+    mock_config.parallel_config.world_size = 1
+    NeuronPlatform.check_and_update_config(mock_config)
+    assert mock_config.parallel_config.worker_cls == \
+        "vllm_neuron.worker.neuron_worker.NeuronWorker"
+
+    # Test world size > 1
+    mock_config.parallel_config.world_size = 2
+    NeuronPlatform.check_and_update_config(mock_config)
+    assert mock_config.parallel_config.distributed_executor_backend == "uni"
+
+
+def test_num_gpu_block_override_incremented_flag():
+    """Test instance-level null block adjustment functionality.
+    
+    Verifies:
+    - num_gpu_blocks_override is incremented by 1 for each config instance
+    - Instance-level marker prevents multiple increments on same instance
+    - Multiple config instances each get their own adjustment
+    - Logging behavior for increment operation
+    - No increment when num_gpu_blocks_override is None
+    """
+    # Test case 1: First config instance with num_gpu_blocks_override set
+    mock_config = Mock()
+    mock_config.model_config = Mock()
+    mock_config.parallel_config = Mock(world_size=1, worker_cls="auto")
+    mock_config.cache_config = Mock(enable_prefix_caching=True)
+    mock_config.cache_config.num_gpu_blocks_override = 10
+    mock_config.scheduler_config = Mock()
+    mock_config.lora_config = None
+
+    with patch('vllm_neuron.platform.logger') as mock_logger:
+        NeuronPlatform.check_and_update_config(mock_config)
+
+        # Verify increment happened
+        assert mock_config.cache_config.num_gpu_blocks_override == 11
+        assert '_neuron_null_block_adjusted' in mock_config.cache_config.__dict__
+        assert mock_config.cache_config._neuron_null_block_adjusted is True
+
+        # Verify logging
+        mock_logger.info.assert_any_call(
+            "Adding 1 to num_gpu_blocks_override (%d -> %d) "
+            "to account for null block allocation", 10, 11)
+
+    # Test case 2: Same config instance called again - should not increment
+    with patch('vllm_neuron.platform.logger') as mock_logger:
+        NeuronPlatform.check_and_update_config(mock_config)
+
+        # Verify no additional increment (should remain 11)
+        assert mock_config.cache_config.num_gpu_blocks_override == 11
+
+        # Verify no increment logging occurred
+        increment_calls = [
+            call for call in mock_logger.info.call_args_list
+            if "Adding 1 to num_gpu_blocks_override" in str(call)
+        ]
+        assert len(increment_calls) == 0
+
+    # Test case 3: Different config instance should get its own increment
+    mock_config2 = Mock()
+    mock_config2.model_config = Mock()
+    mock_config2.parallel_config = Mock(world_size=1, worker_cls="auto")
+    mock_config2.cache_config = Mock(enable_prefix_caching=True)
+    mock_config2.cache_config.num_gpu_blocks_override = 20
+    mock_config2.scheduler_config = Mock()
+    mock_config2.lora_config = None
+
+    with patch('vllm_neuron.platform.logger') as mock_logger:
+        NeuronPlatform.check_and_update_config(mock_config2)
+
+        # Verify increment happened for this new instance
+        assert mock_config2.cache_config.num_gpu_blocks_override == 21
+        assert '_neuron_null_block_adjusted' in mock_config2.cache_config.__dict__
+        assert mock_config2.cache_config._neuron_null_block_adjusted is True
+
+        # Verify increment logging occurred
+        mock_logger.info.assert_any_call(
+            "Adding 1 to num_gpu_blocks_override (%d -> %d) "
+            "to account for null block allocation", 20, 21)
+
+    # Test case 4: No increment when num_gpu_blocks_override is None
+    mock_config3 = Mock()
+    mock_config3.model_config = Mock()
+    mock_config3.parallel_config = Mock(world_size=1, worker_cls="auto")
+    mock_config3.cache_config = Mock(enable_prefix_caching=True)
+    mock_config3.cache_config.num_gpu_blocks_override = None
+    mock_config3.scheduler_config = Mock()
+    mock_config3.lora_config = None
+
+    with patch('vllm_neuron.platform.logger') as mock_logger:
+        NeuronPlatform.check_and_update_config(mock_config3)
+
+        # Verify no increment happened and no marker set
+        assert mock_config3.cache_config.num_gpu_blocks_override is None
+        assert '_neuron_null_block_adjusted' not in mock_config3.cache_config.__dict__
+
+        # Verify no increment logging occurred
+        increment_calls = [
+            call for call in mock_logger.info.call_args_list
+            if "Adding 1 to num_gpu_blocks_override" in str(call)
+        ]
+        assert len(increment_calls) == 0

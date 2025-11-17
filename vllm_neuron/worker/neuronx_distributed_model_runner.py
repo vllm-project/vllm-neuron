@@ -2,7 +2,7 @@
 import copy
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import torch
 from neuronx_distributed_inference.modules.generation.sampling import \
@@ -10,7 +10,7 @@ from neuronx_distributed_inference.modules.generation.sampling import \
 from neuronx_distributed_inference.modules.padding import pad_tensor
 from vllm.config import VllmConfig
 from vllm.multimodal import BatchedTensorInputs, MultiModalKwargs
-from vllm.multimodal.inputs import MultiModalFieldElem, MultiModalKwargsItem
+from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalFieldElem
 from vllm.sequence import IntermediateTensors
 from vllm.utils import make_tensor_with_pad
 from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData,
@@ -19,6 +19,7 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, DraftTokenIds,
                              ModelRunnerOutput, SamplerOutput)
+from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
@@ -35,20 +36,20 @@ class ModelInputForNeuron:
     """
     Model input for NeuronX Distributed Inference model runner.
     """
-    request_ids: Optional[list[str]] = None
-    input_tokens: Optional[torch.Tensor] = None
-    position_ids: Optional[torch.Tensor] = None
-    input_block_ids: Optional[torch.Tensor] = None
-    slot_mapping: Optional[torch.Tensor] = None
-    block_tables: Optional[torch.Tensor] = None
-    full_context_lens: Optional[torch.Tensor] = None
-    computed_context_lens: Optional[torch.Tensor] = None
-    sampling_params: Optional[torch.Tensor] = None
+    request_ids: list[str] | None = None
+    input_tokens: torch.Tensor | None = None
+    position_ids: torch.Tensor | None = None
+    input_block_ids: torch.Tensor | None = None
+    slot_mapping: torch.Tensor | None = None
+    block_tables: torch.Tensor | None = None
+    full_context_lens: torch.Tensor | None = None
+    computed_context_lens: torch.Tensor | None = None
+    sampling_params: torch.Tensor | None = None
     multi_modal_kwargs: BatchedTensorInputs = None
-    adapter_ids: Optional[str] = None
+    adapter_ids: str | None = None
     # Boolean tensor to indicate if the request is ready
     # for sampling. Needed by chunked prefill.
-    prefill_completion_state: Optional[torch.Tensor] = None
+    prefill_completion_state: torch.Tensor | None = None
 
 
 # This class is used for constructing ModelInputForNeuron and
@@ -120,11 +121,7 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
         self.requests: dict[str, CachedRequestState] = {}
         # req_id -> (input_id -> encoder_output)
         self.encoder_cache: dict[str, dict[int, torch.Tensor]] = {}
-
-        # vLLM uses lora_manager to manage LoRA modules
-        self.lora_manager = None
         self.model = None
-        self.lora_serving_config = None
 
         self.is_block_kv_layout = False
         self.is_prefix_caching = False
@@ -139,6 +136,9 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
         self.free_seq_ids = set(range(self.max_num_reqs))
         self._draft_token_ids = None
 
+        # Initialize CPU sampler for when on-device sampling is not available
+        self.cpu_sampler = Sampler()
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig):
         """
         Initialize KV cache based on `kv_cache_config`.
@@ -152,20 +152,6 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
     def _get_nxdi_lora_config(self):
         raise NotImplementedError(
             "Multi-lora is not yet supported on the Neuron plugin")
-        override_neuron_config = self.vllm_config.additional_config.get(
-            "override_neuron_config", None)
-        lora_ckpt_paths = override_neuron_config.pop("lora_modules", None)
-        target_modules = override_neuron_config.pop("target_modules", None)
-        lora_ckpt_json = override_neuron_config.pop("lora_ckpt_json", None)
-
-        return LoraServingConfig(  # noqa: F821
-            max_loras=self.lora_config.max_loras,
-            max_lora_rank=self.lora_config.max_lora_rank,
-            target_modules=target_modules,
-            lora_ckpt_paths=lora_ckpt_paths,
-            lora_ckpt_json=lora_ckpt_json,
-            batch_size=self.scheduler_config.max_num_seqs,
-        )
 
     def _get_last_token_position(self, state: CachedRequestState) -> int:
         """
@@ -193,15 +179,12 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
         if self.lora_config is not None:
             raise NotImplementedError(
                 "Multi-lora is not yet supported on the Neuron plugin")
-            self.lora_serving_config = self._get_nxdi_lora_config()
-            self.lora_manager = LoraModelManager(  # noqa: F821
-                self.lora_serving_config)
         self.model = get_neuron_model(
             self.model_config,
             cache_config=self.cache_config,
             parallel_config=self.parallel_config,
             scheduler_config=self.scheduler_config,
-            lora_serving_config=self.lora_serving_config,
+            lora_serving_config=None,
             speculative_config=self.speculative_config,
             additional_config=self.vllm_config.additional_config)
         self.is_block_kv_layout = self.model.neuron_config.is_block_kv_layout
@@ -211,11 +194,66 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
         self.model.is_reorder_needed = not (self.is_prefix_caching
                                             or self.is_chunked_prefill)
 
+        # Validate and log sampling configuration
+        self._validate_sampling_configuration()
+
+    def _validate_sampling_configuration(self) -> None:
+        """
+        Validate the sampling configuration and log the sampling strategy.
+        
+        Raises:
+            RuntimeError: If sampling configuration is invalid
+        """
+        try:
+            has_on_device_sampling = (
+                hasattr(self.model, 'neuron_config') and hasattr(
+                    self.model.neuron_config, 'on_device_sampling_config') and
+                self.model.neuron_config.on_device_sampling_config is not None)
+
+            if has_on_device_sampling:
+                logger.info(
+                    "Hardware sampling enabled: "
+                    f"config={self.model.neuron_config.on_device_sampling_config}"
+                )
+                # Validate hardware sampling configuration
+                config = self.model.neuron_config.on_device_sampling_config
+                if hasattr(config, 'global_topk') and (
+                        config.global_topk <= 0 or config.global_topk
+                        > self._MAX_NEURON_SAMPLING_TOP_K):
+                    logger.warning(
+                        f"Hardware sampling global_topk={config.global_topk} "
+                        f"is outside the accepted range of [1-{self._MAX_NEURON_SAMPLING_TOP_K}]. "
+                        f"Actual topk will be set to {self._MAX_NEURON_SAMPLING_TOP_K}, the max for neuron."
+                    )
+            else:
+                logger.info(
+                    "CPU sampling enabled: on_device_sampling_config is None. "
+                    "All sampling will be performed on CPU using vLLM's standard sampler."
+                )
+
+                # Ensure CPU sampler is available
+                if not hasattr(self,
+                               'cpu_sampler') or self.cpu_sampler is None:
+                    raise RuntimeError(
+                        "CPU sampling is required but cpu_sampler is not initialized"
+                    )
+
+            # Validate model has required sampling interface
+            if not hasattr(self.model, 'sample'):
+                raise RuntimeError(
+                    "Model does not have required 'sample' method for hardware sampling"
+                )
+
+        except Exception as e:
+            logger.error(f"Sampling configuration validation failed: {str(e)}")
+            raise RuntimeError(
+                f"Invalid sampling configuration: {str(e)}") from e
+
     @torch.inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
-        intermediate_tensors: Optional[IntermediateTensors] = None,
+        intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput:
         logger.debug(f"scheduler_output: {scheduler_output}")
 
@@ -253,8 +291,7 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
         return self._generate_model_runner_output(sampler_outputs)
 
     def _generate_model_runner_output(
-            self,
-            sampler_outputs: Optional[SamplerOutput]) -> ModelRunnerOutput:
+            self, sampler_outputs: SamplerOutput | None) -> ModelRunnerOutput:
         if sampler_outputs is None:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
@@ -306,12 +343,18 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
 
         logger.debug(
             f"final valid_sampled_token_ids: {valid_sampled_token_ids}")
+
+        logprobs = None
+        if sampler_outputs.logprobs_tensors is not None:
+            logprobs = sampler_outputs.logprobs_tensors.tolists()
+
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
             sampled_token_ids=valid_sampled_token_ids,
-            # TODO: support the following fields. currently they are hardcoded to None
-            logprobs=None,
+            # CPU sampling supports logprobs.
+            logprobs=logprobs,
+            # TODO: support the following fields.
             prompt_logprobs_dict={},
             pooler_output=[])
 
@@ -331,7 +374,6 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
                 head_size=self.model.head_dim,
                 # TODO: take the following from the model config
                 dtype=torch.bfloat16,
-                use_mla=False,
                 sliding_window=None,
             )
         }
@@ -349,6 +391,8 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
+            if self.lora_config is not None:
+                self.lora_manager.remove_req_id(req_id)
 
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
@@ -388,9 +432,7 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
             req_state = CachedRequestState(
                 req_id=req_id,
                 prompt_token_ids=new_req_data.prompt_token_ids,
-                mm_kwargs=new_req_data.mm_kwargs,
-                mm_positions=new_req_data.mm_positions,
-                mm_hashes=new_req_data.mm_hashes,
+                mm_features=new_req_data.mm_features or [],
                 sampling_params=sampling_params,
                 pooling_params=pooling_params,
                 generator=None,
@@ -470,8 +512,8 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
     def _execute_model_for_text(
         self,
         model_input: ModelInputForNeuron,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-    ) -> Optional[SamplerOutput]:
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> SamplerOutput | None:
         hidden_states = self.model(
             input_ids=model_input.input_tokens,
             position_ids=model_input.position_ids,
@@ -493,8 +535,8 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
     def _execute_model_for_multimodal_models(
         self,
         model_input: ModelInputForNeuron,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-    ) -> Optional[SamplerOutput]:
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> SamplerOutput | None:
         hidden_states = self.model.execute_model(model_input)
         sampled_output = self._sample(hidden_states, model_input)
         return sampled_output
@@ -524,12 +566,12 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
             )
 
     def _process_multi_modal_data_neuron(
-            self, mm_data: list[MultiModalKwargsItem]) -> None:
+            self, mm_data: list[MultiModalFeatureSpec]) -> None:
         assert len(
             mm_data
-        ) <= 1, "Processing multiple MultiModalKwargsItem within one request is not yet supported"
+        ) <= 1, "Processing multiple MultiModalFeatureSpec within one request is not yet supported"
 
-        mm_data = self._make_mm_data_dict(mm_data[0])
+        mm_data = self._make_mm_data_dict(mm_data[0].data)
         mm_data_neuron = None
         if self.model.model.config.model_type == 'llava':
             mm_data_neuron = self._process_multi_modal_data_neuron_llava(
@@ -690,9 +732,9 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
             self._process_new_request_for_continuous_batching_with_prefix_caching(
                 request_data, data)
 
-        if request_data.mm_kwargs:
+        if request_data.mm_features:
             data.multi_modal_kwargs = self._process_multi_modal_data_neuron(
-                request_data.mm_kwargs)
+                request_data.mm_features)
 
     def _process_new_request_for_continuous_batching_with_prefix_caching(
             self, request_data: NewRequestData,
@@ -959,7 +1001,7 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
         self,
         data: IntermediateInputData,
         multi_modal_kwargs: BatchedTensorInputs,
-        lora_adapter_ids: Optional[str],
+        lora_adapter_ids: str | None,
     ) -> ModelInputForNeuron:
         device = self.device
 
@@ -1040,17 +1082,33 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
         # Reorder along the batch dimension to restore outputs into the original request order
         hidden_states = hidden_states[reorder_indices]
 
-        # Sample the next token.
-        output = self.model.sample(logits=hidden_states, )
-        return output
+        # Determine sampling method based on configuration
+        try:
+            if self.model.neuron_config.on_device_sampling_config is None:
+                # CPU sampling path - hidden_states are actual logits
+                logger.debug(
+                    "Using CPU sampling: on_device_sampling_config is None")
+                return self._cpu_sample(hidden_states, model_input)
+            else:
+                # Hardware sampling path - hidden_states are pre-sampled token IDs
+                logger.debug(
+                    "Using hardware sampling: on_device_sampling_config is configured"
+                )
+                return self.model.sample(logits=hidden_states)
+
+        except Exception as e:
+            logger.error(
+                f"Sampling failed for requests {model_input.request_ids}: {str(e)}. "
+                f"On-device config available: {self.model.neuron_config.on_device_sampling_config is not None}"
+            )
+            raise RuntimeError(f"Sampling operation failed: {str(e)}") from e
 
     def get_nxd_sampling_params(self, input_ids: torch.Tensor):
         if self.model.neuron_config.on_device_sampling_config:
-            # TODO: fix bug when passing in sampling params via override_neuron_config
             max_topk = (
                 self.model.neuron_config.on_device_sampling_config.global_topk)
         else:
-            max_topk = self.model.neuron_config.vocab_size
+            max_topk = self.model_config.get_vocab_size()
 
         max_topk = min(max_topk, self._MAX_NEURON_SAMPLING_TOP_K)
 
@@ -1081,7 +1139,106 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
 
         return sampling_params
 
-    def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
+    def _cpu_sample(
+        self,
+        logits: torch.Tensor,
+        model_input: ModelInputForNeuron,
+    ) -> SamplerOutput:
+        """
+        CPU sampling when on-device sampling is not available.
+        
+        Args:
+            logits: Model output logits [batch_size, vocab_size]
+            model_input: Model input containing request information
+            
+        Returns:
+            SamplerOutput: Sampled token IDs compatible with hardware sampling output
+            
+        Raises:
+            RuntimeError: If CPU sampling fails or sampling metadata is invalid
+            ValueError: If logits tensor has invalid dimensions
+        """
+        try:
+            # Validate input logits
+            if logits.dim() != 2:
+                raise ValueError(
+                    f"Expected logits to be 2D tensor [batch_size, vocab_size], "
+                    f"got {logits.dim()}D tensor with shape {logits.shape}")
+            # Debug logging for logits inspection
+            logger.debug("=== CPU SAMPLING DEBUG ===")
+            logger.debug(
+                f"Logits tensor - shape: {logits.shape}, dtype: {logits.dtype}, device: {logits.device}"
+            )
+            logger.debug(
+                f"Logits statistics - min: {logits.min().item():.4f}, max: {logits.max().item():.4f}"
+            )
+            logger.debug(
+                f"Logits statistics - mean: {logits.mean().item():.4f}, std: {logits.std().item():.4f}"
+            )
+
+            # Show top-k logits for first sequence to verify they look like real logits
+            if logits.shape[0] > 0:
+                first_seq_logits = logits[0]
+                top_k_values, top_k_indices = torch.topk(first_seq_logits, k=5)
+                logger.debug(
+                    f"First sequence top-5 logits: values={top_k_values.tolist()}, token_ids={top_k_indices.tolist()}"
+                )
+
+                # Check for suspicious patterns that might indicate pre-sampled tokens
+                if logits.dtype in [torch.int32, torch.int64]:
+                    logger.debug(
+                        "WARNING: Logits tensor has integer dtype - might be pre-sampled tokens!"
+                    )
+                if (logits >= 0).all() and (
+                        logits < self.model_config.get_vocab_size()).all():
+                    logger.debug(
+                        "WARNING: All logits values look like token IDs - might be pre-sampled!"
+                    )
+
+            logger.debug(
+                f"Request IDs being processed: {model_input.request_ids}")
+            logger.debug("=== END CPU SAMPLING DEBUG ===")
+
+            batch_size, vocab_size = logits.shape
+            expected_vocab_size = self.model_config.get_vocab_size()
+
+            if vocab_size != expected_vocab_size:
+                raise ValueError(
+                    f"Logits vocab size {vocab_size} does not match model vocab size {expected_vocab_size}"
+                )
+
+            # Validate sampling metadata availability
+            sampling_metadata = self.input_batch.sampling_metadata
+            if sampling_metadata is None:
+                raise RuntimeError(
+                    "CPU sampling requires sampling metadata, but InputBatch.sampling_metadata is None. "
+                    "This indicates an issue with batch preparation.")
+
+            # Use vLLM's standard CPU sampler
+            sampler_output = self.cpu_sampler(logits, sampling_metadata)
+
+            # Validate sampler output
+            if sampler_output is None:
+                raise RuntimeError("CPU sampler returned None output")
+
+            if sampler_output.sampled_token_ids is None:
+                raise RuntimeError(
+                    "CPU sampler returned None sampled_token_ids")
+
+            logger.debug(
+                f"CPU sampling completed successfully. "
+                f"Sampled {len(sampler_output.sampled_token_ids)} sequences.")
+
+            return sampler_output
+
+        except Exception as e:
+            logger.error(
+                f"CPU sampling failed: {str(e)}. "
+                f"Logits shape: {logits.shape if logits is not None else 'None'}, "
+                f"Model input request IDs: {model_input.request_ids}")
+            raise RuntimeError(f"CPU sampling failed: {str(e)}") from e
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
         if self._draft_token_ids is None:
             return None
         req_ids = self.input_batch.req_ids

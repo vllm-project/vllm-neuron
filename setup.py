@@ -26,17 +26,17 @@ for root, dirs, files in os.walk("configuration"):
 
 setup(
     name="vllm-neuron",
-    version="0.1",
+    version="0.2.0",
     author="AWS Neuron team",
     license="Apache 2.0",
     description="vLLM Neuron backend plugin",
     classifiers=[
-        "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
     ],
     packages=find_packages(exclude=("docs", "examples", "tests*", "csrc")),
-    python_requires=">=3.9",
+    python_requires=">=3.10",
     install_requires=read_requirements(),
     entry_points={
         "vllm.platform_plugins": ["neuron = vllm_neuron:register"],

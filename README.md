@@ -4,11 +4,11 @@
 
 The vLLM Neuron plugin (vllm-neuron) is a vLLM extension that integrates AWS Neuron Trainium/Inferentia support with vLLM. Built on [vLLM's Plugin System](https://docs.vllm.ai/en/latest/design/plugin_system.html), it enables the optimization of existing vLLM workflows on AWS Neuron.
 
-* vLLM v0.10.2 is automatically installed as part of this installation. Refer to the Quickstart Guide below.
+* vLLM v0.11.0 is automatically installed as part of this installation. Refer to the Quickstart Guide below.
 
 ## Prerequisites
 
-- AWS Neuron SDK 2.26 ([Release Notes](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/release-notes/2.26.0/))
+- AWS Neuron SDK 2.26.1 ([Release Notes](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/release-notes/2.26.1.html))
 - Python 3.8+ (compatible with vLLM requirements)
 - Supported AWS instances: Inf2, Trn1/Trn1n, Trn2
 
@@ -85,16 +85,20 @@ python3 -m vllm.entrypoints.openai.api_server \
 ```
 ## Feature Support
 
-| Feature | Status | Notes |
-|:--------|:------:|-------|
-| Prefix Caching | 🟢 |  |
-| Speculative Decoding | 🟢 | Only Eagle V1 is supported  |
-| Quantization | 🟢 | INT8/FP8 quantization support |
-| Chunked Prefill | 🚧 |  |
-| Multimodal | 🚧 | Only Llama 4 is supported |
+| Feature                 | Status | Notes                         |
+|:------------------------|:------:|-------------------------------|
+| Continuous batching     |   🟢   |                               |
+| Chunked prefill         |   🚧   |                               |
+| Prefix caching          |   🟢   |                               |
+| Speculative decoding    |   🟢   | Only Eagle V1 is supported    |
+| Dynamic sampling        |   🟢   |                               |
+| Tool calling            |   🟢   |                               |
+| CPU Sampling            |   🟢   |                               |
+| Multimodal              |   🚧   | Only Llama 4 is supported     |
+| Quantization            |   🟢   | INT8/FP8 quantization support |
 
-- 🟢 Functional: Fully operational, with ongoing optimizations.
-- 🚧 WIP: Under active development.
+* 🟢 Functional: Fully operational, with ongoing optimizations.
+* 🚧 WIP: Under active development.
   
 ## Feature Configuration
 
@@ -108,7 +112,10 @@ We support a subset of [models supported on NxDI](https://awsdocs-neuron.readthe
 * Qwen 3
   
 ## Known Issues
-1. Chunked prefill is disabled by default on Neuron for optimal performance. To enable chunked prefill, set the environment variable `DISABLE_NEURON_CUSTOM_SCHEDULER="1"`. Users are required to provide a `num_gpu_blocks_override` arg calculated as `ceil(max_model_len // block_size) * max_num_seqs` when invoking vllm to avoid a potential OOB error.
+
+1. Chunked prefill is disabled by default on Neuron for optimal performance. To enable chunked prefill, set the environment variable `DISABLE_NEURON_CUSTOM_SCHEDULER="1"`.  
+2. Users are required to provide a `num_gpu_blocks_override` arg calculated as `ceil(max_model_len // block_size) * max_num_seqs` when invoking vLLM to avoid a potential OOB error.
+3. Prefix caching with batch_size=1 generates incorrect outputs. Recommend to use batch_size>1 when prefix caching is enabled.
 
 ## Support
 
