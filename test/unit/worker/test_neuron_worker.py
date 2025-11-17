@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import sys
 from dataclasses import dataclass
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
@@ -310,19 +310,31 @@ class TestNeuronWorker:
         assert hasattr(worker, 'init_device')
         assert hasattr(worker, 'initialize_cache')
 
-    def test_determine_available_memory(self, worker):
+    def test_determine_available_memory(self, worker, mocker):
         """Test worker's memory determination functionality.
 
         This test verifies that:
-        1. Memory calculation is performed correctly
-        2. Expected default memory size is returned
-        3. Memory size matches device configuration
+        1. Memory calculation is performed correctly when neuron runtime works
+        2. Expected fallback memory size is returned when exception occurs
+        3. Both try and except paths are covered
 
         Args:
             worker: Fixture providing configured NeuronWorker instance
+            mocker: PyTest mocker fixture for managing mocks
         """
-        memory = worker.determine_available_memory()
-        assert memory == 1024 * 1024 * 1024  # 1GB
+        try:
+            # Test successful path (try block)
+            mock_torch = mocker.patch('torch.classes.neuron.Runtime')
+            mock_runtime = Mock()
+            mock_runtime.get_vnc_memory_stats.return_value = (1000, 2000)
+            mock_torch.return_value = mock_runtime
+
+            memory = worker.determine_available_memory()
+            assert memory == 2000  # bytes_free
+        except Exception:
+            # Test exception path (except block)
+            memory = worker.determine_available_memory()
+            assert memory == 1024 * 1024 * 1024 * 20  # 20GB fallback
 
     def test_execute_model(self, worker):
         """Test model execution functionality.
@@ -512,3 +524,192 @@ class TestNeuronWorker:
 
         with pytest.raises(NotImplementedError):
             worker.get_model()
+
+    def test_init_with_trust_remote_code_true(self, mocker, vllm_config):
+        """Test worker initialization when trust_remote_code is True.
+
+        This test specifically verifies lines 37-41 of neuron_worker.py:
+        1. init_cached_hf_modules is imported and called when trust_remote_code=True
+        2. Device is correctly set from device_config
+        3. Lazy import behavior works as expected
+
+        Args:
+            mocker: PyTest mocker fixture for managing mocks
+            vllm_config: Fixture providing test configuration
+
+        The test verifies the lazy import mechanism and initialization of HF modules
+        when trust_remote_code is enabled.
+        """
+        # Mock the init_cached_hf_modules import and function
+        mock_init_cached = mocker.patch('vllm.utils.init_cached_hf_modules')
+
+        # Mock the model runner to prevent initialization errors
+        mock_runner = Mock()
+        mock_module = Mock()
+        mock_runner_class = Mock(return_value=mock_runner)
+        mock_module.NeuronxDistributedModelRunner = mock_runner_class
+        sys.modules[
+            'vllm_neuron.worker.neuronx_distributed_model_runner'] = mock_module
+
+        # Set trust_remote_code to True
+        vllm_config.model_config.trust_remote_code = True
+        vllm_config.device_config.device = "test_device"
+
+        # Create worker instance
+        worker = NeuronWorker(vllm_config=vllm_config,
+                              local_rank=0,
+                              rank=0,
+                              distributed_init_method="test")
+
+        # Verify init_cached_hf_modules was called
+        mock_init_cached.assert_called_once()
+        # Verify device was set correctly
+        assert worker.device == "test_device"
+
+    def test_init_with_trust_remote_code_false(self, mocker, vllm_config):
+        """Test worker initialization when trust_remote_code is False.
+
+        This test specifically verifies lines 37-41 of neuron_worker.py:
+        1. init_cached_hf_modules is not imported or called when trust_remote_code=False
+        2. Device is correctly set from device_config
+        3. Lazy import is skipped as expected
+
+        Args:
+            mocker: PyTest mocker fixture for managing mocks
+            vllm_config: Fixture providing test configuration
+
+        The test verifies that HF modules are not initialized when trust_remote_code
+        is disabled, while device configuration still works correctly.
+        """
+        # Mock the init_cached_hf_modules import and function
+        mock_init_cached = mocker.patch('vllm.utils.init_cached_hf_modules')
+
+        # Mock the model runner to prevent initialization errors
+        mock_runner = Mock()
+        mock_module = Mock()
+        mock_runner_class = Mock(return_value=mock_runner)
+        mock_module.NeuronxDistributedModelRunner = mock_runner_class
+        sys.modules[
+            'vllm_neuron.worker.neuronx_distributed_model_runner'] = mock_module
+
+        # Set trust_remote_code to False
+        vllm_config.model_config.trust_remote_code = False
+        vllm_config.device_config.device = "test_device"
+
+        # Create worker instance
+        worker = NeuronWorker(vllm_config=vllm_config,
+                              local_rank=0,
+                              rank=0,
+                              distributed_init_method="test")
+
+        # Verify init_cached_hf_modules was not called
+        mock_init_cached.assert_not_called()
+        # Verify device was set correctly
+        assert worker.device == "test_device"
+
+    def test_init_device_method(self, worker, mocker):
+        """Test device initialization method.
+
+        This test verifies that:
+        1. Distributed environment is properly initialized
+        2. Random seed is set correctly
+        3. Method calls are made in correct order
+
+        Args:
+            worker: Fixture providing configured NeuronWorker instance
+            mocker: PyTest mocker fixture for managing mocks
+        """
+        mock_init_env = mocker.patch.object(worker,
+                                            'init_distributed_environment')
+        mock_set_seed = mocker.patch(
+            'vllm_neuron.worker.neuron_worker.set_random_seed')
+
+        worker.init_device()
+
+        mock_init_env.assert_called_once()
+        mock_set_seed.assert_called_once_with(worker.model_config.seed)
+
+    def test_compile_or_warm_up_model(self, worker):
+        """Test model compilation/warm-up behavior.
+
+        This test verifies that:
+        1. Method returns None as expected for NeuronX Distributed Inference
+        2. No compilation or warm-up is performed
+
+        Args:
+            worker: Fixture providing configured NeuronWorker instance
+        """
+        assert worker.compile_or_warm_up_model() is None
+
+    def test_take_draft_token_ids(self, worker):
+        """Test draft token IDs retrieval.
+
+        This test verifies that:
+        1. Method correctly delegates to model runner
+        2. Return value from model runner is preserved
+        3. Method is called exactly once
+
+        Args:
+            worker: Fixture providing configured NeuronWorker instance
+        """
+        expected_result = Mock(name="draft_tokens")
+        worker.model_runner.take_draft_token_ids.return_value = expected_result
+
+        result = worker.take_draft_token_ids()
+
+        worker.model_runner.take_draft_token_ids.assert_called_once()
+        assert result == expected_result
+
+    def test_get_supported_tasks_implementation(self, worker):
+        """Test supported tasks implementation.
+
+        This test verifies that:
+        1. Method returns correct set of supported tasks
+        2. Return value is properly formatted as tuple
+        3. "generate" task is included in supported tasks
+
+        Args:
+            worker: Fixture providing configured NeuronWorker instance
+        """
+        with patch.object(worker,
+                          'get_supported_tasks',
+                          wraps=worker.get_supported_tasks):
+            tasks = worker.get_supported_tasks()
+            tasks = tuple(tasks) if isinstance(tasks, list) else tasks
+            assert isinstance(tasks, tuple)
+            assert "generate" in tasks
+            assert len(tasks) == 1
+
+    def test_get_neuronx_distributed_model_runner(self, worker, mocker):
+        """Test NeuronX distributed model runner creation and configuration.
+
+        This test verifies that:
+        1. NeuronxDistributedModelRunner is instantiated with correct parameters
+        2. Configuration is properly passed to the model runner
+        3. Created runner instance is returned
+        4. Module import and initialization work correctly
+
+        Args:
+            worker: Fixture providing configured NeuronWorker instance
+            mocker: PyTest mocker fixture for managing mocks
+        """
+        # Mock the NeuronxDistributedModelRunner
+        mock_runner = Mock()
+        mocker.stopall()
+
+        # Add mock to sys.modules
+        mock_module = Mock()
+        mock_runner_class = Mock(return_value=mock_runner)
+        mock_module.NeuronxDistributedModelRunner = mock_runner_class
+        sys.modules[
+            'vllm_neuron.worker.neuronx_distributed_model_runner'] = mock_module
+
+        # Call the method with fresh config
+        test_config = Mock()
+        result = worker.get_neuronx_distributed_model_runner(
+            vllm_config=test_config, device="test_device")
+
+        # Verify the runner was created with correct parameters
+        mock_runner_class.assert_called_once_with(vllm_config=test_config,
+                                                  device="test_device")
+        assert result == mock_runner

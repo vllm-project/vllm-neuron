@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import logging
 from collections import deque
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -130,7 +130,7 @@ class ContinuousBatchingNeuronScheduler(NeuronScheduler):
 def check_stop_with_min_tokens(
         request: Request,
         max_model_len: int,
-        pooler_output: Optional[torch.Tensor] = None) -> bool:
+        pooler_output: torch.Tensor | None = None) -> bool:
     """
     Temporary fix to address missing min_token check. The V1 scheduler's stop checker 
     does not properly respect min_tokens.

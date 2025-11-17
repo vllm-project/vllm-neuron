@@ -3,7 +3,7 @@ import enum
 import logging
 import os
 from functools import lru_cache
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from vllm.platforms import Platform, PlatformEnum
 
@@ -117,12 +117,12 @@ class NeuronPlatform(Platform):
         return "neuron"
 
     @classmethod
-    def is_async_output_supported(cls, enforce_eager: Optional[bool]) -> bool:
+    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
         return False
 
     @classmethod
     def pre_register_and_update(cls,
-                                parser: Optional[FlexibleArgumentParser] = None
+                                parser: "FlexibleArgumentParser | None" = None
                                 ) -> None:
         # Ensure config overrides are applied
         cls._ensure_config_overrides_applied()
@@ -140,8 +140,23 @@ class NeuronPlatform(Platform):
         # TODO figure out a better way to verify empty VllmConfigs instead of just
         # checking if the VllmConfig.model_config is None.
         model_config = vllm_config.model_config
+        if model_config is None:
+            return
+
         disable_scheduler_override = bool(
             int(os.getenv("DISABLE_NEURON_CUSTOM_SCHEDULER", "0")))
+
+        # Add 1 to num_gpu_blocks_override to account for lazy null block allocation
+        cache_config = vllm_config.cache_config
+        if cache_config and cache_config.num_gpu_blocks_override is not None \
+            and '_neuron_null_block_adjusted' not in cache_config.__dict__:
+            logger.info(
+                "Adding 1 to num_gpu_blocks_override (%d -> %d) "
+                "to account for null block allocation",
+                cache_config.num_gpu_blocks_override,
+                cache_config.num_gpu_blocks_override + 1)
+            cache_config.num_gpu_blocks_override += 1
+            cache_config._neuron_null_block_adjusted = True
 
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
@@ -151,7 +166,7 @@ class NeuronPlatform(Platform):
         if parallel_config.world_size > 1:
             parallel_config.distributed_executor_backend = "uni"
 
-        if disable_scheduler_override and model_config is not None:
+        if disable_scheduler_override:
             logger.warning(
                 "The vLLM V1 native scheduler will be used with chunked prefill enabled. "
                 "This may lead to suboptimal performance on Neuron devices.")
@@ -169,34 +184,30 @@ class NeuronPlatform(Platform):
 
             sched_cfg = vllm_config.scheduler_config
 
-            if model_config is not None and sched_cfg is not None:
+            # Set default token budget for Neuron to 128k
+            sched_cfg.max_num_batched_tokens = 131072
+            logger.info(
+                "Neuron custom scheduler default: max_num_batched_tokens set to %d. "
+                "Override with --max-num-batched-tokens if needed.",
+                sched_cfg.max_num_batched_tokens,
+            )
 
-                # Set default token budget for Neuron to 128k
-                sched_cfg.max_num_batched_tokens = 131072
+            # Set default batch size for Neuron to 32
+            if not sched_cfg.max_num_seqs:
+                sched_cfg.max_num_seqs = 32
                 logger.info(
-                    "Neuron custom scheduler default: max_num_batched_tokens set to %d. "
-                    "Override with --max-num-batched-tokens if needed.",
-                    sched_cfg.max_num_batched_tokens,
+                    "Neuron custom scheduler default: max_num_seqs set to %d.",
+                    sched_cfg.max_num_seqs,
                 )
 
-                # Set default batch size for Neuron to 32
-                if not sched_cfg.max_num_seqs:
-                    sched_cfg.max_num_seqs = 32
-                    logger.info(
-                        "Neuron custom scheduler default: max_num_seqs set to %d.",
-                        sched_cfg.max_num_seqs,
-                    )
-
-            if model_config is not None:
-                if not vllm_config.cache_config.enable_prefix_caching:
-                    # Neuron requires block_size = max_model_len when blockwise KV cache is disabled
-                    vllm_config.cache_config.block_size = (
-                        vllm_config.model_config.max_model_len  # type: ignore
-                    )
-                else:
-                    assert vllm_config.cache_config.block_size is not None, (
-                        "When prefix caching is enabled, block_size must be set."
-                    )
+            if not vllm_config.cache_config.enable_prefix_caching:
+                # Neuron requires block_size = max_model_len when blockwise KV cache is disabled
+                vllm_config.cache_config.block_size = (
+                    vllm_config.model_config.max_model_len  # type: ignore
+                )
+            else:
+                assert vllm_config.cache_config.block_size is not None, (
+                    "When prefix caching is enabled, block_size must be set.")
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:

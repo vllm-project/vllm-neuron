@@ -26,7 +26,7 @@ import shutil
 from contextlib import contextmanager
 from math import ceil
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 import regex as re
 import torch
@@ -43,8 +43,8 @@ from transformers import AutoModelForCausalLM, PretrainedConfig
 from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
                          SchedulerConfig, SpeculativeConfig)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.sampler import Sampler
 from vllm.v1.outputs import SamplerOutput
+from vllm.v1.sample import sampler as Sampler
 
 from vllm_neuron.worker.constants import (NEURON_MULTI_MODAL_MODELS,
                                           TORCH_DTYPE_TO_NEURON_AMP)
@@ -71,7 +71,7 @@ class NeuronModelBase(nn.Module):
 
         # Lazy initialized
         self.model: nn.Module
-        self.kv_caches: Optional[list[Any]] = None
+        self.kv_caches: list[Any] | None = None
         self.neuron_config: NeuronConfig
         self.is_reorder_needed: bool
         self.architecture: str
@@ -83,7 +83,7 @@ class NeuronModelBase(nn.Module):
                 **kwargs):
         raise NotImplementedError
 
-    def sample(self, logits: torch.Tensor) -> Optional[SamplerOutput]:
+    def sample(self, logits: torch.Tensor) -> SamplerOutput | None:
         raise NotImplementedError
 
     def load_weights(self, model_name_or_path: str, architecture: str,
@@ -234,6 +234,9 @@ class NeuronModelBase(nn.Module):
     def _compile_and_load_model(self, model_path: str, neuronx_model_cls,
                                 config, compiled_path: str):
         self.model = neuronx_model_cls(model_path, config)
+        # Quantize model.
+        if config.neuron_config.quantized:
+            neuronx_model_cls.save_quantized_state_dict(model_path, config)
         self.model.compile(compiled_path)
         self.model.load(compiled_path)
 
@@ -253,8 +256,7 @@ class NeuronModelBase(nn.Module):
             automatically by NxDI and should not be set explicitly).
         • Apply any optional overrides such as
             `draft_model_modules_to_not_convert`.
-        • For EAGLE drafts, mark `is_eagle_draft=True` and disable sequence
-            parallelism.
+        • For EAGLE drafts, mark `is_eagle_draft=True`
         • Load the draft HF config and wrap everything in a
             `FusedSpecNeuronConfig`, which is then attached to the target's
             config.
@@ -286,7 +288,6 @@ class NeuronModelBase(nn.Module):
 
         if getattr(config.neuron_config, "enable_eagle_speculation", False):
             draft_neuron_config.is_eagle_draft = True
-            draft_neuron_config.sequence_parallel_enabled = False
 
         draft_config = neuronx_model_cls.get_config_cls()(
             draft_neuron_config,
@@ -363,7 +364,7 @@ class NeuronCausalLM(NeuronModelBase):
 
             return restore(output)
 
-    def sample(self, logits: torch.Tensor) -> Optional[SamplerOutput]:
+    def sample(self, logits: torch.Tensor) -> SamplerOutput | None:
         if self.model.config.neuron_config.on_device_sampling_config:
             return SamplerOutput(
                 # The sampled tokens are expanded to 2D tensor with shape
@@ -373,7 +374,12 @@ class NeuronCausalLM(NeuronModelBase):
                 logprobs_tensors=None,
             )
         else:
-            raise NotImplementedError("CPU sampler not implemented")
+            # CPU sampling is now handled by the model runner
+            # This should not be called when on_device_sampling_config is None
+            # as the model runner will use its own CPU sampler
+            raise RuntimeError(
+                "CPU sampling should be handled by the model runner, not the model. "
+                "This indicates a bug in the sampling path routing.")
 
     def load_weights(self, model_name_or_path: str, architecture: str,
                      **kwargs):
@@ -469,8 +475,8 @@ class NeuronMultiModalCausalLM(NeuronCausalLM):
         positions: torch.Tensor,
         input_block_ids: torch.Tensor,
         sampling_params: torch.Tensor,
-        pixel_values: Optional[torch.Tensor] = None,
-        vision_mask: Optional[torch.Tensor] = None,
+        pixel_values: torch.Tensor | None = None,
+        vision_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward pass with multimodal support for multi-modal model."""
@@ -525,9 +531,9 @@ class NeuronPixtralForCausalLM(NeuronMultiModalCausalLM):
         positions: torch.Tensor,
         input_block_ids: torch.Tensor,
         sampling_params: torch.Tensor,
-        pixel_values: Optional[Union[torch.Tensor, list]] = None,
-        image_sizes: Optional[torch.Tensor] = None,
-        vision_mask: Optional[torch.Tensor] = None,
+        pixel_values: Union[torch.Tensor, list] | None = None,
+        image_sizes: torch.Tensor | None = None,
+        vision_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward pass with multimodal support."""
@@ -574,8 +580,8 @@ class NeuronLlama4ForCausalLM(NeuronMultiModalCausalLM):
         positions: torch.Tensor,
         input_block_ids: torch.Tensor,
         sampling_params: torch.Tensor,
-        pixel_values: Optional[torch.Tensor] = None,
-        vision_mask: Optional[torch.Tensor] = None,
+        pixel_values: torch.Tensor | None = None,
+        vision_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward pass with multimodal support for Llama4."""
@@ -637,9 +643,6 @@ def _get_neuron_model_cls(architecture: str):
             if task == "ConditionalGeneration":
                 task = "CausalLM"  # to match NxDI class names for Mllama and Pixtral
             model, task = model.lower(), _camel_to_kebab(task)
-            # TODO fix this hack, ask NXDI team to just call this model gptoss?
-            if model == "gptoss":
-                model = "gpt_oss"
 
             if model == "qwen3moe":
                 model = "qwen3_moe"
@@ -697,6 +700,11 @@ def get_neuron_model(model_config: ModelConfig,
     neuron_config = _get_neuron_config_after_override(
         default_neuron_config_args, override_neuron_config)
 
+    # Handle pa_num_blocks increment logic before validation
+    if neuron_config.get("is_block_kv_layout"):
+        neuron_config = _handle_pa_num_blocks(cache_config, neuron_config,
+                                              override_neuron_config)
+
     neuron_config = _validate_neuron_config(cache_config, scheduler_config,
                                             neuron_config)
 
@@ -736,9 +744,9 @@ def _get_default_neuron_config(model_config: ModelConfig,
     if cache_config.num_gpu_blocks_override is not None:
         default_num_blocks = cache_config.num_gpu_blocks_override
 
-    if lora_serving_config:
-        raise NotImplementedError(
-            "Multi-lora is not yet supported on the Neuron plugin")
+    logger.debug(
+        f"Setting num_blocks to {default_num_blocks} in the default neuron config."
+    )
 
     neuron_config = {
         "tp_degree":
@@ -785,6 +793,44 @@ def _get_default_neuron_config(model_config: ModelConfig,
     return neuron_config
 
 
+def _handle_pa_num_blocks(cache_config: CacheConfig, neuron_config: dict,
+                          override_neuron_config: dict) -> dict:
+    """Handle the pa_num_blocks increment logic to ensure vLLM and NxDI have consistent block counts."""
+    if cache_config.num_gpu_blocks_override is not None:
+        pa_num_blocks = neuron_config.get("pa_num_blocks")
+        original_user_override = cache_config.num_gpu_blocks_override - 1  # Remove the +1 increment to get original user value
+
+        # Check if pa_num_blocks was explicitly set in override_neuron_config
+        pa_num_blocks_explicitly_set = override_neuron_config and "pa_num_blocks" in override_neuron_config
+
+        if pa_num_blocks_explicitly_set:
+            # User explicitly set pa_num_blocks, it must match their original intent
+            if pa_num_blocks == original_user_override:
+                # User provided original intended value, increment pa_num_blocks to match the incremented num_gpu_blocks_override
+                neuron_config[
+                    "pa_num_blocks"] = cache_config.num_gpu_blocks_override
+                logger.info(
+                    f"User provided pa_num_blocks ({pa_num_blocks}) matching original --num-gpu-blocks-override intent. "
+                    f"Incrementing pa_num_blocks to {cache_config.num_gpu_blocks_override} to match the increment for a null block in vllm."
+                )
+            else:
+                # pa_num_blocks doesn't match the original user intent, this creates a mismatch
+                raise ValueError(
+                    f"pa_num_blocks ({pa_num_blocks}) must match your --num-gpu-blocks-override intent({original_user_override}) to ensure vLLM and NxDI have consistent block counts. "
+                )
+
+    else:
+        # User didn't set num_gpu_blocks_override, check if they explicitly set pa_num_blocks
+        pa_num_blocks_explicitly_set = override_neuron_config and "pa_num_blocks" in override_neuron_config
+
+        if pa_num_blocks_explicitly_set:
+            # User set pa_num_blocks without num_gpu_blocks_override
+            raise ValueError(f"When setting pa_num_blocks ({neuron_config.get('pa_num_blocks')}) in override_neuron_config, " \
+            f"you must also set --num-gpu-blocks-override to the same value to ensure vLLM and NxDI have consistent block counts.")
+
+    return neuron_config
+
+
 def _validate_neuron_config(cache_config: CacheConfig,
                             scheduler_config: SchedulerConfig,
                             neuron_config: dict):
@@ -795,6 +841,22 @@ def _validate_neuron_config(cache_config: CacheConfig,
     if scheduler_config.chunked_prefill_enabled:
         assert neuron_config.get("chunked_prefill_config")
         assert neuron_config.get("is_block_kv_layout", False)
+
+    if neuron_config.get("is_block_kv_layout"):
+        min_blocks_required = ceil(
+            scheduler_config.max_model_len /
+            cache_config.block_size) * scheduler_config.max_num_seqs
+
+        # Calculate effective blocks based on whether num_gpu_blocks_override was set
+        if cache_config.num_gpu_blocks_override is not None:
+            # User set num_gpu_blocks_override, so the effective blocks = original user intent
+            effective_blocks = cache_config.num_gpu_blocks_override - 1
+        else:
+            # No override set, pa_num_blocks contains the raw calculated value (no increment applied)
+            effective_blocks = neuron_config.get("pa_num_blocks")
+
+        assert effective_blocks >= min_blocks_required, \
+        f"At least {min_blocks_required} blocks are required for max_model_len {scheduler_config.max_model_len}, but only {effective_blocks} blocks are available (user-intended blocks, excluding the +1 for null block)"
 
     assert "text_neuron_config" not in neuron_config, \
         "text_neuron_config should not be in the default neuron_config. It should be initialized in specific ImageToText models."
@@ -819,10 +881,21 @@ def _get_neuron_config_after_override(default_neuron_config,
         default_neuron_config.pop("text_neuron_config")
     if "vision_neuron_config" in default_neuron_config:
         default_neuron_config.pop("vision_neuron_config")
-    if "lora_modules" in overridden_neuron_config and len("lora_modules") > 0:
-        raise NotImplementedError(
-            "Multi-lora is not yet supported on the Neuron plugin")
 
+    # Get quantization config if specified
+    if "quantized" in overridden_neuron_config:
+        quantization_cfg = {
+            "quantized":
+            overridden_neuron_config.pop("quantized", False),
+            "quantized_checkpoints_path":
+            overridden_neuron_config.pop("quantized_checkpoints_path", None),
+            "quantization_type":
+            overridden_neuron_config.pop("quantization_type",
+                                         "per_tensor_symmetric"),
+            "quantization_dtype":
+            overridden_neuron_config.pop("quantization_dtype", "int8"),
+        }
+        default_neuron_config.update(quantization_cfg)
     logger.debug("Neuron Config after override: %s", default_neuron_config)
     return default_neuron_config
 
