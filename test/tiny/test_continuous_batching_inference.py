@@ -18,7 +18,8 @@ logger = logging.getLogger(__name__)
 @pytest.mark.integration
 def test_inference_tinyllama_prefill_disabled():
     os.environ["VLLM_USE_V1"] = "1"
-    model_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    model = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+  
 
     prompts = [
         "Hello, my name is",
