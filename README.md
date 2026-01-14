@@ -91,7 +91,8 @@ llm = LLM(
     max_num_seqs=4,
     max_model_len=128,
     tensor_parallel_size=2,
-    block_size=32
+    block_size=32,
+    num_gpu_blocks_override=16
 )
 
 # Generate text
@@ -229,6 +230,7 @@ python3 -m vllm.entrypoints.openai.api_server \
     --max-model-len 128 \
     --max-num-seqs 4 \
     --block-size 32 \
+    --num-gpu-blocks-override 16 \
     --port 8000
 ```
 
@@ -283,11 +285,11 @@ print(generated_text)
 ## Known Issues
 
 1. Chunked prefill is disabled by default on Neuron for optimal performance. To enable chunked prefill, set the environment variable `DISABLE_NEURON_CUSTOM_SCHEDULER="1"`.
-   1. Users are required to provide a `num_gpu_blocks_override` arg, which should be at least `ceil(max_model_len // block_size) * max_num_seqs` when invoking vLLM to avoid a potential OOB error.
-2. When using HuggingFace model IDs with both [shard on load](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/nxd-inference/developer_guides/weights-sharding-guide.html#shard-on-load) and models that have `tie_word_embeddings` set to `true` in their config (such as [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B/blob/main/config.json#L24)), you may encounter the error `NotImplementedError: Cannot copy out of meta tensor; no data!`. To resolve this, download the model checkpoint locally from Hugging Face and serve it from the local path instead of using the HuggingFace model ID.
-3. For vLLM version 0.11.0 there is a bug where chat templates are not cached. This affects request preprocessing time. This is fixed in future vLLM versions.
-4. Async tokenization in vLLM V1 can increase request preprocessing time for small inputs and batch sizes. The Neuron team is investigating potential solutions.
-5. Pixtral has out of bounds issues for batch sizes greater than 4. The max sequence length is 10240.
+2. Users are required to provide a `num_gpu_blocks_override` arg, which should be at least `ceil(max_model_len // block_size) * max_num_seqs` when invoking vLLM to avoid a potential OOB error.
+3. When using HuggingFace model IDs with both [shard on load](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/nxd-inference/developer_guides/weights-sharding-guide.html#shard-on-load) and models that have `tie_word_embeddings` set to `true` in their config (such as [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B/blob/main/config.json#L24)), you may encounter the error `NotImplementedError: Cannot copy out of meta tensor; no data!`. To resolve this, download the model checkpoint locally from Hugging Face and serve it from the local path instead of using the HuggingFace model ID.
+4. For vLLM version 0.11.0 there is a bug where chat templates are not cached. This affects request preprocessing time. This is fixed in future vLLM versions.
+5. Async tokenization in vLLM V1 can increase request preprocessing time for small inputs and batch sizes. The Neuron team is investigating potential solutions.
+6. Pixtral has out of bounds issues for batch sizes greater than 4. The max sequence length is 10240.
 
 ## Support
 
