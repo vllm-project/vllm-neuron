@@ -268,8 +268,9 @@ class NeuronPlatform(Platform):
         block_size: int,
         use_v1: bool,
         use_mla: bool,
-        has_sink,
-        use_sparse,
+        has_sink=False,
+        use_sparse=False,
+        **kwargs,
     ) -> str:
         if selected_backend != _Backend.NEURON_ATTN:
             logger.warning(
@@ -439,12 +440,19 @@ class NeuronPlatform(Platform):
 
     @classmethod
     def get_nixl_supported_devices(cls) -> dict[str, tuple[str, ...]]:
+        """Neuron supports NIXL KV transfer via CPU host buffer only.
+
+        Trainium/Inferentia device memory cannot be directly registered with
+        NIXL (no CUDA driver, no Level Zero). KV cache blocks are staged
+        through pinned CPU DRAM and transferred via NIXL LIBFABRIC over
+        EFA RDMA -- the same pattern used by TPU and XPU.
         """
-        Returns a mapping from device_type to a tuple of supported
-        kv_buffer_device for nixl.
-        Neuron supports "cpu" now.
-        """
-        return {NeuronPlatform.device_type: {"cpu"}}
+        return {NeuronPlatform.device_type: ("cpu",)}
+
+    @classmethod
+    def get_nixl_memory_type(cls) -> str | None:
+        """NIXL memory type for Neuron: always DRAM (host-buffered)."""
+        return "DRAM"
 
     @classmethod
     def device_id_to_physical_device_id(cls, device_id: int):

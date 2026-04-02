@@ -457,7 +457,89 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
                         kv_caches[f"tp{rank}_layer{layer}_k"] = kv_on_tp_rank[k_key]
                         kv_caches[f"tp{rank}_layer{layer}_v"] = kv_on_tp_rank[v_key]
 
-            get_kv_transfer_group().register_kv_caches(kv_caches)
+            # P2/P9/P10: Move KV tensors to CPU and reshape NxDI BHSD layout
+            # into CUDA paged block format for NIXL compatibility.
+            #
+            # NxDI produces K,V tensors of shape (batch, kv_heads, seq_len, head_dim).
+            # NIXL/NixlConnector expects CUDA FlashAttention paged format:
+            #   (2, num_blocks, block_size, kv_heads, head_dim) per layer.
+            #
+            # Also aligns the number of blocks to kv_cache_config.num_blocks
+            # (the scheduler's block pool) to prevent:
+            #   makeXferReq: remote index out of range
+            import torch as _torch
+            _block_size = self.cache_config.block_size
+            _num_gpu_blocks = kv_cache_config.num_blocks
+            _aligned_kv = {}
+            _layer_k = {}
+            _layer_v = {}
+
+            logger.info(
+                "NIXL KV reshape: block_size=%d, num_gpu_blocks=%d (scheduler pool)",
+                _block_size, _num_gpu_blocks
+            )
+
+            for key, tensor in kv_caches.items():
+                t = tensor.cpu().contiguous() if str(tensor.device) != 'cpu' else tensor.contiguous()
+                if t.dim() == 4:
+                    batch, kv_heads, seq_len, head_dim = t.shape
+                    assert batch == 1, f"Expected batch=1, got {batch}"
+                    t = t.squeeze(0)
+                    _nxdi_blocks = seq_len // _block_size
+                    assert seq_len == _nxdi_blocks * _block_size, \
+                        f"seq_len {seq_len} not divisible by block_size {_block_size}"
+                    t = t.reshape(kv_heads, _nxdi_blocks, _block_size, head_dim)
+                    t = t.permute(1, 2, 0, 3).contiguous()
+                    if _nxdi_blocks < _num_gpu_blocks:
+                        padded = _torch.zeros(
+                            (_num_gpu_blocks, _block_size, kv_heads, head_dim),
+                            dtype=t.dtype, device='cpu'
+                        )
+                        padded[:_nxdi_blocks].copy_(t)
+                        t = padded
+                    elif _nxdi_blocks > _num_gpu_blocks:
+                        t = t[:_num_gpu_blocks].contiguous()
+
+                parts = key.split('_')
+                layer_idx = None
+                is_k = None
+                for part in parts:
+                    if part.startswith('layer'):
+                        layer_idx = int(part[5:])
+                    if part == 'k':
+                        is_k = True
+                    elif part == 'v':
+                        is_k = False
+                    elif part == 'kv':
+                        is_k = None
+
+                if layer_idx is not None:
+                    if is_k is True:
+                        _layer_k[layer_idx] = t
+                    elif is_k is False:
+                        _layer_v[layer_idx] = t
+                    else:
+                        _aligned_kv[f"layer_{layer_idx}"] = t
+                else:
+                    _aligned_kv[key] = t
+
+            for layer_idx in sorted(set(list(_layer_k.keys()) + list(_layer_v.keys()))):
+                k_t = _layer_k.get(layer_idx)
+                v_t = _layer_v.get(layer_idx)
+                if k_t is not None and v_t is not None:
+                    _aligned_kv[f"layer_{layer_idx}"] = _torch.stack([k_t, v_t], dim=0)
+                elif k_t is not None:
+                    _aligned_kv[f"layer_{layer_idx}_k"] = k_t
+                elif v_t is not None:
+                    _aligned_kv[f"layer_{layer_idx}_v"] = v_t
+
+            if _aligned_kv:
+                _sample = next(iter(_aligned_kv.values()))
+                logger.info(
+                    "NIXL KV reshape: %d layers, sample shape=%s, dtype=%s",
+                    len(_aligned_kv), _sample.shape, _sample.dtype
+                )
+            get_kv_transfer_group().register_kv_caches(_aligned_kv)
 
     def _get_nxdi_lora_config(self):
         """
@@ -742,11 +824,34 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
         logger.debug("model_input: %s", model_input)
 
         # NOTE: setup current batch's metadata for kv connector.
-        # Currently, only verified with NixlConnector
-        with (
-            set_forward_context(None, self.vllm_config),
-            self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
-        ):
+        # Currently, only verified with NixlConnector.
+        # P6: Skip the KV connector context manager when there are no pending
+        # transfers, to avoid blocking on start_load_kv() every iteration.
+        _kv_md = getattr(scheduler_output, 'kv_connector_metadata', None)
+        _has_kv_work = bool(
+            _kv_md and (
+                getattr(_kv_md, 'reqs_to_recv', None)
+                or getattr(_kv_md, 'reqs_to_send', None)
+            )
+        )
+        if _has_kv_work:
+            _ctx_mgrs = (
+                set_forward_context(None, self.vllm_config),
+                self.maybe_get_kv_connector_output(scheduler_output),
+            )
+        else:
+            _ctx_mgrs = (
+                set_forward_context(None, self.vllm_config),
+            )
+
+        import contextlib
+        kv_connector_output = None
+        with contextlib.ExitStack() as _stack:
+            for _ctx in _ctx_mgrs:
+                _result = _stack.enter_context(_ctx)
+            if _has_kv_work:
+                kv_connector_output = _result
+
             # Execute model forward pass (no sampling - deferred to sample_tokens())
             model_exec_start = time.perf_counter()
             if self.model.architecture in NEURON_MULTI_MODAL_MODELS:
@@ -1399,7 +1504,7 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
 
         # pad the block_table to have the length of num_gpu_blocks
         block_size = self.cache_config.block_size
-        max_len = self.scheduler_config.max_model_len
+        max_len = self.model_config.max_model_len
         max_blocks_per_seq = max_len // block_size
         padded_block_table = [self._BLOCK_TABLE_PAD] * max_blocks_per_seq
         padded_block_table[: len(block_table)] = block_table[:]

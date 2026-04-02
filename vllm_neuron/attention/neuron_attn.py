@@ -27,4 +27,4 @@ class NeuronAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        raise NotImplementedError
+        return (2, num_blocks, block_size, num_kv_heads, head_size)

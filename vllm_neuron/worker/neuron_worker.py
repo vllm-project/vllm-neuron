@@ -198,6 +198,26 @@ class NeuronWorker(WorkerBase):
 
         ensure_kv_transfer_initialized(vllm_config)
 
+    def get_kv_connector_handshake_metadata(self):
+        """Return NIXL handshake metadata for KV connector discovery.
+
+        The V1 engine calls this during startup to exchange NIXL agent
+        metadata between prefill and decode workers. Without this, the
+        workers cannot discover each other for KV cache transfer.
+        """
+        from vllm.distributed.kv_transfer import (
+            has_kv_transfer_group,
+            get_kv_transfer_group,
+        )
+        from vllm.distributed.parallel_state import get_tp_group
+        if not has_kv_transfer_group():
+            return None
+        connector = get_kv_transfer_group()
+        metadata = connector.get_handshake_metadata()
+        if metadata is None:
+            return None
+        return {get_tp_group().rank_in_group: metadata}
+
     def shutdown(self) -> None:
         self.model_runner.ensure_kv_transfer_shutdown()
 
