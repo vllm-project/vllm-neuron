@@ -51,7 +51,7 @@ from vllm.config import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample import sampler as Sampler
+from vllm.v1.sample.sampler import Sampler
 
 from vllm_neuron.worker.constants import (
     NEURON_MULTI_MODAL_MODELS,
