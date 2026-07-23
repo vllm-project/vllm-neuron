@@ -7261,7 +7261,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                 # deferred to the async output thread in
                 # AsyncNeuronModelRunnerOutput.get_output().
                 return SamplerOutput(model_output_tensor, None)
-            return SamplerOutput(model_output_tensor, None)
+            # ODS normally keeps sampled tokens asynchronous, but requested
+            # logprobs require the gathered full-vocabulary logits now. This
+            # intentionally synchronizes only logprobs requests; token-only
+            # requests retain the existing asynchronous fast path.
+            logprobs = None
+            if (
+                self.on_device_sampling
+                and self._on_device_logits is not None
+                and (sampling_metadata.max_num_logprobs or 0) > 0
+            ):
+                logits_cpu = self._on_device_logits.to("cpu")
+                logprobs_output = self.sampler(
+                    logits=logits_cpu,
+                    sampling_metadata=sampling_metadata,
+                )
+                logprobs = logprobs_output.logprobs_tensors
+            return SamplerOutput(model_output_tensor, logprobs)
 
         if spec_decode_metadata is None:
             if not self.on_device_sampling:

@@ -113,7 +113,7 @@ class Qwen3Config:
         filtered["moe_intermediate_size"] = config_dict.get(
             "moe_intermediate_size", 0
         )
-        filtered["use_qk_norm"] = config_dict.get("use_qk_norm", False)
+        filtered["use_qk_norm"] = config_dict.get("use_qk_norm", True)
 
         # Newer Transformers versions store Qwen3's RoPE base in
         # ``rope_parameters`` rather than the legacy top-level
@@ -127,7 +127,28 @@ class Qwen3Config:
         if rope_theta is not None:
             filtered["rope_theta"] = float(rope_theta)
 
-        return cls(**filtered)
+        config = cls(**filtered)
+        if config.attention_bias:
+            raise ValueError("Qwen3 attention_bias=True is not supported")
+        if not config.use_qk_norm:
+            raise ValueError("Qwen3 use_qk_norm=False is not supported")
+        if config.torch_dtype != torch.bfloat16:
+            raise ValueError(
+                "Qwen3 currently supports only torch.bfloat16, "
+                f"got {config.torch_dtype}"
+            )
+        return config
+
+
+def _sanitize_slot_mapping(
+    slot_mapping: torch.Tensor, max_slot: int
+) -> torch.Tensor:
+    """Map padding/out-of-range cache slots to vLLM's reserved null block."""
+    return torch.where(
+        (slot_mapping < 0) | (slot_mapping >= max_slot),
+        torch.zeros_like(slot_mapping),
+        slot_mapping,
+    ).to(torch.long)
 
 
 # ============================================================================
@@ -393,11 +414,7 @@ class Qwen3Attention(nn.Module):
         kv_segment_size = attn_metadata[layer_name].get("kv_segment_size")
 
         max_slot = self.k_cache.shape[0] * block_size
-        slot_mapping = torch.where(
-            (slot_mapping < 0) | (slot_mapping >= max_slot),
-            torch.zeros_like(slot_mapping),
-            slot_mapping,
-        ).to(torch.long)
+        slot_mapping = _sanitize_slot_mapping(slot_mapping, max_slot)
         block_indices = slot_mapping // block_size
         position_indices = slot_mapping % block_size
         head_indices = torch.arange(
@@ -538,6 +555,8 @@ class Qwen3Attention(nn.Module):
         )
 
         # Manual KV cache update
+        max_slot = self.k_cache.shape[0] * block_size
+        slot_mapping = _sanitize_slot_mapping(slot_mapping, max_slot)
         block_indices = slot_mapping // block_size
         position_indices = slot_mapping % block_size
         num_tokens = slot_mapping.shape[0]
@@ -1096,14 +1115,6 @@ class Qwen3ForCausalLM(nn.Module):
         self.config = config
         self.model = Qwen3Model(config)
 
-        # LM head
-        self.lm_head = neuron_nn.ColumnParallelLinear(
-            config.hidden_size,
-            config.vocab_size,
-            bias=False,
-            dtype=config.torch_dtype,
-        )
-
         # TP info
         self.tp_group = get_tp_group()
         self.rank = get_tensor_model_parallel_rank()
@@ -1115,7 +1126,25 @@ class Qwen3ForCausalLM(nn.Module):
             if config.neuron_config
             else None
         )
-        if self.on_device_sampling_config:
+        self._gather_logits = (
+            config.neuron_config is not None
+            and config.neuron_config.max_logprobs != 0
+        ) or (
+            config.neuron_config is not None
+            and config.neuron_config.debug_logits_dir is not None
+        )
+
+        # LM head
+        self.lm_head = neuron_nn.ColumnParallelLinear(
+            config.hidden_size,
+            config.vocab_size,
+            bias=False,
+            dtype=config.torch_dtype,
+            gather_output=self.on_device_sampling_config is None,
+            tp_group=self.tp_group.device_group,
+        )
+
+        if self.on_device_sampling_config is not None:
             self.sampler = Sampler(self.on_device_sampling_config, process_group=self.tp_group.device_group)
         else:
             self.sampler = None
@@ -1159,13 +1188,20 @@ class Qwen3ForCausalLM(nn.Module):
         )
         logits = self.lm_head(hidden_states_for_logits)
 
+        gathered_logits = None
+        if self._gather_logits:
+            if self.lm_head.gather_output:
+                gathered_logits = logits
+            else:
+                gathered_logits = self.tp_group.all_gather(logits, dim=1)
+
         if self.sampler is None:
             return logits
 
         sampled_tokens = self.sampler(
             logits, sampling_params, logit_mask=logit_mask, tp_rank=rank
         )
-        return sampled_tokens, None
+        return sampled_tokens, gathered_logits
 
     def compute_logits(
         self,
