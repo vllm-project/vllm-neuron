@@ -115,6 +115,18 @@ class Qwen3Config:
         )
         filtered["use_qk_norm"] = config_dict.get("use_qk_norm", False)
 
+        # Newer Transformers versions store Qwen3's RoPE base in
+        # ``rope_parameters`` rather than the legacy top-level
+        # ``rope_theta`` field. Falling back to this dataclass's 10k default
+        # silently corrupts long-context positions for official Qwen3 models,
+        # whose base is 1M.
+        rope_theta = config_dict.get("rope_theta")
+        if rope_theta is None:
+            rope_parameters = config_dict.get("rope_parameters") or {}
+            rope_theta = rope_parameters.get("rope_theta")
+        if rope_theta is not None:
+            filtered["rope_theta"] = float(rope_theta)
+
         return cls(**filtered)
 
 
@@ -168,11 +180,14 @@ class Qwen3RotaryEmbedding(nn.Module):
             dtype = torch.float32
 
         inv_freq = self._compute_inv_freq(device)
-        positions = positions.to(device=device, dtype=dtype)
-        freqs = torch.einsum("i,j->ij", positions, inv_freq.to(dtype))
+        # Keep the phase calculation in FP32. BF16 cannot represent every
+        # integer position above 256, so computing frequencies in the model
+        # dtype silently aliases long-context token positions.
+        positions = positions.to(device=device, dtype=torch.float32)
+        freqs = torch.einsum("i,j->ij", positions, inv_freq)
         emb = torch.cat([freqs, freqs], dim=-1)
-        cos = emb.cos()
-        sin = emb.sin()
+        cos = emb.cos().to(dtype=dtype)
+        sin = emb.sin().to(dtype=dtype)
         return cos, sin
 
 
@@ -356,63 +371,81 @@ class Qwen3Attention(nn.Module):
         ).squeeze(0)
 
         q, k, v = torch.tensor_split(qkv, self.qkv_split_indices, dim=-1)
+        q = q.view(
+            tokens, self.num_attention_heads_per_rank, self.head_dim
+        ).transpose(0, 1)
+        k = k.view(
+            tokens, self.num_key_value_heads_per_rank, self.head_dim
+        ).transpose(0, 1)
+        v = v.view(
+            tokens, self.num_key_value_heads_per_rank, self.head_dim
+        ).transpose(0, 1)
 
-        q = q.view(tokens, self.num_attention_heads_per_rank, self.head_dim).transpose(
-            0, 1
-        )
-        k = k.view(tokens, self.num_key_value_heads_per_rank, self.head_dim).transpose(
-            0, 1
-        )
-        v = v.view(tokens, self.num_key_value_heads_per_rank, self.head_dim).transpose(
-            0, 1
-        )
-
-        # Step 2: Update KV Cache
+        # Update the canonical paged cache. Padding slots are never read, but
+        # must be remapped to an in-range location before index_put_. Use
+        # vLLM's reserved null block (slot 0), not the last physical block,
+        # which may be allocated to this request and read by segmented prefill.
         layer_name = f"layers.{self.layer_idx}.self_attn"
         slot_mapping = attn_metadata[layer_name]["slot_mapping"]
         block_size = attn_metadata[layer_name]["block_size"]
+        block_table = attn_metadata[layer_name]["block_table_tensor"]
+        cached_seq_len = attn_metadata[layer_name].get("cached_seq_len")
+        kv_segment_size = attn_metadata[layer_name].get("kv_segment_size")
 
+        max_slot = self.k_cache.shape[0] * block_size
+        slot_mapping = torch.where(
+            (slot_mapping < 0) | (slot_mapping >= max_slot),
+            torch.zeros_like(slot_mapping),
+            slot_mapping,
+        ).to(torch.long)
         block_indices = slot_mapping // block_size
         position_indices = slot_mapping % block_size
-
-        k_flat = k.reshape(-1, self.head_dim)
-        v_flat = v.reshape(-1, self.head_dim)
-
-        head_indices_for_put = torch.arange(
+        head_indices = torch.arange(
             self.num_key_value_heads_per_rank,
             dtype=torch.long,
             device=hidden_states.device,
         ).repeat_interleave(slot_mapping.shape[0])
-        block_indices_for_put = block_indices.repeat(self.num_key_value_heads_per_rank)
-        position_indices_for_put = position_indices.repeat(
+        block_indices = block_indices.repeat(self.num_key_value_heads_per_rank)
+        position_indices = position_indices.repeat(
             self.num_key_value_heads_per_rank
         )
-
         self.k_cache.index_put_(
-            (block_indices_for_put, head_indices_for_put, position_indices_for_put),
-            k_flat,
+            (block_indices, head_indices, position_indices),
+            k.reshape(-1, self.head_dim),
         )
         self.v_cache.index_put_(
-            (block_indices_for_put, head_indices_for_put, position_indices_for_put),
-            v_flat,
+            (block_indices, head_indices, position_indices),
+            v.reshape(-1, self.head_dim),
         )
 
-        # Step 4: Flash Attention
-        k = k.repeat_interleave(self.num_key_value_groups, dim=0)
-        v = v.repeat_interleave(self.num_key_value_groups, dim=0)
-
-        q_flash = q.transpose(1, 2)
-        k_flash = k.transpose(1, 2)
-        v_flash = v
-
-        attn_output = NF.flash_attention(
-            q_flash,
-            k_flash,
-            v_flash,
-            scale=self.scaling,
-            tp_q=False,
-            tp_out=True,
-        )
+        if kv_segment_size:
+            if cached_seq_len is None:
+                raise ValueError(
+                    "cached_seq_len is required when segmented prefill is enabled"
+                )
+            attn_output = NF.segmented_attention(
+                q,
+                k_cache=self.k_cache,
+                v_cache=self.v_cache,
+                block_tables=block_table,
+                prior_tokens=cached_seq_len,
+                block_size=block_size,
+                kv_segment_size=kv_segment_size,
+                scale=self.scaling,
+                tp_q=True,
+                tp_out=True,
+            )
+        else:
+            k = k.repeat_interleave(self.num_key_value_groups, dim=0)
+            v = v.repeat_interleave(self.num_key_value_groups, dim=0)
+            attn_output = NF.flash_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v,
+                scale=self.scaling,
+                tp_q=False,
+                tp_out=True,
+            )
 
         # Step 5: Output Projection
         attn_output = attn_output.unsqueeze(0)
