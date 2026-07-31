@@ -498,6 +498,7 @@ class Qwen3Attention(nn.Module):
                 scale=self.scaling,
                 tp_q=True,
                 tp_out=True,
+                fp8_packed=self.fp8_packed,
             )
         else:
             k = k.repeat_interleave(self.num_key_value_groups, dim=0)
@@ -595,7 +596,7 @@ class Qwen3Attention(nn.Module):
         W_q_norm = self.q_layernorm.weight.view(self.head_dim, 1)
         W_k_norm = self.k_layernorm.weight.view(self.head_dim, 1)
 
-        output, K_new, V_new = NF.attention_decode(
+        output = NF.attention_decode(
             X=X,
             W_qkv=self.qkv_proj_weight,
             rmsnorm_X_enabled=False,
@@ -612,7 +613,8 @@ class Qwen3Attention(nn.Module):
             pos_ids=pos_ids_kernel,
             swa_start_pos_ids=None,
             softmax_scale=self.scaling / self.k_scale_float,
-            update_cache=False,
+            update_cache=True,
+            kv_cache_update_idx=slot_mapping.view(B, S_decode).to(torch.uint32),
             fp8_packed=use_packed_kernel,
             W_out=self.o_proj_weight / self.v_scale_float,
             transposed_out=False,
@@ -624,16 +626,6 @@ class Qwen3Attention(nn.Module):
         # Re-swizzle if we un-swizzled for a non-viable bucket
         if self.fp8_packed and not use_packed_kernel:
             self.k_cache.copy_(_swizzle_packed_k(k_cache))
-
-        # Manual KV cache update using FP8-aware helper
-        k_new = (
-            K_new.permute(1, 2, 0)
-            .reshape(B, nkh, S_decode, self.head_dim)
-            .transpose(0, 1)
-            .reshape(nkh, B * S_decode, self.head_dim)
-        )
-        v_new = V_new.transpose(0, 1).reshape(nkh, B * S_decode, self.head_dim)
-        self._write_paged_kv_cache(k_new, v_new, slot_mapping, block_size)
 
         # >>> PARALLELISM: TP all-reduce after megakernel <<<
         if self.world_size > 1:
