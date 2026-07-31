@@ -9,6 +9,7 @@ Architecture: RMSNorm, standard RoPE, no bias, no sliding window, no sinks.
 """
 
 import logging
+import os
 from dataclasses import dataclass, field
 
 import nki.language as nl
@@ -834,6 +835,67 @@ class Qwen3MoeExperts(nn.Module):
         set_weight_loader(self.gate_up_proj_weight, gate_up_loader)
         set_weight_loader(self.down_proj_weight, down_loader)
 
+        self.fp8_weights_enabled = False
+        self.gate_up_weights_scale = None
+        self.down_weights_scale = None
+        self.gate_up_input_scale = None
+        self.down_input_scale = None
+
+    def quantize_weights_to_fp8(self):
+        """Create FP8 weight copies for decode (STATIC quant path on Trn2).
+
+        The NKI moe_block_tkg kernel's STATIC quantization path performs
+        BF16 × FP8 matmul natively on Trn2 hardware. Weights are stored as
+        torch.float8_e4m3fn (non-packed). Original BF16 weights kept for prefill.
+        """
+        _FP8_MAX = 240.0
+        E = self.num_experts
+        device = self.gate_up_proj_weight.device
+
+        gate_up_w = self.gate_up_proj_weight.data.cpu().float()  # [E, H, 2, I]
+        down_w = self.down_proj_weight.data.cpu().float()  # [E, I, H]
+
+        gate_up_scales = torch.zeros(E, 2, 1, dtype=torch.float32)
+        down_scales = torch.zeros(E, 1, dtype=torch.float32)
+
+        for e in range(E):
+            gate_amax = gate_up_w[e, :, 0, :].abs().max().item()
+            up_amax = gate_up_w[e, :, 1, :].abs().max().item()
+            down_amax = down_w[e].abs().max().item()
+
+            gate_scale = gate_amax / _FP8_MAX if gate_amax > 0 else 1.0
+            up_scale = up_amax / _FP8_MAX if up_amax > 0 else 1.0
+            down_scale = down_amax / _FP8_MAX if down_amax > 0 else 1.0
+
+            gate_up_w[e, :, 0, :] = (gate_up_w[e, :, 0, :] / gate_scale).clamp(
+                -_FP8_MAX, _FP8_MAX
+            )
+            gate_up_w[e, :, 1, :] = (gate_up_w[e, :, 1, :] / up_scale).clamp(
+                -_FP8_MAX, _FP8_MAX
+            )
+            down_w[e] = (down_w[e] / down_scale).clamp(-_FP8_MAX, _FP8_MAX)
+
+            gate_up_scales[e, 0, 0] = gate_scale
+            gate_up_scales[e, 1, 0] = up_scale
+            down_scales[e, 0] = down_scale
+
+        gate_up_fp8 = gate_up_w.to(torch.float8_e4m3fn)  # [E, H, 2, I]
+        down_fp8 = down_w.to(torch.float8_e4m3fn)  # [E, I, H]
+
+        self.register_buffer('gate_up_proj_weight_fp8', gate_up_fp8.to(device))
+        self.register_buffer('down_proj_weight_fp8', down_fp8.to(device))
+
+        self.gate_up_weights_scale = gate_up_scales.to(device)
+        self.down_weights_scale = down_scales.to(device)
+        self.gate_up_input_scale = torch.ones(E, 1, dtype=torch.float32, device=device)
+        self.down_input_scale = torch.ones(E, 1, dtype=torch.float32, device=device)
+        self.fp8_weights_enabled = True
+        logger.info(
+            f"Quantized {E} expert weights to FP8 "
+            f"(gate_up: {list(gate_up_fp8.shape)}, down: {list(down_fp8.shape)}, "
+            f"amax range: {gate_up_scales[:, 0, 0].min():.4f}-{gate_up_scales[:, 0, 0].max():.4f})"
+        )
+
     def forward(self, hidden_states, positions, is_decode, rank=None):
         if is_decode:
             return self.forward_decode(hidden_states)
@@ -849,12 +911,25 @@ class Qwen3MoeExperts(nn.Module):
             rank_id = torch.tensor(
                 [[self.ep_rank]], dtype=torch.int32, device=hidden_states.device
             )
+        fp8_kwargs = {}
+        if self.fp8_weights_enabled:
+            gate_up_w = self.gate_up_proj_weight_fp8
+            down_w = self.down_proj_weight_fp8
+            fp8_kwargs = dict(
+                expert_gate_up_weights_scale=self.gate_up_weights_scale,
+                expert_down_weights_scale=self.down_weights_scale,
+                expert_gate_up_input_scale=self.gate_up_input_scale,
+                expert_down_input_scale=self.down_input_scale,
+            )
+        else:
+            gate_up_w = self.gate_up_proj_weight
+            down_w = self.down_proj_weight
         output = NF.moe_block_tkg(
             inp=hidden_states.unsqueeze(0),
             gamma=self.post_attention_layernorm.weight.unsqueeze(0).to(torch.float32),
             router_weights=self.router_weight.T,
-            expert_gate_up_weights=self.gate_up_proj_weight,
-            expert_down_weights=self.down_proj_weight,
+            expert_gate_up_weights=gate_up_w,
+            expert_down_weights=down_w,
             rank_id=rank_id,
             top_k=self.top_k,
             eps=self.rms_norm_eps,
@@ -867,7 +942,10 @@ class Qwen3MoeExperts(nn.Module):
             hidden_actual=self.hidden_size,
             is_all_expert=use_all_experts,
             skip_router_logits=True,
+            **fp8_kwargs,
         )
+        if self.fp8_weights_enabled:
+            output = output.to(torch.bfloat16)
         if self.world_size > 1:
             output = self.tp_group.all_reduce(output)
         return output
@@ -1343,6 +1421,9 @@ class Qwen3ForCausalLM(nn.Module):
         # Apply weights
         self.load_state_dict(rank_sharded_checkpoint, strict=False, assign=True)
 
+        if os.environ.get("VLLM_NEURON_FP8_EXPERT_WEIGHTS") == "1":
+            self._quantize_expert_weights_to_fp8()
+
         logger.info(f"Successfully loaded Qwen3 weights from {checkpoint_path}")
 
     def _load_kv_cache_scales(
@@ -1376,3 +1457,11 @@ class Qwen3ForCausalLM(nn.Module):
 
             attn.k_scale_float = attn.k_scale.item()
             attn.v_scale_float = attn.v_scale.item()
+
+    def _quantize_expert_weights_to_fp8(self):
+        """Quantize all MoE expert weights from BF16 to FP8 for decode speedup."""
+        for layer_id in range(self.config.num_hidden_layers):
+            layer = self.model.layers[layer_id]
+            if hasattr(layer.mlp, 'is_moe') and layer.mlp.is_moe:
+                layer.mlp.experts.quantize_weights_to_fp8()
+        logger.info("FP8 expert weight quantization complete for all MoE layers")
