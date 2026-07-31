@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import math
+import os
 import torch
 import torch.distributed as dist
 from torch import Tensor
@@ -116,6 +117,11 @@ def build_blockwise_mapping(
         f_len=f_len,
     )
     use_kernel_flow = can_use_find_nonzero_kernel and can_use_indexed_flatten_kernel
+    # Diagnostic escape hatch: the torch fallback is functionally equivalent, so
+    # forcing it isolates "is the DGE mapping kernel at fault?" from the rest of
+    # the MoE dispatch. Set VLLM_NEURON_MOE_MAPPING_FORCE_TORCH=1 to use it.
+    if os.environ.get("VLLM_NEURON_MOE_MAPPING_FORCE_TORCH") == "1":
+        use_kernel_flow = False
 
     if use_kernel_flow:
         token_position_to_id, block_to_expert, num_blocks = (

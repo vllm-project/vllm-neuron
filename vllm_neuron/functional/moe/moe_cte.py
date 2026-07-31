@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
+
 import nki
 import torch
 import nki.language as nl
@@ -591,6 +593,13 @@ def _can_use_moe_cte_kernel(
     I_TP = gate_up_proj_weight.shape[-1]
 
     if I_TP < 128:
+        return False
+
+    # Diagnostic escape hatch: force the (functionally equivalent, much slower)
+    # torch MoE compute. Isolates "does the fault come from the MoE dispatch
+    # kernel or from somewhere else in the layer?" -- the mapping-kernel hatch in
+    # moe_blockwise.py already showed the mapping itself is not at fault.
+    if os.environ.get("VLLM_NEURON_MOE_CTE_FORCE_TORCH") == "1":
         return False
 
     if implementation in [

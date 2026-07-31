@@ -6,6 +6,7 @@ from .spec_decode_correction import (
 from .attention.attention_decode_mask import gen_attention_decode_mask
 from .attention.attention_decode import attention_decode
 from .attention.qkv import qkv_proj
+from .attention.kv_cache_write import write_paged_kv_cache
 from .attention.o_proj import o_proj
 from .attention.attention_cte import flash_attention
 from .attention.attention_segmented_cte import (
@@ -71,4 +72,5 @@ __all__ = [
     "segmented_attention_cp",
     "topk_reduce",
     "validate_expert_parallelism_config",
+    "write_paged_kv_cache",
 ]

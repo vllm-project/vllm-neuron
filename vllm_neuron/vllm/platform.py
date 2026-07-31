@@ -195,6 +195,37 @@ class NeuronPlatform(Platform):
             logger.info("Defaulting optimization level to O1 on Neuron")
 
     @classmethod
+    def _mm_disabled(cls, model_config) -> bool:
+        """True if no request to this model can carry multimodal input.
+
+        Two ways that happens:
+
+        1. ``model_config.multimodal_config is None`` -- vLLM only builds it for
+           models the registry classifies as multimodal, so ``None`` means the
+           whole multimodal path is inert. This is the case that matters for a
+           text-only checkpoint whose custom ``configuration_*.py`` sets
+           ``self.vision_config`` anyway (MiMo-V2.5 does).
+        2. Every declared per-prompt limit is 0, i.e.
+           ``--limit-mm-per-prompt '{"image":0,"video":0,"audio":0}'``. An empty
+           mapping on a genuinely multimodal model means "defaults apply", which
+           is NOT disabled.
+
+        For case 2, read through ``multimodal_config``: ``ModelConfig`` takes
+        ``limit_mm_per_prompt`` as an ``InitVar``, so it is not an attribute
+        after construction -- it is forwarded into ``MultiModalConfig``, whose
+        validator normalizes each value into a ``*DummyOptions`` object. Hence
+        ``get_limit_per_prompt`` (which reads ``.count``) rather than comparing
+        the mapping's values to 0 directly.
+        """
+        mm_config = getattr(model_config, "multimodal_config", None)
+        if mm_config is None:
+            return True
+        limits = getattr(mm_config, "limit_per_prompt", None) or {}
+        return bool(limits) and all(
+            mm_config.get_limit_per_prompt(modality) == 0 for modality in limits
+        )
+
+    @classmethod
     def _resolve_vision_auto_config(
         cls, vllm_config: "VllmConfig", model_config
     ) -> None:
@@ -354,7 +385,18 @@ class NeuronPlatform(Platform):
         # max_num_batched_tokens. The encoder budget cap in NeuronScheduler
         # already prevents overflow without needing this flag.
 
-        if hasattr(model_config.hf_config, "vision_config"):
+        # ``hasattr`` is a weaker signal than it looks: some checkpoints' custom
+        # configuration_*.py set ``self.vision_config`` unconditionally (MiMo-V2.5
+        # does), so it is True even when the key is absent from config.json and no
+        # vision tower will ever run. Resolving vision config anyway forces a
+        # ``vision_attention_block_size`` (2048 by default) floor on the largest
+        # bucket, which makes a text-only server with max_model_len < 2048 abort:
+        # "Largest bucket (1024) is smaller than vision_attention_block_size".
+        # If the caller declared every modality limit as 0, no request can carry
+        # multimodal input, so skip vision sizing entirely.
+        if hasattr(model_config.hf_config, "vision_config") and not cls._mm_disabled(
+            model_config
+        ):
             cls._resolve_vision_auto_config(vllm_config, model_config)
 
         # Compute per-image embed limit for request validation.
