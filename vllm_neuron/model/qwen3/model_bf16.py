@@ -33,6 +33,10 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.nn.sampler import Sampler
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
+from vllm_neuron.utils.dtype_utils import (
+    FP8_CLAMP_MAX,
+    validate_fp8_segmented_supported,
+)
 import vllm_neuron.functional as NF
 import vllm_neuron.nn as neuron_nn
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
@@ -43,9 +47,23 @@ from vllm_neuron.utils.weight_loader import (
     with_rank_override,
     sharding_weight_loader,
 )
+from vllm_neuron.functional.attention.attention_decode import (
+    _swizzle_packed_k,
+    _unswizzle_packed_k,
+)
+from vllm_neuron.functional.attention.attention_decode_mask import _resize_block_len
 from vllm_neuron.functional.moe.router import RouterComputationOrder
 
 logger = logging.getLogger(__name__)
+
+
+def _packed_fp8_viable_for_bucket(
+    block_len: int, bs: int, q_head: int, s_active: int, s_prior: int
+) -> bool:
+    """Whether the packed FP8 decode kernel is usable for this bucket geometry."""
+    if block_len <= 0 or s_prior <= 0:
+        return False
+    return _resize_block_len(block_len, bs, q_head, s_active, s_prior) >= 2
 
 
 # ============================================================================
@@ -293,6 +311,13 @@ class Qwen3Attention(nn.Module):
         self.k_cache = None
         self.v_cache = None
 
+        # FP8 KV cache support
+        self.fp8_packed = False
+        self.register_buffer("k_scale", None, persistent=False)
+        self.register_buffer("v_scale", None, persistent=False)
+        self.k_scale_float = 1.0
+        self.v_scale_float = 1.0
+
         self._setup_weight_loaders()
 
     def _setup_weight_loaders(self):
@@ -322,6 +347,47 @@ class Qwen3Attention(nn.Module):
                 is_storage_transposed=True,
             ),
         )
+
+    # ── KV cache write helper ───────────────────────────────────────────
+
+    def _write_paged_kv_cache(self, k, v, slot_mapping, block_size):
+        """Scatter post-RoPE K/V into the paged cache.
+
+        FP8 caches store fp8(clamp(tensor * scale)); BF16 caches store directly.
+        Packed FP8 K is un-swizzled, scattered, then re-swizzled in place.
+        """
+        if self.k_cache.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+            k_flat = (
+                (k.reshape(-1, self.head_dim) * self.k_scale)
+                .clamp(-FP8_CLAMP_MAX, FP8_CLAMP_MAX)
+                .to(self.k_cache.dtype)
+            )
+            v_flat = (
+                (v.reshape(-1, self.head_dim) * self.v_scale)
+                .clamp(-FP8_CLAMP_MAX, FP8_CLAMP_MAX)
+                .to(self.k_cache.dtype)
+            )
+        else:
+            k_flat = k.reshape(-1, self.head_dim).to(self.k_cache.dtype)
+            v_flat = v.reshape(-1, self.head_dim).to(self.k_cache.dtype)
+
+        nkh = self.num_key_value_heads_per_rank
+        max_slot = self.k_cache.shape[0] * block_size
+        slot_mapping = _sanitize_slot_mapping(slot_mapping, max_slot)
+        block_indices = (slot_mapping // block_size).repeat(nkh)
+        position_indices = (slot_mapping % block_size).repeat(nkh)
+        head_indices = torch.arange(
+            nkh, dtype=torch.long, device=k.device
+        ).repeat_interleave(slot_mapping.shape[0])
+        index = (block_indices, head_indices, position_indices)
+
+        self.v_cache.index_put_(index, v_flat)
+        if self.fp8_packed:
+            k_unpacked = _unswizzle_packed_k(self.k_cache)
+            k_unpacked.index_put_(index, k_flat)
+            self.k_cache.copy_(_swizzle_packed_k(k_unpacked))
+        else:
+            self.k_cache.index_put_(index, k_flat)
 
     # ── Forward dispatch ─────────────────────────────────────────────────
 
@@ -402,10 +468,7 @@ class Qwen3Attention(nn.Module):
             tokens, self.num_key_value_heads_per_rank, self.head_dim
         ).transpose(0, 1)
 
-        # Update the canonical paged cache. Padding slots are never read, but
-        # must be remapped to an in-range location before index_put_. Use
-        # vLLM's reserved null block (slot 0), not the last physical block,
-        # which may be allocated to this request and read by segmented prefill.
+        # Write K/V into paged cache (handles FP8 quantization + packed layout)
         layer_name = f"layers.{self.layer_idx}.self_attn"
         slot_mapping = attn_metadata[layer_name]["slot_mapping"]
         block_size = attn_metadata[layer_name]["block_size"]
@@ -413,27 +476,11 @@ class Qwen3Attention(nn.Module):
         cached_seq_len = attn_metadata[layer_name].get("cached_seq_len")
         kv_segment_size = attn_metadata[layer_name].get("kv_segment_size")
 
-        max_slot = self.k_cache.shape[0] * block_size
-        slot_mapping = _sanitize_slot_mapping(slot_mapping, max_slot)
-        block_indices = slot_mapping // block_size
-        position_indices = slot_mapping % block_size
-        head_indices = torch.arange(
-            self.num_key_value_heads_per_rank,
-            dtype=torch.long,
-            device=hidden_states.device,
-        ).repeat_interleave(slot_mapping.shape[0])
-        block_indices = block_indices.repeat(self.num_key_value_heads_per_rank)
-        position_indices = position_indices.repeat(
-            self.num_key_value_heads_per_rank
-        )
-        self.k_cache.index_put_(
-            (block_indices, head_indices, position_indices),
-            k.reshape(-1, self.head_dim),
-        )
-        self.v_cache.index_put_(
-            (block_indices, head_indices, position_indices),
-            v.reshape(-1, self.head_dim),
-        )
+        kv_is_fp8 = self.k_cache.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
+        if kv_segment_size:
+            validate_fp8_segmented_supported(kv_is_fp8, self.fp8_packed)
+
+        self._write_paged_kv_cache(k, v, slot_mapping, block_size)
 
         if kv_segment_size:
             if cached_seq_len is None:
@@ -519,9 +566,26 @@ class Qwen3Attention(nn.Module):
 
         pos_ids_kernel = positions.view(B, S_decode).to(torch.float32)
 
-        k_cache = (
-            self.k_cache.squeeze(1) if self.k_cache.dim() == 4 and nkh else self.k_cache
+        kv_is_fp8 = self.k_cache.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
+
+        # FP8 packed: check if the packed kernel is viable for this bucket
+        S_ctx = block_table.shape[-1] * block_size
+        use_packed_kernel = self.fp8_packed and _packed_fp8_viable_for_bucket(
+            block_len=block_size,
+            bs=B,
+            q_head=self.num_attention_heads_per_rank,
+            s_active=S_decode,
+            s_prior=S_ctx,
         )
+        k_cache = (
+            self.k_cache
+            if (use_packed_kernel or not self.fp8_packed)
+            else _unswizzle_packed_k(self.k_cache)
+        )
+        if not self.fp8_packed:
+            k_cache = (
+                k_cache.squeeze(1) if k_cache.dim() == 4 and nkh else k_cache
+            )
         v_cache = (
             self.v_cache.squeeze(1) if self.v_cache.dim() == 4 and nkh else self.v_cache
         )
@@ -547,43 +611,29 @@ class Qwen3Attention(nn.Module):
             V_cache=v_cache,
             pos_ids=pos_ids_kernel,
             swa_start_pos_ids=None,
-            softmax_scale=self.scaling,
+            softmax_scale=self.scaling / self.k_scale_float,
             update_cache=False,
-            W_out=self.o_proj_weight,
+            fp8_packed=use_packed_kernel,
+            W_out=self.o_proj_weight / self.v_scale_float,
             transposed_out=False,
             out_in_sb=False,
+            k_scale=self.k_scale if kv_is_fp8 else None,
+            v_scale=self.v_scale if kv_is_fp8 else None,
         )
 
-        # Manual KV cache update
-        max_slot = self.k_cache.shape[0] * block_size
-        slot_mapping = _sanitize_slot_mapping(slot_mapping, max_slot)
-        block_indices = slot_mapping // block_size
-        position_indices = slot_mapping % block_size
-        num_tokens = slot_mapping.shape[0]
+        # Re-swizzle if we un-swizzled for a non-viable bucket
+        if self.fp8_packed and not use_packed_kernel:
+            self.k_cache.copy_(_swizzle_packed_k(k_cache))
 
+        # Manual KV cache update using FP8-aware helper
         k_new = (
             K_new.permute(1, 2, 0)
             .reshape(B, nkh, S_decode, self.head_dim)
             .transpose(0, 1)
             .reshape(nkh, B * S_decode, self.head_dim)
         )
-        k_new_flat = k_new.reshape(-1, self.head_dim)
-        v_new_flat = V_new.transpose(0, 1).reshape(-1, self.head_dim)
-
-        head_indices_for_put = torch.arange(
-            nkh, dtype=torch.long, device=hidden_states.device
-        ).repeat_interleave(num_tokens)
-        block_indices_for_put = block_indices.repeat(nkh)
-        position_indices_for_put = position_indices.repeat(nkh)
-
-        self.k_cache.index_put_(
-            (block_indices_for_put, head_indices_for_put, position_indices_for_put),
-            k_new_flat.to(self.k_cache.dtype),
-        )
-        self.v_cache.index_put_(
-            (block_indices_for_put, head_indices_for_put, position_indices_for_put),
-            v_new_flat.to(self.v_cache.dtype),
-        )
+        v_new = V_new.transpose(0, 1).reshape(nkh, B * S_decode, self.head_dim)
+        self._write_paged_kv_cache(k_new, v_new, slot_mapping, block_size)
 
         # >>> PARALLELISM: TP all-reduce after megakernel <<<
         if self.world_size > 1:
@@ -1041,6 +1091,7 @@ class Qwen3Model(nn.Module):
         # Final norm
         self.norm = Qwen3RMSNorm(config.hidden_size, config.rms_norm_eps, config.torch_dtype)
 
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -1049,7 +1100,7 @@ class Qwen3Model(nn.Module):
         rank: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         is_token_ids: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, list]:
+    ) -> torch.Tensor:
         """Model forward: embedding -> layers -> norm."""
         first_layer_name = "layers.0.self_attn"
         max_query_len = attn_metadata[first_layer_name]["max_query_len"]
@@ -1098,9 +1149,7 @@ class Qwen3Model(nn.Module):
         if is_prefill and self.world_size > 1:
             hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
 
-        # Return (hidden_states, aux_hidden_states)
-        # Qwen3 has no Eagle3, so aux is empty
-        return hidden_states, []
+        return hidden_states
 
 
 # ============================================================================
@@ -1165,16 +1214,15 @@ class Qwen3ForCausalLM(nn.Module):
         attn_metadata: dict | None = None,
         sampling_positions: torch.Tensor | None = None,
         sampling_params: torch.Tensor | None = None,
-        spec_decode_metadata=None,
         logit_mask: torch.Tensor | None = None,
         rank: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Forward: input -> hidden -> logits (-> sample)."""
         positions = positions.to(torch.int32)
 
         # Model forward
-        hidden_states, _ = self.model(
+        hidden_states = self.model(
             input_ids,
             positions,
             attn_metadata,
@@ -1195,30 +1243,16 @@ class Qwen3ForCausalLM(nn.Module):
             else:
                 gathered_logits = self.tp_group.all_gather(logits, dim=1)
 
+        # CPU sampling path (no on-device sampler)
         if self.sampler is None:
             return logits
 
+        # Standard on-device sampling
         sampled_tokens = self.sampler(
             logits, sampling_params, logit_mask=logit_mask, tp_rank=rank
         )
+
         return sampled_tokens, gathered_logits
-
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-        sampling_metadata: object | None = None,
-    ) -> torch.Tensor:
-        """Compute logits from hidden states."""
-        logits = torch.matmul(hidden_states, self.lm_head.weight.t())
-        return logits
-
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: object | None = None,
-    ) -> torch.Tensor:
-        """Sample next tokens."""
-        return self.sampler(logits, sampling_metadata)
 
     def get_kv_spec(self):
         """Return KV cache specification."""
@@ -1246,6 +1280,8 @@ class Qwen3ForCausalLM(nn.Module):
             k_cache, v_cache = kv_caches[layer_name]
             layer.self_attn.k_cache = k_cache
             layer.self_attn.v_cache = v_cache
+            # Detect packed FP8 K layout (one rank higher than V)
+            layer.self_attn.fp8_packed = k_cache.dim() == v_cache.dim() + 1
 
     def load_weights(
         self, checkpoint_path: str, device: torch.device, cache_dir: str | None
@@ -1310,7 +1346,41 @@ class Qwen3ForCausalLM(nn.Module):
             tp_rank, tp_size, self, mappings, device
         ).state_dict
 
+        self._load_kv_cache_scales(checkpoint, device)
+
         # Apply weights
         self.load_state_dict(rank_sharded_checkpoint, strict=False, assign=True)
 
         logger.info(f"Successfully loaded Qwen3 weights from {checkpoint_path}")
+
+    def _load_kv_cache_scales(
+        self, checkpoint: SafetensorsCheckpoint, device: torch.device
+    ):
+        """Load KV cache quantization scales from checkpoint if provided."""
+        from vllm_neuron.utils.dtype_utils import QUANTIZED_KV_CACHE_DTYPES
+
+        try:
+            from vllm.config import get_current_vllm_config
+            vllm_config = get_current_vllm_config()
+            cache_dtype = vllm_config.cache_config.cache_dtype
+        except Exception:
+            return
+
+        if cache_dtype not in QUANTIZED_KV_CACHE_DTYPES:
+            return
+
+        for layer_id in range(self.config.num_hidden_layers):
+            attn = self.model.layers[layer_id].self_attn
+
+            for scale_name in ("k_scale", "v_scale"):
+                key = f"model.layers.{layer_id}.self_attn.{scale_name}"
+                if key in checkpoint._tensor_name_to_file:
+                    val = 1.0 / checkpoint._get_slice(key)[:].to(
+                        dtype=torch.bfloat16, device=device
+                    )
+                else:
+                    val = torch.ones(1, dtype=torch.bfloat16, device=device)
+                setattr(attn, scale_name, val.reshape(1, 1))
+
+            attn.k_scale_float = attn.k_scale.item()
+            attn.v_scale_float = attn.v_scale.item()

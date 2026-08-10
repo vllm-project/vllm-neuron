@@ -44,7 +44,7 @@ cross-model feature compatibility matrix.
 |---|---|---|
 | **Inputs** | Text | ✅ |
 | **Quantization** | BF16 weights | ✅ |
-| | FP8 KV cache | ❌ |
+| | FP8 KV cache | ✅ |
 | **Parallelism** | Tensor parallelism (TP) | ✅ |
 | | Expert parallelism (EP) | ✅ (MoE) |
 | | Pipeline parallelism (PP) | ❌ |
@@ -53,8 +53,8 @@ cross-model feature compatibility matrix.
 | | Segmented prefill | ✅ |
 | | Prefix caching (APC) | ✅ |
 | | On-device sampling (greedy, top-k, top-p) | ✅ |
-| | Speculative decoding (EAGLE3) | ❌ |
-| | Disaggregated inference | ❌ |
+| | Speculative decoding (EAGLE3) | ✅ |
+| | Disaggregated inference (1P1D) | ✅ |
 | **Serving** | OpenAI-compatible logprobs | ✅ |
 | **Compilation** | torch.compile (XLA backend) | ✅ |
 
