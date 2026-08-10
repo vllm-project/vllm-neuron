@@ -479,7 +479,7 @@ class Qwen3Attention(nn.Module):
 
         kv_is_fp8 = self.k_cache.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
         if kv_segment_size:
-            validate_fp8_segmented_supported(kv_is_fp8, self.fp8_packed)
+            validate_fp8_segmented_supported(kv_is_fp8, self.fp8_packed, self.k_cache)
 
         self._write_paged_kv_cache(k, v, slot_mapping, block_size)
 
@@ -836,17 +836,21 @@ class Qwen3MoeExperts(nn.Module):
         set_weight_loader(self.down_proj_weight, down_loader)
 
         self.fp8_weights_enabled = False
+        self.fp8_only = False
         self.gate_up_weights_scale = None
         self.down_weights_scale = None
         self.gate_up_input_scale = None
         self.down_input_scale = None
 
-    def quantize_weights_to_fp8(self):
+    def quantize_weights_to_fp8(self, fp8_only=False):
         """Create FP8 weight copies for decode (STATIC quant path on Trn2).
 
         The NKI moe_block_tkg kernel's STATIC quantization path performs
         BF16 × FP8 matmul natively on Trn2 hardware. Weights are stored as
-        torch.float8_e4m3fn (non-packed). Original BF16 weights kept for prefill.
+        torch.float8_e4m3fn (non-packed).
+
+        If fp8_only=True, the original BF16 weights are deleted after
+        quantization to save HBM. Prefill will dequantize FP8→BF16 on the fly.
         """
         _FP8_MAX = 240.0
         E = self.num_experts
@@ -890,11 +894,37 @@ class Qwen3MoeExperts(nn.Module):
         self.gate_up_input_scale = torch.ones(E, 1, dtype=torch.float32, device=device)
         self.down_input_scale = torch.ones(E, 1, dtype=torch.float32, device=device)
         self.fp8_weights_enabled = True
+        self.fp8_only = fp8_only
+
+        if fp8_only:
+            del self.gate_up_proj_weight
+            del self.down_proj_weight
+            self.gate_up_proj_weight = None
+            self.down_proj_weight = None
+
         logger.info(
             f"Quantized {E} expert weights to FP8 "
             f"(gate_up: {list(gate_up_fp8.shape)}, down: {list(down_fp8.shape)}, "
             f"amax range: {gate_up_scales[:, 0, 0].min():.4f}-{gate_up_scales[:, 0, 0].max():.4f})"
+            f"{' [FP8-only, BF16 originals deleted]' if fp8_only else ''}"
         )
+
+    def _dequant_gate_up_for_prefill(self):
+        """Dequantize FP8 gate_up weights back to BF16 for prefill CTE kernel.
+        gate_up shape: [E, H, 2, I], scale shape: [E, 2, 1]"""
+        w = self.gate_up_proj_weight_fp8.float()  # [E, H, 2, I]
+        scale = self.gate_up_weights_scale  # [E, 2, 1]
+        # Reshape scale to [E, 1, 2, 1] for broadcast across H and I dims
+        w = w * scale.unsqueeze(1)  # [E, 2, 1] → unsqueeze(1) → [E, 1, 2, 1]
+        return w.to(torch.bfloat16)
+
+    def _dequant_down_for_prefill(self):
+        """Dequantize FP8 down weights back to BF16 for prefill CTE kernel.
+        down shape: [E, I, H], scale shape: [E, 1]"""
+        w = self.down_proj_weight_fp8.float()  # [E, I, H]
+        scale = self.down_weights_scale  # [E, 1]
+        w = w * scale.unsqueeze(-1)  # [E, 1] → [E, 1, 1] broadcast to [E, I, H]
+        return w.to(torch.bfloat16)
 
     def forward(self, hidden_states, positions, is_decode, rank=None):
         if is_decode:
@@ -902,10 +932,7 @@ class Qwen3MoeExperts(nn.Module):
         return self.forward_prefill(hidden_states, positions)
 
     def forward_decode(self, hidden_states):
-        use_all_experts = (
-            self.ep_enabled
-            or hidden_states.shape[0] * self.top_k >= self.num_experts
-        )
+        use_all_experts = (self.ep_enabled or hidden_states.shape[0] * self.top_k >= self.num_experts)
         rank_id = None
         if use_all_experts:
             rank_id = torch.tensor(
@@ -1011,13 +1038,19 @@ class Qwen3MoeExperts(nn.Module):
             tp_degree=self.tp_degree,
             padding_mask=padding_mask,
         )
+        if self.fp8_weights_enabled and self.fp8_only:
+            gate_up_w = self._dequant_gate_up_for_prefill()
+            down_w = self._dequant_down_for_prefill()
+        else:
+            gate_up_w = self.gate_up_proj_weight
+            down_w = self.down_proj_weight
         output = NF.moe_cte(
             implementation=MoECTEImplementation.shard_on_block,
             conditions=conditions,
             hidden_states=hidden_states,
             expert_affinities_masked=expert_affinities_masked,
-            gate_up_proj_weight=self.gate_up_proj_weight,
-            down_proj_weight=self.down_proj_weight,
+            gate_up_proj_weight=gate_up_w,
+            down_proj_weight=down_w,
             activation_function=ActFnType.SiLU,
             block_size=self.block_size,
             token_position_to_id=token_position_to_id.to(torch.int32),
@@ -1460,8 +1493,10 @@ class Qwen3ForCausalLM(nn.Module):
 
     def _quantize_expert_weights_to_fp8(self):
         """Quantize all MoE expert weights from BF16 to FP8 for decode speedup."""
+        fp8_only = os.environ.get("VLLM_NEURON_FP8_ONLY") == "1"
         for layer_id in range(self.config.num_hidden_layers):
             layer = self.model.layers[layer_id]
             if hasattr(layer.mlp, 'is_moe') and layer.mlp.is_moe:
-                layer.mlp.experts.quantize_weights_to_fp8()
-        logger.info("FP8 expert weight quantization complete for all MoE layers")
+                layer.mlp.experts.quantize_weights_to_fp8(fp8_only=fp8_only)
+        mode = "FP8-only (BF16 deleted)" if fp8_only else "FP8 decode + BF16 prefill"
+        logger.info(f"FP8 expert weight quantization complete for all MoE layers [{mode}]")
