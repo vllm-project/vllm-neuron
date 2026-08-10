@@ -98,7 +98,8 @@ def build_blockwise_mapping(
     # Kernel configs
     max_chunk_size = 16384
     chunk_size = min(total_tokens, max_chunk_size)
-    f_len = min(128, total_tokens // 16)
+    # Single-token decode must not produce a zero flatten width.
+    f_len = min(128, max(1, total_tokens // 16))
 
     # When TP-sharded, the kernel processes E_kernel = E_local // tp_degree experts
     # per rank. The kernel constraints must be checked against E_kernel, not E_local.

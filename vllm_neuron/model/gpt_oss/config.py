@@ -52,6 +52,8 @@ class GptOssConfig:
 
     # ── Attention features (MODEL-SPECIFIC) ──────────────────────────────
     sliding_window: int | None = None  # Sliding window size (applied to even layers)
+    attention_bias: bool = True  # Whether attention layers have bias terms
+    mlp_bias: bool = True  # Whether MLP layers have bias terms
 
     # ── RoPE settings (MODEL-SPECIFIC: YaRN scaling) ─────────────────────
     rope_parameters: dict = field(
@@ -111,6 +113,10 @@ class GptOssConfig:
             filtered_dict["torch_dtype"] = getattr(torch, filtered_dict["torch_dtype"])
 
         filtered_dict["neuron_config"] = neuron_config
+
+        # Read attention_bias and mlp_bias from HF config (default True for backward compatibility)
+        filtered_dict["attention_bias"] = config_dict.get("attention_bias", True)
+        filtered_dict["mlp_bias"] = config_dict.get("mlp_bias", True)
 
         # <-- MODEL-SPECIFIC: GPT-OSS pads hidden and intermediate to 3072
         filtered_dict["unpadded_intermediate_size"] = filtered_dict["intermediate_size"]

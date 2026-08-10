@@ -395,11 +395,17 @@ class GptOssAttention(nn.Module):
         self.qkv_proj_weight = nn.Parameter(
             torch.empty(self.hidden_size, qkv_size, dtype=self.dtype)
         )
-        self.qkv_proj_bias = nn.Parameter(torch.zeros(qkv_size, dtype=self.dtype))
+        # Conditionally create bias parameters based on config
+        if config.attention_bias:
+            self.qkv_proj_bias = nn.Parameter(torch.zeros(qkv_size, dtype=self.dtype))
+            self.o_proj_bias = nn.Parameter(torch.zeros(self.hidden_size, dtype=self.dtype))
+        else:
+            # Register as None so state_dict doesn't expect them
+            self.register_parameter('qkv_proj_bias', None)
+            self.register_parameter('o_proj_bias', None)
         self.o_proj_weight = nn.Parameter(
             torch.empty(o_proj_in_features, self.hidden_size, dtype=self.dtype)
         )
-        self.o_proj_bias = nn.Parameter(torch.zeros(self.hidden_size, dtype=self.dtype))
 
         # <-- MODEL-SPECIFIC: Learnable attention sinks (per-head)
         # Pre-gathered across attention DP so no runtime all_gather is needed.
@@ -461,17 +467,19 @@ class GptOssAttention(nn.Module):
         qkv_loader = with_rank_override(qkv_loader, rank=effective_q_rank)
         set_weight_loader(self.qkv_proj_weight, qkv_loader)
 
-        qkv_bias_loader = fused_qkv_bias_loader(
-            q_size=self.q_size,
-            kv_size=self.kv_size,
-            num_shards=effective_q_shards,
-            num_kv_heads=self.num_key_value_heads,
-            head_dim=self.head_dim,
-            num_kv_replicas=self.num_kv_replicas,
-            kv_num_shards=self.world_size if not self.kv_needs_a2a else None,
-        )
-        qkv_bias_loader = with_rank_override(qkv_bias_loader, rank=effective_q_rank)
-        set_weight_loader(self.qkv_proj_bias, qkv_bias_loader)
+        # Only register bias loader if bias parameters exist
+        if self.qkv_proj_bias is not None:
+            qkv_bias_loader = fused_qkv_bias_loader(
+                q_size=self.q_size,
+                kv_size=self.kv_size,
+                num_shards=effective_q_shards,
+                num_kv_heads=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                num_kv_replicas=self.num_kv_replicas,
+                kv_num_shards=self.world_size if not self.kv_needs_a2a else None,
+            )
+            qkv_bias_loader = with_rank_override(qkv_bias_loader, rank=effective_q_rank)
+            set_weight_loader(self.qkv_proj_bias, qkv_bias_loader)
 
         o_loader = o_proj_weight_loader(
             shard_size=(self.num_attention_heads * self.head_dim) // effective_q_shards,
@@ -661,7 +669,7 @@ class GptOssAttention(nn.Module):
                 q_hbm, _, _ = NF.qkv_proj(
                     hidden=hidden_states.unsqueeze(0),
                     qkv_weights=self.qkv_proj_weight,
-                    bias=self.qkv_proj_bias.unsqueeze(0),
+                    bias=self.qkv_proj_bias.unsqueeze(0) if self.qkv_proj_bias is not None else None,
                     d_head=self.head_dim,
                     cos_cache=cos_cache,
                     sin_cache=sin_cache,
@@ -685,7 +693,7 @@ class GptOssAttention(nn.Module):
                 qkv = NF.qkv_proj(
                     hidden=hidden_states.unsqueeze(0),
                     qkv_weights=self.qkv_proj_weight,
-                    bias=self.qkv_proj_bias.unsqueeze(0),
+                    bias=self.qkv_proj_bias.unsqueeze(0) if self.qkv_proj_bias is not None else None,
                     d_head=self.head_dim,
                     cos_cache=cos_cache,
                     sin_cache=sin_cache,
@@ -725,7 +733,7 @@ class GptOssAttention(nn.Module):
             qkv = NF.qkv_proj(
                 hidden=hidden_states.unsqueeze(0),
                 qkv_weights=self.qkv_proj_weight,
-                bias=self.qkv_proj_bias.unsqueeze(0),
+                bias=self.qkv_proj_bias.unsqueeze(0) if self.qkv_proj_bias is not None else None,
                 d_head=self.head_dim,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
@@ -2264,20 +2272,23 @@ class GptOssForCausalLM(nn.Module, SupportsEagle3):
                 f"{layer_prefix}.self_attn.k_proj.weight",
                 f"{layer_prefix}.self_attn.v_proj.weight",
             ]
-            mappings[f"{layer_prefix}.self_attn.qkv_proj_bias"] = [
-                f"{layer_prefix}.self_attn.q_proj.bias",
-                f"{layer_prefix}.self_attn.k_proj.bias",
-                f"{layer_prefix}.self_attn.v_proj.bias",
-            ]
+            # Only map bias keys if model has attention bias
+            if self.model.layers[0].self_attn.qkv_proj_bias is not None:
+                mappings[f"{layer_prefix}.self_attn.qkv_proj_bias"] = [
+                    f"{layer_prefix}.self_attn.q_proj.bias",
+                    f"{layer_prefix}.self_attn.k_proj.bias",
+                    f"{layer_prefix}.self_attn.v_proj.bias",
+                ]
             mappings[f"{layer_prefix}.input_layernorm.weight"] = (
                 f"{layer_prefix}.input_layernorm.weight"
             )
             mappings[f"{layer_prefix}.self_attn.o_proj_weight"] = (
                 f"{layer_prefix}.self_attn.o_proj.weight"
             )
-            mappings[f"{layer_prefix}.self_attn.o_proj_bias"] = (
-                f"{layer_prefix}.self_attn.o_proj.bias"
-            )
+            if self.model.layers[0].self_attn.o_proj_bias is not None:
+                mappings[f"{layer_prefix}.self_attn.o_proj_bias"] = (
+                    f"{layer_prefix}.self_attn.o_proj.bias"
+                )
             mappings[f"{layer_prefix}.self_attn.sinks"] = (
                 f"{layer_prefix}.self_attn.sinks"
             )
