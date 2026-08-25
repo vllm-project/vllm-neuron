@@ -811,7 +811,8 @@ class Qwen3ForCausalLM(nn.Module):
     """Qwen3 model with LM head.
 
     >>> PARALLELISM: Column-parallel LM head. <<<
-    <-- MODEL-SPECIFIC: No tied embeddings (tie_word_embeddings=False).
+    <-- MODEL-SPECIFIC: tie_word_embeddings is honoured; the smaller Qwen3
+    checkpoints tie the LM head to the embedding.
     """
 
     def __init__(self, config: Qwen3Config):
@@ -836,7 +837,6 @@ class Qwen3ForCausalLM(nn.Module):
             config.neuron_config is not None and config.neuron_config.max_logprobs != 0
         ) or debug_logits_enabled
 
-        # <-- MODEL-SPECIFIC: No tied embeddings — separate lm_head weight
         # >>> PARALLELISM: Column-parallel LM head <<<
         self.lm_head = neuron_nn.ColumnParallelLinear(
             config.hidden_size,
@@ -978,7 +978,15 @@ class Qwen3ForCausalLM(nn.Module):
 
         # Embedding and LM head
         mappings["model.embed_tokens.weight"] = "model.embed_tokens.weight"
-        mappings["lm_head.weight"] = "lm_head.weight"
+        # Smaller Qwen3 checkpoints (0.6B/1.7B/4B) tie the LM head to the
+        # embedding and ship no lm_head.weight. The two are sharded differently
+        # here (VocabDimShardedEmbedding vs ColumnParallelLinear), so rather than
+        # aliasing the parameter, load the same checkpoint tensor through each
+        # one's own loader. Costs one extra vocab x hidden shard per rank.
+        if self.config.tie_word_embeddings:
+            mappings["lm_head.weight"] = "model.embed_tokens.weight"
+        else:
+            mappings["lm_head.weight"] = "lm_head.weight"
         mappings["model.norm.weight"] = "model.norm.weight"
 
         for layer_id in range(len(self.model.layers)):
