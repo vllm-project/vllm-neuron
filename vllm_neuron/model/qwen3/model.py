@@ -22,6 +22,9 @@ import logging
 import torch
 from torch import nn
 from vllm.distributed.parallel_state import get_tp_group
+from vllm.model_executor.models.interfaces import SupportsEagle3
+
+from vllm_neuron.vllm.spec_decode.decorator import async_speculative_decoding
 from transformers import PretrainedConfig
 
 import vllm_neuron.functional as NF
@@ -733,6 +736,10 @@ class Qwen3Model(nn.Module):
         )
         self.rotary_emb = Qwen3RotaryEmbedding(config)
 
+        # Layer indices whose *input* residual stream is exported for a draft
+        # model. Empty unless a drafter is attached.
+        self.aux_hidden_state_layers: list[int] = []
+
         set_weight_loader(
             self.embed_tokens.weight,
             sharding_weight_loader(
@@ -784,7 +791,13 @@ class Qwen3Model(nn.Module):
             positions, device=hidden_states.device, dtype=hidden_states.dtype
         )
 
-        for decoder_layer in self.layers:
+        # Auxiliary hidden states for draft models (EAGLE3, DFlash). The
+        # capture is taken *before* layer idx runs, i.e. the residual stream
+        # entering it, which is the output of layer idx - 1.
+        aux_hidden_states = []
+        for idx, decoder_layer in enumerate(self.layers):
+            if idx in self.aux_hidden_state_layers:
+                aux_hidden_states.append(hidden_states)
             hidden_states = decoder_layer(
                 hidden_states,
                 positions=positions,
@@ -797,8 +810,11 @@ class Qwen3Model(nn.Module):
         # >>> PARALLELISM: SP — all-gather to reconstruct full sequence <<<
         if is_prefill and self.world_size > 1:
             hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
+            aux_hidden_states = [
+                self.tp_group.all_gather(aux, dim=0) for aux in aux_hidden_states
+            ]
 
-        return hidden_states, []
+        return hidden_states, aux_hidden_states
 
 
 # =============================================================================
@@ -807,11 +823,13 @@ class Qwen3Model(nn.Module):
 # =============================================================================
 
 
-class Qwen3ForCausalLM(nn.Module):
+@async_speculative_decoding
+class Qwen3ForCausalLM(nn.Module, SupportsEagle3):
     """Qwen3 model with LM head.
 
     >>> PARALLELISM: Column-parallel LM head. <<<
-    <-- MODEL-SPECIFIC: No tied embeddings (tie_word_embeddings=False).
+    <-- MODEL-SPECIFIC: tie_word_embeddings is honoured; the smaller Qwen3
+    checkpoints tie the LM head to the embedding.
     """
 
     def __init__(self, config: Qwen3Config):
@@ -836,7 +854,6 @@ class Qwen3ForCausalLM(nn.Module):
             config.neuron_config is not None and config.neuron_config.max_logprobs != 0
         ) or debug_logits_enabled
 
-        # <-- MODEL-SPECIFIC: No tied embeddings — separate lm_head weight
         # >>> PARALLELISM: Column-parallel LM head <<<
         self.lm_head = neuron_nn.ColumnParallelLinear(
             config.hidden_size,
@@ -875,7 +892,7 @@ class Qwen3ForCausalLM(nn.Module):
         spec_decode_metadata=None,
         logit_mask: torch.Tensor | None = None,
         rank: torch.Tensor | None = None,
-        **kwargs,
+        **kwargs,  # @async_speculative_decoding injects async-spec args
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         positions = positions.to(torch.int32)
 
@@ -894,7 +911,7 @@ class Qwen3ForCausalLM(nn.Module):
                 f"Prompt Length ({T}) must be > world_size ({self.world_size}) for SP."
             )
 
-        hidden_states, _ = self.model(
+        hidden_states, aux_hidden_states = self.model(
             input_ids,
             positions,
             attn_metadata=attn_metadata,
@@ -902,6 +919,10 @@ class Qwen3ForCausalLM(nn.Module):
             inputs_embeds=inputs_embeds,
             is_token_ids=is_token_ids,
         )
+        # Concatenate inside the compile boundary so the target NEFF emits one
+        # tensor rather than a list; a host-side cat here would sit between the
+        # target NEFF and the draft NEFF and serialise them.
+        aux_concat = torch.cat(aux_hidden_states, dim=-1) if aux_hidden_states else None
 
         hidden_states_for_logits = torch.index_select(
             hidden_states, dim=0, index=sampling_positions
@@ -910,6 +931,8 @@ class Qwen3ForCausalLM(nn.Module):
         logits = self.lm_head(hidden_states_for_logits)
 
         if self.on_device_sampling_config is None:
+            if aux_concat is not None:
+                return logits, aux_concat
             return logits
 
         sampled_tokens = self.sampler(
@@ -926,9 +949,28 @@ class Qwen3ForCausalLM(nn.Module):
         if spec_decode_metadata is not None:
             from vllm_neuron.nn.rejection_sampler import rejection_sampler
 
-            return rejection_sampler(spec_decode_metadata, sampled_tokens)
+            rejection_sampled_tokens = rejection_sampler(
+                spec_decode_metadata, sampled_tokens
+            )
+            if aux_concat is not None:
+                return rejection_sampled_tokens, aux_concat, gathered_logits
+            return rejection_sampled_tokens
+
+        if aux_concat is not None:
+            return sampled_tokens, aux_concat, gathered_logits
 
         return sampled_tokens, gathered_logits
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        if layers is not None:
+            self.model.aux_hidden_state_layers = list(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        if self.model.aux_hidden_state_layers:
+            return tuple(self.model.aux_hidden_state_layers)
+        # Same spread EAGLE3 uses by default: early, middle, late.
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
 
     @classmethod
     def from_configs(cls, hf_config: PretrainedConfig, neuron_config: NeuronConfig):
@@ -978,7 +1020,15 @@ class Qwen3ForCausalLM(nn.Module):
 
         # Embedding and LM head
         mappings["model.embed_tokens.weight"] = "model.embed_tokens.weight"
-        mappings["lm_head.weight"] = "lm_head.weight"
+        # Smaller Qwen3 checkpoints (0.6B/1.7B/4B) tie the LM head to the
+        # embedding and ship no lm_head.weight. The two are sharded differently
+        # here (VocabDimShardedEmbedding vs ColumnParallelLinear), so rather than
+        # aliasing the parameter, load the same checkpoint tensor through each
+        # one's own loader. Costs one extra vocab x hidden shard per rank.
+        if self.config.tie_word_embeddings:
+            mappings["lm_head.weight"] = "model.embed_tokens.weight"
+        else:
+            mappings["lm_head.weight"] = "lm_head.weight"
         mappings["model.norm.weight"] = "model.norm.weight"
 
         for layer_id in range(len(self.model.layers)):
