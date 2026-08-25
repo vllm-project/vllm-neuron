@@ -6,7 +6,7 @@ the end-to-end deployment tutorial for gpt-oss 20B and 120B on Trn3 (MXFP4) or
 Trn2 (BF16). -->
 <!-- meta: keywords: vLLM, Neuron, gpt-oss, gpt-oss-20b, gpt-oss-120b, MoE,
 MXFP4, model recipe, model card, LLM serving, Trn2, Trn3, Trainium -->
-<!-- meta: date_updated: 2026-07-15 -->
+<!-- meta: date_updated: 2026-08-25 -->
 <!-- Content type: model-card -->
 <!-- Jira: NDOC-185 -->
 
@@ -49,6 +49,7 @@ Per-model feature availability for gpt-oss. See the
 | | Segmented prefill | ✅ |
 | | Prefix caching (APC) | ✅ |
 | | Speculative decoding (EAGLE3) | ✅ |
+| | Speculative decoding (DFlash, Trn2 BF16) | Preview |
 | | Disaggregated inference (1P1D / xPyD) | ✅ |
 | | On-device sampling (greedy, top-k, top-p) | ✅ |
 | **Serving** | Structured outputs / tool calling | ✅ |
@@ -58,6 +59,7 @@ Per-model feature availability for gpt-oss. See the
 **Status legend:**
 
 - ✅ Supported: integrated and tested for gpt-oss
+- Preview: integrated, with real-hardware validation still in progress
 - ❌ Not supported: may be considered for future releases
 
 The [deployment tutorial](../tutorials/tutorial-gpt-oss.md) walks through
@@ -75,6 +77,40 @@ reasoning effort.
 | GSM8K-CoT | 88.8% |
 | AIME25 (avg@8, medium) | 78.75% |
 | GPQA-diamond (medium) | 72.22% |
+
+## DFlash preview on Trn2
+
+The DFlash integration targets `openai/gpt-oss-20b` with the
+[`z-lab/gpt-oss-20b-DFlash`](https://huggingface.co/z-lab/gpt-oss-20b-DFlash)
+block-diffusion drafter. DFlash proposes all seven speculative tokens in a
+single non-causal draft pass, so the draft cost per step is one forward, not
+seven.
+
+The preview enforces the validated envelope: BF16 target weights and KV cache,
+TP=4 (one Trn2 chip at LNC=2) or TP=8, seven speculative tokens, synchronous
+scheduling, and no chunked prefill, prefix caching, or disaggregated inference.
+
+```bash
+vllm serve openai/gpt-oss-20b \
+    --tensor-parallel-size 4 \
+    --dtype bfloat16 \
+    --max-model-len 8192 \
+    --max-num-batched-tokens 8192 \
+    --max-num-seqs 4 \
+    --no-async-scheduling \
+    --no-enable-chunked-prefill \
+    --no-enable-prefix-caching \
+    --hf-overrides '{"quantization_config": {}}' \
+    --speculative-config \
+      '{"method":"dflash","model":"z-lab/gpt-oss-20b-DFlash","num_speculative_tokens":7}' \
+    --additional-config \
+      '{"neuron_config":{"quantization":"bf16"}}'
+```
+
+Validate with greedy decoding first: the token IDs must match the same server
+command run without `--speculative-config`. Only then measure acceptance length
+and throughput. See the runnable
+[Trn2 DFlash example](../../examples/vllm_neuron/models/gpt_oss/20b/mxfp4/dflash/README.md).
 
 ## Tutorials
 
