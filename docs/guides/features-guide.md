@@ -512,7 +512,7 @@ python3 -m vllm.entrypoints.openai.api_server \
   means the async path is active for a larger fraction of total
   generation
 
-## Speculative decoding (EAGLE3)
+## Speculative decoding (EAGLE3, DFlash)
 
 Speculative decoding accelerates autoregressive inference without
 changing the output distribution. A lightweight draft model predicts
@@ -523,8 +523,8 @@ forward pass.
 **Mutually exclusive with async scheduling.** Setting `--speculative-config`
 disables async scheduling automatically with a startup warning.
 
-EAGLE3 and DFlash are supported speculative methods. The examples below use
-EAGLE3. For per-model compatibility, see the
+EAGLE3 and DFlash are supported speculative methods. The EAGLE3 examples
+follow; DFlash has its own section below. For per-model compatibility, see the
 [model recipes](../model-recipes/index.md).
 For compatible target/draft pairings and worked examples, see the EAGLE3
 speculative decoding tutorials for
@@ -584,6 +584,83 @@ llm = LLM(
 sampling_params = SamplingParams(max_tokens=256, temperature=0.0)
 outputs = llm.generate(["Explain quantum computing"], sampling_params)
 ```
+
+### DFlash
+
+DFlash is a parallel drafter. Where EAGLE3 runs its draft model once per
+speculative token, DFlash proposes the whole block in a **single** non-causal
+forward pass, so the draft cost per step does not grow with `K`.
+
+The drafter is a small block-diffusion model that reads the target's auxiliary
+hidden states. It has no embedding or LM head of its own; both are taken from
+the target, which is why a DFlash checkpoint is only valid for the target it
+was trained against.
+
+```bash
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+    --tensor-parallel-size 4 \
+    --dtype bfloat16 \
+    --max-model-len 8192 \
+    --max-num-batched-tokens 8192 \
+    --max-num-seqs 4 \
+    --num-gpu-blocks-override 1200 \
+    --no-async-scheduling \
+    --no-enable-chunked-prefill \
+    --no-enable-prefix-caching \
+    --disable-hybrid-kv-cache-manager \
+    --speculative-config '{"method":"dflash","model":"z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat","num_speculative_tokens":9}' \
+    --additional-config '{"neuron_config": {"quantization": "bf16"}}'
+```
+
+#### Required settings
+
+| Setting | Why |
+|---|---|
+| `num_speculative_tokens` = `block_size - 1` | The proposal block size is fixed by training. The value differs per checkpoint (7, 9 and 15 for the three published drafters). |
+| `--no-async-scheduling` | DFlash currently supports synchronous scheduling only. |
+| `--disable-hybrid-kv-cache-manager` | Required for targets that mix sliding-window and full attention (gpt-oss). The hybrid manager splits the draft's layers across KV cache groups, and the Neuron draft path drives all of them from one `AttentionMetadata`. |
+| `--num-gpu-blocks-override` | Strongly recommended. See below. |
+| BF16 target, draft and KV cache | The only combination validated so far. |
+
+Prefix caching, chunked prefill and disaggregated inference are not supported.
+
+#### Size the KV cache to the workload
+
+By default vLLM grows the KV cache into all spare device memory. That is free
+for a normal decode, but not for DFlash: the drafter writes its context K/V
+through the in-kernel cache-write path, whose cost tracks the **allocated**
+cache rather than the slots actually written.
+
+On a `trn2.3xlarge` with `max_model_len 8192` and `max_num_seqs 4`, the default
+allocation was 434k tokens where 32k is reachable. Right-sizing it moved
+gpt-oss from 23.5 to 40.9 tok/s and cut the draft NEFF from 57 ms to 22 ms per
+step. Set:
+
+```
+--num-gpu-blocks-override $(( max_model_len * max_num_seqs / block_size ))
+```
+
+#### When DFlash helps
+
+Speculation wins when the accepted length exceeds the cost of verifying the
+block. On Neuron that ratio is decided mostly by whether the target is dense.
+
+| target | marginal cost per extra verified token | break-even accepted length |
+|---|---|---|
+| Llama 3.1 8B (dense) | ~0.2 ms | ~1.2 |
+| Qwen3 4B (dense) | ~0.7 ms | ~1.3 |
+| gpt-oss-20b (MoE, top-4 of 32) | ~6-7 ms | ~3.5 |
+
+A dense target reads the same weights whichever number of tokens it verifies,
+so a block is nearly as cheap as a single token. A sparse MoE target does not:
+each additional token in the block routes to its own experts, so verification
+cost grows almost linearly and the accepted length has to clear a much higher
+bar. Per-model measurements are in the
+[model recipes](../model-recipes/index.md).
+
+Block size also interacts with batching, because the target verifies
+`concurrency x block_size` tokens per step. A block that pays at concurrency 1
+may not at concurrency 4.
 
 ### Key parameters
 
