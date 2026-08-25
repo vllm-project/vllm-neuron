@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-import torch
+import math
 from typing import Optional
 
-from torch import Tensor
-
 import nki
-import math
-
+import torch
 from nkilib.core.attention.gen_mask_tkg import gen_mask_tkg_hbm
+from torch import Tensor
 
 # QK-swap mask layout: newer nkilib ``attention_block_tkg`` selects a transposed,
 # column-tiled MM1 ("QK-swap") path for certain decode shapes and then expects
@@ -17,10 +15,11 @@ from nkilib.core.attention.gen_mask_tkg import gen_mask_tkg_hbm
 # layout contract) imports the predicate so callers don't have to. Guarded so
 # older nkilib without the predicate keeps the legacy layout.
 try:
+    import inspect as _inspect
+
     from nkilib.core.attention.attention_tkg_utils import (
         is_qk_swapped as _nki_is_qk_swapped,
     )
-    import inspect as _inspect
 
     _QK_SWAP_PARAMS = frozenset(_inspect.signature(_nki_is_qk_swapped).parameters)
 except ImportError:
@@ -86,6 +85,7 @@ def maybe_transpose_mask_for_qk_swap(
 jitted_gen_mask = nki.jit()(gen_mask_tkg_hbm)
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 P_MAX = 128
@@ -101,6 +101,7 @@ def gen_attention_decode_mask(
     block_len: int = 0,
     local_filled_slots: Optional[Tensor] = None,
     dcp_active_mask: Optional[Tensor] = None,
+    active_mask: Optional[Tensor] = None,
 ) -> Tensor:
     """
     Generate an attention mask for token-generation (TKG).
@@ -122,6 +123,10 @@ def gen_attention_decode_mask(
                       threshold for all lines; ``[bs]``/``[1, bs]`` = per-request.
         dcp_active_mask: Per-rank active-token gate for DCP (scalar or ``[bs]``),
                       broadcast the same way as ``local_filled_slots``.
+        active_mask:  Optional [s_active, bs, q_head, s_active] active-token
+                      mask. Defaults to the causal staircase. DFlash passes an
+                      all-ones mask so every query in a proposal block can see
+                      the whole block (bidirectional block diffusion).
 
     Returns:
         Tensor of shape [s_prior, bs, q_head, s_active] with values in {0, 1}.
@@ -147,7 +152,7 @@ def gen_attention_decode_mask(
             kernel_pos_ids = local_filled_slots.to(torch.float32).reshape(1, -1)
             if kernel_pos_ids.shape[1] == 1 and bs > 1:
                 kernel_pos_ids = kernel_pos_ids.expand(1, bs)
-            active_mask = torch.ones(
+            dcp_mask = torch.ones(
                 s_active,
                 bs,
                 q_head,
@@ -156,7 +161,7 @@ def gen_attention_decode_mask(
                 device=pos_ids.device,
             )
             if dcp_active_mask is not None:
-                active_mask = active_mask * dcp_active_mask.to(torch.float32).reshape(
+                dcp_mask = dcp_mask * dcp_active_mask.to(torch.float32).reshape(
                     1, -1, 1, 1
                 )
             return _gen_mask_via_kernel(
@@ -167,7 +172,7 @@ def gen_attention_decode_mask(
                 s_prior,
                 None,
                 block_len,
-                active_mask.contiguous(),
+                dcp_mask.contiguous(),
             )
 
         if block_len > 0:
@@ -201,15 +206,24 @@ def gen_attention_decode_mask(
         )
         return mask
 
-    # Build causal mask over the two s_active dimensions (dim 0 and dim 3)
-    causal = torch.triu(
-        torch.ones(s_active, s_active, dtype=torch.float32, device=pos_ids.device)
-    )
+    if active_mask is None:
+        # Build causal mask over the two s_active dimensions (dim 0 and dim 3)
+        causal = torch.triu(
+            torch.ones(s_active, s_active, dtype=torch.float32, device=pos_ids.device)
+        )
 
-    # Broadcast to [s_active, bs, q_head, s_active]
-    active_mask = (
-        causal[:, None, None, :].expand(s_active, bs, q_head, s_active).contiguous()
-    )
+        # Broadcast to [s_active, bs, q_head, s_active]
+        active_mask = (
+            causal[:, None, None, :].expand(s_active, bs, q_head, s_active).contiguous()
+        )
+    else:
+        expected = (s_active, bs, q_head, s_active)
+        if tuple(active_mask.shape) != expected:
+            raise ValueError(
+                f"active_mask must have shape {expected}, "
+                f"got {tuple(active_mask.shape)}"
+            )
+        active_mask = active_mask.to(torch.float32).contiguous()
 
     # SWA + s_active > 1: NKI mask kernel now supports per-token start bounds.
     if _can_use_kernel(pos_ids, bs, s_active, s_prior):

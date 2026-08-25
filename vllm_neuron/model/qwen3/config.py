@@ -9,7 +9,7 @@ Key differences from Llama:
   - QK-norm applied per-head (q_norm / k_norm on head_dim)
   - Standard RoPE (no Llama3-style scaling)
   - rope_theta = 1_000_000
-  - tie_word_embeddings = False
+  - tie_word_embeddings varies: False on 8B+, True on 0.6B/1.7B/4B
   - no sliding window for the 32B dense variant (use_sliding_window=False)
 """
 
