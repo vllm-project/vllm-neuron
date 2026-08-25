@@ -1,4 +1,4 @@
-# Speculative Decoding (EAGLE3) in the vLLM Neuron Framework
+# Speculative Decoding (EAGLE3, DFlash) in the vLLM Neuron Framework
 
 <!-- meta: description: Speculative decoding (EAGLE3) design -->
 <!-- meta: content_type: conceptual-deep-dive -->
@@ -613,3 +613,81 @@ General guidelines:
 **On-device sampling** is the recommended production configuration. Both sampling and rejection happen on the Neuron device, avoiding CPU round-trips. The on-device rejection sampler uses pure tensor operations compatible with `torch.compile`.
 
 **CPU sampling** should only be used when access to raw logits is needed — for example, during accuracy testing, logit validation, or debugging. In this mode, the model returns full logits to CPU, and both bonus token sampling and rejection sampling happen on CPU. The CPU rejection sampler supports the full range of sampling parameters (temperature, top-k, top-p, probabilistic rejection with Gumbel-max recovery).
+
+
+## DFlash
+
+DFlash is a second speculative method sharing most of the EAGLE3 machinery. It
+differs in one respect that shapes the whole design: it is a **parallel**
+drafter. EAGLE3 runs its draft model once per speculative token; DFlash fills
+the entire proposal block in a single non-causal forward pass, so draft cost per
+step is independent of `K`.
+
+### What the drafter is
+
+A small block-diffusion transformer that consumes the target's auxiliary hidden
+states. It carries **no embedding and no LM head** — both are borrowed from the
+target (`DFlashDraftModel.load_target_weights`). A drafter is therefore only
+valid for the target it was trained against, and `DFlashProposer.__init__`
+validates that pairing: hidden size, vocabulary, `num_target_layers`, that the
+requested `target_layer_ids` fit the target's depth, and that
+`num_speculative_tokens == block_size - 1`.
+
+### The proposal block
+
+Each step the drafter is handed one block per request: the bonus token the
+target just accepted, followed by `K` copies of the checkpoint's mask token.
+Attention within the block is **bidirectional** — that is the block-diffusion
+property, and making it causal changes the algorithm rather than just its
+numerics. Prior context is masked causally as usual.
+
+Two consequences for the Neuron implementation:
+
+- The attention backend advertises `supports_non_causal()`, and
+  `gen_attention_decode_mask` accepts an `active_mask` override so the
+  active-token overlay can be all-ones.
+- The block's K/V is **not** written to the cache (`update_cache=False`),
+  because the proposals are unverified. Every query in the block therefore uses
+  the same prior bound — the block's start position — rather than its own
+  position, since the slots at and after that point still hold the previous
+  step's rejected context.
+
+### Where the work happens
+
+Everything that derives the block — bonus-token resolution, rewinding the
+context boundary over rejected tokens, the mask-token block, query positions and
+the attention mask — lives inside `DFlashDraftModel.forward`, not in the
+proposer. This mirrors `EagleProposer.propose`, which likewise does no tensor
+arithmetic: any Python-side op between the target NEFF and the draft NEFF both
+breaks graph capture and serialises the two executables.
+
+### Adding a new target
+
+The framework side is model-agnostic; a new target needs four things, three of
+which are not specific to DFlash at all:
+
+1. Add its `model_type` to `SUPPORTED_TARGET_TYPES` in
+   `vllm_neuron/vllm/spec_decode/dflash.py`.
+2. **Auxiliary hidden state capture.** Capture the residual stream *entering*
+   each requested layer (the output of the previous one), all-gather it
+   alongside `hidden_states` under sequence parallelism, concatenate inside the
+   compile boundary so the target NEFF emits a single tensor, and thread it
+   through every return shape.
+3. **Inherit `SupportsEagle3`** on the `ForCausalLM` class. vLLM's
+   `supports_eagle3()` is an `isinstance()` check against a runtime-checkable
+   Protocol, so defining the methods is not sufficient — the class-level flags
+   come from inheriting it.
+4. **Apply `@async_speculative_decoding`** to the class. The runner unpacks four
+   values from the target in the speculative path; models return three and the
+   decorator's epilogue appends the last-accepted token.
+
+Steps 2-4 are equally the requirements for EAGLE3 support, so a target that
+already supports EAGLE3 needs only step 1.
+
+### Layer-id translation
+
+DFlash checkpoints name their `target_layer_ids` as zero-based decoder
+*outputs*. Neuron captures the residual stream immediately *before* a layer, so
+the output of layer `i` is the boundary before layer `i + 1`.
+`dflash_target_capture_layer_ids` applies that `+1`, matching upstream vLLM's
+own translation.

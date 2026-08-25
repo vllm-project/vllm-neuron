@@ -23,6 +23,11 @@ class NeuronAttentionBackend(AttentionBackend):
     def get_name() -> str:
         return "CUSTOM"
 
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        """The Neuron model path supports decoder-style bidirectional attention."""
+        return True
+
     @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,
