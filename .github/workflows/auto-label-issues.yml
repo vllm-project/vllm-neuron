@@ -225,7 +225,16 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Only apply labels that actually exist in the repo. Referencing a
+          # nonexistent label makes `gh issue edit` fail the whole job (see
+          # e.g. the runs for issues #33 and #51), leaving remaining labels
+          # unapplied and the workflow red.
+          existing_labels=$(gh label list -R ${{ github.repository }} --limit 100 --json name --jq '.[].name')
           IFS=',' read -ra LABELS <<< "${{ steps.analyze_content.outputs.labels }}"
           for label in "${LABELS[@]}"; do
-            gh issue edit ${{ github.event.issue.number }} --add-label "$label" -R ${{ github.repository }}
+            if grep -Fxq "$label" <<< "$existing_labels"; then
+              gh issue edit ${{ github.event.issue.number }} --add-label "$label" -R ${{ github.repository }}
+            else
+              echo "::warning::Skipping label '$label': not defined in ${{ github.repository }}"
+            fi
           done
