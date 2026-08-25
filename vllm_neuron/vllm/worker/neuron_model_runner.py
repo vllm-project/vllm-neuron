@@ -73,6 +73,10 @@ from vllm_neuron.model.neuron_config import (
 )
 from libtorch_neuronx_lite.compile.capture_backend import CaptureComplete
 from vllm_neuron.vllm.sample.rejection_sampler import RejectionSampler
+from vllm_neuron.vllm.spec_decode.dflash import (
+    DFlashProposer,
+    dflash_target_capture_layer_ids,
+)
 from vllm_neuron.vllm.spec_decode.eagle import EagleProposer
 from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE
 from vllm_neuron.utils.bucket_utils import (
@@ -736,6 +740,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Set up speculative decoding.
         self.drafter = None
         self.is_eagle3_spec = False
+        self.is_dflash_spec = False
+        # Drafters fed by target-model auxiliary hidden states (EAGLE3, DFlash).
+        self.is_aux_hidden_spec = False
         self._draft_token_ids = None
         # Async EAGLE3 draft rows by req_id. Only used at batch-composition
         # changes (e.g. several prefills merging into the first bs-wide decode).
@@ -747,7 +754,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # TODO add more spec decode methods
             if self.speculative_config.method == "eagle3":
                 self.is_eagle3_spec = True
+                self.is_aux_hidden_spec = True
                 self.drafter = EagleProposer(
+                    self.vllm_config, self.device, self.on_device_sampling
+                )
+                self.rejection_sampler = RejectionSampler()
+            elif self.speculative_config.method == "dflash":
+                self.is_dflash_spec = True
+                self.is_aux_hidden_spec = True
+                self.drafter = DFlashProposer(
                     self.vllm_config, self.device, self.on_device_sampling
                 )
                 self.rejection_sampler = RejectionSampler()
@@ -1364,7 +1379,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # Explicit call to force all buffers to use meta.
             self.model = self.model.to("meta")
 
-        if self.is_eagle3_spec:
+        if self.is_aux_hidden_spec:
             if supports_eagle3(self.model):
                 # First try to get aux_layers from draft model config, then fall back to model's default
                 aux_layers = self._get_eagle3_aux_layers_from_config()
@@ -1583,6 +1598,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             return None
 
         hf_config = self.speculative_config.draft_model_config.hf_config
+        if self.is_dflash_spec:
+            return dflash_target_capture_layer_ids(hf_config)
+
         if not hasattr(hf_config, "eagle_aux_hidden_state_layer_ids"):
             return None
 
@@ -5897,8 +5915,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         )
 
         # If spec decode enabled, log acceptance stats and propose draft tokens.
-        # aux_hidden_states is None when eagle3 is not active.
-        if self.is_eagle3_spec and aux_hidden_states is not None:
+        # aux_hidden_states is None when no auxiliary-hidden-state drafter
+        # (EAGLE3, DFlash) is active.
+        if self.is_aux_hidden_spec and aux_hidden_states is not None:
             max_position = positions.max().item() if positions.numel() > 0 else 0
             num_spec_tokens = self.drafter.num_speculative_tokens
             # Stop proposing early enough that the scheduler never trims
@@ -7169,9 +7188,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         last_accepted_token: torch.Tensor | None = None
 
         if self.on_device_sampling:
-            if self.is_eagle3_spec:
+            if self.is_aux_hidden_spec:
                 if spec_decode_metadata is not None:
-                    # Eagle3 + spec decode: model returns 4-tuple
+                    # Aux-hidden drafter + spec decode: model returns 4-tuple
                     # (sampled_tokens, aux_hidden_states, gathered_logits,
                     #  last_accepted_token). The fourth element is emitted
                     # by the rejection sampler and is shape [bs] with
@@ -7200,8 +7219,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 else:
                     model_output_tensor = model_output
                 aux_hidden_states = None
-        elif self.is_eagle3_spec:
-            # Eagle3 without ODS: model returns (logits, aux_hidden_states)
+        elif self.is_aux_hidden_spec:
+            # Aux-hidden drafter without ODS: returns (logits, aux_hidden_states)
             model_output_tensor, aux_hidden_states = model_output
         else:
             model_output_tensor = model_output
@@ -8308,7 +8327,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     ) -> list[list[int]] | torch.Tensor:
         # TODO: now only supports EAGLE speculative decoding
         # Add more when needed
-        assert isinstance(self.drafter, EagleProposer)
+        assert isinstance(self.drafter, (EagleProposer, DFlashProposer))
 
         num_reqs = self.input_batch.num_reqs
 
@@ -8604,7 +8623,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self.model.bind_kv_cache(kv_caches)
 
         if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
+            assert isinstance(self.drafter, (EagleProposer, DFlashProposer))
             # This binds the cache tensors to the draft model
             self.drafter.model.bind_kv_cache(kv_caches)
             # validate all draft model layers belong to the same kv cache group
@@ -8671,7 +8690,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             all_kv_cache_specs[layer_name] = spec
 
         if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
+            assert isinstance(self.drafter, (EagleProposer, DFlashProposer))
 
             drafter_kv_spec = self.drafter.model.get_kv_spec()
             for layer in drafter_kv_spec.layers:

@@ -56,13 +56,36 @@ and the way you launch the server are identical on both platforms.
 
 ### Speculative decoding
 
-Llama 3 supports **EAGLE3** speculative decoding. Pair a target checkpoint with
+Llama 3 supports **EAGLE3** and **DFlash** speculative decoding.
+
+#### EAGLE3
+
+Pair a target checkpoint with
 a matching EAGLE3 draft, for example
 [RedHatAI/Llama-3.3-70B-Instruct-speculator.eagle3](https://huggingface.co/RedHatAI/Llama-3.3-70B-Instruct-speculator.eagle3)
 as the draft for `meta-llama/Llama-3.3-70B-Instruct`. Under greedy sampling
 EAGLE3 is a lossless acceleration — the target model's output is unchanged. See
 the [EAGLE3 speculative decoding tutorial](../tutorials/tutorial-eagle3-speculative-decoding-llama-3-1.md)
 for an end-to-end walkthrough and acceptance-rate tuning.
+
+#### DFlash
+
+DFlash proposes a whole block of tokens in one non-causal pass rather than
+one token at a time, so the draft cost per step does not grow with the
+number of speculative tokens. Llama 3.1 is dense, which makes verifying a
+block nearly as cheap as verifying a single token.
+
+Measured on a single Trn2 chip at TP4, BF16:
+
+| | baseline | DFlash |
+|---|---|---|
+| Output tok/s, concurrency 1 | 39.0 | **121.5** (3.11x) |
+| Output tok/s, concurrency 4 | 151.2 | **184.2** (1.22x) |
+| Mean accepted length | 1.0 | 3.2 of 10 |
+
+See the [DFlash example](../../examples/vllm_neuron/models/llama3/dflash/README.md)
+for the full command. Note the drafter's proposal block is 10, so it requires
+`num_speculative_tokens=9`.
 
 ## Features
 
