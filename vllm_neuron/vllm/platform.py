@@ -174,9 +174,73 @@ class NeuronPlatform(Platform):
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
         """Default block_size to 32 for Neuron when the user didn't override."""
         cache_config = vllm_config.cache_config
-        if cache_config.user_specified_block_size:
+        if not cache_config.user_specified_block_size:
+            cache_config.block_size = 32
+        cls._align_hybrid_page_sizes(vllm_config)
+
+    # Neuron's default KV block size, and the only kernel block alignment the
+    # plugin's attention paths assume.
+    _KERNEL_BLOCK_ALIGNMENT = 32
+
+    @classmethod
+    def _align_hybrid_page_sizes(cls, vllm_config: "VllmConfig") -> None:
+        """Reconcile attention and recurrent-state page sizes for hybrid models.
+
+        Hybrid models (Qwen3.5: 18 gated-DeltaNet layers + 6 attention) put the
+        two kinds of layer in separate KV cache groups, and
+        ``unify_kv_cache_spec_page_size`` requires every group's page size to
+        divide the largest. A DeltaNet state page is 271360 bytes per rank while
+        an attention page is ``block_size * 1024``, and 271360 factors as
+        ``1024 * 5 * 53`` -- so no sane block size divides it and startup fails
+        with "Cannot unify by adjusting block_size".
+
+        vLLM solves this in ``Platform._align_hybrid_block_size``: grow the
+        attention block size until its page is at least as large as the state
+        page, then pad the state page to match exactly. **That never runs on the
+        Neuron path** -- vLLM gates it on ``_find_non_ssm_backend`` finding one of
+        its own attention backends, and this platform registers none. So call it
+        directly, with a stub backend supplying the one thing it reads.
+
+        Reusing vLLM's implementation rather than reimplementing it matters
+        because the same helper also sizes the state *pages* the planner
+        allocates; the two have to agree exactly, and a second copy of the
+        arithmetic is a silent memory-aliasing bug waiting to happen.
+        """
+        model_config = vllm_config.model_config
+        if model_config is None or not getattr(model_config, "is_hybrid", False):
             return
-        cache_config.block_size = 32
+
+        from vllm.v1.attention.backend import MultipleOf
+
+        class _BlockAlignmentOnlyBackend:
+            """The slice of the AttentionBackend interface vLLM reads here."""
+
+            @staticmethod
+            def get_supported_kernel_block_sizes():
+                return [MultipleOf(cls._KERNEL_BLOCK_ALIGNMENT)]
+
+            @staticmethod
+            def get_name() -> str:
+                return "neuron"
+
+        before = (
+            vllm_config.cache_config.block_size,
+            vllm_config.cache_config.mamba_page_size_padded,
+        )
+        super()._align_hybrid_block_size(vllm_config, _BlockAlignmentOnlyBackend)
+        after = (
+            vllm_config.cache_config.block_size,
+            vllm_config.cache_config.mamba_page_size_padded,
+        )
+        if before != after:
+            logger.info(
+                "Hybrid model: block_size %s -> %s, mamba_page_size_padded "
+                "%s -> %s so the attention and state page sizes match",
+                before[0],
+                after[0],
+                before[1],
+                after[1],
+            )
 
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:
@@ -202,6 +266,28 @@ class NeuronPlatform(Platform):
         if vllm_config.optimization_level == OptimizationLevel.O2:
             vllm_config.optimization_level = OptimizationLevel.O1
             logger.info("Defaulting optimization level to O1 on Neuron")
+
+    @classmethod
+    def _multimodal_inputs_enabled(cls, model_config) -> bool:
+        """False when every modality's per-prompt limit is 0.
+
+        A vision-capable checkpoint can legitimately be served text-only, and
+        for a hybrid model that is the common case: the recurrent state pages
+        are sized off ``max_model_len``, so paying for vision buckets a request
+        can never use is pure waste. ``limit_mm_per_prompt={"image": 0,
+        "video": 0}``
+        is how that is expressed, and vision bucket resolution should then be
+        skipped entirely rather than validated against a text-sized
+        ``max_model_len``.
+        """
+        mm_config = getattr(model_config, "multimodal_config", None)
+        if mm_config is None:
+            return False
+        limits = getattr(mm_config, "limit_per_prompt", None) or {}
+        # vLLM normalises the raw ints into per-modality ``BaseDummyOptions``
+        # (which also carry profiling hints), so read ``.count`` when present.
+        counts = [int(getattr(limit, "count", limit)) for limit in limits.values()]
+        return not (counts and all(count == 0 for count in counts))
 
     @classmethod
     def _resolve_vision_auto_config(
@@ -386,7 +472,14 @@ class NeuronPlatform(Platform):
         # already prevents overflow without needing this flag.
 
         if hasattr(model_config.hf_config, "vision_config"):
-            cls._resolve_vision_auto_config(vllm_config, model_config)
+            if cls._multimodal_inputs_enabled(model_config):
+                cls._resolve_vision_auto_config(vllm_config, model_config)
+            else:
+                logger.info(
+                    "All multimodal per-prompt limits are 0: skipping vision "
+                    "bucket resolution and serving %s text-only",
+                    model_config.architecture,
+                )
 
         # Compute per-image embed limit for request validation.
         # Buckets are in raw-token space; mm_pos.length is in embed space.
