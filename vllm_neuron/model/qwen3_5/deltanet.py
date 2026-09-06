@@ -69,6 +69,7 @@ def _segment_shard_loader(
     segment_sizes: tuple[int, ...],
     num_shards: int,
     *,
+    segment_shards: tuple[int, ...] | None = None,
     is_storage_transposed: bool,
     squeeze_dim: int | None = None,
 ) -> SafetensorsWeightLoader:
@@ -76,14 +77,21 @@ def _segment_shard_loader(
 
     Args:
         segment_sizes: Global size of each segment along the checkpoint's dim 0.
-            Every entry must divide ``num_shards``.
         num_shards: TP world size.
+        segment_shards: How many distinct shards each segment is cut into.
+            Defaults to ``num_shards`` for every segment. A segment given fewer
+            shards than the world is *replicated*: ``num_shards // shards``
+            consecutive ranks receive the same slice. That is what lets a
+            segment whose head count is smaller than the world still be loaded
+            -- see the replication note in ``Qwen3_5GatedDeltaNet.__init__``.
         is_storage_transposed: Transpose the result, for the plugin's
             ``[in_features, out_features]`` parameter layout.
         squeeze_dim: Drop this dim after slicing. ``conv1d.weight`` is
             ``[conv_dim, 1, kernel]`` and the singleton input-channel dim is
             not wanted.
     """
+    if segment_shards is None:
+        segment_shards = (num_shards,) * len(segment_sizes)
 
     def transform(slices: list, rank: int) -> torch.Tensor:
         assert len(slices) == 1, "_segment_shard_loader() takes a single tensor"
@@ -92,9 +100,10 @@ def _segment_shard_loader(
 
         parts = []
         offset = 0
-        for size in segment_sizes:
-            per_rank = size // num_shards
-            start = offset + (rank % num_shards) * per_rank
+        for size, shards in zip(segment_sizes, segment_shards):
+            per_rank = size // shards
+            replicas = num_shards // shards
+            start = offset + ((rank % num_shards) // replicas) * per_rank
             sel = [slice(None)] * ndim
             sel[0] = slice(start, start + per_rank)
             parts.append(slice_obj[tuple(sel)])
@@ -560,16 +569,37 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         self.head_k_dim = config.linear_key_head_dim
         self.head_v_dim = config.linear_value_head_dim
+        # A rank cannot hold a fraction of a head, so once the world is wider
+        # than a head count the heads are *replicated*: ``world_size // heads``
+        # consecutive ranks share one key head while each still carries its own
+        # value heads. Only the value dimension has to shard cleanly, because
+        # ``out_proj`` is row-parallel over it and the tp all-reduce sums the
+        # per-rank partial products; q and k are pure inputs to the recurrence,
+        # so duplicating them costs a few hundred KB per layer and changes no
+        # arithmetic -- the per-rank shapes come out identical to a legal
+        # narrower world, which is why the forward path needs no change.
+        # 397B-A17B needs this at world_size 32 (16 key heads, 2-way) and 64
+        # (4-way, with value heads landing at exactly one per rank).
+        global_k_heads = config.linear_num_key_heads
+        global_v_heads = config.linear_num_value_heads
         for name, heads in (
-            ("linear_num_key_heads", config.linear_num_key_heads),
-            ("linear_num_value_heads", config.linear_num_value_heads),
+            ("linear_num_key_heads", global_k_heads),
+            ("linear_num_value_heads", global_v_heads),
         ):
-            if heads % self.world_size:
+            if max(heads, self.world_size) % min(heads, self.world_size):
                 raise ValueError(
-                    f"{name}={heads} must be divisible by tp_size={self.world_size}"
+                    f"{name}={heads} and tp_size={self.world_size} must divide one "
+                    f"another; neither sharding nor replication applies"
                 )
-        self.num_k_heads = config.linear_num_key_heads // self.world_size
-        self.num_v_heads = config.linear_num_value_heads // self.world_size
+        if global_v_heads < self.world_size:
+            raise NotImplementedError(
+                f"tp_size={self.world_size} exceeds linear_num_value_heads="
+                f"{global_v_heads}; replicating value heads would make out_proj's "
+                f"row shards overlap and the tp all-reduce would double-count them."
+            )
+        self.k_replicas = max(1, self.world_size // global_k_heads)
+        self.num_k_heads = max(1, global_k_heads // self.world_size)
+        self.num_v_heads = global_v_heads // self.world_size
         if self.num_v_heads % self.num_k_heads:
             raise ValueError(
                 f"per-rank value heads ({self.num_v_heads}) must be a multiple of "
@@ -597,9 +627,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.conv_dim = 2 * self.key_dim + self.value_dim
         self.qkv_split = (self.key_dim, self.key_dim, self.value_dim)
 
-        global_key_dim = config.linear_num_key_heads * self.head_k_dim
-        global_value_dim = config.linear_num_value_heads * self.head_v_dim
-        global_v_heads = config.linear_num_value_heads
+        global_key_dim = global_k_heads * self.head_k_dim
+        global_value_dim = global_v_heads * self.head_v_dim
+        # The q and k segments of ``in_proj_qkv``/``conv1d`` are cut into as many
+        # shards as there are key heads, and replicated across the rest.
+        qkv_segment_shards = (
+            self.world_size // self.k_replicas,
+            self.world_size // self.k_replicas,
+            self.world_size,
+        )
 
         self.in_proj_qkv_weight = nn.Parameter(
             torch.empty(self.hidden_size, self.conv_dim, dtype=self.dtype)
@@ -640,6 +676,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             _segment_shard_loader(
                 (global_key_dim, global_key_dim, global_value_dim),
                 self.world_size,
+                segment_shards=qkv_segment_shards,
                 is_storage_transposed=True,
             ),
         )
@@ -661,6 +698,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             _segment_shard_loader(
                 (global_key_dim, global_key_dim, global_value_dim),
                 self.world_size,
+                segment_shards=qkv_segment_shards,
                 is_storage_transposed=False,
                 squeeze_dim=1,
             ),
@@ -1006,11 +1044,27 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         qkv, z, beta, g = self._project(hidden_states)
         read_idx, write_idx = self.state_indices(metadata, num_reqs)
 
-        # Depthwise conv as a single fused window: the cached tail plus this
-        # token, contracted against the kernel.
+        # Depthwise conv over the cached tail plus this token, unrolled tap by
+        # tap exactly as ``_causal_conv`` does for prefill.
+        #
+        # The compact form — build the ``[reqs, kernel, conv_dim]`` window with
+        # one ``cat`` and contract it against a broadcast kernel,
+        # ``(window * self.conv1d_weight.t()).sum(dim=1)`` — is what this used to
+        # be, and neuronx-cc fails codegen on it: ``[INTERNAL_ERROR]
+        # [NCC_ILSA901] LegalizeSundaAccess assertion error: Unexpected free
+        # aps`` on the multiply whose operand is the concatenate, at every
+        # optlevel. It only shows up once ``conv_dim`` drops to 512, i.e. at
+        # world_size 32 and above on 397B-A17B, which is why 2B/27B/35B never hit
+        # it. Unrolled there is no rank-3 intermediate and no concatenate feeding
+        # a broadcast multiply, and the summation order is unchanged.
         conv_prev, state = self._read_states(read_idx)
-        conv_window = torch.cat([conv_prev.to(qkv.dtype), qkv.unsqueeze(1)], dim=1)
-        mixed = F.silu((conv_window * self.conv1d_weight.t()).sum(dim=1))
+        conv_prev = conv_prev.to(qkv.dtype)
+        w = self.conv1d_weight
+        last = self.conv_kernel_size - 1
+        mixed = conv_prev[:, 0] * w[:, 0]
+        for tap in range(1, last):
+            mixed = mixed + conv_prev[:, tap] * w[:, tap]
+        mixed = F.silu(mixed + qkv * w[:, last])
 
         q, k, v = self._split_heads(mixed, (num_reqs,))
         core, new_state = recurrent_gated_delta_rule_step(
@@ -1023,7 +1077,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         # Both states go back in one write, so the conv update waits for the
         # recurrence. Nothing reads either state in between.
-        self._write_states(write_idx, conv_window[:, 1:], new_state)
+        self._write_states(
+            write_idx,
+            torch.cat([conv_prev[:, 1:], qkv.unsqueeze(1)], dim=1),
+            new_state,
+        )
 
         output = self._output(core, z, num_reqs)
         if self.world_size > 1:

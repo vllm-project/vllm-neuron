@@ -196,12 +196,23 @@ class Qwen3_5Attention(nn.Module):
 
         num_heads = config.num_attention_heads
         num_kv_heads = config.num_key_value_heads
-        if num_heads % self.world_size:
+        if max(num_heads, self.world_size) % min(num_heads, self.world_size):
             raise ValueError(
-                f"num_attention_heads={num_heads} must be divisible by "
-                f"tp_size={self.world_size}"
+                f"num_attention_heads={num_heads} and tp_size={self.world_size} "
+                f"must divide one another; neither sharding nor replication applies"
             )
-        self.num_heads_per_rank = num_heads // self.world_size
+        # Once the world is wider than the head count, whole query heads are
+        # *replicated*: ``world_size // num_heads`` ranks each recompute the same
+        # head, and the split moves into ``o_proj``, which is row-parallel over
+        # ``head_dim`` and so shards to ``num_heads * head_dim // world_size``
+        # rows on every rank regardless. Each of those ranks then feeds o_proj
+        # only its own slice of the head's output (``_finish``), and the existing
+        # tp all-reduce sums the partial products -- exactly the arithmetic a
+        # narrower world does, just cut one level finer. Duplicating q/k/v/norms
+        # costs a few MB per layer. 397B-A17B needs this at world_size 64: 32
+        # query heads, 2 ranks each.
+        self.q_replicas = max(1, self.world_size // num_heads)
+        self.num_heads_per_rank = max(1, num_heads // self.world_size)
         if self.world_size >= num_kv_heads:
             self.num_kv_heads_per_rank = 1
             self.num_kv_replicas = self.world_size // num_kv_heads
@@ -213,6 +224,10 @@ class Qwen3_5Attention(nn.Module):
         # q_proj emits [query | gate] per head, hence the factor of two.
         self.q_size = self.num_heads_per_rank * self.head_dim
         self.kv_size = self.num_kv_heads_per_rank * self.head_dim
+        # o_proj's row count, and this rank's window into the attention output.
+        # Equal to ``q_size`` unless query heads are replicated.
+        self.o_size = self.q_size // self.q_replicas
+        self.o_offset = (self.rank % self.q_replicas) * self.o_size
 
         self.q_proj_weight = nn.Parameter(
             torch.empty(self.hidden_size, 2 * self.q_size, dtype=self.dtype)
@@ -224,7 +239,7 @@ class Qwen3_5Attention(nn.Module):
             torch.empty(self.hidden_size, self.kv_size, dtype=self.dtype)
         )
         self.o_proj_weight = nn.Parameter(
-            torch.empty(self.q_size, self.hidden_size, dtype=self.dtype)
+            torch.empty(self.o_size, self.hidden_size, dtype=self.dtype)
         )
         self.q_norm = Qwen3_5RMSNorm(self.head_dim, self.rms_norm_eps, self.dtype)
         self.k_norm = Qwen3_5RMSNorm(self.head_dim, self.rms_norm_eps, self.dtype)
@@ -237,14 +252,17 @@ class Qwen3_5Attention(nn.Module):
 
         # Each head contributes a contiguous 2 * head_dim block to q_proj, so
         # sharding its output dim by whole heads keeps query and gate together.
+        q_loader = sharding_weight_loader(
+            shard_dim=1,
+            shard_size=2 * self.q_size,
+            num_shards=self.world_size // self.q_replicas,
+            is_storage_transposed=True,
+        )
         set_weight_loader(
             self.q_proj_weight,
-            sharding_weight_loader(
-                shard_dim=1,
-                shard_size=2 * self.q_size,
-                num_shards=self.world_size,
-                is_storage_transposed=True,
-            ),
+            q_loader
+            if self.q_replicas == 1
+            else with_rank_override(q_loader, self.rank // self.q_replicas),
         )
         # Replicated KV: several ranks share one KV head, so the shard index is
         # the KV head this rank's queries attend to, not the TP rank.
@@ -257,11 +275,14 @@ class Qwen3_5Attention(nn.Module):
         kv_shard = self.rank // self.num_kv_replicas
         for param in (self.k_proj_weight, self.v_proj_weight):
             set_weight_loader(param, with_rank_override(kv_loader, kv_shard))
+        # ``num_heads * head_dim`` rows split contiguously across the world. With
+        # replicated query heads that lands each of a head's replica ranks on a
+        # different ``o_size`` window of that head's rows, matching ``o_offset``.
         set_weight_loader(
             self.o_proj_weight,
             sharding_weight_loader(
                 shard_dim=0,
-                shard_size=self.q_size,
+                shard_size=self.o_size,
                 num_shards=self.world_size,
                 is_storage_transposed=True,
             ),
@@ -348,6 +369,10 @@ class Qwen3_5Attention(nn.Module):
     def _finish(self, attn_output: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """Gate by ``sigmoid(gate)``, then the row-parallel output projection."""
         attn_output = attn_output * torch.sigmoid(gate.float()).to(attn_output.dtype)
+        if self.q_replicas > 1:
+            # Gate first, then narrow: the gate spans the whole (replicated) head
+            # and only the product is split between the head's replica ranks.
+            attn_output = attn_output[:, self.o_offset : self.o_offset + self.o_size]
         return attn_output @ self.o_proj_weight
 
     def forward(

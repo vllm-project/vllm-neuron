@@ -2,10 +2,9 @@
 
 Support for **Qwen3.5-2B** and **Qwen3.5-27B** (dense, via
 `Qwen3_5ForConditionalGeneration`) and **Qwen3.5-35B-A3B** (sparse, via
-`Qwen3_5MoeForConditionalGeneration`). **Qwen3.5-397B-A17B** declares the same
-sparse architecture and needs no code of its own, but it has not been run: its
-weights do not fit on the 4-core instance this was developed on. What it would
-take is under *Expert parallelism* below.
+`Qwen3_5MoeForConditionalGeneration`), and **Qwen3.5-397B-A17B** (sparse, 512
+experts top-10) on a trn2.48xlarge at `world_size = 64, ep_degree = 8`. Sizing and
+the constraints that fix that layout are under *Expert parallelism* below.
 
 Qwen3.5 is a *hybrid* decoder. Most layers are gated DeltaNet, a linear
 recurrence carrying a fixed-size state, and the rest are ordinary full
@@ -16,6 +15,7 @@ attention:
 | Qwen3.5-2B | 24 | 18 | 6 | 2048 | 16 / 2 | 128 |
 | Qwen3.5-27B | 64 | 48 | 16 | 5120 | 24 / 4 | 256 |
 | Qwen3.5-35B-A3B | 40 | 30 | 10 | 2048 | 16 / 2 | 256 |
+| Qwen3.5-397B-A17B | 60 | 45 | 15 | 4096 | 32 / 2 | 256 |
 
 That makes it the first model in this plugin to need **two KV cache groups** —
 one paged group for the attention layers and one recurrent group whose "blocks"
@@ -44,6 +44,15 @@ python examples/vllm_neuron/models/qwen3_5/run.py \
 python examples/vllm_neuron/models/qwen3_5/run.py \
     --model <path-to-checkpoint>/Qwen3.5-35B-A3B \
     --gpu-memory-utilization 0.72 --expert-parallel --ep-degree 2
+
+# 397B-A17B, on a whole trn2.48xlarge. All four settings are required: 64 ranks
+# to fit the weights, ep_degree=8 to make 64 legal, the memory cap so the KV
+# planner leaves room for activations, and a patched nkilib for top-k > 8.
+# See *Expert parallelism*.
+python examples/vllm_neuron/models/qwen3_5/run.py \
+    --model <path-to-checkpoint>/Qwen3.5-397B-A17B \
+    --tensor-parallel-size 64 --expert-parallel --ep-degree 8 \
+    --gpu-memory-utilization 0.7
 ```
 
 `enable_prefix_caching` must stay off (see *Known limitations*).
@@ -158,29 +167,58 @@ What it does is make a wide `world_size` **legal**, which is the only reason it 
 here:
 
 ```
-397B-A17B, bf16, 389.5 B text parameters = 725 GiB
+397B-A17B, bf16, text-only weights = 738.25 GiB (measured: the 751.39 GiB
+checkpoint less the vision tower and the MTP head)
 
 world_size   attention (32 q heads)   I/tp_degree, pure TP   weights/rank
-     8       ok                       128  ok                90.7 GiB
-    16       ok                        64  fails             45.3 GiB
-    32       ok                        32  fails             22.7 GiB
-    64       fails (32 % 64)           16  fails             11.3 GiB
+     8       ok                       128  ok                92.3 GiB
+    16       ok                        64  fails             46.1 GiB
+    32       ok                        32  fails             23.1 GiB
+    64       replicated, 2 ranks/head  16  fails             11.5 GiB
 ```
 
 The fused decode kernel needs `moe_intermediate_size / tp_degree` to be a multiple
-of 128, which caps *pure TP* at 8 ranks; 725 GiB needs at least 31 of this
-device's 24 GiB cores. Empty intersection. EP breaks it — at
-`world_size = 32, ep_degree = 4, tp_degree = 8` every guard passes — which also
+of 128, which caps *pure TP* at 8 ranks; 738 GiB needs at least 32 of this
+device's cores, whose usable ceiling is **23.50 GiB** each (a hard partition — the
+other three cores of a 96 GB device being idle does not raise it). Empty
+intersection. EP breaks it — at
+`world_size = 64, ep_degree = 8, tp_degree = 8` every guard passes — which also
 gives the rule to size by: **take the smallest `ep_degree` that clears the 128
 rule, not the largest**, since per-rank work and the number of graphs to compile
 both grow with it while footprint does not. The block logs a warning if you leave
 the degree at the world size and something smaller would do.
 
-397B-A17B has not been run. At `world_size = 32` its weights are 22.7 of each
-core's 24 GiB, so it configures on half a trn2.48xlarge with little room for KV;
-using all 64 cores needs experts sharded across data-parallel replicas, which this
-block does not do — it reduces over the tensor-parallel group only, and raises
-rather than silently dropping off-replica tokens.
+**397B-A17B runs at `world_size = 64, ep_degree = 8`** (so `tp_degree = 8`), which
+is the only layout that fits: at 32 its 23.1 GiB/rank leaves ~0.4 GiB of the 23.50
+GiB core for KV and activations. 64 ranks is wider than its 32 query heads and its
+16 DeltaNet key heads, so those are *replicated* — see the replication notes in
+`Qwen3_5Attention.__init__` and `Qwen3_5GatedDeltaNet.__init__`; only a dimension a
+row-parallel projection reduces over has to shard cleanly, because the tp
+all-reduce sums the per-rank partial products. Measured: **11.93 GiB used / 12.07
+GiB free per rank**, engine init 640 s of which 633 s is compilation, correct
+greedy output.
+
+Two things it needs from the caller, neither of which the defaults give:
+
+- **`--gpu-memory-utilization 0.7`.** The KV budget is `core capacity * gmu -
+  weights` and the planner spends all of it, which for a hybrid model means
+  recurrent-state blocks far past `max_num_seqs` — at the default, ~4825 blocks
+  for a 4-sequence run, and `neuronx-cc` rejects the graph with `[NCC_EVRF009] ...
+  Needed 27,029,780,748 bytes (25 GB) vs. available 25,769,803,776 bytes (24 GB)`.
+  The budget does not count the ~4.7 GB of activations, so leave that headroom.
+- **A patched `nkilib`.** `nkilib.core.router_topk.router_topk` hard-caps top-k at
+  8 (`nisa.max8` / `nisa.nc_find_index8` are 8-per-pass DVE instructions), and
+  397B-A17B routes top-10, so the fused decode kernel `moe_block_tkg` cannot serve
+  it as shipped. A `ceil(k/8)`-pass cascade over a scratch SBUF copy, erasing each
+  pass's winners with `nisa.nc_match_replace8(imm=-inf)` — the idiom
+  `vendored_kernels/rotational_topk` already uses — lifts it, and matches
+  `nkilib`'s own torch reference at K=10 and K=16 to the same 0.007 relative error
+  as the untouched K=8 path. That fix belongs in `nkilib`, not here, and has been
+  reported; it is not part of this branch.
+
+Spreading experts across *data-parallel replicas* is still not supported — this
+block reduces over the tensor-parallel group only, and raises rather than silently
+dropping off-replica tokens.
 
 ## Measured
 
@@ -368,10 +406,12 @@ Stated plainly rather than left to be discovered:
 - **Experts cannot span data-parallel replicas.** `ep_degree > 1` with
   `data_parallel_size > 1` raises: this block reduces over the tensor-parallel
   group only, so tokens routed off-replica would be dropped silently rather than
-  loudly. That is what would be needed to spread 397B-A17B over all 64 cores of a
-  trn2.48xlarge instead of 32.
-- **397B-A17B is untested.** It configures — same architecture, no code of its own
-  — and the sizing is above, but nothing here has run it.
+  loudly. 397B-A17B does not need it: expert parallelism alone reaches all 64
+  cores of a trn2.48xlarge.
+- **397B-A17B has functional validation only** — correct greedy output at
+  `world_size = 64`, no latency, throughput or per-token HF comparison. It also
+  needs a patched `nkilib` for top-k > 8 and `--gpu-memory-utilization 0.7`; both
+  are under *Expert parallelism*.
 
 ## Attribution
 

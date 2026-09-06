@@ -23,6 +23,13 @@ Usage (2B, on a trn2.3xlarge: 4 logical NeuronCores, so TP=4 is the ceiling):
         --model <path-to-checkpoint>/Qwen3.5-35B-A3B \
         --gpu-memory-utilization 0.72
 
+    # 397B-A17B (sparse), on all 64 logical cores of a trn2.48xlarge. Every one
+    # of these is required; README.md, *Expert parallelism*, says why.
+    python examples/vllm_neuron/models/qwen3_5/run.py \
+        --model <path-to-checkpoint>/Qwen3.5-397B-A17B \
+        --tensor-parallel-size 64 --expert-parallel --ep-degree 8 \
+        --gpu-memory-utilization 0.7
+
 This demo is text-only. The vision-language path (``model/qwen3_5/vl.py``,
 which reuses the Qwen3-VL encoder) is selected by passing a
 ``vision_neuron_config``; see ``check_generation_vs_hf.py --vl``.
@@ -60,6 +67,56 @@ def mac_threshold_override(model: str) -> dict:
     if getattr(text_config, "num_experts", None):
         return {}
     return {"hlo2tensorizer_options": ""}
+
+
+def relax_head_divisibility() -> None:
+    """Let the world be wider than the model's attention-head count.
+
+    ``ModelConfig.verify_with_parallel_config`` rejects
+    ``total_num_attention_heads % tensor_parallel_size != 0`` outright, so a
+    32-head model cannot be given 64 ranks even though nothing about the model
+    requires one head per rank. vLLM already replicates in the analogous case
+    one line away -- ``get_num_kv_heads`` is ``max(1, total // tp)``, explicitly
+    "so each GPU has at least one KV head" -- it is only the *query* head count
+    that is checked for exact divisibility.
+
+    Qwen3.5-397B-A17B needs 64 ranks to fit its weights (738 GiB of text-only
+    parameters against a hard 23.5 GiB per logical core) and has 32 query heads,
+    so this check, not any hardware or model limit, is what stands between the
+    checkpoint and the machine. The modules replicate the affected heads across
+    ``tp // heads`` consecutive ranks -- see the replication notes in
+    ``Qwen3_5Attention.__init__`` and ``Qwen3_5GatedDeltaNet.__init__``; only
+    dimensions a row-parallel projection reduces over have to shard cleanly.
+
+    Relaxed only in the direction that is safe: the world must be a whole
+    multiple of the head count, which is what makes every rank's shape identical
+    to that of a legal narrower world. ``get_num_attention_heads`` would return
+    0 here, so it is given the same ``max(1, ...)`` as its kv-head sibling; on
+    Neuron nothing reads it (every consumer in this vLLM is a GPU/ROCm/CPU
+    attention backend), but returning 0 from a head count is a trap either way.
+    """
+    from vllm.config.model import ModelConfig
+
+    original_verify = ModelConfig.verify_with_parallel_config
+
+    def verify(self, parallel_config):
+        arch = self.model_arch_config
+        heads, tp = arch.total_num_attention_heads, parallel_config.tensor_parallel_size
+        if heads and tp > heads and tp % heads == 0:
+            # Present a count the check accepts, for the duration of the check.
+            try:
+                arch.total_num_attention_heads = tp
+                return original_verify(self, parallel_config)
+            finally:
+                arch.total_num_attention_heads = heads
+        return original_verify(self, parallel_config)
+
+    def get_num_attention_heads(self, parallel_config):
+        heads = self.model_arch_config.total_num_attention_heads
+        return max(1, heads // parallel_config.tensor_parallel_size)
+
+    ModelConfig.verify_with_parallel_config = verify
+    ModelConfig.get_num_attention_heads = get_num_attention_heads
 
 
 def ep_neuron_config(args) -> dict:
@@ -126,6 +183,8 @@ def main() -> None:
         extra["optimization_level"] = OptimizationLevel(args.optlevel)
     if args.expert_parallel:
         extra["enable_expert_parallel"] = True
+    if args.tensor_parallel_size > 1:
+        relax_head_divisibility()
 
     llm = LLM(
         model=args.model,
