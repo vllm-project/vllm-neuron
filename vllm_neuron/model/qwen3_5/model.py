@@ -846,6 +846,10 @@ class Qwen3_5ForCausalLM(nn.Module, SupportsMRoPE):
 
     def get_kv_spec(self) -> KVSpec:
         """Report both kinds of layer: paged KV for attention, state for DeltaNet."""
+        from vllm.model_executor.layers.mamba.mamba_utils import (
+            MambaStateShapeCalculator,
+        )
+
         layers: list[LayerSpec] = []
         recurrent: list[RecurrentLayerSpec] = []
         for layer in self.language_model.layers:
@@ -854,7 +858,26 @@ class Qwen3_5ForCausalLM(nn.Module, SupportsMRoPE):
                 recurrent.append(
                     RecurrentLayerSpec(
                         name=mixer.layer_name,
-                        shapes=self.text_config.state_shapes(self.world_size),
+                        # Keep the temporal shape the config derives, but report
+                        # the conv width the mixer actually uses.
+                        # ``state_shapes()`` shards ``conv_dim`` by the world
+                        # size, while the mixer shards it by its own -- smaller
+                        # -- count whenever the linear key heads cannot divide
+                        # the world (e.g. 16 key heads over 64 ranks).  The
+                        # model itself never notices, because it reads and
+                        # writes the same offsets, but a KV connector registers
+                        # the widths reported here, so a mismatch makes
+                        # disaggregated serving transfer the recurrent state
+                        # shifted and truncated: the first request after a
+                        # decode-role restart is correct, every later one
+                        # decodes garbage.
+                        shapes=(
+                            MambaStateShapeCalculator._orient_conv_shape(
+                                mixer.conv_dim,
+                                mixer.conv_kernel_size - 1,
+                            ),
+                            self.text_config.state_shapes(self.world_size)[1],
+                        ),
                         dtypes=self.text_config.state_dtypes(),
                     )
                 )

@@ -213,6 +213,15 @@ class Qwen3_5TextConfig:
         ``(4, 128, 128)``: the 16 value heads shard 4-per-rank, and only
         ``kernel - 1`` conv columns are carried between steps because the current
         token supplies the last one.
+
+        ``tp_size`` caveat: this shards ``conv_dim`` by ``tp_size``, which is only
+        the width the mixer uses when the linear *key* heads also divide
+        ``tp_size``. They do not at world=64 (16 key heads), where the mixer
+        shards by its own smaller count and ends up with twice this conv width.
+        The recurrent half is unaffected. Callers that report these shapes to
+        something outside the model -- a KV connector registers them, and then
+        transfers exactly this many bytes -- must use the mixer's own dims
+        instead; see ``Qwen3_5.get_kv_spec``.
         """
         from vllm.model_executor.layers.mamba.mamba_utils import (
             MambaStateShapeCalculator,
