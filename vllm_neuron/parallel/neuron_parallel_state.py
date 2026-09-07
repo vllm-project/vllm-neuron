@@ -134,6 +134,34 @@ for _row_idx, _row in enumerate(_TRN2_MESH):
         _TRN2_RANK_TO_ROW[_rank] = _row_idx
 
 
+# The mesh above, as arithmetic. Needed because the tables cannot be consulted
+# from inside a traced graph at all: the rank the model runner passes down is a
+# 0-d tensor (``neuron_model_runner.py``: ``torch.tensor(tp_rank, ...)``), and
+#   * ``table_tensor[rank]`` is *basic* indexing -- torch must turn the tensor
+#     into a Python int, which under dynamo means reading data it cannot see, so
+#     tracing dies with "Could not extract specialized integer from
+#     data-dependent expression u0";
+#   * rewriting it as a gather trades that for "Please convert all Tensors to
+#     FakeTensors first", because the ``torch.tensor(table)`` constant is a real
+#     tensor meeting a FakeTensor.
+# Pure integer arithmetic on ``rank`` has neither problem and works unchanged for
+# Python ints. The structure it encodes: each group of 16 ranks fills two mesh
+# rows, in quads -- quad 0 -> row 0 cols 0-3, quad 1 -> row 1 cols 0-3, quad 2 ->
+# row 1 cols 4-7, quad 3 -> row 0 cols 4-7. ``_TRN2_MESH`` stays the definition
+# of record and the assertion below holds these two to it.
+def _mesh_col(rank):
+    return (rank % 4) + 4 * ((rank % 16) // 4 // 2)
+
+
+def _mesh_row(rank):
+    return 2 * (rank // 16) + (((rank % 16) // 4 + 1) // 2) % 2
+
+
+for _r in range(64):
+    assert _mesh_col(_r) == _TRN2_RANK_TO_COL[_r], _r
+    assert _mesh_row(_r) == _TRN2_RANK_TO_ROW[_r], _r
+
+
 def rank_to_col(rank, row_size: int, world_size: int):
     """Map a global rank to its column position (EP-TP local rank) in the 2D mesh.
 
@@ -147,10 +175,7 @@ def rank_to_col(rank, row_size: int, world_size: int):
         import torch
 
         if isinstance(rank, torch.Tensor):
-            col_map = torch.tensor(
-                _TRN2_RANK_TO_COL, dtype=torch.int32, device=rank.device
-            )
-            return col_map[rank.long()]
+            return _mesh_col(rank)
         return _TRN2_RANK_TO_COL[rank]
     return rank % row_size
 
@@ -168,10 +193,7 @@ def rank_to_row(rank, row_size: int, world_size: int):
         import torch
 
         if isinstance(rank, torch.Tensor):
-            row_map = torch.tensor(
-                _TRN2_RANK_TO_ROW, dtype=torch.int32, device=rank.device
-            )
-            return row_map[rank.long()]
+            return _mesh_row(rank)
         return _TRN2_RANK_TO_ROW[rank]
     return rank // row_size
 

@@ -167,6 +167,15 @@ class NeuronConfig:
     # for the packed layout (currently GPT-OSS and Llama3, incl. Eagle3) support
     # it; left off by default so other models keep the standard 4-D FP8 cache.
     fp8_packed_kv: bool = False
+    # Override for the extra ``--internal-hlo2tensorizer-options`` the runner
+    # passes to neuronx-cc. ``None`` keeps the default
+    # ``--modular-flow-mac-threshold=10``, which exists only because NKI kernels
+    # do not yet report MAC counts. Set ``""`` to pass no extra options, which
+    # is what a model built entirely from torch ops wants: the threshold makes
+    # neuronx-cc fail codegen on some such graphs (Qwen3.5's decode graph hits
+    # NCC_IBTN006, a pftranspose whose copy fails backend verification).
+    # The fp8 cast flag is still appended when the graph needs it.
+    hlo2tensorizer_options: str | None = None
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "NeuronConfig":
@@ -244,6 +253,8 @@ class NeuronConfig:
                 "enable_structured_outputs", False
             ),
             fp8_packed_kv=config_dict.get("fp8_packed_kv", False),
+            # Absent -> None -> the runner keeps its default extra options.
+            hlo2tensorizer_options=config_dict.get("hlo2tensorizer_options"),
         )
 
     def __post_init__(self):

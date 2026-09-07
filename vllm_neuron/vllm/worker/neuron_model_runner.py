@@ -33,9 +33,11 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
@@ -1399,7 +1401,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self.compile_options = {"alias_meta_to_neuron": True}
 
         # FIXME: -O1 and mac-threshold are temporary until NKI adds MAC count estimates for kernels.
-        hlo2tensorizer_opts = "--modular-flow-mac-threshold=10"
+        # A model can opt out via neuron_config.hlo2tensorizer_options: the
+        # threshold only exists for NKI kernels, and it makes neuronx-cc fail
+        # codegen on some pure-torch graphs (Qwen3.5's decode graph raises
+        # NCC_IBTN006 with it, and compiles cleanly without it).
+        override = getattr(self.neuron_config, "hlo2tensorizer_options", None)
+        hlo2tensorizer_opts = (
+            "--modular-flow-mac-threshold=10" if override is None else override
+        )
         # The unsafe fp8 cast flag is only needed on Trn2 where kernels use
         # legacy nl.float8_e4m3 (max=240). Trn3 supports OCP e4m3fn natively.
         from libtorch_neuronx_lite.compile.platform import get_platform_target
@@ -1410,19 +1419,24 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if not has_fp8:
             has_fp8 = getattr(self.neuron_config, "quantization", None) == "fp8"
         if has_fp8 and get_platform_target() not in ("trn3", "trn3pre"):
-            hlo2tensorizer_opts += " --experimental-unsafe-fp8e4m3fn-as-fp8e4m3"
+            hlo2tensorizer_opts = (
+                f"{hlo2tensorizer_opts} --experimental-unsafe-fp8e4m3fn-as-fp8e4m3"
+            ).strip()
         # vLLM optimization levels map 1:1 onto neuronx-cc optlevels (CHRS-721).
         self.compile_options["compiler_args"] = [
             "--auto-cast=none",
             "--verbose=35",
             f"-O{self.vllm_config.optimization_level.value}",
-            f"--internal-hlo2tensorizer-options={hlo2tensorizer_opts}",
             # --enable-nested-dynamic-loop: NKI kernels may contain nested
             # dynamic loops (scf.for inside scf.for). After inline_nki_kernel
             # inlines kernel BIR into the parent graph, birverifier rejects the
             # resulting multiple back-edges without this flag.
             "--internal-backend-options=--enable-verifier=false --enable-nested-dynamic-loop",
         ]
+        if hlo2tensorizer_opts:
+            self.compile_options["compiler_args"].insert(
+                -1, f"--internal-hlo2tensorizer-options={hlo2tensorizer_opts}"
+            )
         logger.info(
             "neuronx-cc optlevel -O%s (from vLLM optimization_level)",
             self.vllm_config.optimization_level.value,
@@ -8499,10 +8513,30 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             is_pooling_model=self.is_pooling_model,
         )
 
+        # Models whose groups have different per-layer layouts on one shared
+        # buffer must be page-major. vLLM hands the i-th layer of every KV-cache
+        # group the same raw buffer and requires block ``b`` to live inside page
+        # ``b`` for all of them; a flat "all of state A, then all of state B"
+        # layout only works when a layer owns its buffer outright. On a shared
+        # buffer it runs through the other groups' pages, which is silent
+        # corruption rather than an error.
+        page_major = bool(getattr(self.model, "kv_cache_page_major", False))
+        page_bytes = max(
+            group.kv_cache_spec.page_size_bytes
+            for group in kv_cache_config.kv_cache_groups
+        )
+
         # Initialize the KV Cache tensors
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for tensor in kv_cache_config.kv_cache_tensors:
-            raw_tensor = torch.zeros(tensor.size, dtype=torch.int8, device=self.device)
+            # Two extra pages per buffer, both private to the model because
+            # vLLM only knows about ``num_blocks``. The last is the write sink
+            # for padded rows; the one before it is the zero page they read, and
+            # nothing ever writes it, so it still holds the zeros this
+            # allocation puts there. vLLM's own null block cannot serve as the
+            # zero page -- warmup leaves data in it.
+            size = tensor.size + (2 * page_bytes if page_major else 0)
+            raw_tensor = torch.zeros(size, dtype=torch.int8, device=self.device)
             # Case where the KV cache is shared across layers
             for layer_name in tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = raw_tensor
@@ -8548,6 +8582,38 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         num_blocks, num_kv_heads, block_size, head_size, k_is_packed
                     )
 
+                    if page_major:
+                        # [pages, 2, kv_heads, block_size, head_size]: natural
+                        # strides, and page ``b`` is exactly the bytes vLLM
+                        # reserved for block ``b``. K is column 0, V column 1.
+                        used = (
+                            2
+                            * num_kv_heads
+                            * block_size
+                            * head_size
+                            * get_dtype_size(kv_cache_spec.dtype)
+                        )
+                        if used != page_bytes:
+                            raise NotImplementedError(
+                                f"page-major attention needs the K/V bytes "
+                                f"({used}) to fill the shared page "
+                                f"({page_bytes}); reaching only part of a page "
+                                f"would need a strided view, and Neuron device "
+                                f"tensors reject those"
+                            )
+                        if k_is_packed:
+                            raise NotImplementedError(
+                                "page-major layout with an FP8-packed K cache "
+                                "is not implemented"
+                            )
+                        num_pages = raw_tensor.numel() // page_bytes
+                        kv_pages = _shared_dtype_view(
+                            raw_tensor, kv_cache_spec.dtype
+                        ).view(num_pages, 2, num_kv_heads, block_size, head_size)
+                        kv_caches[layer_name] = [kv_pages]
+                        self._kv_cache_full_tensors[layer_name] = kv_pages
+                        continue
+
                     kv_shape = (2, num_blocks, num_kv_heads, block_size, head_size)
                     typed_tensor = _shared_dtype_view(
                         raw_tensor, kv_cache_spec.dtype
@@ -8562,6 +8628,98 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     # Store the full (2, ...) tensor for DI connector registration;
                     # typed_tensor[0] and typed_tensor[1] are views into it.
                     self._kv_cache_full_tensors[layer_name] = typed_tensor
+
+            # Recurrent-state layers (gated DeltaNet / Mamba).
+            #
+            # vLLM's own gpu_model_runner strides each state tensor out of the
+            # layer's raw buffer with the block dim striding by a whole page, so
+            # each block stays page-aligned and one block's states sit together
+            # inside its page. **Neuron device tensors reject that**: the runtime
+            # raises "Detected non-contiguous slicing for requested Device
+            # Tensor" for any view whose stride is not the natural one.
+            #
+            # Two layouts follow, and which one a model gets is its choice.
+            #
+            # Default: lay the states out one after another -- every block's conv
+            # state, then every block's recurrent state -- which leaves each
+            # tensor contiguous. Safe only because nothing outside the model
+            # reads them: vLLM's stake in the layout is the *page size*, which is
+            # unchanged, so the planner's block accounting still holds, and its
+            # per-block state-copy hooks are inactive at
+            # ``mamba_cache_mode == "none"``. Revisit if prefix caching over
+            # recurrent state is ever enabled -- those hooks are what it needs.
+            #
+            # ``page_major``: one view per buffer at full page width, states
+            # packed inside each page in declaration order. Needed when the
+            # buffer is *shared* -- vLLM hands one raw buffer to one layer from
+            # each KV-cache group -- because only a full-page-width view of a
+            # page-major buffer is contiguous. Two consequences the model must
+            # own. One dtype per page, so narrower states are upcast into the
+            # widest one's columns rather than ``state_dtypes()`` changing. And
+            # block ids, though allocated per group, are global: a page that held
+            # another group's float32 state comes back as this group's, so the
+            # model must treat any byte it did not write this step as hostile
+            # rather than merely stale. Reading such a page back as bf16 yields
+            # infinities and NaNs; masking them needs a select, since ``inf * 0``
+            # is NaN -- which is why this only shows up above
+            # ``max_num_seqs == 1``, where padded rows first appear.
+            elif isinstance(kv_cache_spec, MambaSpec):
+                for layer_name in group.layer_names:
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+                    num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+
+                    if page_major:
+                        # One view, one dtype: a page-major view is only
+                        # contiguous at full page width, so every state shares
+                        # the widest dtype's element size and the narrower ones
+                        # are upcast by the model. The states sit in declaration
+                        # order inside the page, and the model recomputes the
+                        # same column offsets from its own shapes.
+                        elem = max(get_dtype_size(d) for d in kv_cache_spec.dtypes)
+                        view_dtype = next(
+                            d
+                            for d in kv_cache_spec.dtypes
+                            if get_dtype_size(d) == elem
+                        )
+                        used = elem * sum(
+                            math.prod(shape) for shape in kv_cache_spec.shapes
+                        )
+                        if used > page_bytes or page_bytes % elem:
+                            raise NotImplementedError(
+                                f"page-major recurrent states need {used} bytes "
+                                f"inside a {page_bytes}-byte page at {elem}-byte "
+                                f"alignment; widen the attention block size"
+                            )
+                        num_pages = raw_tensor.numel() // page_bytes
+                        kv_caches[layer_name] = [
+                            _shared_dtype_view(raw_tensor, view_dtype).view(
+                                num_pages, page_bytes // elem
+                            )
+                        ]
+                        continue
+
+                    state_tensors = []
+                    offset_bytes = 0
+                    for shape, dtype in zip(
+                        kv_cache_spec.shapes, kv_cache_spec.dtypes
+                    ):
+                        dtype_size = get_dtype_size(dtype)
+                        assert offset_bytes % dtype_size == 0, (
+                            f"state offset {offset_bytes} is misaligned for "
+                            f"{dtype}; order the shapes widest-dtype-first"
+                        )
+                        numel = num_blocks * math.prod(shape)
+                        start = offset_bytes // dtype_size
+                        state_tensors.append(
+                            raw_tensor.view(dtype)[start : start + numel].view(
+                                num_blocks, *shape
+                            )
+                        )
+                        offset_bytes += numel * dtype_size
+
+                    assert offset_bytes <= raw_tensor.numel()
+                    kv_caches[layer_name] = state_tensors
 
             # Spec decoding specifically use this because hidden_size of different layers
             # (draft and target model) are different.
@@ -8669,6 +8827,34 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     sliding_window=layer.sliding_window_size,
                 )
             all_kv_cache_specs[layer_name] = spec
+
+        # Hybrid models (e.g. Qwen3.5: 18 gated-DeltaNet + 6 attention layers)
+        # additionally report layers that keep fixed-size recurrent state instead
+        # of a KV cache. vLLM puts those in their own KV cache group.
+        #
+        # block_size and page_size_padded come from cache_config, which vLLM has
+        # already filled in for us: ModelConfig.is_hybrid is derived from the HF
+        # config, and Platform._align_hybrid_block_size then sets
+        # mamba_block_size and mamba_page_size_padded. Do not recompute either --
+        # the planner has already sized the pages from those values.
+        for rec_layer in getattr(target_kv_spec, "recurrent_layers", ()):
+            mamba_block_size = self.vllm_config.cache_config.mamba_block_size
+            if mamba_block_size is None:
+                raise ValueError(
+                    "cache_config.mamba_block_size is unset but the model "
+                    f"reports recurrent layer {rec_layer.name!r}. vLLM normally "
+                    "sets it for hybrid models; check that ModelConfig.is_hybrid "
+                    "is True for this checkpoint."
+                )
+            all_kv_cache_specs[rec_layer.name] = MambaSpec(
+                shapes=rec_layer.shapes,
+                dtypes=rec_layer.dtypes,
+                block_size=mamba_block_size,
+                page_size_padded=(
+                    self.vllm_config.cache_config.mamba_page_size_padded
+                ),
+                mamba_cache_mode=self.vllm_config.cache_config.mamba_cache_mode,
+            )
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
