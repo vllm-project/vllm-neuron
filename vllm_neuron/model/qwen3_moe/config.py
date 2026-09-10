@@ -45,14 +45,25 @@ class Qwen3MoeConfig:
     norm_topk_prob: bool = True  # Normalize routing probabilities
 
     # ── RoPE settings ────────────────────────────────────────────────────
-    rope_theta: float = 1000000.0
-    # YaRN RoPE scaling for long context. None = native 32,768 tokens.
+    # Both spellings are accepted because the key was renamed underneath us.
+    # transformers 4.x exposed a top-level ``rope_theta`` plus ``rope_scaling``;
+    # transformers 5.x (shipped with vllm-neuron 0.24) folds both into a single
+    # ``rope_parameters`` dict and silently redirects writes to ``rope_scaling``
+    # into it, so a config built only from ``rope_scaling`` reads back as None.
+    # Reading just one spelling therefore fails silently on one of the two
+    # versions: YaRN would appear to be enabled and do nothing.
+    #
+    # __post_init__ normalises whichever arrived into ``rope_scaling``, and
+    # lifts ``rope_theta`` out of the dict when that is where it lives.
+    #
     # Qwen publishes this for 131,072-token context:
     #   {"rope_type": "yarn", "factor": 4.0,
     #    "original_max_position_embeddings": 32768}
     # beta_fast / beta_slow are not in Qwen's published config; the YaRN paper
     # defaults (32 / 1) are used when absent.
+    rope_theta: float = 1000000.0
     rope_scaling: dict | None = None
+    rope_parameters: dict | None = None
 
     # ── Special tokens ───────────────────────────────────────────────────
     pad_token_id: int | None = None
@@ -68,6 +79,30 @@ class Qwen3MoeConfig:
     def __post_init__(self):
         if self.head_dim is None:
             self.head_dim = self.hidden_size // self.num_attention_heads
+        self._normalise_rope()
+
+    def _normalise_rope(self) -> None:
+        """Collapse rope_parameters / rope_scaling into one representation.
+
+        After this runs, ``rope_theta`` holds the base frequency and
+        ``rope_scaling`` holds the scaling spec (or None when unscaled), no
+        matter which transformers version produced the source config.
+        """
+        params = self.rope_parameters or self.rope_scaling or {}
+
+        # transformers 5.x keeps the base frequency inside the dict. Only take
+        # it from there if present, so an explicitly-passed rope_theta wins on
+        # 4.x where the dict carries no base frequency.
+        if "rope_theta" in params:
+            self.rope_theta = float(params["rope_theta"])
+
+        rope_type = params.get("rope_type") or params.get("type")
+        if rope_type in (None, "default"):
+            # "default" means plain RoPE; carrying the dict forward would make
+            # the model think a scaling method was requested.
+            self.rope_scaling = None
+        else:
+            self.rope_scaling = dict(params)
 
     @classmethod
     def from_configs(cls, hf_config: PretrainedConfig, neuron_config: NeuronConfig):
