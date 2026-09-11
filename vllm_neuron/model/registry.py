@@ -5,6 +5,7 @@ from .llama3 import LlamaForCausalLM
 from .gpt_oss import GptOssForCausalLM
 from .llama3 import Eagle3LlamaForCausalLM
 from .qwen3 import Qwen3ForCausalLM
+from .qwen3_moe import Qwen3MoeForCausalLM
 from .qwen3_vl import Qwen3VLForConditionalGeneration
 
 
@@ -22,6 +23,7 @@ def get_models() -> list[tuple[str, type]]:
         ("GptOssForCausalLM", GptOssForCausalLM),
         ("Eagle3LlamaForCausalLM", Eagle3LlamaForCausalLM),
         ("Qwen3ForCausalLM", Qwen3ForCausalLM),
+        ("Qwen3MoeForCausalLM", Qwen3MoeForCausalLM),
         ("Qwen3VLForConditionalGeneration", Qwen3VLForConditionalGeneration),
     ]
 
