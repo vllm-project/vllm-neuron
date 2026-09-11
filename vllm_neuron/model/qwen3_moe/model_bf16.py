@@ -59,7 +59,7 @@ from .weight_loaders_bf16 import (
     expert_down_weight_sharding_loader,
 )
 from vllm_neuron.utils.weight_loader import (
-    expert_parallel_tensor_dim_loader,
+    expert_parallel_grouped_loader,
 )
 
 # Threshold for decode MoE kernel selection
@@ -995,7 +995,21 @@ class Qwen3MoeExperts(nn.Module):
 
         def _maybe_ep_wrap(loader):
             if self.ep_degree > 1:
-                loader = expert_parallel_tensor_dim_loader(local_expert_indices, loader)
+                # Qwen3-MoE checkpoints store experts as SEPARATE per-expert
+                # tensors, so the loader receives a flat list grouped by item:
+                # [gate_0..gate_{E-1}, up_0..up_{E-1}] (2 groups) for gate_up and
+                # [down_0..down_{E-1}] (1 group) for down_proj. The correct EP
+                # wrapper selects the local expert range *within each group*.
+                #
+                # Do NOT use expert_parallel_tensor_dim_loader here: that one is
+                # for GPT-OSS's FUSED [E, ...] layout and applies a SliceView on
+                # expert_dim=0 inside each tensor. Against Qwen3's per-expert
+                # tensors (each [I, H]) it slices the intermediate dimension
+                # instead of experts, leaves the list length at 2*total_experts,
+                # and fails as "Expected 64 slices (gate+up), got 256".
+                loader = expert_parallel_grouped_loader(
+                    local_expert_indices, loader, self.total_num_experts
+                )
             if self.mlp_dp_size > 1:
                 loader = with_rank_override(loader, rank=self.mlp_tp_rank)
             return loader
