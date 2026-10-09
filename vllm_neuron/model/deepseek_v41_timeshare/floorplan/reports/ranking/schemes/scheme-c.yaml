@@ -1,0 +1,4093 @@
+# scheme-c. One of three candidate deployment schemes, presented in arbitrary
+# order. Nothing about this file's name or position indicates its quality.
+
+version: 1
+target: trn2-16device
+notes: |
+  iter-5, three changes off iter-4, each measured separately.
+
+  (1) The five attention layers whose KV sweep does not grow with context -- layers.0, layers.1
+  (compress_ratio 0) and mtp.0/1/2 (is_mtp, so ratio 0 by construction) -- go from
+  `head x4 * batch x2` to `head x8` on the *same* eight logical cores. iter-4 established the
+  law that governs attention: `heads = share(n_heads, "head", "hidden")` while `kv_width` is
+  undivided, so the total KV sweep across a group is `head_factor x batch x kv_rows` -- the head
+  factor halves the weight stream and *replicates* the sweep. That trade is only bad where
+  `kv_rows` grows, and `kv_rows = window_span + compress_rows` with `compress_rows = 0` on
+  exactly these five layers: their sweep is the 128-row sliding window at both context lengths.
+  So on them the head factor is free. Same units, same group, same collective, same hops --
+  only `weight_divisor` moves from 4 to 8. Worth -3.0% on decode_128_b1 and -0.8..-3.2% on the
+  other seven decode points, +0.19% on prefill_128_b32.
+
+  (2) Both Engram tables go from `ngram x16` to `ngram x8 * batch x2` on the same sixteen
+  logical cores. engram.py's `gate` pass is `stream * FP32 * 4` on the scalar engine with
+  `stream = tokens * hc_mult * share(dim, "hidden")` -- an `ngram` split divides the row lookup
+  and `wkv`'s contraction but leaves the gate fully replicated on all sixteen shards, so it was
+  the largest token-proportional term in the file that no split touched. `tokens` is
+  `work_tokens`, which divides by the batch factor, so a batch split halves it. Everything else
+  is invariant under (ngram 16 -> 8, batch 1 -> 2): `lookups = share(tokens*cols,"ngram")/span`
+  is unchanged, `wkv` is `tokens x out_width x share(hash_cols*row_width,"head","ngram")` and
+  unchanged, and the `ngram` rejoin payload `tokens * full_out * FP32` halves over the same
+  sixteen participants. Capacity stays honest and stays inside the bank: `batch` is not in
+  WEIGHT_PARTITION_DIMS, so `weight_divisor` is 8 and each shard is charged 94.56/8 = 11.8 GiB,
+  which is what a batch-parallel replica of an eighth of the rows really holds -- 189 GiB
+  charged for a 94.56 GiB table, the honest 2x of a replicated table rather than a divisor
+  fiction. (`hidden` would divide the gate too, and was rejected for exactly that reason: it is
+  in WEIGHT_PARTITION_DIMS but does not partition the table's rows, so it would have
+  under-charged residency 2x.) Worth -1.2% on prefill_128_b32 and -2.2% on prefill_8192_b32,
+  against +0.4% on decode_128_b1 from the doubled `wkv` dense read.
+
+  (3) `prefill_chunk_tokens: 96 -> 80`. iter-3 and iter-4 both measured this and both shipped 96
+  on an absolute-milliseconds argument: chunk 80 saved ~120 ms over the four prefill_128 points
+  and cost ~176 ms over the four prefill_8192 points. Change (2) moves that knee, because the
+  Engram gate it halves is a per-chunk cost that a long context pays 86 times. Re-measured on
+  this plan the trade is now a wash in absolute terms (21319 ms summed over the eight prefill
+  points at chunk 80 against 21262 ms at chunk 96, +0.27%) while the per-metric picture is
+  strictly better: all four prefill_128 points become new bests at -8.8..-10.5% instead of three
+  of them regressing +5.0..+5.9%, and the four prefill_8192 points give back only 0.7-2.4% more
+  than they already did. Twelve of sixteen metrics are new bests; the four that regress do so by
+  +1.6% to +5.7%, the widest gate margin any iteration has shipped since iter-3.
+
+  Measured and rejected this iteration:
+  - ffn `expert x2 * hidden x4` on the same eight cores. moe.py makes this look free on paper:
+    `weight_divisor` is still 8, and every term is algebraically invariant under (expert 8 -> 2,
+    hidden 1 -> 4) -- `assignments` rises 4x but `inter = share(moe_inter_dim,"hidden")` falls
+    4x, so all three routed GEMMs, the dispatch, the combine, the gate GEMM and the shared
+    expert are unchanged -- while the two `sp_tokens * model_dim * FP32` terms that are the
+    whole of iter-4's prefill give-back fall *4x*, since `sp_tokens = ceil_div(tokens, span)`.
+    It is much worse everywhere: prefill_128_b32 663.2 against 607.3, decode_128_b1 11.92
+    against 10.72, decode_8192_b32 51.81 against 49.38. The `hidden` rejoin
+    (`assignments*dim*BF16 + tokens*dim*FP32`, and `assignments` is now 3x tokens) swamps it.
+    Together with iter-4's `expert x4 * hidden x2` (624.1 / 11.51) this closes intermediate-dim
+    parallelism of the MoE at every factor: `expert x8` is the answer.
+  - Engram `ngram x8 * seq x2` instead of `batch x2`, same sixteen cores. `seq` also divides
+    `work_tokens`, and unlike `batch` it divides at batch 1 too, so it should dominate. It wins
+    only where that matters -- prefill_8192_b1 604.7 against 612.5 -- and loses everywhere else
+    (decode_128_b1 10.835 against 10.715, decode_128_b32 29.24 against 28.97, prefill_128_b32
+    607.5 against 607.3, prefill_8192_b32 14337.9 against 14332.8), because the `seq` leg adds a
+    second collective (`group_tokens(tokens) * dim * BF16`) that `batch` gets for free.
+  - `overlap_collectives: true` on all 271 placements. Worth -0.08% on prefill_8192_b32,
+    -0.13% on prefill_128_b32, -0.04% on decode_128_b1: the fourth consecutive iteration to
+    measure it at 0.05-0.15% for the structural reason in iter-1 (E). Considered closed.
+  - `decode_micro_batch: 5`, re-swept because change (1) moved decode: decode_128_b32 26.41
+    (-8.8%) but decode_8192_b8 33.09 and decode_8192_b32 60.94, +26% and +23% over their best.
+    4 remains the only value that passes, for the fifth iteration running.
+runtime:
+  prefill_chunk_tokens: 80
+  decode_micro_batch: 4
+  pipeline_chunks: true
+placements:
+- module: embed
+  units:
+  - d0.l0
+  - d0.l1
+  - d0.l2
+  - d0.l3
+  splits:
+  - dim: vocab
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 0
+- module: final_norm
+  units:
+  - d15.l0
+  - d15.l1
+  - d15.l2
+  - d15.l3
+  weights:
+    tier: hbm_bank
+  stage: 15
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+- module: hc_collapse
+  units:
+  - d15.l0
+  - d15.l1
+  - d15.l2
+  - d15.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 15
+- module: hc_expand
+  units:
+  - d0.l0
+  - d0.l1
+  - d0.l2
+  - d0.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 0
+- module: layers.0.attention
+  units:
+  - d0.l0
+  - d1.l0
+  - d0.l1
+  - d1.l1
+  - d0.l2
+  - d1.l2
+  - d0.l3
+  - d1.l3
+  splits:
+  - dim: head
+    factor: 8
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 0
+- module: layers.0.ffn
+  units:
+  - d0.l0
+  - d1.l0
+  - d0.l1
+  - d1.l1
+  - d0.l2
+  - d1.l2
+  - d0.l3
+  - d1.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 0
+- module: layers.0.hc_attn_in
+  units:
+  - d0.l0
+  - d0.l1
+  - d0.l2
+  - d0.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 0
+- module: layers.0.hc_attn_out
+  units:
+  - d0.l0
+  - d0.l1
+  - d0.l2
+  - d0.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 0
+- module: layers.0.hc_ffn_in
+  units:
+  - d0.l0
+  - d0.l1
+  - d0.l2
+  - d0.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 0
+- module: layers.0.hc_ffn_out
+  units:
+  - d0.l0
+  - d0.l1
+  - d0.l2
+  - d0.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 0
+- module: layers.1.attention
+  units:
+  - d0.l0
+  - d1.l0
+  - d0.l1
+  - d1.l1
+  - d0.l2
+  - d1.l2
+  - d0.l3
+  - d1.l3
+  splits:
+  - dim: head
+    factor: 8
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 0
+- module: layers.1.engram
+  units:
+  - d0.l0
+  - d0.l1
+  - d0.l2
+  - d0.l3
+  - d1.l0
+  - d1.l1
+  - d1.l2
+  - d1.l3
+  - d2.l0
+  - d2.l1
+  - d2.l2
+  - d2.l3
+  - d3.l0
+  - d3.l1
+  - d3.l2
+  - d3.l3
+  splits:
+  - dim: ngram
+    factor: 8
+    collective: allgather
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 0
+- module: layers.1.ffn
+  units:
+  - d0.l0
+  - d1.l0
+  - d0.l1
+  - d1.l1
+  - d0.l2
+  - d1.l2
+  - d0.l3
+  - d1.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 0
+- module: layers.1.hc_attn_in
+  units:
+  - d0.l0
+  - d0.l1
+  - d0.l2
+  - d0.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 0
+- module: layers.1.hc_attn_out
+  units:
+  - d0.l0
+  - d0.l1
+  - d0.l2
+  - d0.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 0
+- module: layers.1.hc_ffn_in
+  units:
+  - d0.l0
+  - d0.l1
+  - d0.l2
+  - d0.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 0
+- module: layers.1.hc_ffn_out
+  units:
+  - d0.l0
+  - d0.l1
+  - d0.l2
+  - d0.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 0
+- module: layers.10.attention
+  units:
+  - d3.l0
+  - d2.l0
+  - d3.l1
+  - d2.l1
+  - d3.l2
+  - d2.l2
+  - d3.l3
+  - d2.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 3
+- module: layers.10.ffn
+  units:
+  - d3.l0
+  - d2.l0
+  - d3.l1
+  - d2.l1
+  - d3.l2
+  - d2.l2
+  - d3.l3
+  - d2.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 3
+- module: layers.10.hc_attn_in
+  units:
+  - d3.l0
+  - d3.l1
+  - d3.l2
+  - d3.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 3
+- module: layers.10.hc_attn_out
+  units:
+  - d3.l0
+  - d3.l1
+  - d3.l2
+  - d3.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 3
+- module: layers.10.hc_ffn_in
+  units:
+  - d3.l0
+  - d3.l1
+  - d3.l2
+  - d3.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 3
+- module: layers.10.hc_ffn_out
+  units:
+  - d3.l0
+  - d3.l1
+  - d3.l2
+  - d3.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 3
+- module: layers.11.attention
+  units:
+  - d4.l0
+  - d5.l0
+  - d4.l1
+  - d5.l1
+  - d4.l2
+  - d5.l2
+  - d4.l3
+  - d5.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 4
+- module: layers.11.ffn
+  units:
+  - d4.l0
+  - d5.l0
+  - d4.l1
+  - d5.l1
+  - d4.l2
+  - d5.l2
+  - d4.l3
+  - d5.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 4
+- module: layers.11.hc_attn_in
+  units:
+  - d4.l0
+  - d4.l1
+  - d4.l2
+  - d4.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 4
+- module: layers.11.hc_attn_out
+  units:
+  - d4.l0
+  - d4.l1
+  - d4.l2
+  - d4.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 4
+- module: layers.11.hc_ffn_in
+  units:
+  - d4.l0
+  - d4.l1
+  - d4.l2
+  - d4.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 4
+- module: layers.11.hc_ffn_out
+  units:
+  - d4.l0
+  - d4.l1
+  - d4.l2
+  - d4.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 4
+- module: layers.12.attention
+  units:
+  - d4.l0
+  - d5.l0
+  - d4.l1
+  - d5.l1
+  - d4.l2
+  - d5.l2
+  - d4.l3
+  - d5.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 4
+- module: layers.12.ffn
+  units:
+  - d4.l0
+  - d5.l0
+  - d4.l1
+  - d5.l1
+  - d4.l2
+  - d5.l2
+  - d4.l3
+  - d5.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 4
+- module: layers.12.hc_attn_in
+  units:
+  - d4.l0
+  - d4.l1
+  - d4.l2
+  - d4.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 4
+- module: layers.12.hc_attn_out
+  units:
+  - d4.l0
+  - d4.l1
+  - d4.l2
+  - d4.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 4
+- module: layers.12.hc_ffn_in
+  units:
+  - d4.l0
+  - d4.l1
+  - d4.l2
+  - d4.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 4
+- module: layers.12.hc_ffn_out
+  units:
+  - d4.l0
+  - d4.l1
+  - d4.l2
+  - d4.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 4
+- module: layers.13.attention
+  units:
+  - d4.l0
+  - d5.l0
+  - d4.l1
+  - d5.l1
+  - d4.l2
+  - d5.l2
+  - d4.l3
+  - d5.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 4
+- module: layers.13.ffn
+  units:
+  - d4.l0
+  - d5.l0
+  - d4.l1
+  - d5.l1
+  - d4.l2
+  - d5.l2
+  - d4.l3
+  - d5.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 4
+- module: layers.13.hc_attn_in
+  units:
+  - d4.l0
+  - d4.l1
+  - d4.l2
+  - d4.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 4
+- module: layers.13.hc_attn_out
+  units:
+  - d4.l0
+  - d4.l1
+  - d4.l2
+  - d4.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 4
+- module: layers.13.hc_ffn_in
+  units:
+  - d4.l0
+  - d4.l1
+  - d4.l2
+  - d4.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 4
+- module: layers.13.hc_ffn_out
+  units:
+  - d4.l0
+  - d4.l1
+  - d4.l2
+  - d4.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 4
+- module: layers.14.attention
+  units:
+  - d5.l0
+  - d4.l0
+  - d5.l1
+  - d4.l1
+  - d5.l2
+  - d4.l2
+  - d5.l3
+  - d4.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 5
+- module: layers.14.engram
+  units:
+  - d4.l0
+  - d4.l1
+  - d4.l2
+  - d4.l3
+  - d5.l0
+  - d5.l1
+  - d5.l2
+  - d5.l3
+  - d6.l0
+  - d6.l1
+  - d6.l2
+  - d6.l3
+  - d7.l0
+  - d7.l1
+  - d7.l2
+  - d7.l3
+  splits:
+  - dim: ngram
+    factor: 8
+    collective: allgather
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 5
+- module: layers.14.ffn
+  units:
+  - d5.l0
+  - d4.l0
+  - d5.l1
+  - d4.l1
+  - d5.l2
+  - d4.l2
+  - d5.l3
+  - d4.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 5
+- module: layers.14.hc_attn_in
+  units:
+  - d5.l0
+  - d5.l1
+  - d5.l2
+  - d5.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 5
+- module: layers.14.hc_attn_out
+  units:
+  - d5.l0
+  - d5.l1
+  - d5.l2
+  - d5.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 5
+- module: layers.14.hc_ffn_in
+  units:
+  - d5.l0
+  - d5.l1
+  - d5.l2
+  - d5.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 5
+- module: layers.14.hc_ffn_out
+  units:
+  - d5.l0
+  - d5.l1
+  - d5.l2
+  - d5.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 5
+- module: layers.15.attention
+  units:
+  - d5.l0
+  - d4.l0
+  - d5.l1
+  - d4.l1
+  - d5.l2
+  - d4.l2
+  - d5.l3
+  - d4.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 5
+- module: layers.15.ffn
+  units:
+  - d5.l0
+  - d4.l0
+  - d5.l1
+  - d4.l1
+  - d5.l2
+  - d4.l2
+  - d5.l3
+  - d4.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 5
+- module: layers.15.hc_attn_in
+  units:
+  - d5.l0
+  - d5.l1
+  - d5.l2
+  - d5.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 5
+- module: layers.15.hc_attn_out
+  units:
+  - d5.l0
+  - d5.l1
+  - d5.l2
+  - d5.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 5
+- module: layers.15.hc_ffn_in
+  units:
+  - d5.l0
+  - d5.l1
+  - d5.l2
+  - d5.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 5
+- module: layers.15.hc_ffn_out
+  units:
+  - d5.l0
+  - d5.l1
+  - d5.l2
+  - d5.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 5
+- module: layers.16.attention
+  units:
+  - d5.l0
+  - d4.l0
+  - d5.l1
+  - d4.l1
+  - d5.l2
+  - d4.l2
+  - d5.l3
+  - d4.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 5
+- module: layers.16.ffn
+  units:
+  - d5.l0
+  - d4.l0
+  - d5.l1
+  - d4.l1
+  - d5.l2
+  - d4.l2
+  - d5.l3
+  - d4.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 5
+- module: layers.16.hc_attn_in
+  units:
+  - d5.l0
+  - d5.l1
+  - d5.l2
+  - d5.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 5
+- module: layers.16.hc_attn_out
+  units:
+  - d5.l0
+  - d5.l1
+  - d5.l2
+  - d5.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 5
+- module: layers.16.hc_ffn_in
+  units:
+  - d5.l0
+  - d5.l1
+  - d5.l2
+  - d5.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 5
+- module: layers.16.hc_ffn_out
+  units:
+  - d5.l0
+  - d5.l1
+  - d5.l2
+  - d5.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 5
+- module: layers.17.attention
+  units:
+  - d6.l0
+  - d7.l0
+  - d6.l1
+  - d7.l1
+  - d6.l2
+  - d7.l2
+  - d6.l3
+  - d7.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 6
+- module: layers.17.ffn
+  units:
+  - d6.l0
+  - d7.l0
+  - d6.l1
+  - d7.l1
+  - d6.l2
+  - d7.l2
+  - d6.l3
+  - d7.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 6
+- module: layers.17.hc_attn_in
+  units:
+  - d6.l0
+  - d6.l1
+  - d6.l2
+  - d6.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 6
+- module: layers.17.hc_attn_out
+  units:
+  - d6.l0
+  - d6.l1
+  - d6.l2
+  - d6.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 6
+- module: layers.17.hc_ffn_in
+  units:
+  - d6.l0
+  - d6.l1
+  - d6.l2
+  - d6.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 6
+- module: layers.17.hc_ffn_out
+  units:
+  - d6.l0
+  - d6.l1
+  - d6.l2
+  - d6.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 6
+- module: layers.18.attention
+  units:
+  - d6.l0
+  - d7.l0
+  - d6.l1
+  - d7.l1
+  - d6.l2
+  - d7.l2
+  - d6.l3
+  - d7.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 6
+- module: layers.18.ffn
+  units:
+  - d6.l0
+  - d7.l0
+  - d6.l1
+  - d7.l1
+  - d6.l2
+  - d7.l2
+  - d6.l3
+  - d7.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 6
+- module: layers.18.hc_attn_in
+  units:
+  - d6.l0
+  - d6.l1
+  - d6.l2
+  - d6.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 6
+- module: layers.18.hc_attn_out
+  units:
+  - d6.l0
+  - d6.l1
+  - d6.l2
+  - d6.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 6
+- module: layers.18.hc_ffn_in
+  units:
+  - d6.l0
+  - d6.l1
+  - d6.l2
+  - d6.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 6
+- module: layers.18.hc_ffn_out
+  units:
+  - d6.l0
+  - d6.l1
+  - d6.l2
+  - d6.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 6
+- module: layers.19.attention
+  units:
+  - d7.l0
+  - d6.l0
+  - d7.l1
+  - d6.l1
+  - d7.l2
+  - d6.l2
+  - d7.l3
+  - d6.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 7
+- module: layers.19.ffn
+  units:
+  - d7.l0
+  - d6.l0
+  - d7.l1
+  - d6.l1
+  - d7.l2
+  - d6.l2
+  - d7.l3
+  - d6.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 7
+- module: layers.19.hc_attn_in
+  units:
+  - d7.l0
+  - d7.l1
+  - d7.l2
+  - d7.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 7
+- module: layers.19.hc_attn_out
+  units:
+  - d7.l0
+  - d7.l1
+  - d7.l2
+  - d7.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 7
+- module: layers.19.hc_ffn_in
+  units:
+  - d7.l0
+  - d7.l1
+  - d7.l2
+  - d7.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 7
+- module: layers.19.hc_ffn_out
+  units:
+  - d7.l0
+  - d7.l1
+  - d7.l2
+  - d7.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 7
+- module: layers.2.attention
+  units:
+  - d0.l0
+  - d1.l0
+  - d0.l1
+  - d1.l1
+  - d0.l2
+  - d1.l2
+  - d0.l3
+  - d1.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 0
+- module: layers.2.ffn
+  units:
+  - d0.l0
+  - d1.l0
+  - d0.l1
+  - d1.l1
+  - d0.l2
+  - d1.l2
+  - d0.l3
+  - d1.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 0
+- module: layers.2.hc_attn_in
+  units:
+  - d0.l0
+  - d0.l1
+  - d0.l2
+  - d0.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 0
+- module: layers.2.hc_attn_out
+  units:
+  - d0.l0
+  - d0.l1
+  - d0.l2
+  - d0.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 0
+- module: layers.2.hc_ffn_in
+  units:
+  - d0.l0
+  - d0.l1
+  - d0.l2
+  - d0.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 0
+- module: layers.2.hc_ffn_out
+  units:
+  - d0.l0
+  - d0.l1
+  - d0.l2
+  - d0.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 0
+- module: layers.20.attention
+  units:
+  - d7.l0
+  - d6.l0
+  - d7.l1
+  - d6.l1
+  - d7.l2
+  - d6.l2
+  - d7.l3
+  - d6.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 7
+- module: layers.20.ffn
+  units:
+  - d7.l0
+  - d6.l0
+  - d7.l1
+  - d6.l1
+  - d7.l2
+  - d6.l2
+  - d7.l3
+  - d6.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 7
+- module: layers.20.hc_attn_in
+  units:
+  - d7.l0
+  - d7.l1
+  - d7.l2
+  - d7.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 7
+- module: layers.20.hc_attn_out
+  units:
+  - d7.l0
+  - d7.l1
+  - d7.l2
+  - d7.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 7
+- module: layers.20.hc_ffn_in
+  units:
+  - d7.l0
+  - d7.l1
+  - d7.l2
+  - d7.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 7
+- module: layers.20.hc_ffn_out
+  units:
+  - d7.l0
+  - d7.l1
+  - d7.l2
+  - d7.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 7
+- module: layers.21.attention
+  units:
+  - d7.l0
+  - d6.l0
+  - d7.l1
+  - d6.l1
+  - d7.l2
+  - d6.l2
+  - d7.l3
+  - d6.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 7
+- module: layers.21.ffn
+  units:
+  - d7.l0
+  - d6.l0
+  - d7.l1
+  - d6.l1
+  - d7.l2
+  - d6.l2
+  - d7.l3
+  - d6.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 7
+- module: layers.21.hc_attn_in
+  units:
+  - d7.l0
+  - d7.l1
+  - d7.l2
+  - d7.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 7
+- module: layers.21.hc_attn_out
+  units:
+  - d7.l0
+  - d7.l1
+  - d7.l2
+  - d7.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 7
+- module: layers.21.hc_ffn_in
+  units:
+  - d7.l0
+  - d7.l1
+  - d7.l2
+  - d7.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 7
+- module: layers.21.hc_ffn_out
+  units:
+  - d7.l0
+  - d7.l1
+  - d7.l2
+  - d7.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 7
+- module: layers.22.attention
+  units:
+  - d8.l0
+  - d9.l0
+  - d8.l1
+  - d9.l1
+  - d8.l2
+  - d9.l2
+  - d8.l3
+  - d9.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 8
+- module: layers.22.ffn
+  units:
+  - d8.l0
+  - d9.l0
+  - d8.l1
+  - d9.l1
+  - d8.l2
+  - d9.l2
+  - d8.l3
+  - d9.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 8
+- module: layers.22.hc_attn_in
+  units:
+  - d8.l0
+  - d8.l1
+  - d8.l2
+  - d8.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 8
+- module: layers.22.hc_attn_out
+  units:
+  - d8.l0
+  - d8.l1
+  - d8.l2
+  - d8.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 8
+- module: layers.22.hc_ffn_in
+  units:
+  - d8.l0
+  - d8.l1
+  - d8.l2
+  - d8.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 8
+- module: layers.22.hc_ffn_out
+  units:
+  - d8.l0
+  - d8.l1
+  - d8.l2
+  - d8.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 8
+- module: layers.23.attention
+  units:
+  - d8.l0
+  - d9.l0
+  - d8.l1
+  - d9.l1
+  - d8.l2
+  - d9.l2
+  - d8.l3
+  - d9.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 8
+- module: layers.23.ffn
+  units:
+  - d8.l0
+  - d9.l0
+  - d8.l1
+  - d9.l1
+  - d8.l2
+  - d9.l2
+  - d8.l3
+  - d9.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 8
+- module: layers.23.hc_attn_in
+  units:
+  - d8.l0
+  - d8.l1
+  - d8.l2
+  - d8.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 8
+- module: layers.23.hc_attn_out
+  units:
+  - d8.l0
+  - d8.l1
+  - d8.l2
+  - d8.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 8
+- module: layers.23.hc_ffn_in
+  units:
+  - d8.l0
+  - d8.l1
+  - d8.l2
+  - d8.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 8
+- module: layers.23.hc_ffn_out
+  units:
+  - d8.l0
+  - d8.l1
+  - d8.l2
+  - d8.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 8
+- module: layers.24.attention
+  units:
+  - d8.l0
+  - d9.l0
+  - d8.l1
+  - d9.l1
+  - d8.l2
+  - d9.l2
+  - d8.l3
+  - d9.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 8
+- module: layers.24.ffn
+  units:
+  - d8.l0
+  - d9.l0
+  - d8.l1
+  - d9.l1
+  - d8.l2
+  - d9.l2
+  - d8.l3
+  - d9.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 8
+- module: layers.24.hc_attn_in
+  units:
+  - d8.l0
+  - d8.l1
+  - d8.l2
+  - d8.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 8
+- module: layers.24.hc_attn_out
+  units:
+  - d8.l0
+  - d8.l1
+  - d8.l2
+  - d8.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 8
+- module: layers.24.hc_ffn_in
+  units:
+  - d8.l0
+  - d8.l1
+  - d8.l2
+  - d8.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 8
+- module: layers.24.hc_ffn_out
+  units:
+  - d8.l0
+  - d8.l1
+  - d8.l2
+  - d8.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 8
+- module: layers.25.attention
+  units:
+  - d9.l0
+  - d8.l0
+  - d9.l1
+  - d8.l1
+  - d9.l2
+  - d8.l2
+  - d9.l3
+  - d8.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 9
+- module: layers.25.ffn
+  units:
+  - d9.l0
+  - d8.l0
+  - d9.l1
+  - d8.l1
+  - d9.l2
+  - d8.l2
+  - d9.l3
+  - d8.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 9
+- module: layers.25.hc_attn_in
+  units:
+  - d9.l0
+  - d9.l1
+  - d9.l2
+  - d9.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 9
+- module: layers.25.hc_attn_out
+  units:
+  - d9.l0
+  - d9.l1
+  - d9.l2
+  - d9.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 9
+- module: layers.25.hc_ffn_in
+  units:
+  - d9.l0
+  - d9.l1
+  - d9.l2
+  - d9.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 9
+- module: layers.25.hc_ffn_out
+  units:
+  - d9.l0
+  - d9.l1
+  - d9.l2
+  - d9.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 9
+- module: layers.26.attention
+  units:
+  - d9.l0
+  - d8.l0
+  - d9.l1
+  - d8.l1
+  - d9.l2
+  - d8.l2
+  - d9.l3
+  - d8.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 9
+- module: layers.26.ffn
+  units:
+  - d9.l0
+  - d8.l0
+  - d9.l1
+  - d8.l1
+  - d9.l2
+  - d8.l2
+  - d9.l3
+  - d8.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 9
+- module: layers.26.hc_attn_in
+  units:
+  - d9.l0
+  - d9.l1
+  - d9.l2
+  - d9.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 9
+- module: layers.26.hc_attn_out
+  units:
+  - d9.l0
+  - d9.l1
+  - d9.l2
+  - d9.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 9
+- module: layers.26.hc_ffn_in
+  units:
+  - d9.l0
+  - d9.l1
+  - d9.l2
+  - d9.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 9
+- module: layers.26.hc_ffn_out
+  units:
+  - d9.l0
+  - d9.l1
+  - d9.l2
+  - d9.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 9
+- module: layers.27.attention
+  units:
+  - d10.l0
+  - d11.l0
+  - d10.l1
+  - d11.l1
+  - d10.l2
+  - d11.l2
+  - d10.l3
+  - d11.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 10
+- module: layers.27.ffn
+  units:
+  - d10.l0
+  - d11.l0
+  - d10.l1
+  - d11.l1
+  - d10.l2
+  - d11.l2
+  - d10.l3
+  - d11.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 10
+- module: layers.27.hc_attn_in
+  units:
+  - d10.l0
+  - d10.l1
+  - d10.l2
+  - d10.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 10
+- module: layers.27.hc_attn_out
+  units:
+  - d10.l0
+  - d10.l1
+  - d10.l2
+  - d10.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 10
+- module: layers.27.hc_ffn_in
+  units:
+  - d10.l0
+  - d10.l1
+  - d10.l2
+  - d10.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 10
+- module: layers.27.hc_ffn_out
+  units:
+  - d10.l0
+  - d10.l1
+  - d10.l2
+  - d10.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 10
+- module: layers.28.attention
+  units:
+  - d10.l0
+  - d11.l0
+  - d10.l1
+  - d11.l1
+  - d10.l2
+  - d11.l2
+  - d10.l3
+  - d11.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 10
+- module: layers.28.ffn
+  units:
+  - d10.l0
+  - d11.l0
+  - d10.l1
+  - d11.l1
+  - d10.l2
+  - d11.l2
+  - d10.l3
+  - d11.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 10
+- module: layers.28.hc_attn_in
+  units:
+  - d10.l0
+  - d10.l1
+  - d10.l2
+  - d10.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 10
+- module: layers.28.hc_attn_out
+  units:
+  - d10.l0
+  - d10.l1
+  - d10.l2
+  - d10.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 10
+- module: layers.28.hc_ffn_in
+  units:
+  - d10.l0
+  - d10.l1
+  - d10.l2
+  - d10.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 10
+- module: layers.28.hc_ffn_out
+  units:
+  - d10.l0
+  - d10.l1
+  - d10.l2
+  - d10.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 10
+- module: layers.29.attention
+  units:
+  - d10.l0
+  - d11.l0
+  - d10.l1
+  - d11.l1
+  - d10.l2
+  - d11.l2
+  - d10.l3
+  - d11.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 10
+- module: layers.29.ffn
+  units:
+  - d10.l0
+  - d11.l0
+  - d10.l1
+  - d11.l1
+  - d10.l2
+  - d11.l2
+  - d10.l3
+  - d11.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 10
+- module: layers.29.hc_attn_in
+  units:
+  - d10.l0
+  - d10.l1
+  - d10.l2
+  - d10.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 10
+- module: layers.29.hc_attn_out
+  units:
+  - d10.l0
+  - d10.l1
+  - d10.l2
+  - d10.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 10
+- module: layers.29.hc_ffn_in
+  units:
+  - d10.l0
+  - d10.l1
+  - d10.l2
+  - d10.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 10
+- module: layers.29.hc_ffn_out
+  units:
+  - d10.l0
+  - d10.l1
+  - d10.l2
+  - d10.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 10
+- module: layers.3.attention
+  units:
+  - d1.l0
+  - d0.l0
+  - d1.l1
+  - d0.l1
+  - d1.l2
+  - d0.l2
+  - d1.l3
+  - d0.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 1
+- module: layers.3.ffn
+  units:
+  - d1.l0
+  - d0.l0
+  - d1.l1
+  - d0.l1
+  - d1.l2
+  - d0.l2
+  - d1.l3
+  - d0.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 1
+- module: layers.3.hc_attn_in
+  units:
+  - d1.l0
+  - d1.l1
+  - d1.l2
+  - d1.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 1
+- module: layers.3.hc_attn_out
+  units:
+  - d1.l0
+  - d1.l1
+  - d1.l2
+  - d1.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 1
+- module: layers.3.hc_ffn_in
+  units:
+  - d1.l0
+  - d1.l1
+  - d1.l2
+  - d1.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 1
+- module: layers.3.hc_ffn_out
+  units:
+  - d1.l0
+  - d1.l1
+  - d1.l2
+  - d1.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 1
+- module: layers.30.attention
+  units:
+  - d11.l0
+  - d10.l0
+  - d11.l1
+  - d10.l1
+  - d11.l2
+  - d10.l2
+  - d11.l3
+  - d10.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 11
+- module: layers.30.ffn
+  units:
+  - d11.l0
+  - d10.l0
+  - d11.l1
+  - d10.l1
+  - d11.l2
+  - d10.l2
+  - d11.l3
+  - d10.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 11
+- module: layers.30.hc_attn_in
+  units:
+  - d11.l0
+  - d11.l1
+  - d11.l2
+  - d11.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 11
+- module: layers.30.hc_attn_out
+  units:
+  - d11.l0
+  - d11.l1
+  - d11.l2
+  - d11.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 11
+- module: layers.30.hc_ffn_in
+  units:
+  - d11.l0
+  - d11.l1
+  - d11.l2
+  - d11.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 11
+- module: layers.30.hc_ffn_out
+  units:
+  - d11.l0
+  - d11.l1
+  - d11.l2
+  - d11.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 11
+- module: layers.31.attention
+  units:
+  - d11.l0
+  - d10.l0
+  - d11.l1
+  - d10.l1
+  - d11.l2
+  - d10.l2
+  - d11.l3
+  - d10.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 11
+- module: layers.31.ffn
+  units:
+  - d11.l0
+  - d10.l0
+  - d11.l1
+  - d10.l1
+  - d11.l2
+  - d10.l2
+  - d11.l3
+  - d10.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 11
+- module: layers.31.hc_attn_in
+  units:
+  - d11.l0
+  - d11.l1
+  - d11.l2
+  - d11.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 11
+- module: layers.31.hc_attn_out
+  units:
+  - d11.l0
+  - d11.l1
+  - d11.l2
+  - d11.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 11
+- module: layers.31.hc_ffn_in
+  units:
+  - d11.l0
+  - d11.l1
+  - d11.l2
+  - d11.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 11
+- module: layers.31.hc_ffn_out
+  units:
+  - d11.l0
+  - d11.l1
+  - d11.l2
+  - d11.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 11
+- module: layers.32.attention
+  units:
+  - d11.l0
+  - d10.l0
+  - d11.l1
+  - d10.l1
+  - d11.l2
+  - d10.l2
+  - d11.l3
+  - d10.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 11
+- module: layers.32.ffn
+  units:
+  - d11.l0
+  - d10.l0
+  - d11.l1
+  - d10.l1
+  - d11.l2
+  - d10.l2
+  - d11.l3
+  - d10.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 11
+- module: layers.32.hc_attn_in
+  units:
+  - d11.l0
+  - d11.l1
+  - d11.l2
+  - d11.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 11
+- module: layers.32.hc_attn_out
+  units:
+  - d11.l0
+  - d11.l1
+  - d11.l2
+  - d11.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 11
+- module: layers.32.hc_ffn_in
+  units:
+  - d11.l0
+  - d11.l1
+  - d11.l2
+  - d11.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 11
+- module: layers.32.hc_ffn_out
+  units:
+  - d11.l0
+  - d11.l1
+  - d11.l2
+  - d11.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 11
+- module: layers.33.attention
+  units:
+  - d12.l0
+  - d13.l0
+  - d12.l1
+  - d13.l1
+  - d12.l2
+  - d13.l2
+  - d12.l3
+  - d13.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 12
+- module: layers.33.ffn
+  units:
+  - d12.l0
+  - d13.l0
+  - d12.l1
+  - d13.l1
+  - d12.l2
+  - d13.l2
+  - d12.l3
+  - d13.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 12
+- module: layers.33.hc_attn_in
+  units:
+  - d12.l0
+  - d12.l1
+  - d12.l2
+  - d12.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 12
+- module: layers.33.hc_attn_out
+  units:
+  - d12.l0
+  - d12.l1
+  - d12.l2
+  - d12.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 12
+- module: layers.33.hc_ffn_in
+  units:
+  - d12.l0
+  - d12.l1
+  - d12.l2
+  - d12.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 12
+- module: layers.33.hc_ffn_out
+  units:
+  - d12.l0
+  - d12.l1
+  - d12.l2
+  - d12.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 12
+- module: layers.34.attention
+  units:
+  - d12.l0
+  - d13.l0
+  - d12.l1
+  - d13.l1
+  - d12.l2
+  - d13.l2
+  - d12.l3
+  - d13.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 12
+- module: layers.34.ffn
+  units:
+  - d12.l0
+  - d13.l0
+  - d12.l1
+  - d13.l1
+  - d12.l2
+  - d13.l2
+  - d12.l3
+  - d13.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 12
+- module: layers.34.hc_attn_in
+  units:
+  - d12.l0
+  - d12.l1
+  - d12.l2
+  - d12.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 12
+- module: layers.34.hc_attn_out
+  units:
+  - d12.l0
+  - d12.l1
+  - d12.l2
+  - d12.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 12
+- module: layers.34.hc_ffn_in
+  units:
+  - d12.l0
+  - d12.l1
+  - d12.l2
+  - d12.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 12
+- module: layers.34.hc_ffn_out
+  units:
+  - d12.l0
+  - d12.l1
+  - d12.l2
+  - d12.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 12
+- module: layers.35.attention
+  units:
+  - d13.l0
+  - d12.l0
+  - d13.l1
+  - d12.l1
+  - d13.l2
+  - d12.l2
+  - d13.l3
+  - d12.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 13
+- module: layers.35.ffn
+  units:
+  - d13.l0
+  - d12.l0
+  - d13.l1
+  - d12.l1
+  - d13.l2
+  - d12.l2
+  - d13.l3
+  - d12.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 13
+- module: layers.35.hc_attn_in
+  units:
+  - d13.l0
+  - d13.l1
+  - d13.l2
+  - d13.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 13
+- module: layers.35.hc_attn_out
+  units:
+  - d13.l0
+  - d13.l1
+  - d13.l2
+  - d13.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 13
+- module: layers.35.hc_ffn_in
+  units:
+  - d13.l0
+  - d13.l1
+  - d13.l2
+  - d13.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 13
+- module: layers.35.hc_ffn_out
+  units:
+  - d13.l0
+  - d13.l1
+  - d13.l2
+  - d13.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 13
+- module: layers.36.attention
+  units:
+  - d13.l0
+  - d12.l0
+  - d13.l1
+  - d12.l1
+  - d13.l2
+  - d12.l2
+  - d13.l3
+  - d12.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 13
+- module: layers.36.ffn
+  units:
+  - d13.l0
+  - d12.l0
+  - d13.l1
+  - d12.l1
+  - d13.l2
+  - d12.l2
+  - d13.l3
+  - d12.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 13
+- module: layers.36.hc_attn_in
+  units:
+  - d13.l0
+  - d13.l1
+  - d13.l2
+  - d13.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 13
+- module: layers.36.hc_attn_out
+  units:
+  - d13.l0
+  - d13.l1
+  - d13.l2
+  - d13.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 13
+- module: layers.36.hc_ffn_in
+  units:
+  - d13.l0
+  - d13.l1
+  - d13.l2
+  - d13.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 13
+- module: layers.36.hc_ffn_out
+  units:
+  - d13.l0
+  - d13.l1
+  - d13.l2
+  - d13.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 13
+- module: layers.37.attention
+  units:
+  - d13.l0
+  - d12.l0
+  - d13.l1
+  - d12.l1
+  - d13.l2
+  - d12.l2
+  - d13.l3
+  - d12.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 13
+- module: layers.37.ffn
+  units:
+  - d13.l0
+  - d12.l0
+  - d13.l1
+  - d12.l1
+  - d13.l2
+  - d12.l2
+  - d13.l3
+  - d12.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 13
+- module: layers.37.hc_attn_in
+  units:
+  - d13.l0
+  - d13.l1
+  - d13.l2
+  - d13.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 13
+- module: layers.37.hc_attn_out
+  units:
+  - d13.l0
+  - d13.l1
+  - d13.l2
+  - d13.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 13
+- module: layers.37.hc_ffn_in
+  units:
+  - d13.l0
+  - d13.l1
+  - d13.l2
+  - d13.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 13
+- module: layers.37.hc_ffn_out
+  units:
+  - d13.l0
+  - d13.l1
+  - d13.l2
+  - d13.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 13
+- module: layers.38.attention
+  units:
+  - d14.l0
+  - d15.l0
+  - d14.l1
+  - d15.l1
+  - d14.l2
+  - d15.l2
+  - d14.l3
+  - d15.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 14
+- module: layers.38.ffn
+  units:
+  - d14.l0
+  - d15.l0
+  - d14.l1
+  - d15.l1
+  - d14.l2
+  - d15.l2
+  - d14.l3
+  - d15.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 14
+- module: layers.38.hc_attn_in
+  units:
+  - d14.l0
+  - d14.l1
+  - d14.l2
+  - d14.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 14
+- module: layers.38.hc_attn_out
+  units:
+  - d14.l0
+  - d14.l1
+  - d14.l2
+  - d14.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 14
+- module: layers.38.hc_ffn_in
+  units:
+  - d14.l0
+  - d14.l1
+  - d14.l2
+  - d14.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 14
+- module: layers.38.hc_ffn_out
+  units:
+  - d14.l0
+  - d14.l1
+  - d14.l2
+  - d14.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 14
+- module: layers.39.attention
+  units:
+  - d14.l0
+  - d15.l0
+  - d14.l1
+  - d15.l1
+  - d14.l2
+  - d15.l2
+  - d14.l3
+  - d15.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 14
+- module: layers.39.ffn
+  units:
+  - d14.l0
+  - d15.l0
+  - d14.l1
+  - d15.l1
+  - d14.l2
+  - d15.l2
+  - d14.l3
+  - d15.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 14
+- module: layers.39.hc_attn_in
+  units:
+  - d14.l0
+  - d14.l1
+  - d14.l2
+  - d14.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 14
+- module: layers.39.hc_attn_out
+  units:
+  - d14.l0
+  - d14.l1
+  - d14.l2
+  - d14.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 14
+- module: layers.39.hc_ffn_in
+  units:
+  - d14.l0
+  - d14.l1
+  - d14.l2
+  - d14.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 14
+- module: layers.39.hc_ffn_out
+  units:
+  - d14.l0
+  - d14.l1
+  - d14.l2
+  - d14.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 14
+- module: layers.4.attention
+  units:
+  - d1.l0
+  - d0.l0
+  - d1.l1
+  - d0.l1
+  - d1.l2
+  - d0.l2
+  - d1.l3
+  - d0.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 1
+- module: layers.4.ffn
+  units:
+  - d1.l0
+  - d0.l0
+  - d1.l1
+  - d0.l1
+  - d1.l2
+  - d0.l2
+  - d1.l3
+  - d0.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 1
+- module: layers.4.hc_attn_in
+  units:
+  - d1.l0
+  - d1.l1
+  - d1.l2
+  - d1.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 1
+- module: layers.4.hc_attn_out
+  units:
+  - d1.l0
+  - d1.l1
+  - d1.l2
+  - d1.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 1
+- module: layers.4.hc_ffn_in
+  units:
+  - d1.l0
+  - d1.l1
+  - d1.l2
+  - d1.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 1
+- module: layers.4.hc_ffn_out
+  units:
+  - d1.l0
+  - d1.l1
+  - d1.l2
+  - d1.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 1
+- module: layers.5.attention
+  units:
+  - d1.l0
+  - d0.l0
+  - d1.l1
+  - d0.l1
+  - d1.l2
+  - d0.l2
+  - d1.l3
+  - d0.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 1
+- module: layers.5.ffn
+  units:
+  - d1.l0
+  - d0.l0
+  - d1.l1
+  - d0.l1
+  - d1.l2
+  - d0.l2
+  - d1.l3
+  - d0.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 1
+- module: layers.5.hc_attn_in
+  units:
+  - d1.l0
+  - d1.l1
+  - d1.l2
+  - d1.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 1
+- module: layers.5.hc_attn_out
+  units:
+  - d1.l0
+  - d1.l1
+  - d1.l2
+  - d1.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 1
+- module: layers.5.hc_ffn_in
+  units:
+  - d1.l0
+  - d1.l1
+  - d1.l2
+  - d1.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 1
+- module: layers.5.hc_ffn_out
+  units:
+  - d1.l0
+  - d1.l1
+  - d1.l2
+  - d1.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 1
+- module: layers.6.attention
+  units:
+  - d2.l0
+  - d3.l0
+  - d2.l1
+  - d3.l1
+  - d2.l2
+  - d3.l2
+  - d2.l3
+  - d3.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 2
+- module: layers.6.ffn
+  units:
+  - d2.l0
+  - d3.l0
+  - d2.l1
+  - d3.l1
+  - d2.l2
+  - d3.l2
+  - d2.l3
+  - d3.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 2
+- module: layers.6.hc_attn_in
+  units:
+  - d2.l0
+  - d2.l1
+  - d2.l2
+  - d2.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 2
+- module: layers.6.hc_attn_out
+  units:
+  - d2.l0
+  - d2.l1
+  - d2.l2
+  - d2.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 2
+- module: layers.6.hc_ffn_in
+  units:
+  - d2.l0
+  - d2.l1
+  - d2.l2
+  - d2.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 2
+- module: layers.6.hc_ffn_out
+  units:
+  - d2.l0
+  - d2.l1
+  - d2.l2
+  - d2.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 2
+- module: layers.7.attention
+  units:
+  - d2.l0
+  - d3.l0
+  - d2.l1
+  - d3.l1
+  - d2.l2
+  - d3.l2
+  - d2.l3
+  - d3.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 2
+- module: layers.7.ffn
+  units:
+  - d2.l0
+  - d3.l0
+  - d2.l1
+  - d3.l1
+  - d2.l2
+  - d3.l2
+  - d2.l3
+  - d3.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 2
+- module: layers.7.hc_attn_in
+  units:
+  - d2.l0
+  - d2.l1
+  - d2.l2
+  - d2.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 2
+- module: layers.7.hc_attn_out
+  units:
+  - d2.l0
+  - d2.l1
+  - d2.l2
+  - d2.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 2
+- module: layers.7.hc_ffn_in
+  units:
+  - d2.l0
+  - d2.l1
+  - d2.l2
+  - d2.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 2
+- module: layers.7.hc_ffn_out
+  units:
+  - d2.l0
+  - d2.l1
+  - d2.l2
+  - d2.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 2
+- module: layers.8.attention
+  units:
+  - d2.l0
+  - d3.l0
+  - d2.l1
+  - d3.l1
+  - d2.l2
+  - d3.l2
+  - d2.l3
+  - d3.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 2
+- module: layers.8.ffn
+  units:
+  - d2.l0
+  - d3.l0
+  - d2.l1
+  - d3.l1
+  - d2.l2
+  - d3.l2
+  - d2.l3
+  - d3.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 2
+- module: layers.8.hc_attn_in
+  units:
+  - d2.l0
+  - d2.l1
+  - d2.l2
+  - d2.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 2
+- module: layers.8.hc_attn_out
+  units:
+  - d2.l0
+  - d2.l1
+  - d2.l2
+  - d2.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 2
+- module: layers.8.hc_ffn_in
+  units:
+  - d2.l0
+  - d2.l1
+  - d2.l2
+  - d2.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 2
+- module: layers.8.hc_ffn_out
+  units:
+  - d2.l0
+  - d2.l1
+  - d2.l2
+  - d2.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 2
+- module: layers.9.attention
+  units:
+  - d3.l0
+  - d2.l0
+  - d3.l1
+  - d2.l1
+  - d3.l2
+  - d2.l2
+  - d3.l3
+  - d2.l3
+  splits:
+  - dim: head
+    factor: 4
+    collective: allreduce
+  - dim: batch
+    factor: 2
+    collective: none
+  weights:
+    tier: hbm_bank
+  stage: 3
+- module: layers.9.ffn
+  units:
+  - d3.l0
+  - d2.l0
+  - d3.l1
+  - d2.l1
+  - d3.l2
+  - d2.l2
+  - d3.l3
+  - d2.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 3
+- module: layers.9.hc_attn_in
+  units:
+  - d3.l0
+  - d3.l1
+  - d3.l2
+  - d3.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 3
+- module: layers.9.hc_attn_out
+  units:
+  - d3.l0
+  - d3.l1
+  - d3.l2
+  - d3.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 3
+- module: layers.9.hc_ffn_in
+  units:
+  - d3.l0
+  - d3.l1
+  - d3.l2
+  - d3.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 3
+- module: layers.9.hc_ffn_out
+  units:
+  - d3.l0
+  - d3.l1
+  - d3.l2
+  - d3.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 3
+- module: lm_head
+  units:
+  - d14.l0
+  - d14.l1
+  - d14.l2
+  - d14.l3
+  - d15.l0
+  - d15.l1
+  - d15.l2
+  - d15.l3
+  splits:
+  - dim: vocab
+    factor: 8
+    collective: allgather
+  weights:
+    tier: hbm_bank
+  stage: 15
+- module: mtp.0.attention
+  units:
+  - d14.l0
+  - d15.l0
+  - d14.l1
+  - d15.l1
+  - d14.l2
+  - d15.l2
+  - d14.l3
+  - d15.l3
+  splits:
+  - dim: head
+    factor: 8
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 14
+- module: mtp.0.ffn
+  units:
+  - d14.l0
+  - d15.l0
+  - d14.l1
+  - d15.l1
+  - d14.l2
+  - d15.l2
+  - d14.l3
+  - d15.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 14
+- module: mtp.0.hc_attn_in
+  units:
+  - d14.l0
+  - d14.l1
+  - d14.l2
+  - d14.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 14
+- module: mtp.0.hc_attn_out
+  units:
+  - d14.l0
+  - d14.l1
+  - d14.l2
+  - d14.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 14
+- module: mtp.0.hc_ffn_in
+  units:
+  - d14.l0
+  - d14.l1
+  - d14.l2
+  - d14.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 14
+- module: mtp.0.hc_ffn_out
+  units:
+  - d14.l0
+  - d14.l1
+  - d14.l2
+  - d14.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 14
+- module: mtp.0.main_norm
+  units:
+  - d14.l0
+  - d14.l1
+  - d14.l2
+  - d14.l3
+  weights:
+    tier: hbm_bank
+  stage: 14
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+- module: mtp.0.main_proj
+  units:
+  - d14.l0
+  - d14.l1
+  - d14.l2
+  - d14.l3
+  weights:
+    tier: hbm_bank
+  stage: 14
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+- module: mtp.1.attention
+  units:
+  - d15.l0
+  - d14.l0
+  - d15.l1
+  - d14.l1
+  - d15.l2
+  - d14.l2
+  - d15.l3
+  - d14.l3
+  splits:
+  - dim: head
+    factor: 8
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 15
+- module: mtp.1.ffn
+  units:
+  - d15.l0
+  - d14.l0
+  - d15.l1
+  - d14.l1
+  - d15.l2
+  - d14.l2
+  - d15.l3
+  - d14.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 15
+- module: mtp.1.hc_attn_in
+  units:
+  - d15.l0
+  - d15.l1
+  - d15.l2
+  - d15.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 15
+- module: mtp.1.hc_attn_out
+  units:
+  - d15.l0
+  - d15.l1
+  - d15.l2
+  - d15.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 15
+- module: mtp.1.hc_ffn_in
+  units:
+  - d15.l0
+  - d15.l1
+  - d15.l2
+  - d15.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 15
+- module: mtp.1.hc_ffn_out
+  units:
+  - d15.l0
+  - d15.l1
+  - d15.l2
+  - d15.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 15
+- module: mtp.2.attention
+  units:
+  - d15.l0
+  - d14.l0
+  - d15.l1
+  - d14.l1
+  - d15.l2
+  - d14.l2
+  - d15.l3
+  - d14.l3
+  splits:
+  - dim: head
+    factor: 8
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 15
+- module: mtp.2.confidence_head
+  units:
+  - d15.l0
+  - d15.l1
+  - d15.l2
+  - d15.l3
+  weights:
+    tier: hbm_bank
+  stage: 15
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+- module: mtp.2.ffn
+  units:
+  - d15.l0
+  - d14.l0
+  - d15.l1
+  - d14.l1
+  - d15.l2
+  - d14.l2
+  - d15.l3
+  - d14.l3
+  splits:
+  - dim: expert
+    factor: 8
+    collective: all_to_all
+  weights:
+    tier: hbm_bank
+  stage: 15
+- module: mtp.2.hc_attn_in
+  units:
+  - d15.l0
+  - d15.l1
+  - d15.l2
+  - d15.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 15
+- module: mtp.2.hc_attn_out
+  units:
+  - d15.l0
+  - d15.l1
+  - d15.l2
+  - d15.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 15
+- module: mtp.2.hc_ffn_in
+  units:
+  - d15.l0
+  - d15.l1
+  - d15.l2
+  - d15.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 15
+- module: mtp.2.hc_ffn_out
+  units:
+  - d15.l0
+  - d15.l1
+  - d15.l2
+  - d15.l3
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+  weights:
+    tier: hbm_bank
+  stage: 15
+- module: mtp.2.markov_head
+  units:
+  - d15.l0
+  - d15.l1
+  - d15.l2
+  - d15.l3
+  weights:
+    tier: hbm_bank
+  stage: 15
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+- module: mtp.2.norm
+  units:
+  - d15.l0
+  - d15.l1
+  - d15.l2
+  - d15.l3
+  weights:
+    tier: hbm_bank
+  stage: 15
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce
+- module: other_globals
+  units:
+  - d0.l0
+  - d0.l1
+  - d0.l2
+  - d0.l3
+  weights:
+    tier: hbm_bank
+  stage: 0
+  splits:
+  - dim: hidden
+    factor: 4
+    collective: allreduce

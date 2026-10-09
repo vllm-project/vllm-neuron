@@ -1,0 +1,23 @@
+{
+  "captured_at": "2026-09-26T10:27:27",
+  "metrics": {
+    "decode_128_b1_ms": 11.001516,
+    "decode_128_b32_ms": 29.461345,
+    "decode_128_b4_ms": 11.819518,
+    "decode_128_b8_ms": 14.339779,
+    "decode_8192_b1_ms": 13.868032,
+    "decode_8192_b32_ms": 49.666709,
+    "decode_8192_b4_ms": 22.266808,
+    "decode_8192_b8_ms": 26.181079,
+    "prefill_128_b1_ms": 27.288519,
+    "prefill_128_b32_ms": 613.792679,
+    "prefill_128_b4_ms": 81.172703,
+    "prefill_128_b8_ms": 157.152873,
+    "prefill_8192_b1_ms": 617.393417,
+    "prefill_8192_b32_ms": 14619.674471,
+    "prefill_8192_b4_ms": 1867.113979,
+    "prefill_8192_b8_ms": 3688.863321
+  },
+  "passed_gate": true,
+  "plan_sha256": "5ec7f98a84d29f8cbd3dd9c138599c3c772747b23c287168e463a1d2061927c4"
+}

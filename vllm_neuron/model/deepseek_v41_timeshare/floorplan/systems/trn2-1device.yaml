@@ -1,0 +1,121 @@
+# The dev host: one trn2.3xlarge. Same schema as trn2-16device.yaml, one device.
+#
+# This file exists so that the one configuration where a prediction can be checked against
+# hardware is a first-class target rather than a special case. Everything a single device
+# can do is identical to the 16-device target — same silicon, same banks, same engines —
+# so a scheme spot-checked here is evidence about the cost model even though it says
+# nothing about the torus.
+#
+# What is missing relative to the target, and therefore what this host can never validate:
+# `topology` is a single node, `links.inter_device` is absent, and `tiers.peer_hbm` is
+# absent. A floorplan that names a device other than d0 is rejected against this target.
+
+name: trn2-1device
+description: trn2.3xlarge — 1 Trainium2 device, 4 logical NeuronCores. Development only.
+
+provenance:
+  urls:
+    - https://aws.amazon.com/ec2/instance-types/trn2/
+  fetched: 2026-09-25
+  observed: "neuron-ls: instance-type trn2.3xlarge, logical-neuroncore-config 2, 1 device, 4 cores, 96 GB"
+
+lnc: 2
+placement_grain: logical_nc
+
+hierarchy:
+  instance:
+    count: 1
+  device:
+    count: 1
+    per: instance
+    address: d{i}
+  logical_nc:
+    count: 4
+    per: device
+    address: d{i}.l{j}
+  physical_nc:
+    count: 2
+    per: logical_nc
+    address: d{i}.l{j}.p{k}
+    schedulable: false
+
+# Identical silicon — inherited wholesale from the target so the two files cannot drift.
+device:
+  inherit: trn2-16device
+
+topology:
+  kind: single
+  shape: [1, 1]
+  wrap: false
+
+links:
+  intra_device:
+    scope: logical_nc <-> logical_nc within one device
+    bandwidth_bytes_per_s: null
+    latency_us: null
+    source: probe_required
+    confidence: low
+    note: Probeable here, and this is the host that probes it.
+  host:
+    scope: device <-> host DRAM over PCIe
+    bandwidth_bytes_per_s: null
+    latency_us: null
+    source: probe_required
+    confidence: low
+
+tiers:
+  - name: hbm_bank
+    scope: logical_nc
+    capacity_bytes: 25769803776         # 24 GiB
+    bandwidth_bytes_per_s: 7.25e11
+    latency_us: 0
+    source: derived
+    reachable_from: own logical_nc
+
+  - name: device_hbm
+    scope: device
+    capacity_bytes: 103079215104        # 96 GiB
+    bandwidth_bytes_per_s: 2.9e12
+    latency_us: 0
+    source: datasheet
+    reachable_from: the 4 logical_nc of that device
+
+  - name: host_dram
+    scope: instance
+    capacity_bytes: 137438953472        # 128 GB instance memory
+    capacity_source: datasheet
+    bandwidth_bytes_per_s: null
+    latency_us: null
+    source: probe_required
+    confidence: low
+    reachable_from: any device, over PCIe
+
+  - name: nvme
+    scope: instance
+    capacity_bytes: 470000000000        # 1 x 470 GB
+    capacity_source: datasheet
+    devices: 1
+    bandwidth_bytes_per_s: null
+    random_read_iops: null
+    latency_us: null
+    min_transfer_granularity_bytes: 4096
+    via: [host_dram]          # no direct accelerator-to-NVMe path; both legs are charged
+    source: probe_required
+    confidence: low
+    reachable_from: any device, but only through host_dram
+
+host:
+  vcpus: 12
+  dram_bytes: 137438953472
+  source: datasheet
+
+efficiency:
+  inherit: trn2-16device
+
+# The text constraints are properties of the silicon, not of the instance size, so items
+# 1-4 and 6-9 apply here verbatim. Item 5 (torus non-uniformity) does not: there is one
+# device and no hop to pay. Stating that explicitly keeps the invariant suite from
+# reporting item 5 as unimplemented against this target.
+constraints_text:
+  inherit: trn2-16device
+  not_applicable: [5]
