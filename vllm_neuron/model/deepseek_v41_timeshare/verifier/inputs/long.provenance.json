@@ -1,0 +1,13 @@
+{
+  "generator": "fetch_long_inputs.py",
+  "source": "synthetic",
+  "seed": 20260920,
+  "budgets": [
+    2048,
+    8192,
+    16384
+  ],
+  "per_budget": 1,
+  "n_samples": 3,
+  "sha256_16": "709c2fc31010c085"
+}
