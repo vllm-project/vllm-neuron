@@ -1,62 +1,7 @@
-"""`layers.20.attention` — the whole module, on 4 ranks, rejoined by `nki.collectives`.
-
-One rank is a quarter of the module cut along the **query-head** dimension
-(`FLOORPLAN.md`: `headx4(allreduce)`), and the four ranks rejoin by summing `wo_b`'s partials
-with one `ncc.all_reduce` inside the traced graph. `torch.distributed` only bootstraps the
-process group; no tensor data passes through it or through the host.
-
-The computational body below is `submodule/source.py` at its best accepted commit (25.7837 ms on
-one logical NeuronCore), unchanged in its arithmetic, its tile widths and its schedule. It carries
-no comments because that copy carries none — the comments were an earlier agent's claims and were
-stripped on purpose, and keeping the body byte-comparable is what makes "unchanged" checkable.
-Everything new is commented, and it is exactly three things:
-
-  1. the **rank-indexed weight slicing** (`_rank_id`, `_shard0`, `_shard1`, `_shard_src`,
-     `_load_bcast_shard`, and the `shard=`/`rid=` arguments threaded into `_dequant_weight`).
-     Every rank is handed the module's *whole* recorded weight set and the kernel picks its own
-     quarter of `wq_b`, `wo_a`, `wo_b` and `attn_sink` out of it;
-  2. the **seam**: `cc_src`, `cc_dst`, the `all_reduce`, and the copy out into the returned
-     tensor;
-  3. the dtypes at the seam (`OUT_DTYPE`, `CC_DTYPE`).
-
-A rank's identity lives entirely in the *values* `inference.py` hands this kernel, never in the
-code: one NEFF runs on all four ranks. It reaches the hardware only through `ncc.rank_id()`, as
-the `scalar_offset` of the staging DMAs that feed the fp8 dequantizer and of the `attn_sink`
-read. Everything downstream of those DMAs indexes trace-time constants again, so no other helper
-in this file had to learn about dynamic addressing — and nothing about the rank reaches a width or
-a trip count, which it cannot.
-
-Inside a rank, `nl.program_id(0)` *is* a trace-time constant, so the two physical cores behind one
-logical NeuronCore (`logical-neuroncore-config: 2`) split the rank's 16 query groups statically
-and front-to-back: `_core_runs` gives core 0 groups 0–3 and 12–15 and core 1 groups 4–11, which is
-68 (query tile, compressed block) block-units each rather than the 34/102 a contiguous halving
-would give. That is the submodule's own code.
-
-Eight things about `nki.collectives` on this toolchain, each of which otherwise fails with an
-internal compiler error that names something else:
-
-  1. the NEFF must be **LNC-wide**, because this host is LNC=2 and a LNC=1 NEFF leaves the
-     collective's buffer unallocated on the logical core's second physical core
-     (`NCC_ILLC059 Could not find MemoryLocation ... on core 1`). `kernel = _impl[CORES]` at the
-     bottom of this file binds that here, so the frozen validator's plain `kernel(*args, group)`
-     launches a 2-wide SPMD grid; the validator asserts the width it got rather than choosing it;
-  2. `cc_src` / `cc_dst` carry `name=`, or DRAM allocation fails (`NCC_IBIR440`);
-  3. they are scratch and not the returned tensor, because a collective may not read or write an
-     IO tensor (`NCC_INLA001`) — hence the copy out. Plain DMA is *not* restricted this way, which
-     is what makes the scalar-indirect staging reads of the weight IO tensors legal;
-  4. both are `nl.shared_hbm`: buffer kinds may not be mixed across a collective's operands;
-  5. the `ReplicaGroup` is built by `inference.py` and passed in, because the tracer rejects
-     `range` in a traced body;
-  6. the inputs are built on CPU and `.to(device)`'d, because `torch.full(..., device=xla)` emits
-     a broadcast HLO that hits `NCC_ISMP902` — and that error is the broadcast, not the
-     collective;
-  7. a collective operand's access pattern must start at element offset zero and cover the whole
-     buffer, so `cc_src` and `cc_dst` are dedicated buffers of exactly the reduced shape rather
-     than views of something larger;
-  8. and, not about collectives: this kernel needs `NKI_COMPILER_FRONTEND=tracer`, which is what
-     the submodule's 25.7837 ms baseline was compiled with. NKI's default frontend rejects the
-     generator and comprehension expressions `_core_runs` and the attention's static schedule are
-     built out of.
+"""`layers.20.attention` on 4 ranks, cut along the **query-head** dimension (`FLOORPLAN.md`:
+`head x4 (allreduce)`). The four ranks rejoin by summing `wo_b`'s partials with one
+`ncc.all_reduce` inside the traced graph; `torch.distributed` only bootstraps the process group,
+and no tensor data passes through it.
 """
 
 import torch
@@ -86,47 +31,11 @@ NEG_INF = -1.0e30
 NEG_BOUND = -1.0e30
 SM_SCALE = HEAD_DIM ** -0.5
 HEADS_PER_GROUP = N_HEADS // O_GROUPS
-# Linear bisection steps resolving the top-512 threshold, over the bracket [min - 1, max]: `k`
-# steps place it within (max - min) / 2^k. This was 12, and at float32 iteration 2 measured that
-# dropping to 11 cost 48% of the accuracy margin for 0.42% of latency and left it on the shelf.
-#
-# `IDX_SCORE_DTYPE = bfloat16` below changes that trade, because it changes what the threshold is
-# resolving *against*: the score's own quantization step near the threshold is about |score| * 2^-9,
-# which for these brackets is of order (max - min) * 2^-10, so a 12th step refines the threshold
-# finer than the score it thresholds can distinguish. Measured: **11 steps is bit-identical to 12**
-# (every printed accuracy digit the same) for -0.052 ms. 9 is not bit-identical -- it is the first
-# step that actually coarsens the selection -- but it costs only 3.1e-05 of (1 - cosine), 6.8% of
-# that margin, for a further -0.233 ms (-0.89%). 26.1150 -> 26.0635 (11) -> 25.8308 (9).
-#
-# If a later change needs the fidelity back, **11 is the free setting** and is worth 26.0635 ms.
 BISECT_STEPS = 9
 
-# The dtype the indexer's `index_score` row is *held* in (`rows`/`rflat`), and the dtype its
-# per-head-group partial sums are accumulated in (`part`). Both were float32; this is the whole of
-# iteration 3's first and larger win, 26.7067 -> 26.1150 ms, -2.22%.
-#
-# The score row is the widest live tile in the kernel -- (PT, gbn * NT) with `gbn` up to 16, i.e.
-# 8192 floats = 32 KiB a partition at float32 -- and every bisection step reads all of it, on the
-# two engines the measured region breakdown has the indexer saturating (Vector 83.9%, Scalar 74.9%,
-# against a device utilization ceiling of ~81%). Holding it in bfloat16 halves the bytes every
-# Vector and Scalar pass in the indexer moves, and hands 18 KiB a partition back to the allocator.
-# No instruction moved between engines and no instruction count changed, which is why this won
-# where eight engine-rebalancing experiments did not.
-#
-# `IDX_ACC_DTYPE` is the more aggressive half: it also halves the 32 weighted-accumulate passes
-# that build the score, at the cost of rounding each of the 8 accumulation steps in a chain rather
-# than only the final sum. Its error is a function of `IDX_HG` -- larger `IDX_HG` means fewer terms
-# per chain and so less rounding -- which is the knob to reach for if `cosine` ever becomes binding.
 IDX_SCORE_DTYPE = nl.bfloat16
 IDX_ACC_DTYPE = nl.bfloat16
 
-# The same question asked of the attention's own widest live tile -- `lcs`, the compressed-KV logit
-# row, `(PT, (gbn-1)*NT + dw)` and so also up to 32 KiB a partition at float32. **It must stay
-# float32 and this constant is here to record why**: `lcs` is written by `nisa.select_reduce`, whose
-# `dst` dtype must equal its `on_true` dtype, and `on_true` is the matmul's PSUM tile -- which is
-# float32 because PSUM is. bfloat16 fails MLIR verification at the `select_reduce`, not at runtime:
-#   error: 'nisa.select_reduce' op 'dst' dtype ('bf16') must match 'on_true' dtype ('f32')
-# Narrowing it would take a separate copy pass, which is the cost the narrowing was meant to avoid.
 ATT_LOGIT_DTYPE = nl.float32
 
 BISECT_SCALAR = 1
@@ -177,37 +86,12 @@ QG = NT * RATIO
 NG = SEQ // QG
 QPB = MT // NG
 
-# --- the four ranks -----------------------------------------------------------------------------
-# `N_HEADS = 16`, `O_GROUPS = 2` and `attn_sink`'s 16 entries above are already *this rank's*
-# share; `WORLD_SIZE` is what turns a whole recorded weight into that share. Every shard boundary
-# — 16 sink entries, 8192 `wq_b` rows, 2048 `wo_a` rows, 2048 `wo_b` columns, and each scale's own
-# 256 / 64 / 64 — is a multiple of the 32-wide fp8 scale block, so no block straddles two ranks.
 WORLD_SIZE = 4
 
-# The module's output dtype: the recorded output's own. `RowParallelLinear` ends
-# `return y.type_as(x)` with `x` bfloat16, so the reference rounds to bfloat16 exactly once after
-# the reduce, and so does this chain — in the copy out of `cc_dst`.
 OUT_DTYPE = nl.bfloat16
 
-# The dtype a rank's `wo_b` partial is written in and the four partials are reduced in. float32 is
-# what `RowParallelLinear` reduces in (`y = y.float(); dist.all_reduce(y)`), so it is the faithful
-# reading, and both settings have been built and measured on this host.
-#
-# bfloat16 ships, and it is the whole of this iteration: 27.5008 -> 26.7164 ms, -0.784 ms (-2.85%),
-# because the reduce is 83.9 MB on the wire instead of 167.8 MB and the collective here is pure
-# bandwidth -- two full-size measurements of this same buffer fit a line at 7.13 us/MB (140 GB/s)
-# with a 13 us intercept, so bytes are the only thing that costs. `cc_op_time` 1.209 -> 0.611 ms.
-#
-# The price is 0.00195 of worst element -- `max_abs_err` 0.208984375 -> 0.2109375, 8% of the
-# headroom under the pinned 0.235254 ceiling -- and 3.0e-06 of cosine. That leaves 0.0244, which is
-# the widest accuracy margin this file has had, and it is not recoverable any further in this
-# direction: fp8 e4m3 carries ~6% relative error on O(1) partial sums, so bfloat16 is the narrowest
-# dtype these partials survive. `OUT_DTYPE` is unaffected either way -- the chain still rounds to
-# the recorded output's bfloat16 exactly once, in the copy out of `cc_dst`, which is now a
-# bf16 -> bf16 transfer rather than the fp32 -> bf16 narrowing it was.
 CC_DTYPE = nl.bfloat16
 
-# Rows per DMA of the post-collective copy. 1024 x 5120 bfloat16 = 10 MiB a descriptor.
 CC_ROWS = 1024
 
 
@@ -221,53 +105,30 @@ def _blocks(n, step):
 
 
 def _rank_id():
-    """This rank's index as a 1x1 int32 SBUF scalar, usable as a DMA `scalar_offset`.
-
-    `ncc.rank_id()` is a virtual register, not a trace-time constant: it can *address* data
-    through a DMA's `scalar_offset`, but it cannot choose a width or a trip count. That is the
-    whole reason the four ranks can share one NEFF.
-    """
     rid = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
     nisa.register_store(rid, ncc.rank_id())
     return rid
 
 
 def _shard0(t, rank_rows, cols, rid, row, rows):
-    """`rows` rows at `row` of this rank's `(rank_rows, cols)` block of a dim-0 sharded tensor.
-
-    The whole recorded tensor is `(WORLD_SIZE * rank_rows, cols)`; viewed as
-    `(WORLD_SIZE, rank_rows, cols)` the rank index scales by `rank_rows * cols`, which is what
-    `indirect_dim=0` does with the scalar offset. The returned view is the `src` of one DMA.
-    """
     return t.reshape((WORLD_SIZE, rank_rows, cols)).ap(
         pattern=[[cols, rows], [1, cols]], offset=row * cols,
         scalar_offset=rid, indirect_dim=0)
 
 
 def _shard1(t, rows_all, rank_cols, rid, row, rows):
-    """`rows` rows at `row` of this rank's `(rows_all, rank_cols)` block of a dim-1 sharded tensor.
-
-    A column shard needs no new mechanism: element `(i, rank * rank_cols + j)` of the recorded
-    `(rows_all, WORLD_SIZE * rank_cols)` tensor is row `i * WORLD_SIZE + rank` of the same storage
-    viewed as `(rows_all * WORLD_SIZE, rank_cols)`, so the rank index again scales by dim 0's
-    stride and consecutive rows are `WORLD_SIZE` apart. The run length per row is unchanged —
-    `rank_cols` contiguous elements either way — so this costs the DMA no extra descriptors, only
-    a stride.
-    """
     return t.reshape((rows_all * WORLD_SIZE, rank_cols)).ap(
         pattern=[[WORLD_SIZE * rank_cols, rows], [1, rank_cols]],
         offset=row * WORLD_SIZE * rank_cols, scalar_offset=rid, indirect_dim=0)
 
 
 def _shard_src(t, shard, n, k, rid, row, rows):
-    """`_shard0` or `_shard1`, chosen by the dimension the checkpoint shards this tensor on."""
     if shard == 0:
         return _shard0(t, n, k, rid, row, rows)
     return _shard1(t, n, k, rid, row, rows)
 
 
 def _load_bcast_shard(vec_hbm, n, rows, rid, dt=nl.float32):
-    """`_load_bcast` of this rank's `n` of `WORLD_SIZE * n` entries — `attn_sink`, one per head."""
     v = nl.ndarray((1, n), dtype=dt, buffer=nl.sbuf)
     nisa.dma_copy(dst=v, src=vec_hbm.reshape((WORLD_SIZE, n)).ap(
         pattern=[[n, 1], [1, n]], offset=0, scalar_offset=rid, indirect_dim=0))
@@ -475,18 +336,6 @@ def _scale_selector():
 
 
 def _dequant_weight(w_u8, s_u8, dst_hbm, n, k, dst_row=0, shard=None, rid=None):
-    # `shard` is `None` for a replicated weight -- `w_u8` is then already exactly what this rank
-    # reads. `shard=0` means the recorded tensor is `(WORLD_SIZE * n, k)` and this rank owns rows
-    # `rank * n ...`; `shard=1` means it is `(n, WORLD_SIZE * k)` and this rank owns columns
-    # `rank * k ...`. `n` and `k` always describe *this rank's* block either way, so every index
-    # below and every caller is unchanged by the split: the only difference is that the two byte
-    # reads become explicit DMAs with `rid` as their `scalar_offset`.
-    #
-    # The sharded scale read moves `uint8` and widens to int32 on-chip, where the replicated path
-    # asks the DMA to widen (`nl.load(..., dtype=nl.int32)`). Both produce the same zero-extended
-    # values, and reading the bytes as bytes is the one form with no doubt about what the transfer
-    # does with a narrower source. If one of the two ever changes, both have to change together or
-    # the sharded and replicated weights stop agreeing bit for bit.
     kb = k // FP8_BLK
     sper = PT // FP8_BLK
     sel = _scale_selector()
@@ -965,8 +814,6 @@ def _sparse_attention_gen(q_hbm, kvp_hbm, ckv_hbm, msk_hbm, sink_hbm, freqs_hbm,
     nonneg = nl.copy(nl.greater_equal(jio, float(PT)), dtype=nl.float32)
     pwin_gen = nl.copy(nl.greater(inwin, 0.5), dtype=nl.uint8)
     pwin_zero = nl.copy(nl.greater(nl.multiply(nonneg, inwin), 0.5), dtype=nl.uint8)
-    # `attn_sink` is one float32 per head, sharded dim 0: this rank's 16 of 64, read through
-    # `rid`. The local head index `h` below is global head `16 * rank + h`.
     sinkb = _load_bcast_shard(sink_hbm, N_HEADS, PT, rid)
 
     ckv_t = nl.ndarray((PT, dt, cmax), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -1111,17 +958,11 @@ def _impl(hidden_states, layers_20_attn_attn_sink, layers_20_attn_compress_kv_ca
     agbs = tuple(sorted(gbs, reverse=True))
 
     x_hbm = hidden_states.reshape((SEQ, DIM))
-    # The module's output, and the one tensor the collective may not touch (`NCC_INLA001`).
     out = nl.ndarray((1, SEQ, DIM), dtype=OUT_DTYPE, buffer=nl.shared_hbm)
     out2 = out.reshape((SEQ, DIM))
-    # The seam. Named, both `nl.shared_hbm`, neither an IO tensor, and each exactly the
-    # collective's shape -- an operand must start at element offset zero and cover the whole
-    # buffer, so these cannot be views of something larger.
     cc_src = nl.ndarray((SEQ, DIM), dtype=CC_DTYPE, buffer=nl.shared_hbm, name="cc_src")
     cc_dst = nl.ndarray((SEQ, DIM), dtype=CC_DTYPE, buffer=nl.shared_hbm, name="cc_dst")
 
-    # This rank's index, as the one runtime scalar the staging DMAs address through. Both physical
-    # cores take their own copy, because both dequantize a sharded weight.
     rid = _rank_id()
 
     QKV_N = Q_LORA + HEAD_DIM
@@ -1142,17 +983,11 @@ def _impl(hidden_states, layers_20_attn_attn_sink, layers_20_attn_compress_kv_ca
         _dequant_weight(layers_20_attn_indexer_wq_b_weight,
                         layers_20_attn_indexer_wq_b_scale, iwqb,
                         INDEX_HEADS * INDEX_DIM, Q_LORA)
-        # `wo_a` is `ColumnParallelLinear` over the 8 o-groups: this rank's rows `2048 * rank ...`
-        # are o-groups `2 * rank` and `2 * rank + 1`, which are exactly the heads `wq_b` gives it.
         _dequant_weight(layers_20_attn_wo_a_weight, layers_20_attn_wo_a_scale, wo_a,
                         O_GROUPS * O_LORA, HEADS_PER_GROUP * HEAD_DIM, shard=0, rid=rid)
     else:
-        # `wq_b` is `ColumnParallelLinear`: rows `8192 * rank ...` of 32768 are q heads
-        # `16 * rank ...` of 64, since a head is 512 consecutive rows.
         _dequant_weight(layers_20_attn_wq_b_weight, layers_20_attn_wq_b_scale, wqb,
                         N_HEADS * HEAD_DIM, Q_LORA, shard=0, rid=rid)
-        # `wo_b` is `RowParallelLinear`: this rank holds columns `2048 * rank ...` of the 8192
-        # reduction columns, so what it computes is a *partial sum* of the module's whole output.
         _dequant_weight(layers_20_attn_wo_b_weight, layers_20_attn_wo_b_scale, wo_b,
                         DIM, O_GROUPS * O_LORA, shard=1, rid=rid)
     if CORES > 1:
@@ -1263,27 +1098,12 @@ def _impl(hidden_states, layers_20_attn_attn_sink, layers_20_attn_compress_kv_ca
                   x_row=g * SEQ + r0, w_row=g * O_LORA,
                   dst_row=r0, dst_col=g * O_LORA, qdq=True,
                   mgb_bytes=EPI_MGROUP_BYTES)
-        # `wo_b` writes the collective's source directly: this rank's partial sum of the whole
-        # `(8192, 5120)` output. The submodule wrote `out2` here instead, in float32.
         _gemm(z_q, wo_b, cc_src, m, O_GROUPS * O_LORA, DIM, x_row=r0, dst_row=r0,
               out_dtype=CC_DTYPE, mgb_bytes=EPI_MGROUP_BYTES)
 
-    # The seam. It sits after `wo_b` and nowhere else, because `wo_b` is the row-parallel
-    # projection: the only point at which a rank holds a tensor of the module's full output shape
-    # carrying an incomplete sum. Nothing follows it -- `wo_b` is built with `bias = False`, so
-    # after the reduce every rank holds the whole module's output, rank 0 included.
-    #
-    # The two physical cores filled *disjoint* row runs of `cc_src` (the same runs they computed),
-    # and this barrier between those writes into shared HBM and the collective's read of them is
-    # what makes the other core's rows visible.
     if CORES > 1:
         nisa.core_barrier(data=cc_src, cores=tuple(range(CORES)))
     ncc.all_reduce(srcs=[cc_src], dsts=[cc_dst], replica_group=replica_group, op=nl.add)
-    # A collective may not write an IO tensor, so the reduced result is copied out. Split over the
-    # same row runs, so each physical core moves half of it -- and this is where the chain rounds
-    # to the recorded output's bfloat16, once, as `RowParallelLinear`'s `y.type_as(x)` does. The
-    # narrowing is the DMA's: `nisa.dma_copy` converts float32 to bfloat16 across a transfer, which
-    # is what makes this one pass rather than a load, a cast and a store.
     for r0, m in runs:
         for off, sz in _blocks(m, CC_ROWS):
             nisa.dma_copy(dst=out2[r0 + off:r0 + off + sz, 0:DIM],
@@ -1309,30 +1129,15 @@ def _front(hidden_states, wp_w, norm_w):
     return _linear(hidden_states.reshape(SEQ, DIM), w)
 
 
-# The LNC-wide launch, bound here rather than by the validator: this host is LNC=2 and a LNC=1
-# NEFF leaves the collective's buffer unallocated on the logical core's second physical core
-# (`NCC_ILLC059`). `kernel` below is a plain function, so it carries `lnc` explicitly for the
-# validator to assert on.
 _grid = _impl[CORES]
 
 _I_HIDDEN, _I_WP_W, _I_NORM_W = 0, 8, 25
 
 
 def kernel(*args):
-    """The module's 26 recorded arguments, then the `ReplicaGroup` the validator builds.
-
-    `front` is `weights_proj` folded with `attn_norm.weight` and applied to the raw hidden state,
-    in torch: the indexer's per-head score weights, 32 columns wide. The kernel multiplies it by
-    the RMS reciprocal it computes anyway, which recovers `weights_proj(attn_norm(x))` exactly.
-    It is a 32-wide moving operand, which is the one shape where `nc_matmul` loses badly to XLA
-    and the one projection the submodule measured as worth moving out. It is replicated: the
-    indexer is head-independent of the q heads this rank owns.
-    """
     assert len(args) == 27, f"expected 26 recorded arguments and a replica group, got {len(args)}"
     front = _front(args[_I_HIDDEN], args[_I_WP_W], args[_I_NORM_W])
     return _grid(*args[:26], front, args[26])
 
 
-# `_impl[CORES]` reports `lnc == CORES`; an undecorated `nki.jit` kernel reports 1. The validator
-# asserts this rather than choosing it, so a later iteration that unbinds the grid fails loudly.
 kernel.lnc = getattr(_grid, "lnc", CORES)

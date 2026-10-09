@@ -58,3 +58,21 @@ Local: ~/workspace/partition_artifact/hf. Do not redownload from huggingface.
             - Can also use `neuron-nki-*` subagents
         - All API references: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/api/index.html
     - Neuron Runtime (for Host-Device management): https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/index.html
+
+### Kernels -> Reference Naming Correspondance:
+- dspark_attn -> layer-40-dsparkattn
+- dspark_confhead -> layer-42-dspark-confhead
+- dspark_markov -> layer-42-dspark-markovhead
+- dspark_moe -> layer-40-moe
+- engram_long -> engram-long
+- engram_short -> engram-short
+- hc_attn_out -> hc-sublayer-out-short
+- hc_collapse -> hc-collapse
+- hc_expand -> hcexpand
+- l2_attn -> layer-2-attention-long
+- l3_attn -> layer-0-attention-b
+- l20_attn -> layer-20-attention-long
+- l21_attn -> layer-0-attention-c
+- l24_attn -> layer-24-attention-long
+- moe_long -> layer-1-moe-long
+- moe_short -> layer-1-moe

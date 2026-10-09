@@ -1,59 +1,8 @@
-"""`layers.2.attention`, the whole module, on 4 ranks of one Trainium device.
-
-A rank owns a quarter of the **sequence** and the whole of every weight, rather than a quarter of
-the heads. `wo_b` stops being row-parallel, so a rank writes *finished* rows of the module's output
-and the four ranks rejoin by `all_gather` instead of `all_reduce`.
-
-**The tiles a rank owns are interleaved, and that is what makes one NEFF schedule four ranks
-identically.** Global `PT`-row query tile `WORLD_SIZE * j + rank` is this rank's local tile `j`.
-Global tile `g` reaches `64 * (g + 1)` compressed positions, i.e. `g // 8 + 1` blocks of `NT`; with
-`g = WORLD_SIZE * j + rank` and `rank < WORLD_SIZE` that block count is `j // 2 + 1` for *every*
-rank -- a trace-time constant. Only the valid width inside the last block is rank-dependent, and
-that is a runtime causal compare rather than a trace constant. A contiguous quarter would instead
-make the block count itself rank-dependent, forcing the one shared NEFF to schedule every tile at
-rank 3's reach.
-
-What this buys over the head split it replaces: the whole prefix -- the norm, `wq_a`, `wkv`, the
-gated fp32 compressor, the index keys, the index queries -- *and the indexer's 32-head relu'd QK
-and its top-512 selection*, which the head split computed redundantly on all four ranks, now run on
-a quarter of the rows. What it costs: a rank holds all 64 heads, so `wq_b`/`wo_a`/`wo_b` are no
-longer sharded for compute and their fp8 widening would be fully replicated -- which is why each
-rank widens a plain row quarter of each and the gather supplies the rest.
-
-A rank's identity reaches the hardware only through `ncc.rank_id()`, in four places: the staging
-DMAs that pull this rank's `x` and `freqs_cis` tiles down to a contiguous local range (`_rtile`),
-the dequantizer's row-quarter reads, the causal compare on the last block of the index score, and
-the window-KV read. Everything else indexes trace-time constants -- including the copies that undo
-the gathers' rank-major concatenation, since after an `all_gather` every slot's provenance is known
-at trace time.
-
-The selection is `nisa.topk` on the GpSimd engine rather than a bisection on the Vector engine;
-`_index_mask` documents the 16-partition snake it needs and why the threshold is read as the
-minimum of a `+inf`-prefilled `val_dst`. The copy that puts the gathered compressed KV and index
-keys back into compressed-position order is an **indirect `dma_copy`** with a per-row
-`vector_offset` and `dge_mode.swdge`, so its descriptors are generated on GpSimd; `_gather_index`
-derives the row vector.
-
-Constraints on `nki.collectives` on this toolchain, each of which otherwise fails with an internal
-compiler error that names something else:
-
-1. the NEFF must be LNC-wide. This host is LNC=2 and a LNC=1 NEFF leaves the collective's buffer
-   unallocated on the logical core's second physical core (`NCC_ILLC059`). `kernel = _impl[CORES]`
-   at the bottom of this file binds it, so a plain `kernel(*args)` launches a 2-wide SPMD grid;
-2. every operand carries `name=`, or DRAM allocation fails (`NCC_IBIR440`);
-3. operands are scratch buffers and never the returned tensor, because a collective may not read
-   or write an IO tensor (`NCC_INLA001`) -- hence the copies out. Plain DMA is not restricted this
-   way, which is what makes the scalar-indirect staging reads of the IO tensors legal;
-4. all operands are `nl.shared_hbm`: a collective's buffer kinds may not be mixed;
-5. the `ReplicaGroup` is built by `inference.py` and passed in, because the tracer rejects `range`
-   in a traced body;
-6. a collective operand's access pattern must start at element offset zero and cover the whole
-   buffer, so every `*_src` / `*_dst` is a dedicated buffer of exactly the collective's shape;
-7. `collective_dim=0` is the only value HBM operands support, so a sharded weight has to be split
-   on dim 0 for the gather to reassemble it.
-
-Comments on the inherited body were removed on purpose where they came in: they were written by an
-earlier agent and are its claims, not established fact.
+"""`layers.2.attention` on 4 ranks, sequence-parallel: a rank owns a quarter of the **sequence**
+and the whole of every weight, rather than a quarter of the heads. `wo_b` is therefore not
+row-parallel — a rank writes *finished* output rows — so the ranks rejoin by `all_gather` rather
+than `all_reduce`. A rank's query tiles are interleaved (global tile `WORLD_SIZE * j + rank` is
+its local tile `j`), which is what lets one NEFF schedule all four ranks identically.
 """
 
 import nki
@@ -64,8 +13,6 @@ import nki.language as nl
 SEQ = 8192
 DIM = 5120
 HEAD_DIM = 512
-# A rank now holds *all* 64 query heads and a quarter of the **sequence**, not a quarter of the
-# heads: `wo_b` stops being row-parallel, so a rank writes finished rows of the module's output.
 N_HEADS = 64
 ROPE_DIM = 64
 Q_LORA = 1280
@@ -80,10 +27,6 @@ INDEX_TOPK = 512
 EPS = 1e-20
 INDEX_SCORE_SCALE = 1.0 / 64.0
 NEG_INF = -1.0e30
-# `nisa.topk` returns `NEG_INF` as the threshold for a query with fewer than `INDEX_TOPK`
-# causally-reachable positions, because the causal compare's padding is what fills the snake out.
-# Clamping to this floor turns that into "take every reachable position", which is what the
-# reference's shorter `topk` does.
 THR_FLOOR = -1.0e29
 
 EXACT_SOFTMAX_SHIFT = False
@@ -105,40 +48,15 @@ MT = SEQ // PT
 NG = CSEQ // NT
 
 WORLD_SIZE = 4
-# --- the sequence split -------------------------------------------------------------------------
-# A rank owns `SEQ // WORLD_SIZE` query rows, taken as every fourth `PT`-row tile: global tile
-# `WORLD_SIZE * j + rank` is this rank's local tile `j`. The interleave -- not a contiguous quarter
-# -- is what keeps all four ranks' *schedules* identical while their work stays balanced.
-#
-# Global tile `g` covers rows `[g*PT, g*PT+PT)`, so it reaches compressed position
-# `floor((g*PT + PT) / RATIO) = 64*(g+1)`, i.e. `g // 8 + 1` blocks of `NT = 512`. With
-# `g = 4j + rank` and `rank < 4`: `(4j + rank) // 8 == j // 2`, so the block count is
-# `j // 2 + 1` for *every* rank -- a trace-time constant. Only the valid width inside the *last*
-# block is rank-dependent, and that is a runtime causal compare, not a trace constant. A
-# contiguous quarter would make the block count itself rank-dependent, forcing the one shared
-# NEFF to schedule every tile at rank 3's reach.
 SEQ_LOC = SEQ // WORLD_SIZE
 MT_LOC = SEQ_LOC // PT
 CSEQ_LOC = CSEQ // WORLD_SIZE
-# The module's output dtype: the recorded output's own, so the chain rounds to bfloat16 exactly
-# once however the partials are carried.
 OUT_DTYPE = nl.bfloat16
-# `wo_b` is no longer row-parallel: a rank holds every reduction column and writes *finished* rows,
-# so the collective is an `all_gather` of whole rows rather than an `all_reduce` of partial sums,
-# and the fp32 psum accumulation rounds to bfloat16 exactly once -- at least as faithful as the
-# head-split's four-way float32 reduce, at a quarter of the collective's bytes.
 CC_DTYPE = nl.bfloat16
 CC_HALF = DIM // 2
 
 
 def _core_runs(pid, cores=CORES):
-    """This physical core's local `PT`-row tiles, front-and-back so the two cores balance.
-
-    Local tile `j` sweeps `j // 2 + 1` blocks of `NT` compressed positions, so pairing the front
-    and the back of the range gives both cores 36 block-units. The two runs are deliberately *not*
-    merged even when they are adjacent: `_mg_cap` reads the run lengths, and two runs of four
-    tiles on both cores keeps the GEMM blocking identical on the two cores.
-    """
     per = MT_LOC // (2 * cores)
     a = (pid * per, pid * per + per)
     b = (MT_LOC - (pid + 1) * per, MT_LOC - pid * per)
@@ -148,59 +66,35 @@ def _core_runs(pid, cores=CORES):
 
 
 def _rank_id():
-    """This rank's index as a 1x1 int32 SBUF scalar, usable as a DMA `scalar_offset`."""
     rid = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
     nisa.register_store(rid, ncc.rank_id())
     return rid
 
 
 def _rtile(t, cols, rid, tile, extra=0, rows=PT):
-    """`rows` rows of a `(_, cols)` HBM tensor at global `PT`-row tile `WORLD_SIZE * tile + rid`.
-
-    The sequence split's one piece of runtime addressing. Viewed as `(_, PT, cols)` the rank index
-    scales by `PT * cols`, which is what `indirect_dim=0` does with the scalar offset; `extra`
-    shifts by whole tiles on top of that. The returned view is the `src` or `dst` of one DMA, and
-    everything downstream of it indexes trace-time constants again.
-    """
     return t.reshape((t.shape[0] // PT, PT, cols)).ap(
         pattern=[[cols, rows], [1, cols]],
         offset=(WORLD_SIZE * tile + extra) * PT * cols, scalar_offset=rid, indirect_dim=0)
 
 
 def _rank_col(rid, rows, scale=1.0):
-    """This rank's index as a `(rows, 1)` float32 column -- a per-partition operand."""
     r1 = nl.copy(rid.reshape((1, 1)), dtype=nl.float32)
     return nl.multiply(nl.broadcast_to(r1, (rows, 1)), scale)
 
 
 def _shard0(t, rank_rows, cols, rid, row, rows, col=0, ncols=None):
-    """`rows x ncols` at `(row, col)` of this rank's block of a **dim-0** sharded tensor.
-
-    The whole recorded tensor is `(WORLD_SIZE * rank_rows, cols)`; viewed as
-    `(WORLD_SIZE, rank_rows, cols)` the rank index scales by `rank_rows * cols`, which is what
-    `indirect_dim=0` does with the scalar offset. The returned view is the `src` of one DMA.
-    """
     return t.reshape((WORLD_SIZE, rank_rows, cols)).ap(
         pattern=[[cols, rows], [1, cols if ncols is None else ncols]],
         offset=row * cols + col, scalar_offset=rid, indirect_dim=0)
 
 
 def _shard1(t, rows_all, rank_cols, rid, row, rows, col=0, ncols=None):
-    """`rows x ncols` at `(row, col)` of this rank's block of a **dim-1** sharded tensor.
-
-    A column shard needs no new mechanism: element `(i, rank * rank_cols + j)` of the recorded
-    `(rows_all, WORLD_SIZE * rank_cols)` tensor is row `i * WORLD_SIZE + rank` of the same storage
-    viewed as `(rows_all * WORLD_SIZE, rank_cols)`, so the rank index again scales by dim 0's
-    stride and consecutive rows are `WORLD_SIZE` apart. The run length per row is unchanged --
-    `rank_cols` contiguous elements either way -- so this costs the DMA no extra descriptors.
-    """
     return t.reshape((rows_all * WORLD_SIZE, rank_cols)).ap(
         pattern=[[WORLD_SIZE * rank_cols, rows], [1, rank_cols if ncols is None else ncols]],
         offset=row * WORLD_SIZE * rank_cols + col, scalar_offset=rid, indirect_dim=0)
 
 
 def _shard_src(t, shard, n, k, rid, row, rows, col=0, ncols=None):
-    """`_shard0` or `_shard1`, chosen by which dimension the checkpoint shards this tensor on."""
     if shard == 0:
         return _shard0(t, n, k, rid, row, rows, col, ncols)
     return _shard1(t, n, k, rid, row, rows, col, ncols)
@@ -211,7 +105,6 @@ def _load_bcast(vec_hbm, n, rows):
 
 
 def _load_bcast_shard(vec_hbm, n, rows, rid):
-    """`_load_bcast` of this rank's `n` of `WORLD_SIZE * n` elements -- `attn_sink`, one per head."""
     v = nl.ndarray((1, n), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=v, src=vec_hbm.reshape((WORLD_SIZE, n)).ap(
         pattern=[[n, 1], [1, n]], offset=0, scalar_offset=rid, indirect_dim=0))
@@ -301,8 +194,6 @@ def _qdq_fp8(tile, rows, n):
 
 
 def _act_chunk(k):
-    # Widest first: `_qdq_fp8` takes its amax over `FP8_BLK` columns, so the chunk width cannot
-    # change a single block's scale -- it only changes how many instructions the sweep costs.
     for c in (2560, QDQ_CHUNK, 1024, 512, 256, 128):
         if k % c == 0:
             return c
@@ -343,18 +234,6 @@ def _dq_kchunk(k):
 
 
 def _dequant_weight(w_u8, s_u8, dst_hbm, n, k, shard=None, rid=None):
-    """Dequantize an fp8 weight into `dst_hbm`, optionally reading only this rank's shard.
-
-    `shard` is `None` for a replicated weight -- the reads are plain slices, exactly as the
-    submodule's -- or the dimension (`0` or `1`) the checkpoint shards this tensor on, in which
-    case each tile is read through a `scalar_offset` DMA at the runtime rank index. Same bytes
-    either way, so this is not extra traffic; only the addressing is dynamic, and it is contained
-    to these two DMAs so no helper downstream has to learn about it.
-
-    The scale read widens uint8 to int32 in the DMA in the sharded path, which is the same
-    widening `nl.load(..., dtype=nl.int32)` performs in the replicated one -- deliberately, so the
-    two paths agree bit for bit.
-    """
     sper = PT // FP8_BLK
     kc = _dq_kchunk(k)
     cb = kc // FP8_BLK
@@ -613,10 +492,6 @@ def _gemm_nest(k, nt, nbs, mmax, wb_total=None):
         return True, 1
     if (wb_total if wb_total is not None else wb_one * nbs) + xb <= GEMM_STAGE_BYTES:
         return True, 1
-    # Budget the *x* stage only, not x plus one weight block. A rank now holds every column of
-    # `wq_b`/`wo_a`/`wo_b` while its row count fell by four, so the weight traffic of this nest is
-    # `(mtiles / mg) * (whole weight)` and `mg` is the only lever on it: at `k = 8192` the old
-    # rule picked `mg = 1` and re-staged all 84 MB of `wo_b` once per 128 rows.
     mg = 1
     while mg * 2 <= mmax and (mg * 2) * xb <= MGROUP_BYTES:
         mg *= 2
@@ -624,19 +499,6 @@ def _gemm_nest(k, nt, nbs, mmax, wb_total=None):
 
 
 def _gemm_store(dst_hbm, row, col, w, acc, out_dtype, fp8):
-    """The GEMM epilogue: round the psum sum once, and optionally quantize before it ever lands.
-
-    `fp8=True` folds what `_quantize_act` did in a pass of its own into the store that produces the
-    value, which deletes that pass's whole intermediate buffer -- a write and a read of a
-    `(SEQ_LOC, n)` bfloat16 tensor. It is bit-faithful because the chain is kept in order: round
-    psum to bfloat16 *first*, exactly as the unfused store did, then widen that rounded value back
-    to float32, exactly as `_quantize_act`'s `nl.load(..., dtype=float32)` did. Quantizing straight
-    out of psum would skip a rounding and be *more* accurate than the reference, i.e. wrong.
-
-    The block width is legal because `_qdq_fp8` takes its amax over `FP8_BLK` columns and every
-    GEMM column block is a multiple of `FP8_BLK`, so no block straddles a boundary and the chunk
-    size cannot change any block's scale.
-    """
     bt = nl.copy(acc, dtype=out_dtype)
     if fp8:
         nl.store(dst_hbm[row:row + PT, col:col + w],
@@ -724,7 +586,6 @@ def _gemm_multi(x_hbm, specs, runs, k):
 
 
 def _load_rope_pair(freqs_hbm, row, hpg):
-    """`(cos, sin)` for `PT` consecutive local rows, broadcast over a head group."""
     half = ROPE_DIM // 2
     cosb = nl.ndarray((PT, 1, half), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=cosb[0:PT, 0, 0:half],
@@ -736,19 +597,6 @@ def _load_rope_pair(freqs_hbm, row, hpg):
 
 
 def _head_post(acc, nt, hdim, cos, sin, fp4):
-    """A head-major psum tile to the bf16 rows the consumer reads, rotation and fp4 folded in.
-
-    `_gemm_head_major` already holds `hpg` whole heads of a `PT`-row query tile in one psum tile,
-    and both of this kernel's head-major products -- the 64 attention queries and the 32 index
-    queries -- are followed immediately by a rotation of each head's trailing `ROPE_DIM` columns,
-    the index queries by an fp4 round trip as well. Done here those passes read psum instead of
-    re-reading what the GEMM just wrote, which retires a whole HBM round trip of the product.
-
-    Bit-faithful to the separate passes it replaces: the psum sum is rounded to bfloat16 *before*
-    the rotation reads it, exactly as the intermediate buffer did, and the rotated columns are
-    rounded again on the way back in. `_qdq_fp4`'s blocks are `32` wide and a head is `hdim >= 32`
-    columns, so no block straddles two heads and the group width `nt` cannot change its amax.
-    """
     hpg = nt // hdim
     half = ROPE_DIM // 2
     lo = hdim - ROPE_DIM
@@ -829,9 +677,6 @@ def _gemm_head_major(x_hbm, w_hbm, dst_hbm, runs, k, n, hdim, mstride=SEQ_LOC,
                 wt = nl.ndarray((PT, ktiles, nt), dtype=nl.bfloat16, buffer=nl.sbuf)
                 nisa.dma_transpose(dst=wt[0:PT, 0:ktiles, 0:nt],
                                    src=w3[nb * nt:(nb + 1) * nt, 0:ktiles, 0:PT])
-                # A plain `range`, not `nl.static_range`: `cs` is a Python list of staged SBUF
-                # tiles and indexing one by a `static_range` variable is an idiom this toolchain
-                # was not observed to accept.
                 for i in range(mg):
                     acc = nl.ndarray((PT, nt), dtype=nl.float32, buffer=nl.psum)
                     for kb in nl.static_range(ktiles):
@@ -855,28 +700,6 @@ def _norm_rows(src_hbm, w_hbm, dst_hbm, runs, n):
 
 
 def _index_mask(index_q, ik_hbm, iw_hbm, msk_hbm, scr_hbm, thr_hbm, tiles, rid):
-    """The indexer's score and its top-`INDEX_TOPK` selection, for this core's local query tiles.
-
-    The selection is `nisa.topk` on the GpSimd engine rather than a bisection on the Vector
-    engine. `topk` reads one problem per GpSimd core out of a 16-partition snake, so a
-    `(PT, _)`-partition source tile carries 8 queries; the snake's index mapping does not matter
-    here because only the `INDEX_TOPK`-th largest *value* -- the threshold -- is read, so any
-    bijection between a query's `n` scores and its `16 x n/16` region is as good as the documented
-    one. The cheap bijection is "partition `p` holds the `p`-th contiguous chunk", which makes the
-    staging a plain contiguous load once the score rows are written out chunk-major (`scr_hbm`
-    viewed as `(SEQ_LOC, 16, NT)`).
-
-    Only the *last* block of `NT` needs the causal compare. Local tile `j` is global tile
-    `WORLD_SIZE * j + rid`, whose last reachable compressed position is
-    `64 * (WORLD_SIZE * j + rid + 1)`, i.e. `256 * (j % 2) + 64 * rid + (i + 1) // 2` columns into
-    the last of its `j // 2 + 1` blocks for row `i`. Every earlier block is wholly reachable. The
-    rank's contribution is the only runtime term in the whole score pass.
-
-    A query with fewer than `INDEX_TOPK` causally-reachable positions gets `NEG_INF` back as its
-    threshold, because the padding the causal compare wrote is what fills out the snake. Clamping
-    at `THR_FLOOR` turns that into "take every reachable position", which is what the reference's
-    `topk` over a shorter row does.
-    """
     kmax = max(j // 2 for j in tiles) + 1
     ikt_all = nl.ndarray((INDEX_DIM, kmax, NT), dtype=nl.bfloat16, buffer=nl.sbuf)
     for gb in nl.affine_range(kmax):
@@ -905,8 +728,6 @@ def _index_mask(index_q, ik_hbm, iw_hbm, msk_hbm, scr_hbm, thr_hbm, tiles, rid):
                                          0:INDEX_DIM]))
         rows = nl.ndarray((PT, gbn, NT), dtype=nl.bfloat16, buffer=nl.sbuf)
         for gb in nl.static_range(gbn):
-            # The 32 heads still sum in float32, as the bisection's `total` did; only the finished
-            # score rounds to bfloat16, which is what `topk` and the mask compare read.
             tot = nl.ndarray((PT, NT), dtype=nl.float32, buffer=nl.sbuf)
             for hb in nl.static_range(INDEX_HEADS):
                 ps = nl.ndarray((PT, NT), dtype=nl.float32, buffer=nl.psum)
@@ -930,19 +751,11 @@ def _index_mask(index_q, ik_hbm, iw_hbm, msk_hbm, scr_hbm, thr_hbm, tiles, rid):
             else:
                 nisa.tensor_copy(dst=tgt, src=tot)
 
-        # Out chunk-major and straight back in as the 8-queries-per-tile `topk` snake. `scr_hbm`
-        # and `thr_hbm` are written and read through exactly one view each, and every `topk`
-        # operand is a whole tile of its own -- a sliced tile and a second view of the same buffer
-        # are both things this instruction was not observed to tolerate.
         src_x = (gbn * NT) // 16
         nl.store(scr_hbm[q0:q0 + PT, 0:16, 0:src_x], value=rows.reshape((PT, 16, src_x)))
         for gi in nl.static_range(PT // 8):
             a0 = q0 + gi * 8
             tsrc = nl.ndarray((PT, src_x), dtype=nl.bfloat16, buffer=nl.sbuf)
-            # Pre-filled with +inf so the minimum below is over the slots `topk` actually wrote,
-            # wherever in the K region it chose to write them -- the hardware's order inside the
-            # region is an internal partial order, not ascending. `val_dst` holds exactly the top-K
-            # values, so that minimum is the K-th largest under any ordering.
             vdst = nl.ndarray((PT, INDEX_TOPK), dtype=nl.bfloat16, buffer=nl.sbuf)
             vk = vdst[0:PT, 0:INDEX_TOPK // 16]
             nisa.memset(dst=vk, value=-NEG_INF)
@@ -977,11 +790,8 @@ def _sparse_attention(q_hbm, kvp_hbm, ckv_hbm, msk_hbm, sink_hbm, freqs_hbm,
     inwin = nl.multiply(nl.copy(nl.greater_equal(dio, 1.0), dtype=nl.float32),
                         nl.copy(nl.less_equal(dio, float(PT)), dtype=nl.float32))
     nonneg = nl.copy(nl.greater_equal(jio, float(PT)), dtype=nl.float32)
-    # Every global tile has a predecessor except global tile 0, which is local tile 0 of rank 0
-    # and of no other rank -- the one place the window's live range is rank-dependent.
     rflag = nl.copy(nl.greater(_rank_col(rid, PT), 0.5), dtype=nl.float32)
     one = nl.full((PT, 1), 1.0, dtype=nl.float32)
-    # `attn_sink` is `nn.Parameter(n_heads)` and a rank holds every head now, so it is read whole.
     sinkb = _load_bcast(sink_hbm, N_HEADS, PT)
 
     ckv3 = ckv_hbm.reshape((CSEQ, dt, PT))
@@ -995,9 +805,6 @@ def _sparse_attention(q_hbm, kvp_hbm, ckv_hbm, msk_hbm, sink_hbm, freqs_hbm,
         nisa.dma_transpose(dst=ckv_t[0:PT, 0:dt, gp * PT:(gp + 1) * PT],
                            src=ckv3[gp * PT:(gp + 1) * PT, 0:dt, 0:PT])
 
-    # The window KV latent, staged once per local tile through the one rank-indexed DMA. Local
-    # tile `j`'s window reaches into global tile `WORLD_SIZE * j + rid - 1`, which is why `kvp`
-    # had to be all-gathered first and why this read is the one that needs `rid`.
     for j in tiles:
         for wt in nl.static_range(2):
             wtile = nl.ndarray((PT, HEAD_DIM), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -1114,15 +921,6 @@ def _sparse_attention(q_hbm, kvp_hbm, ckv_hbm, msk_hbm, sink_hbm, freqs_hbm,
 
 
 def _gather_index(rows):
-    """The `(PT, rows // PT)` uint32 row index that undoes the KV gather's rank-major order.
-
-    `all_gather(collective_dim=0)` concatenates rank blocks, so gathered row
-    `s * CSEQ_LOC + 64 * j + i` is global compressed position `256 * j + 64 * s + i` -- rank `s`'s
-    local tile `j` pools its 128 rows into 64 latents. Inverting that for the `p`-th position of
-    the `b`-th `PT`-row output block gives
-    `2048 * (b % 2) + 64 * (b // 2) + 1024 * (p // 64) + (p % 64)`, which is one iota plus a
-    per-block constant -- and the per-row vector an indirect `dma_copy` wants.
-    """
     pio = nl.ndarray((PT, 1), dtype=nl.int32, buffer=nl.sbuf)
     nisa.iota(dst=pio, pattern=[[1, 1]], offset=0, channel_multiplier=1)
     pf = nl.copy(pio, dtype=nl.float32)
@@ -1143,15 +941,8 @@ def _impl(hidden_states, layers_2_attn_attn_sink, layers_2_attn_compress_kv_cach
     ATILES = sorted(TILES, reverse=True)
 
     x_hbm = hidden_states.reshape((SEQ, DIM))
-    # The module's output, and the one IO tensor the collectives may not touch.
     out = nl.ndarray((1, SEQ, DIM), dtype=OUT_DTYPE, buffer=nl.shared_hbm)
     out2 = out.reshape((SEQ, DIM))
-    # The seam's buffers: named, all `nl.shared_hbm`, none an IO tensor, and each the whole of
-    # exactly the collective's shape -- a view of something larger is rejected.
-    #
-    # The output gather is split in two column halves so the first half's collective overlaps the
-    # second half's `wo_b` GEMM: neither the gather nor the copy out can start before the GEMM
-    # ahead of it finishes, so unsplit it is a tail with every compute engine idle.
     cc_src_a = nl.ndarray((SEQ_LOC, CC_HALF), dtype=CC_DTYPE, buffer=nl.shared_hbm,
                           name="cc_src_a")
     cc_dst_a = nl.ndarray((SEQ, CC_HALF), dtype=CC_DTYPE, buffer=nl.shared_hbm, name="cc_dst_a")
@@ -1170,8 +961,6 @@ def _impl(hidden_states, layers_2_attn_attn_sink, layers_2_attn_compress_kv_cach
     ik_dst = nl.ndarray((CSEQ, INDEX_DIM), dtype=nl.bfloat16, buffer=nl.shared_hbm,
                         name="ik_dst")
 
-    # This rank's identity. A runtime register: it can address data through a DMA's
-    # `scalar_offset` and it cannot size anything, so every width below stays trace-time.
     rid = _rank_id()
 
     wq_a = nl.ndarray((Q_LORA, DIM), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="wq_a")
@@ -1184,14 +973,6 @@ def _impl(hidden_states, layers_2_attn_attn_sink, layers_2_attn_compress_kv_cach
                       buffer=nl.shared_hbm, name="wo_a")
     wo_b = nl.ndarray((DIM, O_GROUPS * O_LORA), dtype=nl.bfloat16, buffer=nl.shared_hbm,
                       name="wo_b")
-    # --- the dequantizer, a quarter per rank ----------------------------------------------------
-    # No weight is sharded for *compute* any more -- a rank holds all 64 heads and every reduction
-    # column of `wo_b` -- so all four ranks would widen the same fp8 bytes into the same bfloat16.
-    # `wq_b`, `wo_a` and `wo_b` are 118 of the 132 MB, so each rank widens a plain row quarter of
-    # each into a staging buffer of exactly the collective's source shape and the gather below
-    # supplies the other three quarters. The row quarter has nothing to do with the checkpoint's
-    # own shard dimension: `all_gather(collective_dim=0)` concatenates on dim 0, so a dim-0 row
-    # split is the only one that reassembles into the whole weight.
     WQB_N = N_HEADS * HEAD_DIM // WORLD_SIZE
     WOA_N = O_GROUPS * O_LORA // WORLD_SIZE
     WOB_N = DIM // WORLD_SIZE
@@ -1217,16 +998,7 @@ def _impl(hidden_states, layers_2_attn_attn_sink, layers_2_attn_compress_kv_cach
         for wbuf in (wq_a, wkv, iwqb, wqb_src, woa_src, wob_src):
             nisa.core_barrier(data=wbuf, cores=tuple(range(CORES)))
 
-    # Everything from here to `wo_b` runs on this rank's own SEQ_LOC rows. `xloc` and `floc` are
-    # the rank's interleaved tiles staged down to a contiguous local range, which is what lets
-    # every helper below keep indexing trace-time constants.
     xloc = nl.ndarray((SEQ_LOC, DIM), dtype=nl.bfloat16, buffer=nl.private_hbm)
-    # `freqs_cis` is stored interleaved -- `(rows, ROPE_DIM/2, 2)`, cosine and sine adjacent -- and
-    # every rotation in the kernel reads one of the two. Read straight out of that layout the run
-    # length is **four bytes** and a `(PT, 32)` cosine tile costs 4096 DMA packets; the engines
-    # charge per packet, not per byte. So the staging pass de-interleaves once, on a compute engine
-    # where an SBUF stride is free, into two contiguous `(SEQ_LOC, 32)` buffers, and every reader
-    # below gets a 128-byte run.
     half = ROPE_DIM // 2
     fcos = nl.ndarray((SEQ_LOC, half), dtype=nl.float32, buffer=nl.private_hbm)
     fsin = nl.ndarray((SEQ_LOC, half), dtype=nl.float32, buffer=nl.private_hbm)
@@ -1269,8 +1041,6 @@ def _impl(hidden_states, layers_2_attn_attn_sink, layers_2_attn_compress_kv_cach
                  (layers_2_attn_compressor_wgate_weight, cgt, HEAD_DIM, nl.float32),
                  (layers_2_attn_indexer_weights_proj_weight, iwa, INDEX_HEADS, nl.bfloat16)),
                 QR, DIM)
-    # The compressor pools local rows `2*cl` and `2*cl + 1` into local latent `cl`, so the rank's
-    # own rows are exactly the rank's own latents and the pooling needs no neighbour at all.
     pooled = nl.ndarray((CSEQ_LOC, HEAD_DIM), dtype=nl.bfloat16, buffer=nl.private_hbm)
     for c0, cn in CR:
         for gb in nl.affine_range(cn // PT):
@@ -1297,16 +1067,11 @@ def _impl(hidden_states, layers_2_attn_attn_sink, layers_2_attn_compress_kv_cach
     _gemm(latent, layers_2_attn_indexer_wk_weight, ika, CR, HEAD_DIM, INDEX_DIM)
     ikn = nl.ndarray((CSEQ_LOC, INDEX_DIM), dtype=nl.bfloat16, buffer=nl.private_hbm)
     _norm_rows(ika, layers_2_attn_indexer_k_norm_weight, ikn, CR, INDEX_DIM)
-    # Local latent `cl` sits at local row `RATIO * cl`, so `floc` at `pos_stride = RATIO` is this
-    # rank's own compressed positions' `freqs_cis` -- no second staging pass.
     _rope_qdq_fp4_rows(ikn, ik_src, floc, CR, INDEX_DIM, RATIO, 32, False)
     _rope_qdq_fp4_rows(latent, ck_src, floc, CR, HEAD_DIM, RATIO, 16, True)
 
     qr_q = nl.ndarray((SEQ_LOC, Q_LORA), dtype=nl.bfloat16, buffer=nl.private_hbm)
     _quantize_act(qr, qr_q, QR, Q_LORA)
-    # The rotation and the fp4 round trip ride inside the GEMM: the psum tile already holds four
-    # whole index heads of a query tile, so the pass that used to re-read the product out of HBM
-    # reads psum instead and the intermediate buffer disappears.
     index_q = nl.ndarray((INDEX_HEADS * SEQ_LOC, INDEX_DIM), dtype=nl.bfloat16,
                          buffer=nl.private_hbm)
     _gemm_head_major(qr_q, iwqb, index_q, QR, Q_LORA, INDEX_HEADS * INDEX_DIM, INDEX_DIM,
@@ -1319,12 +1084,6 @@ def _impl(hidden_states, layers_2_attn_attn_sink, layers_2_attn_compress_kv_cach
             nl.store(iw[r0 + mb * PT:r0 + (mb + 1) * PT, 0:INDEX_HEADS],
                      value=nl.copy(nl.multiply(t, INDEX_SCORE_SCALE), dtype=nl.bfloat16))
 
-    # One coalesced collective, not four. Every rank needs the whole compressed KV cache and the
-    # whole index-key cache to attend and to score over, and local tile `j`'s window reaches into
-    # global tile `WORLD_SIZE * j + rid - 1` which belongs to the rank below; the three weight
-    # quarters ride along. Separate `all_gather` calls whose destinations are all read later
-    # corrupt the earlier ones, and none of them can be issued above this point -- a collective in
-    # the dequant region or between the barriers and the prefix is a topological-order violation.
     if CORES > 1:
         for cbuf in (kv_src, ck_src, ik_src):
             nisa.core_barrier(data=cbuf, cores=tuple(range(CORES)))
@@ -1334,10 +1093,6 @@ def _impl(hidden_states, layers_2_attn_attn_sink, layers_2_attn_compress_kv_cach
 
     kvp = nl.ndarray((SEQ + PT, HEAD_DIM), dtype=nl.bfloat16, buffer=nl.private_hbm)
     nl.store(kvp[0:PT, 0:HEAD_DIM], value=nl.zeros((PT, HEAD_DIM), dtype=nl.bfloat16))
-    # Every core scatters the *whole* gathered window latent, not just its own tiles: local tile
-    # `j` takes its window from global tile `WORLD_SIZE * j + rid - 1`, which at a core-run
-    # boundary belongs to the other physical core, so the dependency is removed rather than
-    # synchronised. 8.4 MB duplicated, all of it trace-time addressed.
     for j in range(MT_LOC):
         for s in range(WORLD_SIZE):
             g = WORLD_SIZE * j + s
@@ -1345,11 +1100,6 @@ def _impl(hidden_states, layers_2_attn_attn_sink, layers_2_attn_compress_kv_cach
                           src=kv_dst[s * SEQ_LOC + j * PT:s * SEQ_LOC + (j + 1) * PT,
                                      0:HEAD_DIM])
 
-    # --- the KV gather ---------------------------------------------------------------------------
-    # The gather left both KV caches in rank-major order; the attention and the index score want
-    # them in compressed-position order. One indirect `dma_copy` per `PT` output rows, driven by a
-    # per-row `vector_offset` and `dge_mode.swdge` so the descriptors are generated on GpSimd,
-    # puts every entry where it belongs: 32 gathers of 128 rows rather than 4096 of one.
     compress_kv = nl.ndarray((CSEQ, HEAD_DIM), dtype=nl.bfloat16, buffer=nl.shared_hbm,
                              name="compress_kv")
     index_k = nl.ndarray((CSEQ, INDEX_DIM), dtype=nl.bfloat16, buffer=nl.shared_hbm,
@@ -1378,8 +1128,6 @@ def _impl(hidden_states, layers_2_attn_attn_sink, layers_2_attn_compress_kv_cach
     thrb = nl.ndarray((SEQ_LOC, 16), dtype=nl.bfloat16, buffer=nl.private_hbm)
     _index_mask(index_q, index_k, iw, msk, scr, thrb, ATILES, rid)
 
-    # Below `_index_mask`: `wq_b` arrived in the gather above, which cannot be issued any earlier,
-    # so its only reader moves down to give the gather something to hide behind.
     q = nl.ndarray((N_HEADS * SEQ_LOC, HEAD_DIM), dtype=nl.bfloat16, buffer=nl.private_hbm)
     _gemm_head_major(qr_q, wqb, q, QR, Q_LORA, N_HEADS * HEAD_DIM, HEAD_DIM,
                      freqs_hbm=floc)
@@ -1390,20 +1138,11 @@ def _impl(hidden_states, layers_2_attn_attn_sink, layers_2_attn_compress_kv_cach
     _sparse_attention(q, kvp, compress_kv, msk, layers_2_attn_attn_sink,
                       floc, og, winl, ATILES, rid)
 
-    # `wo_a`'s GEMM quantizes in its own epilogue, so the `z` buffer that used to sit between it
-    # and `_quantize_act` is gone: 33.6 MB written and 33.6 MB read back per rank, and 128 full-row
-    # load/quantize/store sweeps per core, for a value the GEMM already held in psum.
     z_q = nl.ndarray((SEQ_LOC, O_GROUPS * O_LORA), dtype=nl.bfloat16, buffer=nl.private_hbm)
     for g in range(O_GROUPS):
         _gemm(og, wo_a, z_q, QR, HEADS_PER_GROUP * HEAD_DIM, O_LORA,
               x_row=g * SEQ_LOC, w_row=g * O_LORA, dst_col=g * O_LORA, fp8=True)
-    # `wo_b` is no longer row-parallel: a rank holds every reduction column and writes *finished*
-    # rows of the module's output -- its own quarter of the sequence -- so the fp32 psum sum rounds
-    # to bfloat16 exactly once, where the head split rounded four partials and reduced them.
     _gemm(z_q, wo_b, cc_src_a, QR, O_GROUPS * O_LORA, CC_HALF, out_dtype=CC_DTYPE)
-    # The two physical cores of this rank's logical core filled disjoint row runs of `cc_src_*`.
-    # `core_barrier` between those writes into shared HBM and the collective's read of them is
-    # what makes the other core's rows visible.
     if CORES > 1:
         nisa.core_barrier(data=cc_src_a, cores=tuple(range(CORES)))
     ncc.all_gather(srcs=[cc_src_a], dsts=[cc_dst_a], replica_group=replica_group,
@@ -1414,9 +1153,6 @@ def _impl(hidden_states, layers_2_attn_attn_sink, layers_2_attn_compress_kv_cach
         nisa.core_barrier(data=cc_src_b, cores=tuple(range(CORES)))
     ncc.all_gather(srcs=[cc_src_b], dsts=[cc_dst_b], replica_group=replica_group,
                    collective_dim=0)
-    # After the gathers every rank holds all four quarters, rank 0 included. The copy out undoes
-    # the tile interleave: gathered slot `s * SEQ_LOC + j * PT` is global tile `WORLD_SIZE * j + s`,
-    # all of it trace-time -- after a gather every slot's provenance is known at trace time.
     for half, cc_dst in ((0, cc_dst_a), (1, cc_dst_b)):
         for j in TILES:
             for s in range(WORLD_SIZE):

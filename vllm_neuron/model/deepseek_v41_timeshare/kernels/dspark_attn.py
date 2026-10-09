@@ -1,56 +1,6 @@
-"""All of `mtp.0.attention` on 4 ranks, rejoined by `nki.collectives.all_reduce`.
-
-The body below is the optimized single-rank kernel at its best accepted commit, unchanged.
-`FLOORPLAN.md` is binding on the split -- `headx4(allreduce)` -- so one rank is 1/4 of the
-module cut along heads, and the four ranks rejoin by a sum. `ASSEMBLY.md` says which tensors
-are replicated, which are sharded, and why the collective can only sit where it does.
-
-What is new here is the seam, at the very end of `kernel`:
-
-    out_sb      this core's columns of this rank's `wo_b` partial sum, float32
-    cc_src      both cores' columns of it, in named shared HBM
-    core_barrier(cc_src)        makes the other physical core's columns visible
-    ncc.all_reduce(cc_src -> cc_dst)       the four ranks' partials, summed in float32
-    cc_dst -> out_hbm           one HBM->HBM DMA that casts to bfloat16: `y.type_as(x)`
-
-`wo_b` is the module's `RowParallelLinear` and carries no bias, so after the reduce every
-rank holds the whole module's output and nothing is added afterwards.
-
-The reduction is float32, which is both the dtype the reference reduces in and the only one
-that fits the bar: measured on this repo's own tensors, a bfloat16 reduction takes the worst
-element from 0.1875 to 0.2500 against a 0.20625 ceiling and leaves 7 elements outside
-tolerance against 6 allowed. It is also not a saving -- at this size the collective's cost is
-nearly independent of its bytes. Both numbers are in `ASSEMBLY.md`.
-
-Rank 0's post-collective output is bit-identical to `bfloat16(float32 sum of the four ranks'
-partials)` computed on the host, so the collective accumulates in float32 exactly and the
-DMA's conversion is round-to-nearest-even.
-
-Six things about `nki.collectives` on this toolchain, each of which otherwise fails with an
-internal compiler error that names something else:
-
-1. the kernel is launched as `kernel[2]`, because this host is LNC=2 and a LNC=1 NEFF leaves
-   the collective's buffer unallocated on the logical core's second physical core
-   (`NCC_ILLC059 Could not find MemoryLocation ... on core 1`);
-2. `cc_src` / `cc_dst` carry `name=`, or DRAM allocation fails (`NCC_IBIR440`);
-3. they are scratch buffers, because a collective may not read or write an IO tensor
-   (`NCC_INLA001`) -- hence the copy out to `out_hbm`;
-4. both are `nl.shared_hbm`, because a collective's operands may not mix buffer kinds;
-5. the `ReplicaGroup` is built by `inference.py` and passed in, because the tracer rejects
-   `range` in a traced body;
-6. `inference.py` builds its tensors on CPU and transfers them, because
-   `torch.full(..., device=xla)` emits a broadcast HLO that hits `NCC_ISMP902` -- and that
-   error is the broadcast, not the collective.
-
-A seventh, not about collectives: a collective's operand has to be a whole buffer. A `dst`
-sliced at a non-zero row is refused with "Coalesced ccop: AP offsets must be zero" and a
-whole-buffer view at offset zero with "Coalesced ccop Output does not write full tensor", so
-the rule is the buffer and not the offset. That is why `cc_src` and `cc_dst` exist at all
-rather than the reduce running in place on a slice of `out_hbm`.
-
-A rank's identity lives entirely in the values `inference.py` hands it, never in this code:
-one NEFF runs on all four ranks, which is what lets `neuron-explorer capture` replay the
-same NEFF on four workers and keeps the four ranks' schedules identical.
+"""`mtp.0.attention` on 4 ranks, cut along heads (`FLOORPLAN.md`: `head x4 (allreduce)`). Each rank
+computes a quarter of the heads, and `nki.collectives.all_reduce` sums the four `wo_b` partials
+inside the traced graph.
 """
 
 import nki
@@ -86,9 +36,6 @@ NCHMAX = 512
 MAX_KBLK = 8
 NBLK_MAX = NCHMAX // PMAX
 DEPTH = 2
-# Rotation of `wd`, the scaled-weight buffer the transposes read. Decoupled from DEPTH:
-# iter-3 measured that sharing a buffer with the shift/mask output costs 3%, so the WAR
-# edge against the in-flight `nc_transpose`s is what this depth is buying off.
 WD_DEPTH = 4
 WDEPTH = 8
 KF_QA = 1024
@@ -97,11 +44,7 @@ KF_OA = 1024
 KF_OB = 1024
 NKT_MAX = DIM // 32
 N_CORES = 2
-# The four logical NeuronCores the module is split over. `inference.py` checks this against
-# its own WORLD_SIZE, and builds the ReplicaGroup from it.
 WORLD_SIZE = 4
-# Columns per chunk of the post-collective copy out of `cc_dst`. Nothing is resident for it,
-# so this only bounds one DMA's size.
 CC_CHUNK = 1024
 O_SPLIT = DIM // N_CORES
 Q_SPLIT = Q_LORA // N_CORES
@@ -402,11 +345,7 @@ def kernel(hidden_states, mtp_0_attn_attn_sink, mtp_0_attn_freqs_cis,
     _check_shape(mtp_0_attn_wo_b_weight.shape == (DIM, O_INNER),
                  "wo_b is not this rank's reduction slice")
 
-    # The module's output, and the only IO tensor here. bfloat16, because the reference
-    # reduces in float32 and then casts back (`y.type_as(x)`); the collective may not touch
-    # it, so the reduce lands in cc_dst and is copied out below.
     out_hbm = nl.ndarray((1, SEQ, DIM), dtype=nl.bfloat16, buffer=nl.shared_hbm)
-    # The seam's two buffers. Named, both nl.shared_hbm, neither an IO tensor.
     cc_src = nl.ndarray((SEQ, DIM), dtype=nl.float32, buffer=nl.shared_hbm, name="cc_src")
     cc_dst = nl.ndarray((SEQ, DIM), dtype=nl.float32, buffer=nl.shared_hbm, name="cc_dst")
     sc = _alloc_scratch()
@@ -555,22 +494,9 @@ def kernel(hidden_states, mtp_0_attn_attn_sink, mtp_0_attn_freqs_cis,
     _gemm(sc, og_t, 0, O_INNER, mtp_0_attn_wo_b_weight, mtp_0_attn_wo_b_scale,
           pid * O_SPLIT, O_SPLIT, out_sb, 0, KF_OB)
 
-    # ---------------------------------------------------------------------- the seam
-    # `wo_b` is RowParallelLinear over the 2048 of 8192 reduction columns this rank holds,
-    # so `out_sb` is this rank's *partial sum* of the module's whole (1, 5, 5120) output --
-    # the one point in the chain where a rank holds a tensor of the module's output shape
-    # carrying an incomplete sum, and therefore the only place the collective can sit.
     nisa.dma_copy(dst=cc_src[0:SEQ, pid * O_SPLIT:pid * O_SPLIT + O_SPLIT], src=out_sb)
-    # The two physical cores of this rank filled disjoint column runs of `cc_src` -- the same
-    # runs they computed. This is what makes the other core's columns visible to the read the
-    # collective is about to do.
     nisa.core_barrier(data=cc_src, cores=(0, 1))
     ncc.all_reduce(srcs=[cc_src], dsts=[cc_dst], replica_group=replica_group, op=nl.add)
-    # After the reduce every rank holds the whole module's output, rank 0 included. The copy
-    # out is split the same way the compute was, so each core moves half of it, and the DMA
-    # itself does the float32 -> bfloat16 conversion -- `y.type_as(x)`, with no SBUF round
-    # trip and no Vector pass. Measured: the result is bit-identical to casting through SBUF,
-    # and about 6 us cheaper (means of 4 and 2 runs).
     for cc0 in range(0, O_SPLIT, CC_CHUNK):
         ccw = min(CC_CHUNK, O_SPLIT - cc0)
         g0 = pid * O_SPLIT + cc0
