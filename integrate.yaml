@@ -178,6 +178,52 @@ constraints:
     effort: medium
     timeout: 900
 
+  - name: heavy-ops-use-nki-kernels
+    kind: agent
+    rationale: |
+      "PLEASE USE NKI KERNELS AS MUCH AS POSSIBLE for fast inference" made binding. Without
+      this the loop exits the moment a torch forward is correct: nothing else here requires a
+      kernel. `runs-on-trainium` accepts `torch.compile` through the vllm_neuron backend as
+      genuine device execution — which it is — and `full-model-faithful` asks whether the
+      computation happens, not how. So a pure-torch implementation would score full marks.
+
+      Iteration 1 proposed exactly that order, and its diagnosis is right: the kernels under
+      `kernels/` were each generated against one partition trace, so token count, window
+      length and parameter names are module-level constants they assert on entry, and wiring
+      them means parameterizing those shapes first. Torch-first is a reasonable route. This
+      constraint only stops it being the destination.
+    prompt: |
+      Decide whether the heavy arithmetic on the path from tokens to logits runs in NKI
+      kernels from `vllm_neuron/model/deepseek_v41_timeshare/kernels/`, or in PyTorch.
+
+      Read `model.py` and the kernels it calls. For each of these, say which kernel runs it,
+      or state that torch does:
+        - attention for the decoder layers, including the MLA projections;
+        - the MoE FFN expert GEMMs;
+        - the Engram n-gram lookup on layers 1 and 14;
+        - the hyper-connection expand/collapse and Sinkhorn mixing;
+        - the DSpark stages on layers 37-39.
+
+      Torch is explicitly allowed for sampling, glue, reshapes, dtype conversion, control flow
+      and anything off the arithmetic path — the goal says so. It is not allowed as the thing
+      doing the per-layer matmuls.
+
+      A kernel that is imported but never reached, called only behind a flag that defaults
+      off, or wrapped in a try/except that falls back to torch does not count as used. Follow
+      the call, do not trust the import.
+    criteria: |
+      PASS if every item above is computed by a kernel from `kernels/`, citing the call site
+      for each, with torch confined to sampling and glue.
+      FAIL if any of them is computed in torch on the live path, if a kernel is present but
+      unreachable, or if you cannot tell which one runs.
+
+      Partial credit is not available here, but a FAIL is expected while the torch forward is
+      being brought up — say plainly which items already reach a kernel and which do not, so
+      the next iteration knows what is left rather than starting over.
+    model: claude-sonnet-5
+    effort: medium
+    timeout: 900
+
 # What may the agent modify? (everything else is reverted before the constraints run)
 #
 # Exactly the six paths your goal names, as a whitelist. Everything else is reverted, which is
