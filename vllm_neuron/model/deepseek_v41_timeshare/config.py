@@ -43,20 +43,16 @@ from transformers import PretrainedConfig
 
 from vllm_neuron.model.neuron_config import NeuronConfig
 
-#: Tensor-parallel degree to launch the engine with. **Yours to tune** — unlike
-#: every field of `DeepseekV41Config` below, this is not an architectural
-#: parameter and nothing checks it against the official config. Pick whatever
-#: parallelism this port runs best at.
+#: Tensor-parallel degree the verifier launches with. Yours to tune: not an
+#: architectural parameter, so nothing checks it against the official config.
+#: Ceiling is 4 (one device, 4 logical NeuronCores at LNC=2).
 #:
-#: It has to live out here rather than inside the model because
-#: `tensor_parallel_size` is an *engine-construction* argument: it travels
-#: `LLM(tensor_parallel_size=...)` -> `EngineArgs` ->
-#: `VllmConfig.parallel_config` -> `NeuronPlatform.check_and_update_config` ->
-#: worker spawn, and only then is this model class instantiated, once per rank,
-#: inside an already-parallelized engine. So the model cannot choose its own
-#: world size; it can only be told. The verifier reads this value as the default
-#: for `--tensor-parallel-size`, which is how the choice stays yours.
-
+#: Out here rather than on the model because `tensor_parallel_size` is an
+#: engine-construction argument — workers are spawned before this class is
+#: instantiated, once per rank. A model cannot choose its own world size, only
+#: be told. Must match what the kernels were compiled for: a 4-rank NEFF under 1
+#: fails to load, and a 1-rank kernel under 4 silently runs four redundant
+#: copies unless `weight_loader.py` shards.
 TENSOR_PARALLEL_SIZE = 4
 
 

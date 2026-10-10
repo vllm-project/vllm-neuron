@@ -2,24 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Assert the model being served is really DeepSeek-V4.1-Flash.
 
-The verifier proves the port *runs* and that its tokens read sensibly. Neither
-of those catches a port that was made to fit by shrinking the model — 8 layers
-instead of 40, 64 experts instead of 384 — which would still load, still run,
-and still emit fluent text. This checks the shape instead.
+A port made to fit by shrinking the model — 8 layers instead of 40, 64 experts
+instead of 384 — would still load, run, and emit fluent text, so the verifier
+cannot catch it. This checks the shape, in both places it can be weakened: the
+port's own `DeepseekV41Config` defaults, and the `config.json` of the checkpoint
+under `--checkpoint` (as raw JSON and after `from_configs` flattens it).
 
-Two targets, because there are two places a shape can be weakened:
-
-  1. **The port's own config.** Every architectural default of
-     `DeepseekV41Config` must equal the official checkpoint's value.
-  2. **The checkpoint being served.** The `config.json` under `--checkpoint`
-     must agree, both as raw JSON and after `from_configs` has flattened it.
-
-Ground truth is the official checkpoint config,
-`huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/raw/main/config.json`
-(revision `dba1be0a40aa45a94ad051997016db3960a90277`), transcribed into
-`EXPECTED` below. This file lives under `verifier/`, which is outside the
-integration loop's editable scope, so the bar cannot be moved by the thing
-being measured.
+Ground truth is the official config, revision
+`dba1be0a40aa45a94ad051997016db3960a90277`, transcribed into `EXPECTED`.
 
     python -m vllm_neuron.model.deepseek_v41_timeshare.verifier.check_config \\
         --checkpoint <checkpoint-dir>
@@ -34,9 +24,9 @@ import json
 import sys
 from pathlib import Path
 
-#: The architectural fields, as named on `DeepseekV41Config` after flattening.
-#: Values are the official config's. Anything that changes what the model *is*
-#: belongs here; tuning knobs (dtype, neuron_config) deliberately do not.
+#: Architectural fields as named on `DeepseekV41Config` after flattening, with
+#: the official values. Anything that changes what the model *is* belongs here;
+#: tuning knobs (dtype, neuron_config) do not.
 EXPECTED: dict[str, object] = {
     # core transformer shape
     "vocab_size": 129280,
@@ -94,8 +84,7 @@ EXPECTED: dict[str, object] = {
     "pad_token_id": 2,
 }
 
-#: `rope_scaling` is a dict, so it is compared key by key rather than whole:
-#: a checkpoint carrying an extra key there is not a changed model.
+#: Compared key by key: an extra key here is not a changed model.
 EXPECTED_ROPE_SCALING: dict[str, object] = {
     "rope_type": "yarn",
     "factor": 16,
@@ -104,10 +93,8 @@ EXPECTED_ROPE_SCALING: dict[str, object] = {
     "original_max_position_embeddings": 65536,
 }
 
-#: Checked against the checkpoint's *raw* JSON as well as the flattened config,
-#: so a `from_configs` that ignored the file and returned defaults cannot hide a
-#: shrunken checkpoint. Keys are looked for at the top level and in
-#: `text_config`, which is where the official config puts them.
+#: Also checked against the raw JSON, so a `from_configs` that ignored the file
+#: and returned defaults cannot hide a shrunken checkpoint.
 RAW_CRITICAL = (
     "num_hidden_layers",
     "hidden_size",

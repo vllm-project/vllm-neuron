@@ -11,13 +11,9 @@ Three sources, 4 cases:
   - **A trivia question** (1): `"What is the capital of France?"` — the cheapest
     possible check that the model knows anything at all.
 
-One short and one long, not all nine. Every prompt costs a full pass over 475
-GiB of timeshared weights, so the input set is where runtime is decided; two
-TranSonic cases keep both a chat-templated short prompt and a long-context
-retrieval while the other seven were re-measuring the same code path. Dropping
-the 16k case also halves `max_model_len`, which is what the KV cache is sized
-from. The unselected rows stay in `inputs/` — switching one line below widens
-the set again without re-copying anything.
+One short and one long, not all nine: every prompt costs a full pass over 475
+GiB of timeshared weights. Dropping the 16k case also halves `max_model_len`.
+The unselected rows stay in `inputs/`, so widening the set is a one-line change.
 
 The TranSonic sets are **copied into `inputs/` beside this file**, byte-for-byte
 from their source, and read from there by a path anchored to this package.
@@ -52,11 +48,9 @@ INPUTS_DIR = Path(__file__).resolve().parent / "inputs"
 SHORT_JSONL = INPUTS_DIR / "short.jsonl"
 LONG_JSONL = INPUTS_DIR / "long.jsonl"
 
-#: Which rows of the copied sets to use, by `id`. One short and one long:
-#: `short-prose` is chat-templated (`role: user`), `long-needle-8192-0` is a raw
-#: 8192-token continuation carrying a needle, so between them the two exercise
-#: both prompt paths. Add ids here to widen the set — every file in `inputs/` is
-#: still present, so nothing needs re-copying.
+#: Which rows of the copied sets to use. `short-prose` is chat-templated,
+#: `long-needle-8192-0` is a raw continuation, so the two cover both prompt
+#: paths. Add ids to widen the set.
 SELECTED_IDS = ("short-prose", "long-needle-8192-0")
 
 #: Verbatim from the onboarding guide's smoke test.

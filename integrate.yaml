@@ -44,21 +44,15 @@ goal: |
 
 
 # Evaluated in order, cheapest first, so a broken import does not cost a device run before it
-# is reported. The count that hold is the metric; an iteration satisfying fewer than the best so
-# far is rejected.
+# is reported. The count that hold is the metric.
 #
-# Two absolute paths appear below and are the only ones:
-#   - the vLLM-Neuron venv  /home/ubuntu/workspace/vllm-neuron/.venv/bin/python
-#     Hardcoded because `.venv/` is gitignored and so does not exist inside the iteration
-#     worktree. `PYTHONPATH="$PWD"` then points that interpreter at the worktree's copy of
-#     `vllm_neuron` instead of the editable install's, which resolves to this directory.
-#   - the checkpoint        /home/ubuntu/workspace/partition-artifact/hf
-#     Outside the repo, so the operator names it here; this is why the verifier's `--model` is
-#     required and has no default. Assembled and verified: all 48 shards, the official
-#     config.json / model.safetensors.index.json / tokenizer, 96,085 weights.
+# The two absolute paths below are the only ones. The venv is hardcoded because `.venv/` is
+# gitignored and absent from the worktree; `PYTHONPATH="$PWD"` then aims that interpreter at the
+# worktree's `vllm_neuron` rather than the editable install's. The checkpoint is outside the
+# repo, which is why the verifier's `--model` is required and has no default.
 #
-# The `check_*` and `run_verifier` scripts live under `verifier/`, which is NOT in
-# `scope.editable`, so the agent cannot relax its own bar.
+# The `check_*` and `run_verifier` scripts are under `verifier/`, outside `scope.editable`, so
+# the agent cannot relax its own bar.
 constraints:
 
   # ── 1. nothing else can be checked until this holds ────────────────────────────────────
@@ -101,15 +95,11 @@ constraints:
       32 tokens each, greedy. Passes only if nothing raised
       AND a Sonnet 5 judge finds every completion reasonable rather than gibberish.
 
-      Parallelism is not pinned here. The verifier defaults `--tensor-parallel-size` to the
-      port's own `config.TENSOR_PARALLEL_SIZE`, which is editable, so the agent picks whatever
-      degree it runs best at. It has to be surfaced that way because
-      `tensor_parallel_size` is an engine-construction argument — it travels
-      `LLM(...)` -> `EngineArgs` -> `VllmConfig.parallel_config` ->
-      `NeuronPlatform.check_and_update_config` -> worker spawn, and the model class is only
-      instantiated afterwards, once per rank, inside an already-parallelized engine. A model
-      cannot choose its own world size; it can only be told. 4 is the ceiling on this host
-      (one device, `core_count` 8, `_DEFAULT_LNC_CONFIG = 2` -> 4 logical NeuronCores).
+      Parallelism is not pinned here: `--tensor-parallel-size` defaults to the port's editable
+      `config.TENSOR_PARALLEL_SIZE`. It has to be surfaced that way because
+      `tensor_parallel_size` is an engine-construction argument — workers are spawned before
+      the model class exists, so a model cannot choose its own world size, only be told. 4 is
+      the ceiling on this host.
 
   # ── 4-6. the three things no script here can express without becoming gameable ─────────
 
@@ -190,16 +180,14 @@ constraints:
 
 # What may the agent modify? (everything else is reverted before the constraints run)
 #
-# Exactly the six paths your goal names, as a whitelist. Everything else in the repo is
-# reverted — which is what makes the measurement apparatus credible, since it also covers
-# `verifier/` (the gate, the judge, the inputs, the `check_*` scripts),
-# `vllm_neuron/model/registry.py` (so the registration cannot be bent to satisfy constraint 1),
-# and the read-only `references/`, `floorplan/` and `chat_template.jinja` inside the port.
+# Exactly the six paths your goal names, as a whitelist. Everything else is reverted, which is
+# what makes the measurement credible: it covers `verifier/`, `registry.py` (so registration
+# cannot be bent to satisfy constraint 1), and the read-only `references/`, `floorplan/` and
+# `chat_template.jinja`.
 #
-# Note on scratch space: out-of-scope *untracked* files are deleted before the constraints run,
-# but gitignored ones are left alone. So the weight loader's sequential dumps must go to /tmp,
-# or to a gitignored path — not to an untracked path inside the repo, or they will be gone by
-# the time the verifier runs.
+# Scratch space: out-of-scope *untracked* files are deleted before the constraints run, but
+# gitignored ones are left alone. The weight loader's sequential dumps must go to /tmp or a
+# gitignored path, or they will be gone by the time the verifier runs.
 scope:
   editable:
     - vllm_neuron/model/deepseek_v41_timeshare/__init__.py

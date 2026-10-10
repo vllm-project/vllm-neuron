@@ -2,26 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Assert the port is importable and wired into vLLM's model registry.
 
-The cheapest constraint, and the one everything else depends on: until
-`DeepseekV41ForCausalLM` imports and resolves through `vllm_neuron.model.registry`,
-vLLM cannot instantiate the model and every later check fails for a reason that
-has nothing to do with the port.
-
-Checks, in order:
-
-  1. `vllm_neuron.model.registry` imports at all. A missing dependency anywhere
-     in the registry's import chain breaks this, not just the port's own code.
-  2. `get_models()` maps the arch string `DeepseekV41ForCausalLM` to a class.
-  3. That class is the port's, not a stand-in from another model directory.
-  4. The factory and weight loader import, since the registry alone does not
-     reach them.
-
-Lives under `verifier/`, outside the integration loop's editable scope, so the
-check cannot be relaxed by the thing being measured.
+The cheapest constraint and the one everything else depends on: until
+`DeepseekV41ForCausalLM` resolves through `vllm_neuron.model.registry`, vLLM
+cannot instantiate the model and every later check fails for an unrelated
+reason. Checks that the registry imports at all (a missing dependency anywhere
+in its chain breaks this, not just the port's code), that the arch string maps
+to a class, that the class is the port's, and that the port's own four modules
+import.
 
     python -m vllm_neuron.model.deepseek_v41_timeshare.verifier.check_registration
 
-Exit 0 only when all four hold. Needs no device and no checkpoint.
+Needs no device and no checkpoint.
 """
 
 from __future__ import annotations
@@ -29,12 +20,10 @@ from __future__ import annotations
 import sys
 import traceback
 
-#: The arch string vLLM looks up, which is the checkpoint config's
-#: `architectures[0]`. Renaming it in the registry would deregister the model.
+#: The checkpoint config's `architectures[0]`, which is what vLLM looks up.
 ARCH = "DeepseekV41ForCausalLM"
 
-#: Every module the port must expose. `model` is the forward path, `factory`
-#: builds it, `weight_loader` feeds it; a port missing any of them is not wired.
+#: Every module the port must expose; the registry alone does not reach them.
 REQUIRED_MODULES = (
     "vllm_neuron.model.deepseek_v41_timeshare.config",
     "vllm_neuron.model.deepseek_v41_timeshare.model",

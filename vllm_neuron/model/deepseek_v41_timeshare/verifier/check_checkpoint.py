@@ -2,27 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Assert the checkpoint directory is a complete, full-size DeepSeek-V4.1-Flash.
 
-vLLM loads a checkpoint *directory*, which needs three things the raw shard dump
-in `partition-artifact/hf/` does not have: a `config.json`, a
-`model.safetensors.index.json` mapping every weight to its shard, and a
-tokenizer. This checks all three are there and that the index actually describes
-the whole model.
+vLLM loads a checkpoint *directory*, needing a `config.json`, a
+`model.safetensors.index.json`, and a tokenizer. Checks all three are present,
+that every shard the index names exists, and that the index covers every layer —
+an index naming 8 layers would load, serve, and emit fluent text.
 
-The last part is the one that matters. A checkpoint can be complete and still be
-the wrong model: an index naming 8 layers loads, serves, and emits fluent text.
-So every layer `0..num_hidden_layers-1` must appear in the weight map, and every
-shard the map names must exist on disk.
-
-What this does NOT check is the architectural shape of `config.json` — that is
-`check_config.py`'s job, against the official values.
-
-Lives under `verifier/`, outside the integration loop's editable scope.
+The architectural shape of `config.json` is `check_config.py`'s job.
 
     python -m vllm_neuron.model.deepseek_v41_timeshare.verifier.check_checkpoint \\
         --checkpoint <checkpoint-dir>
 
-Exit 0 only when the checkpoint is loadable and whole. Needs no device, and
-reads no tensor data — only the index and the config.
+Needs no device, and reads no tensor data — only the index and the config.
 """
 
 from __future__ import annotations
@@ -31,18 +21,14 @@ import argparse
 import json
 from pathlib import Path
 
-#: A tokenizer is present if any of these groups is complete. vLLM accepts a
-#: fast tokenizer alone; a sentencepiece checkpoint needs the model file beside
-#: its config.
+#: A tokenizer is present if any of these groups is complete.
 TOKENIZER_ALTERNATIVES = (
     ("tokenizer.json",),
     ("tokenizer_config.json", "tokenizer.model"),
 )
 
-#: This checkpoint keys its decoder weights `layers.<i>.…`, not the
-#: `model.layers.<i>.…` that most HF text models use — the tensor names carry no
-#: `model.` prefix, and `vision.blocks.<i>` is the vision tower rather than a
-#: decoder layer. The DSpark/MTP layers are indexed separately under `mtp.<i>`.
+#: This checkpoint keys decoder weights `layers.<i>.`, not the `model.layers.<i>.`
+#: most HF text models use. `vision.blocks.<i>` is the tower, not a decoder layer.
 LAYER_KEY_PREFIX = "layers."
 MTP_KEY_PREFIX = "mtp."
 
