@@ -163,7 +163,10 @@ constraints:
         - Engram n-gram memory on layers 1 and 14, really consulted rather than stubbed to
           zeros or skipped because the table does not fit;
         - the MoE FFN routing to 6 of 384 experts plus 1 shared, with real expert weights;
-        - DSpark on layers 37-39 over its own 128-expert pool;
+        - the DSpark/MTP speculative stack: the three `mtp.*` stages (checkpoint layers
+          40-42), each over its own 128-expert pool with top-3 routing, fed by the attention
+          inputs tapped from backbone layers 37-39 (`dspark_target_layer_ids`) — those three
+          are ordinary 384-expert layers and need nothing beyond that tap;
         - the sparse index / KV compression path.
 
       Sequential load/offload of weights is the intended design and is not a shortcut. What
