@@ -1,0 +1,95 @@
+# An AutoHelix config, with one addition: a constraint may be judged by an agent.
+#
+# Everything here is the ordinary `autohelix.yaml` schema — goal, constraints, scope, agent,
+# budget, reviewer — and means exactly what it means to `autohelix run`. Two things differ, and
+# both come from what this pass is for: driving a repo that does NOT satisfy its constraints to
+# one that does, rather than making a working one faster.
+#
+#   1. `constraints:` is required, and a failing one is the expected starting state. The loop
+#      runs until every constraint holds, so there is no iteration budget you have to pick.
+#
+#   2. A constraint may be `kind: agent` — a prompt and a criteria, judged by a model reading
+#      the repo, for conditions a script cannot express without becoming gameable.
+#
+# `metrics:` and `acceptance:` are NOT yours here. This pass supplies them: the metric is how
+# many constraints hold, and acceptance refuses any iteration that satisfies fewer than the best
+# so far. Setting either is what would let an unbounded loop wander.
+#
+# All paths below are relative to the project root — they resolve inside the per-iteration
+# worktree, so use relative paths (src/, tests/), not absolute.
+
+goal: |
+  Describe what you want the repo to reach — the state in which the constraints below hold.
+
+  The agent is told this every iteration, so it is worth more than one line. Say what "done"
+  looks like beyond the constraints, and name anything deliberately out of scope.
+
+# Must all hold for the run to be finished. Evaluated in order; the count that hold is the
+# metric, so an iteration that satisfies fewer than the best so far is rejected.
+#
+# A bare string is a script constraint, exactly as in `autohelix.yaml`:
+constraints:
+  - pytest tests/
+
+#   # The same thing written out, when you want a name or a longer timeout. `name` is what the
+#   # loop and the reports call it; without one it is the command.
+#   - name: imports-clean
+#     command: python -c "import my_package"
+#     timeout: 300
+#     rationale: nothing else can be checked if the module will not import
+#
+#   # And the addition: a constraint judged by an agent. For what a script cannot express, or
+#   # can only express as something gameable — "does not silently fall back to a reference
+#   # implementation", "the registration is wired as the guide describes".
+#   #
+#   # It fails closed. No verdict, unparseable JSON, a verdict that is neither PASS nor FAIL, a
+#   # backend error, a timeout, or a PASS citing no evidence all count as failing: a judge that
+#   # could not answer has not cleared the constraint.
+#   #
+#   # Costs a model call per iteration, and its verdict is a judgement rather than a
+#   # measurement. Prefer scripts for anything objective.
+#   - name: no-silent-fallback
+#     kind: agent
+#     rationale: |
+#       A port that quietly falls back to the reference path passes every smoke test while
+#       measuring nothing. No script distinguishes that from a real implementation.
+#     prompt: |
+#       Read model.py. Decide whether the forward path genuinely runs the kernels under
+#       kernels/, or whether it falls back to a torch implementation on any path — including
+#       inside a try/except, behind a config flag, or via a default argument.
+#     criteria: |
+#       PASS if every path through `forward` reaches a kernel from kernels/.
+#       FAIL if any path computes a result without them, or if you cannot tell.
+#     model: claude-sonnet-5     # optional; defaults to claude-sonnet-5
+#     effort: medium             # optional; low | medium | high | xhigh | max
+#     timeout: 1800
+
+# What may the agent modify? (everything else is reverted)
+scope:
+  editable: [src/]
+
+# agent:
+#   type: claude          # claude, codex, opencode
+#   # model: claude-opus-4-8
+#   # timeout_seconds: 1800
+
+# Optional, all of it. The loop ends when the constraints hold, so these are safety valves for
+# a run that cannot converge — not a plan. With none of them set, nothing will stop it.
+# budget:
+#   # iterations: 50      # a backstop, not a budget. Omit for unbounded.
+#   iteration_time: 45m   # per-iteration deadline (agent sees countdown)
+#   # time: 24h           # total wall-clock
+#   # max_cost_usd: 200
+
+# A reviewer reads each iteration and can reject it independently of the constraints. Worth
+# having here: the gate says whether a constraint holds, not whether it holds for the right
+# reason, and this pass is exactly where "made the check pass" and "made the thing work" come
+# apart.
+# reviewer:
+#   prompt: |
+#     Review this iteration's changes. Report a problem if any of these is true:
+#       1. a constraint was made to pass by weakening what it checks rather than by
+#          satisfying it;
+#       2. a file outside scope.editable was modified;
+#       3. the implementation stubs, mocks or hard-codes a value a real run would compute.
+#   model: claude-sonnet-5
