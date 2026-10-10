@@ -423,6 +423,27 @@ def staged_cache_root(checkpoint_path: str | os.PathLike) -> Path | None:
 # quadruple both the HBM a staged expert occupies and the bytes crossing PCIe.
 
 
+#: The dtypes the checkpoint uses for *packed* weights, which this loader hands
+#: over as raw `uint8` instead. The NKI kernels in `kernels/blockquant.py` want
+#: the bytes, and a `Tensor.view(torch.uint8)` performed inside a traced graph
+#: is rejected at execution time by the HOP bridge —
+#:
+#:     FATAL: Expected all tensors in the given list to be XLA tensors.
+#:     Element at index 1 is not an XLA tensor. Got: XLAByteType
+#:
+#: — so the bitcast has to happen on the host, before the buffer reaches the
+#: device. `float8_e4m3fn` and `int8` are both one byte per element, so this is
+#: a reinterpretation and never a copy or a conversion.
+_PACKED_DTYPES = (torch.float8_e4m3fn, torch.int8)
+
+
+def as_bytes(tensor: torch.Tensor) -> torch.Tensor:
+    """Reinterpret a packed fp8/fp4 weight as `uint8`; pass anything else on."""
+    if tensor.dtype in _PACKED_DTYPES:
+        return tensor.view(torch.uint8)
+    return tensor
+
+
 def e8m0_to_scale(raw: torch.Tensor, dtype: torch.dtype = torch.float32):
     """Decode `e8m0` exponent bytes into multipliers: `2 ** (byte - 127)`.
 
@@ -452,6 +473,8 @@ def dequant_block_fp8(
     `weight` is `[out, in]`; `scale` is `[ceil(out/block), ceil(in/block)]`.
     """
     out_features, in_features = weight.shape
+    if weight.dtype is torch.uint8:
+        weight = weight.view(torch.float8_e4m3fn)
     values = weight.to(torch.float32)
     factors = e8m0_to_scale(scale)
     factors = factors.repeat_interleave(block, 0).repeat_interleave(block, 1)
@@ -748,7 +771,7 @@ class TimeshareWeightStore:
                 # forward and never twice, and leaving 276 GiB of them in the
                 # page cache starves the Neuron runtime of host DMA memory.
                 # See `SafetensorsIndex.release_pages`.
-                out[f"{name}.{suffix}"] = self.index.tensor(key).clone()
+                out[f"{name}.{suffix}"] = as_bytes(self.index.tensor(key).clone())
                 self.index.release_pages(key)
         return out
 
@@ -917,7 +940,7 @@ def iter_resident_tensors(
     for shard in sorted(by_shard):
         entries = sorted(by_shard[shard], key=lambda item: index.ref(item[1]).begin)
         for name, key in entries:
-            yield name, index.tensor(key)
+            yield name, as_bytes(index.tensor(key))
 
 
 def load_weights(

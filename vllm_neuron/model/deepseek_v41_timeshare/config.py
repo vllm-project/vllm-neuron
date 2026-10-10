@@ -50,10 +50,29 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 #: Out here rather than on the model because `tensor_parallel_size` is an
 #: engine-construction argument — workers are spawned before this class is
 #: instantiated, once per rank. A model cannot choose its own world size, only
-#: be told. Must match what the kernels were compiled for: a 4-rank NEFF under 1
-#: fails to load, and a 1-rank kernel under 4 silently runs four redundant
-#: copies unless `weight_loader.py` shards.
-TENSOR_PARALLEL_SIZE = 4
+#: be told.
+#:
+#: **1, deliberately.** The partition-specific kernels under `kernels/` were
+#: generated for 4 ranks and take a `replica_group`, which is where the old
+#: value of 4 came from — but the kernels actually on the execution path
+#: (`kernels/blockquant.py` and the three generalized `hc_*` ones) contain no
+#: collective and no rank constant, so nothing requires it any more. Against
+#: that, three things favour one rank for a *timeshared* model:
+#:
+#:   - the 9.83 GiB of resident weights fit a single 24 GiB bank whole, so
+#:     sharding buys no capacity — the 465 GiB that does not fit is streamed
+#:     either way;
+#:   - every graph would otherwise be compiled once per rank, and compile time
+#:     is already the binding cost (minutes per layer graph, §7 of
+#:     `.autohelix/notes/iter-2.md`);
+#:   - the task brief's own note from the kernel-optimization project: where
+#:     only an `opt-rank0` variant exists, the 4-rank collective overhead
+#:     exceeded the speedup.
+#:
+#: `weight_loader.py` shards correctly at either value — `verify_shard_plan`
+#: reports 0 problems at 1 and at 4 — so this is reversible by editing the
+#: number.
+TENSOR_PARALLEL_SIZE = 1
 
 
 @dataclass

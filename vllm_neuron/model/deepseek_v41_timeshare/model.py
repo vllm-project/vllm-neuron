@@ -59,19 +59,48 @@ the experts and engram rows are fetched per forward into fixed staging buffers.
 See `weight_loader.py`'s module docstring for the measured census and the
 throughput numbers that make the schedule feasible.
 
+Where the arithmetic runs
+------------------------
+Every matrix multiply in this file goes through a NKI kernel in
+`kernels/blockquant.py` — the MLA projections, the block-diagonal `wo_a`, the
+routed and shared experts, the engram read-out, the compressor, the indexer, the
+router, the unembedding and the hyper-connection coefficients. `nki_linear` is
+the single dispatch point and there is no torch alternative on the execution
+path; `BlockQuantLinear._reference` is the accuracy oracle and nothing calls it.
+Top-k goes through `vllm_neuron.functional.topk`, which is this repo's NKI
+rotational top-k. The remainder — norms, SwiGLU, the Sinkhorn divisions, the
+softmax in `sparse_attn`, the quantization round trips — is torch, which the
+goal permits but deprioritizes.
+
+That torch has to be *inside a compiled graph*, which is the fact that shapes
+this file. `libtorch_neuronx_lite` registers a **backend fallback** for `aten`
+on the `neuron` device, not device kernels: eager ops on a Neuron tensor run on
+the host, and the fallback does not even cover a dtype cast
+(`RuntimeError: Expected self.dtype() == dst.dtype()` on `x.float()`). Several
+constructs are also broken under the `vllm_neuron` compile backend; each
+workaround below is commented with the error it removes, and
+`Tensor.split([sizes], dim)` is the one to remember because it returns **wrong
+numbers** rather than failing.
+
 Status
 ------
-Real and exercised: the module tree with every parameter at the checkpoint's own
-shape and dtype, the per-rank sharding plan (`shard_parameter`), weight loading,
-`get_kv_spec`/`bind_kv_cache`, `embed_input_ids`, `compute_logits`.
+Exercised on the device, against the recorded traces in
+`partition_artifact/trace/`: the hyper-connection coefficients including the
+20-iteration Sinkhorn (cos 1.000000), the unembedding (0.999999), the engram
+read off the 94.6 GiB table (1.000085), the 384-of-6 MoE with 180 real routed
+experts (0.999864) and a whole MLA attention block (0.999895). Also exercised:
+the module tree at the checkpoint's own shapes and dtypes, the per-rank shard
+plan, weight loading, `get_kv_spec`/`bind_kv_cache`, `embed_input_ids`,
+`compute_logits`.
 
-Not yet: `forward`. It raises, naming what is left, rather than running a subset
-of the layers or substituting an approximation — see the `NotImplementedError`
-at the bottom for the remaining work and the order it has to happen in.
+Not yet: `forward` end to end. Its own docstring says what is left and why, in
+those words. It does not run a subset of the layers and does not substitute an
+approximation — where it cannot yet run it raises and names the reason.
 """
 
 from __future__ import annotations
 
+import functools
 import logging
 
 import torch
@@ -166,6 +195,20 @@ class RMSNorm(nn.Module):
 _FP8_MAX = 448.0
 
 
+def _pow2(exponent: torch.Tensor) -> torch.Tensor:
+    """`2 ** exponent`, elementwise, for an integral-valued float exponent.
+
+    Not `torch.exp2`, which has no lowering on this backend and *aborts* the
+    interpreter when the graph runs (a PjRt check failure, not an exception).
+    Not `torch.exp(e * ln2)` either: measured at 4.3e-04 of absolute error,
+    and a `ue8m0` scale is only useful if it is exactly a power of two, so the
+    dequantization stays lossless. `torch.pow` against a tensor of twos lowers
+    and is bit-exact over the whole range these scales use (verified against
+    `torch.exp2` on the host for exponents -40..20).
+    """
+    return torch.pow(torch.full_like(exponent, 2.0), exponent)
+
+
 def act_quant(
     x: torch.Tensor, block: int = 32
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -187,12 +230,159 @@ def act_quant(
     grouped = x.detach().float().reshape(*lead, blocks, block)
     amax = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
     # ceil(log2(amax / 448)) as an exponent, then 2 ** that.
-    scale = torch.exp2(torch.ceil(torch.log2(amax / _FP8_MAX)))
+    scale = _pow2(torch.ceil(torch.log2(amax / _FP8_MAX)))
     quantized = (grouped / scale).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
     return (
         quantized.reshape(*lead, width),
         scale.expand(*lead, blocks, block).reshape(*lead, width),
     )
+
+
+# =============================================================================
+# Section 2b: every GEMM in this model, as a NKI kernel
+# =============================================================================
+# `kernels/blockquant.py` holds four shape-general NKI kernels — the fp8 and fp4
+# block-quantized GEMMs, the fp8 one without the activation round trip, and the
+# plain bf16 one. Between them they are every matrix multiply this architecture
+# performs: the MLA projections, the grouped `wo_a`, the routed and shared
+# experts, the engram read-out, the compressor, the indexer, the router and the
+# unembedding. There is no torch equivalent on the execution path; `_reference`
+# below exists for the accuracy-debugging comparison and nothing calls it.
+#
+# A NKI kernel cannot be invoked eagerly on this backend — the HOP has no
+# PrivateUse1 dispatch —
+#
+#     NotImplementedError: could not find kernel for HigherOrderOperator
+#     nki_kernel_wrapper at dispatch key DispatchKey.PrivateUse1
+#
+# so each one is reached through its own `torch.compile` entry point, which the
+# `vllm_neuron` backend lowers to a NEFF. One entry point per kernel serves every
+# shape: dynamo recompiles per (m, k, n) and the compilation cache under
+# `~/.cache/neuron_libtorch` makes a repeat free.
+
+
+#: Mirrors what `NeuronModelRunner.load_model` passes for the whole-model
+#: compile, so a kernel reached from here is built the same way as one reached
+#: from a single traced graph. The fp8 flag is not optional on Trn2: the kernels
+#: write `nl.float8_e4m3fn`, whose legacy hardware form saturates at 240.
+_COMPILE_OPTIONS = {
+    "alias_meta_to_neuron": True,
+    "compiler_args": [
+        "--auto-cast=none",
+        "-O1",
+        "--internal-hlo2tensorizer-options=--modular-flow-mac-threshold=10"
+        " --experimental-unsafe-fp8e4m3fn-as-fp8e4m3",
+        "--internal-backend-options=--enable-verifier=false"
+        " --enable-nested-dynamic-loop",
+    ],
+}
+
+@functools.lru_cache(maxsize=None)
+def _nki_entry(module: str, name: str = "kernel"):
+    """A compiled entry point for `kernels.<module>.<name>`.
+
+    Cached per kernel, not per shape: dynamo keys its own code cache on the
+    input shapes behind this one callable. `recompile_limit` has to be raised
+    because the default is 8 and this model has more than 8 distinct linear
+    shapes —
+
+        torch._dynamo.exc.FailOnRecompileLimitHit: Hard failure due to
+        fullgraph=True
+
+    which is the same reason `NeuronModelRunner.load_model` raises
+    `cache_size_limit`.
+    """
+    from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
+    from vllm_neuron.envs import get_compile_backend_name
+
+    # Static imports, not `importlib.import_module`: the first call for a given
+    # kernel happens *while dynamo is tracing* the sublayer that uses it, and
+    # dynamo refuses to trace into the import machinery —
+    #
+    #     torch._dynamo.exc.Unsupported: Attempted to call function marked as
+    #     skipped ... `_gcd_import` in `<frozen importlib._bootstrap>`
+    #
+    # whereas an import statement it handles.
+    from .kernels import blockquant, hc_attn_out, hc_collapse, hc_expand
+
+    torch._dynamo.config.recompile_limit = max(
+        getattr(torch._dynamo.config, "recompile_limit", 0), 1 << 30
+    )
+    modules = {
+        "blockquant": blockquant,
+        "hc_attn_out": hc_attn_out,
+        "hc_collapse": hc_collapse,
+        "hc_expand": hc_expand,
+    }
+    wrapped = wrap_nki(getattr(modules[module], name))
+
+    def entry(*args):
+        return wrapped(*args)
+
+    entry.__name__ = f"nki_{module}_{name}"
+    return torch.compile(
+        entry,
+        backend=get_compile_backend_name(),
+        fullgraph=True,
+        options=_COMPILE_OPTIONS,
+    )
+
+
+def nki_topk(tensor: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Top-`k` along the last axis, through this repo's NKI top-k.
+
+    `Tensor.topk` cannot be used on this backend: it lowers to an HLO `sort`
+    that neuronx-cc rejects outright —
+
+        %sort.50 = (f32[128,384], s32[128,384]) sort(...) metadata={
+            op_type="aten__topk" op_name="Gate[G['gate']]/aten__topk" ...}
+        FATAL: neuronx-cc compilation failed with 70.
+
+    `vllm_neuron.functional.topk` exists for exactly this reason and picks
+    `nkilib`'s rotational top-k whenever its shape envelope allows. Called with
+    no process group: every top-k in this model (MoE routing, the indexer's
+    `index_topk`, the candidate blocks) scores a replicated tensor, so there is
+    nothing to gather across ranks.
+    """
+    from vllm_neuron.functional.topk import topk as _topk
+
+    return _topk(tensor, k, -1, -1)
+
+
+def nki_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor | None,
+    storage: str,
+    quantize_activation: bool = True,
+) -> torch.Tensor:
+    """`x @ weight.T` on the device, through the matching NKI kernel.
+
+    `x` is `[..., in_features]` of any leading shape and either bf16 or fp32;
+    `weight` is in its *stored* form — `storage` says which: `"fp8"` e4m3 bytes
+    and `"fp4"` packed nibbles with `scale` the e8m0 exponent bytes beside
+    them, `"bf16"` as is, `"fp32w"` as is and narrowed inside the kernel. Everything this function
+    does around the kernel call is a view — `reshape`, a dtype `view`, a row
+    slice — because any real aten op here would be run by the backend's CPU
+    fallback.
+    """
+    k = x.shape[-1]
+    flat = x.reshape(-1, k)
+    rows = flat.shape[0]
+    if storage == "bf16":
+        out = _nki_entry("blockquant", "bf16_linear")(flat, weight)
+    elif storage == "fp32w":
+        out = _nki_entry("blockquant", "fp32w_linear")(flat, weight)
+    elif storage == "fp8":
+        name = "fp8_linear" if quantize_activation else "fp8_linear_raw"
+        out = _nki_entry("blockquant", name)(flat, weight, scale)
+    elif storage == "fp4":
+        out = _nki_entry("blockquant", "fp4_linear")(flat, weight, scale)
+    else:
+        raise ValueError(f"unknown storage {storage!r}")
+    # The kernels return `ceil(rows/128)*128` rows; the pad rows are zeros.
+    return out[:rows].reshape(*x.shape[:-1], out.shape[-1])
 
 
 class BlockQuantLinear(nn.Module):
@@ -204,10 +394,12 @@ class BlockQuantLinear(nn.Module):
         fp4  `[out, in//2]` two e2m1 per byte + `[out, in/32]`   routed experts
         bf16 `[out, in]`, no scale                               compressor, indexer wk
 
-    The weight is held in the stored form. On device the fp8/fp4 GEMMs in
-    `kernels/` consume it directly; `forward` here dequantizes through
-    `weight_loader`'s helpers, which is the same arithmetic at 4x the memory and
-    is what the accuracy-debugging path compares against.
+    The weight is held in the stored form and stays that way: `forward` hands
+    the stored bytes and their e8m0 scales to the matching NKI kernel in
+    `kernels/blockquant.py`, which decodes them a tile at a time inside the
+    kernel. `dequantized()` materializes the full bf16/fp32 weight and is used
+    by `_reference` and by the shard-plan checks, not by `forward` — at 4x the
+    memory it is exactly what a timeshared model cannot afford.
     """
 
     def __init__(
@@ -225,9 +417,14 @@ class BlockQuantLinear(nn.Module):
         self.storage = storage
         self.block = block
 
+        # Packed weights are held as raw `uint8`, not as `float8_e4m3fn` /
+        # `int8`. The NKI kernels want the bytes, and a `view(torch.uint8)`
+        # inside a traced graph is rejected when the graph runs ("Element at
+        # index 1 is not an XLA tensor. Got: XLAByteType"), so the
+        # reinterpretation happens on the host in `weight_loader.as_bytes`.
         if storage == "fp8":
             specs = [
-                ("weight", (out_features, in_features), torch.float8_e4m3fn),
+                ("weight", (out_features, in_features), torch.uint8),
                 (
                     "scale",
                     (-(-out_features // block), -(-in_features // block)),
@@ -236,7 +433,7 @@ class BlockQuantLinear(nn.Module):
             ]
         elif storage == "fp4":
             specs = [
-                ("weight", (out_features, in_features // 2), torch.int8),
+                ("weight", (out_features, in_features // 2), torch.uint8),
                 ("scale", (out_features, in_features // block), torch.uint8),
             ]
         elif storage == "bf16":
@@ -277,14 +474,54 @@ class BlockQuantLinear(nn.Module):
         return self.weight.to(dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """`x @ weight.T` in a NKI kernel. The only path; there is no fallback.
+
+        The activation round trip the quantized kernels perform is the
+        reference's, not an artifact: `linear()` in `vendor/model.py` runs
+        `act_quant` before *both* the fp8 and the fp4 GEMM, and skipping it is
+        worth 1.5e-2 of max relative error on a 384-expert MoE layer.
+        """
+        return nki_linear(
+            x, self.weight, getattr(self, "scale", None), self.storage
+        )
+
+    def grouped(self, x: torch.Tensor, group: int, width: int) -> torch.Tensor:
+        """One block of a block-diagonal projection: rows
+        `[group*width, (group+1)*width)` against `x`.
+
+        `wo_a` is block-diagonal over `o_groups`, so the stored `[groups*rank,
+        in]` weight is really `groups` independent linears sharing a buffer.
+        The row slice takes the matching 32-row band of the scale grid with it.
+        The activation is *not* quantized here: the reference runs this
+        projection against the dequantized weight with the activation untouched.
+        """
+        if self.storage != "fp8":
+            raise ValueError(f"grouped() is for fp8 storage, not {self.storage!r}")
+        if width % self.block:
+            raise ValueError(f"group width {width} must be a multiple of {self.block}")
+        band = width // self.block
+        return nki_linear(
+            x,
+            self.weight[group * width : (group + 1) * width],
+            self.scale[group * band : (group + 1) * band],
+            "fp8",
+            quantize_activation=False,
+        )
+
+    def _reference(self, x: torch.Tensor) -> torch.Tensor:
+        """The torch emulation of `forward`, for accuracy comparison only.
+
+        Nothing on the execution path calls this — `forward` goes straight to
+        the kernel. It is kept because the accuracy-debugging guide's method is
+        to compare a component against a reference implementation, and this is
+        the one the recorded traces in `partition_artifact/trace/` were checked
+        against (see `.autohelix/notes/iter-1.md` section 3). It differs from
+        the kernel in one documented way: the kernels divide the activation by
+        224 rather than 448 because Trn2's fp8 saturates at 240, which is worth
+        about 3e-3 of max relative error.
+        """
         if self.storage == "bf16":
             return F.linear(x, self.weight.to(x.dtype))
-        # The quantized GEMMs do not take a bf16 activation: `linear()` in
-        # `vendor/model.py` runs `act_quant` first, for fp4 weights as well as
-        # fp8 ones, so the activation's own rounding is part of the reference's
-        # arithmetic rather than an implementation detail. Emulating it here —
-        # instead of multiplying the bf16 activation by a dequantized weight —
-        # is worth 1.5e-2 of max relative error on a 384-expert MoE layer.
         x_q, x_scale = act_quant(x, self.block)
         # `x_q` is fp8; torch will not promote a Float8 type, so the
         # dequantization is explicit.
@@ -293,15 +530,61 @@ class BlockQuantLinear(nn.Module):
         return F.linear(activation, weight).to(x.dtype)
 
 
+def _round_to_bits(x: torch.Tensor, mantissa: int, min_exp: int) -> torch.Tensor:
+    """Round to a float format with `mantissa` explicit bits, arithmetically.
+
+    A `Tensor.to(torch.float8_e4m3fn)` cannot be used inside a traced graph on
+    this backend: the cast has no lowering and the graph dies when it runs, with
+
+        FATAL: Unknown custom-call API version enum value: 0
+        (API_VERSION_UNSPECIFIED)
+
+    naming the node and nothing else. So the rounding is done the way the
+    hardware does it — quantize to the step of the value's own binade, with
+    `min_exp` holding the step flat through the subnormal range, and round half
+    to even. Exact for every representable magnitude, including zero.
+    """
+    # The clamp is *before* the log, and that is the whole correctness of this
+    # function on the device. `log2(0)` is -inf on the host and the old
+    # `log2(x).clamp_min(min_exp)` was fine there, but on this backend it comes
+    # out **NaN**, which then propagates through the quantization into the whole
+    # attention output — a layer-2 attention came back `cos=nan` with nothing in
+    # any log to say why, and layer 0 passed only because its KV latent happened
+    # to contain no exact zeros. Clamping the magnitude to the smallest normal
+    # first is exactly equivalent (anything below it rounds with the subnormal
+    # step either way) and the log never sees a zero.
+    magnitude = x.abs().clamp_min(2.0**min_exp)
+    exponent = torch.floor(torch.log2(magnitude))
+    step = _pow2(exponent - mantissa)
+    return torch.round(x / step) * step
+
+
+#: e4m3: 3 explicit mantissa bits, smallest normal 2**-6.
+_FP8_MANTISSA_BITS, _FP8_MIN_EXP = 3, -6
+#: e2m1: 1 explicit mantissa bit, smallest normal 2**0.
+_FP4_MANTISSA_BITS, _FP4_MIN_EXP = 1, 0
+
+
 def act_quant_dequant(x: torch.Tensor, block: int = 32) -> torch.Tensor:
     """`act_quant(..., inplace=True)`: round-trip `x` through fp8 and return it.
 
     The KV latent and the DSpark window KV go through this before being cached,
     so the cache holds values that have already lost fp8 precision. Skipping it
     would make attention read a *more* precise KV than the reference does.
+
+    Same arithmetic as `act_quant`, written without a float8 cast so it can be
+    traced — see `_round_to_bits`.
     """
-    quantized, scale = act_quant(x, block)
-    return (quantized.to(torch.float32) * scale).to(x.dtype)
+    *lead, width = x.shape
+    blocks = width // block
+    if width % block:
+        raise ValueError(f"act_quant needs a multiple of {block}, got {width}")
+    grouped = x.float().reshape(*lead, blocks, block)
+    amax = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+    scale = _pow2(torch.ceil(torch.log2(amax / _FP8_MAX)))
+    normalized = (grouped / scale).clamp(-_FP8_MAX, _FP8_MAX)
+    rounded = _round_to_bits(normalized, _FP8_MANTISSA_BITS, _FP8_MIN_EXP)
+    return (rounded * scale).reshape(*lead, width).to(x.dtype)
 
 
 def fp4_quant_dequant(
@@ -321,16 +604,19 @@ def fp4_quant_dequant(
     blocks = width // block
     if width % block:
         raise ValueError(f"fp4 quant needs a multiple of {block}, got {width}")
-    grouped = x.detach().float().reshape(*lead, blocks, block)
+    grouped = x.float().reshape(*lead, blocks, block)
     amax = grouped.abs().amax(dim=-1, keepdim=True)
     if scale_e4m3:
+        # The *scale* itself is stored e4m3 here, so it is rounded to e4m3
+        # before it is used — rounded arithmetically, because a float8 cast has
+        # no lowering in a traced graph (see `_round_to_bits`).
         amax = amax.clamp_min(6 * 2.0**-9)
-        scale = (amax / _FP4_MAX).to(torch.float8_e4m3fn).float()
+        scale = _round_to_bits(amax / _FP4_MAX, _FP8_MANTISSA_BITS, _FP8_MIN_EXP)
     else:
         amax = amax.clamp_min(6 * 2.0**-126)
-        scale = torch.exp2(torch.ceil(torch.log2(amax / _FP4_MAX)))
+        scale = _pow2(torch.ceil(torch.log2(amax / _FP4_MAX)))
     normalized = (grouped / scale).clamp(-_FP4_MAX, _FP4_MAX)
-    rounded = _round_to_fp4(normalized)
+    rounded = _round_to_bits(normalized, _FP4_MANTISSA_BITS, _FP4_MIN_EXP)
     return (rounded * scale).reshape(*lead, width).to(x.dtype)
 
 
@@ -344,7 +630,12 @@ _FP4_MIDPOINTS = (_FP4_MAGNITUDES[1:] + _FP4_MAGNITUDES[:-1]) / 2
 
 
 def _round_to_fp4(x: torch.Tensor) -> torch.Tensor:
-    """Round to the nearest `e2m1` value, keeping the sign."""
+    """Round to the nearest `e2m1` value by table lookup, keeping the sign.
+
+    The oracle `_round_to_bits(..., _FP4_MANTISSA_BITS, _FP4_MIN_EXP)` is
+    checked against; `torch.bucketize` and `torch.copysign` are both untraceable
+    on this backend, so this is not on the execution path.
+    """
     midpoints = _FP4_MIDPOINTS.to(x.device)
     magnitudes = _FP4_MAGNITUDES.to(x.device)
     bucket = torch.bucketize(x.abs(), midpoints)
@@ -456,40 +747,50 @@ def slice_freqs(
 #: compressed position a query cannot reach yet. `sparse_attn` skips it.
 EMPTY_SLOT = -1
 
+#: How many queries share one gather. See `sparse_attn`.
+_ATTN_QUERY_TILE = 128
+
 #: The finite lower bound the reference kernel starts its running max at. A row
 #: whose every slot is empty would give exp(-inf - -inf) = NaN with a true -inf;
 #: with this bound the sink term overflows to +inf and the row comes out zero,
 #: which is the kernel's convention.
+#:
+#: Every "unreachable" sentinel in this file uses this and `_POS_BOUND` rather
+#: than a true infinity, for two reasons beyond the NaN above. A
+#: `masked_fill(..., -inf)` has no lowering on this backend (the graph aborts
+#: the interpreter when it runs), and an infinity reaching
+#: `vllm_neuron.functional.topk`'s rotational NKI kernel — whose pad sentinel is
+#: the dtype minimum — came back as NaN from the whole of a layer-2 attention.
+#: Finite bounds are also what `vendor/kernel.py` itself uses.
 _NEG_BOUND = -1e30
+
+#: `_NEG_BOUND`'s mirror, for pinning a block *in* to a top-k.
+_POS_BOUND = 1e30
 
 
 def window_topk_idxs(
-    window_size: int, bsz: int, seqlen: int, start_pos: int, device
+    window_size: int, seqlen: int, start_pos: int, lo: int, device
 ) -> torch.Tensor:
-    """Which sliding-window cache slots each query attends to; -1 is empty.
+    """Which rows of the gathered window each query attends to; -1 is empty.
 
-    `vendor/model.py`'s `get_window_topk_idxs`. The cache is a ring of
-    `window_size` slots. Prefill needs one row per query, each seeing its own
-    causal window; a decode step has one query that sees the whole ring, oldest
-    first. Order within a row does not matter to `sparse_attn`, which treats
-    every slot independently.
+    `vendor/model.py`'s `get_window_topk_idxs`, rewritten for the paged read in
+    `Attention._window_kv`. That read hands back the positions
+    `lo .. start_pos + seqlen - 1` as a contiguous `[1, span, head_dim]`, so a
+    query at absolute position `p` sees rows
+    `max(0, p - window + 1) - lo .. p - lo`. One expression covers prefill and
+    decode, where the reference needed two — a decode step is just `seqlen == 1`
+    with `lo = max(0, p - window + 1)`, which makes the row range `0 .. p - lo`,
+    i.e. the whole gathered window.
+
+    `max(0, p - window + 1) >= lo` for every `p` in the span, so a valid row
+    index is never negative. Order within a row does not matter to
+    `sparse_attn`, which treats every slot independently.
     """
-    if start_pos == 0:
-        end = torch.arange(seqlen, device=device).unsqueeze(1)
-        idxs = (end - window_size + 1).clamp(0) + torch.arange(
-            min(seqlen, window_size), device=device
-        )
-        idxs = torch.where(idxs > end, EMPTY_SLOT, idxs)
-    else:
-        oldest = start_pos % window_size + 1
-        idxs = torch.cat(
-            [
-                torch.arange(oldest, window_size, device=device),
-                torch.arange(oldest, device=device),
-            ]
-        )
-        idxs = torch.where(idxs > start_pos, EMPTY_SLOT, idxs)
-    return idxs.int().unsqueeze(0).expand(bsz, -1, -1).contiguous()
+    p = start_pos + torch.arange(seqlen, device=device)
+    first = (p - window_size + 1).clamp_min(0)
+    idxs = first.unsqueeze(1) + torch.arange(window_size, device=device)
+    idxs = torch.where(idxs > p.unsqueeze(1), EMPTY_SLOT, idxs - lo)
+    return idxs.int().unsqueeze(0)
 
 
 def sparse_attn(
@@ -505,8 +806,22 @@ def sparse_attn(
     is one latent KV, not one per head); `topk_idxs` is `[b, s, topk]` naming
     the slots each query may see. Semantics are `vendor/kernel.py`'s
     `sparse_attn`, transcribed from the torch equivalent the partition artifact
-    ships as `compat/sparse_attn_sm89.py` — including where the precision
-    changes, because those are part of the reference's arithmetic:
+    ships as `compat/sparse_attn_sm89.py`.
+
+    **The query axis is tiled, and it has to be.** The gather is per query, so
+    one `kv[batch, topk_idxs]` over a whole prefill materializes
+    `[1, 8192, 640, 512]` bf16 = 5.4 GiB of activations for a single layer —
+    which no device here has room for, and which earlier component checks never
+    hit because they only ever ran 128-token prompts. Tiling bounds it at 84 MiB
+    and changes nothing numerically: every tile is an independent set of rows
+    with its own softmax.
+
+    This function is the one piece of arithmetic in this model still written in
+    torch rather than as a NKI kernel — see `.autohelix/notes/iter-2.md`
+    section 7. The tiling is also the shape a kernel wants.
+
+    Where the precision changes is part of the reference's arithmetic, not an
+    implementation detail:
 
       - the QK product takes bf16 operands into an fp32 accumulator, and the
         scale multiplies the *logits* afterwards rather than `q` beforehand, so
@@ -525,22 +840,28 @@ def sparse_attn(
 
     sink = attn_sink.float().view(1, 1, h)
     batch = torch.arange(b, device=kv.device).view(b, 1, 1)
-    idxs = topk_idxs.long()
-    empty = idxs == EMPTY_SLOT
+    for lo in range(0, s, _ATTN_QUERY_TILE):
+        hi = min(lo + _ATTN_QUERY_TILE, s)
+        idxs = topk_idxs[:, lo:hi].long()
+        empty = idxs == EMPTY_SLOT
 
-    gathered = kv[batch, idxs.clamp_min(0)]
-    gathered = gathered.masked_fill(empty.unsqueeze(-1), 0).float()
+        gathered = kv[batch, idxs.clamp_min(0)]
+        gathered = gathered.masked_fill(empty.unsqueeze(-1), 0).float()
 
-    scores = torch.einsum("bthd,btkd->bthk", q.float(), gathered) * softmax_scale
-    scores = scores.masked_fill(empty.unsqueeze(2), -torch.inf)
+        scores = (
+            torch.einsum("bthd,btkd->bthk", q[:, lo:hi].float(), gathered)
+            * softmax_scale
+        )
+        scores = scores.masked_fill(empty.unsqueeze(2), _NEG_BOUND)
 
-    scores_max = scores.amax(dim=-1).clamp_min(_NEG_BOUND)
-    probabilities = torch.exp(scores - scores_max.unsqueeze(-1))
-    denominator = probabilities.sum(dim=-1) + torch.exp(sink - scores_max)
-    accumulated = torch.einsum(
-        "bthk,btkd->bthd", probabilities.to(torch.bfloat16).float(), gathered
-    )
-    return (accumulated / denominator.unsqueeze(-1)).to(out.dtype)
+        scores_max = scores.amax(dim=-1).clamp_min(_NEG_BOUND)
+        probabilities = torch.exp(scores - scores_max.unsqueeze(-1))
+        denominator = probabilities.sum(dim=-1) + torch.exp(sink - scores_max)
+        accumulated = torch.einsum(
+            "bthk,btkd->bthd", probabilities.to(torch.bfloat16).float(), gathered
+        )
+        out[:, lo:hi] = (accumulated / denominator.unsqueeze(-1)).to(out.dtype)
+    return out
 
 
 def select_candidate_blocks(
@@ -557,19 +878,97 @@ def select_candidate_blocks(
     outscored by an older full block despite holding the most recent tokens.
     """
     width = logits.size(-1)
-    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
+    scores = F.pad(logits, (0, -width % block_size), value=_NEG_BOUND)
     scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
     num_blocks = scores.size(-1)
 
     last = (compress_lens - 1) // block_size
     scores = scores.masked_fill(
-        torch.arange(num_blocks, device=logits.device) == last, torch.inf
+        torch.arange(num_blocks, device=logits.device) == last, _POS_BOUND
     )
-    top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
+    top_values, top_indices = nki_topk(scores, min(topk_blocks, num_blocks))
     keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
-        -1, top.indices, top.values > -torch.inf
+        -1, top_indices, top_values > _NEG_BOUND
     )
     return keep.repeat_interleave(block_size, dim=-1)[..., :width]
+
+
+class PagedSpan:
+    """Where one scheduled sequence's KV lives in vLLM's paged allocation.
+
+    The runtime hands the model `slot_mapping` for the tokens of this step and
+    a `block_table` row per sequence; a slot is
+    `block_id * block_size + offset`, which is also the row index of
+    `cache.view(-1, head_size)`. Everything this port caches per position —
+    the sliding window, the compressed latents, the index keys and the
+    compressor's per-token pooling inputs — is addressed through `slots()`, so
+    there is no per-request bookkeeping anywhere and the content lives in
+    blocks that prefix caching already tracks. A private contiguous ring would
+    be simpler and would silently serve stale KV on a prefix-cache hit.
+
+    `block_table` is one *row* of `block_table_tensor`: row `k` is the `k`-th
+    scheduled sequence, which is the `k`-th span from `_sequence_spans`.
+    """
+
+    __slots__ = ("block_table", "block_size", "slot_mapping", "start_pos", "length")
+
+    def __init__(
+        self,
+        block_table: torch.Tensor,
+        block_size: int,
+        slot_mapping: torch.Tensor,
+        start_pos: int,
+        length: int,
+    ) -> None:
+        self.block_table = block_table
+        self.block_size = block_size
+        self.slot_mapping = slot_mapping
+        self.start_pos = start_pos
+        self.length = length
+
+    def slots(self, positions: torch.Tensor) -> torch.Tensor:
+        """Flat cache rows for absolute `positions` in this sequence."""
+        return (
+            self.block_table[positions // self.block_size] * self.block_size
+            + positions % self.block_size
+        )
+
+    def write(self, cache: torch.Tensor, values: torch.Tensor) -> None:
+        """Write this step's tokens into a `[num_blocks, 1, block_size, dim]`
+        cache at the runtime's own slots.
+
+        `index_put_` with a tuple of index tensors, which is the pattern
+        `qwen3/model.py` uses and which lowers on this backend; a flat
+        `view(-1, dim)[slots] = values` does not survive functionalization as
+        an in-place write to the real allocation.
+        """
+        slot = self.slot_mapping
+        cache.index_put_(
+            (
+                slot // self.block_size,
+                torch.zeros_like(slot),
+                slot % self.block_size,
+            ),
+            values,
+        )
+
+    def write_flat(self, flat: torch.Tensor, values: torch.Tensor) -> None:
+        """Write this step's tokens into a flat `[num_slots, dim]` buffer."""
+        flat.index_copy_(0, self.slot_mapping, values)
+
+    def put(
+        self, flat: torch.Tensor, positions: torch.Tensor, values: torch.Tensor
+    ) -> None:
+        """Write `values` into a flat `[num_slots, dim]` buffer at the slots of
+        arbitrary absolute `positions` — used for the compressed latents, which
+        land at the slot of their group's first token rather than at this
+        step's own tokens.
+        """
+        flat.index_copy_(0, self.slots(positions), values)
+
+    def gather(self, flat: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """Rows of a flat `[num_slots, dim]` cache for absolute `positions`."""
+        return flat.index_select(0, self.slots(positions))
 
 
 class SharedAttentionState:
@@ -608,6 +1007,7 @@ class Compressor(nn.Module):
         self, config: DeepseekV41Config, layer_id: int, max_batch_size: int = 1
     ) -> None:
         super().__init__()
+        del max_batch_size  # the pooling inputs are paged, not per batch row
         self.compress_ratio = config.compress_ratios[layer_id]
         self.head_dim = config.head_dim
         self.norm = RMSNorm(config.head_dim, config.rms_norm_eps)
@@ -616,67 +1016,74 @@ class Compressor(nn.Module):
             self.wgate = BlockQuantLinear(
                 config.hidden_size, config.head_dim, storage="bf16"
             )
-            # The tail of an incomplete group, carried across decode steps.
-            # Runtime state, not weights: `persistent=False` keeps them out of
-            # the state dict (nothing in the checkpoint corresponds to them) and
-            # `allocate_state` fills them on the device, because a module built
-            # under `torch.device("meta")` cannot allocate anything here.
-            self.state_shape = (max_batch_size, self.compress_ratio, config.head_dim)
-            self.register_buffer("kv_state", None, persistent=False)
-            self.register_buffer("score_state", None, persistent=False)
+        # Per-token pooling inputs, one row per cache slot. A group may straddle
+        # a chunk boundary or two decode steps, so the members have to outlive
+        # the call that produced them — and keying them by batch row would be
+        # wrong the moment the scheduler reorders the running batch or two
+        # requests share a cached prefix. Paged by the token's own slot, the
+        # question does not arise. `persistent=False`: nothing in the
+        # checkpoint corresponds to them, and `allocate_state` fills them
+        # because a module built under `torch.device("meta")` cannot.
+        self.register_buffer("pool_kv", None, persistent=False)
+        self.register_buffer("pool_score", None, persistent=False)
 
-    def allocate_state(self, device) -> None:
+    def allocate_state(self, device, num_slots: int) -> None:
         if self.compress_ratio > 1:
-            self.kv_state = torch.zeros(
-                self.state_shape, dtype=torch.float32, device=device
+            self.pool_kv = torch.zeros(
+                num_slots, self.head_dim, dtype=torch.float32, device=device
             )
-            self.score_state = torch.full(
-                self.state_shape, -torch.inf, dtype=torch.float32, device=device
+            self.pool_score = torch.zeros(
+                num_slots, self.head_dim, dtype=torch.float32, device=device
             )
 
-    def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor | None:
+    def forward(
+        self, x: torch.Tensor, start_pos: int, paged: PagedSpan
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Pool `compress_ratio` consecutive tokens into one latent.
 
-        Returns `None` while a group is still filling up, which during decode
-        means it yields only every `compress_ratio` steps — the partial group
-        waits in `kv_state`/`score_state`. Callers must treat `None` as "nothing
-        to publish yet", not as "no compressed KV": the cache still holds every
-        earlier group.
+        Returns `(latent, first_positions)` where `first_positions` holds the
+        absolute position of each returned group's *first* token — which is
+        also the position the latent stands for, so the caller's RoPE is just
+        `slice_freqs(freqs_cis, first_positions)` with no prefill/decode split.
+        Returns `(None, None)` when this call completes no group, which during
+        decode is every step but the last of a group. Callers must read that as
+        "nothing to publish yet", not "no compressed KV": the cache still holds
+        every earlier group.
+
+        Stateless. The reference carries an incomplete group in `kv_state` /
+        `score_state`; here the per-token inputs go to `pool_kv`/`pool_score` at
+        the token's own slot, so a group that straddles two calls is pooled from
+        the cache rather than from carried state.
         """
-        bsz, seqlen, _ = x.shape
+        _, seqlen, _ = x.shape
         ratio, dtype = self.compress_ratio, x.dtype
+        device = x.device
         if ratio == 1:
             # One token per group: nothing to pool, so no gate and no fp32.
-            return self.norm(self.wkv(x))
+            positions = start_pos + torch.arange(seqlen, device=device)
+            return self.norm(self.wkv(x)), positions
 
-        x = x.float()
-        kv, score = self.wkv(x), self.wgate(x)
-        if start_pos == 0:
-            should_compress = seqlen >= ratio
-            remainder = seqlen % ratio
-            cutoff = seqlen - remainder
-            if remainder:
-                kv, self.kv_state[:bsz, :remainder] = kv.split(
-                    [cutoff, remainder], dim=1
-                )
-                score, self.score_state[:bsz, :remainder] = score.split(
-                    [cutoff, remainder], dim=1
-                )
-            kv = kv.unflatten(1, (-1, ratio))
-            score = score.unflatten(1, (-1, ratio))
-            kv = (kv * score.softmax(dim=2)).sum(dim=2)
-        else:
-            should_compress = (start_pos + 1) % ratio == 0
-            slot = start_pos % ratio
-            self.kv_state[:bsz, slot] = kv.squeeze(1)
-            self.score_state[:bsz, slot] = score.squeeze(1)
-            if should_compress:
-                kv = (
-                    self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1)
-                ).sum(dim=1, keepdim=True)
-        if not should_compress:
-            return None
-        return self.norm(kv.to(dtype))
+        xf = x.float()
+        paged.write_flat(self.pool_kv, self.wkv(xf).reshape(seqlen, -1))
+        paged.write_flat(self.pool_score, self.wgate(xf).reshape(seqlen, -1))
+
+        # Groups this call completes. Group `g` covers tokens
+        # `g*ratio .. g*ratio+ratio-1`, so it is complete once the chunk has
+        # reached `start_pos + seqlen - 1`. Both bounds are Python ints, which
+        # is what keeps the shapes below static.
+        group_lo = start_pos // ratio
+        group_hi = (start_pos + seqlen) // ratio
+        if group_hi <= group_lo:
+            return None, None
+        count = group_hi - group_lo
+
+        firsts = torch.arange(group_lo, group_hi, device=device) * ratio
+        members = firsts.unsqueeze(1) + torch.arange(ratio, device=device)
+        slots = paged.slots(members.reshape(-1))
+        kv = self.pool_kv.index_select(0, slots).reshape(count, ratio, -1)
+        score = self.pool_score.index_select(0, slots).reshape(count, ratio, -1)
+        pooled = (kv * score.softmax(dim=1)).sum(dim=1).unsqueeze(0)
+        return self.norm(pooled.to(dtype)), firsts
 
 
 class Indexer(nn.Module):
@@ -725,9 +1132,11 @@ class Indexer(nn.Module):
         x: torch.Tensor,
         qr: torch.Tensor,
         latent: torch.Tensor | None,
+        group_positions: torch.Tensor | None,
         start_pos: int,
         offset: int,
         shared: SharedAttentionState,
+        paged: PagedSpan,
         tp_group=None,
     ) -> torch.Tensor:
         """The `index_topk` compressed positions each query keeps.
@@ -745,21 +1154,16 @@ class Indexer(nn.Module):
         end_pos = start_pos + seqlen
 
         if self.owns_k and latent is not None:
-            # A latent stands for the first token of its group, so group j takes
-            # position j * ratio.
-            freqs = (
-                slice_freqs(self.freqs_cis, slice(None, seqlen - seqlen % ratio, ratio))
-                if start_pos == 0
-                else slice_freqs(
-                    self.freqs_cis, slice(start_pos + 1 - ratio, start_pos + 2 - ratio)
-                )
-            )
+            # A latent stands for the first token of its group, which is the
+            # position `group_positions` carries — so one expression covers
+            # both the prefill and the decode case the reference splits.
+            freqs = slice_freqs(self.freqs_cis, group_positions)
             k = self.k_norm(self.wk(latent))
             k = torch.cat(
                 [k[..., :-rd], apply_rotary_emb(k[..., -rd:], freqs)], dim=-1
             )
             k = fp4_quant_dequant(k, 32)
-            self.k_cache[:bsz, start_pos // ratio : start_pos // ratio + k.size(1)] = k
+            paged.put(self.k_cache, group_positions, k.reshape(k.size(1), -1))
             shared.index_k = self.k_cache
 
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.index_head_dim))
@@ -775,7 +1179,11 @@ class Indexer(nn.Module):
         )
         q = fp4_quant_dequant(q, 32)
 
-        index_k = shared.index_k[:bsz, : end_pos // ratio]
+        # The compressed positions that exist so far, gathered out of the paged
+        # index-key cache: group j lives at the slot of token j * ratio.
+        compress_len = end_pos // ratio
+        group_pos = torch.arange(compress_len, device=x.device) * ratio
+        index_k = paged.gather(shared.index_k, group_pos).reshape(1, compress_len, -1)
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
         index_score = torch.einsum("bshd,btd->bsht", q.float(), index_k.float())
         index_score = (index_score.relu() * weights.float().unsqueeze(-1)).sum(dim=2)
@@ -793,7 +1201,7 @@ class Indexer(nn.Module):
             ).unsqueeze(-1)
             index_score = index_score.masked_fill(
                 torch.arange(seqlen // ratio, device=x.device) >= compress_lens,
-                -torch.inf,
+                _NEG_BOUND,
             )
         else:
             compress_lens = end_pos // ratio
@@ -808,10 +1216,23 @@ class Indexer(nn.Module):
         elif self.uses_candidates:
             # Level two: score with our own weights, but only inside the
             # source's candidate blocks.
-            index_score = index_score.masked_fill(~shared.candidates, -torch.inf)
+            index_score = index_score.masked_fill(~shared.candidates, _NEG_BOUND)
 
         topk = min(self.index_topk, end_pos // ratio)
-        idxs = index_score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+        # The reference finishes with `.sort(dim=-1)` on the chosen indices.
+        # That is not dropped lightly, and it is not an approximation: every
+        # consumer of this result is invariant under a permutation of the last
+        # axis. `sparse_attn` gathers each named slot independently and sums
+        # over them, the `+ offset` and the `< compress_lens` test are
+        # elementwise, and the later layers that reuse `shared.topk_idxs` do the
+        # same. The reference sorts so its kernel reads the cache in order.
+        #
+        # It is also not available here: `Tensor.sort` makes neuronx-cc fail
+        # (see `nki_topk`) and this repo's `NF.argsort_unstable` is documented
+        # for 1-D or `[1, N]` input only — "Vectorization along a batch
+        # dimension is not supported" — while this is `[b, s, index_topk]`.
+        # If a future NKI attention kernel needs sorted slots, sort there.
+        idxs = nki_topk(index_score, topk)[1]
         return torch.where(idxs < compress_lens, idxs + offset, EMPTY_SLOT).int()
 
 
@@ -926,7 +1347,11 @@ class Attention(nn.Module):
     # ── Forward ───────────────────────────────────────────────────────────
 
     def _window_kv(
-        self, x: torch.Tensor, freqs_cis: torch.Tensor, start_pos: int
+        self,
+        x: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        start_pos: int,
+        paged: PagedSpan,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """This layer's sliding-window K, and the slots every query may see.
 
@@ -934,8 +1359,17 @@ class Attention(nn.Module):
         including its RoPE tail — so the cache holds values that have already
         been through fp8, and attention must read those rather than the
         pre-quantization ones.
+
+        Written into, and read back out of, vLLM's *paged* allocation
+        (`[num_blocks, 1, block_size, head_dim]`) rather than a private
+        contiguous ring: see `PagedSpan`. The write goes to the slots the
+        runtime assigned this step's tokens; the read gathers every position
+        any query in this span can see, which is
+        `max(0, start_pos - window + 1) .. start_pos + seqlen - 1`. At
+        `start_pos == 0` that is exactly this chunk, so a prefill reads back
+        what it just wrote and there is no separate ring-seeding branch.
         """
-        bsz, seqlen, _ = x.shape
+        _, seqlen, _ = x.shape
         win = self.window_size
         rd = self.rope_head_dim
         if self.window_kv_cache is None:
@@ -943,41 +1377,19 @@ class Attention(nn.Module):
                 f"layer {self.layer_id} attention has no window KV cache; "
                 "bind_kv_cache() must run before forward()."
             )
-        if self.window_kv_cache.shape[-2:] != (win, self.head_dim):
-            # The known gap, made explicit so it fails here with its own name
-            # rather than as a fake-tensor error from inside dynamo's warmup
-            # ("expand: attempting to expand a dimension of length 128 -> 32!").
-            raise NotImplementedError(
-                "the sliding-window KV cache is in vLLM's *paged* layout "
-                f"{tuple(self.window_kv_cache.shape)} "
-                "([num_blocks, num_kv_heads, block_size, head_size]), and this "
-                "attention indexes a contiguous ring "
-                f"[batch, {win}, {self.head_dim}] the way the reference does "
-                "(`window_kv_cache[:bsz, start_pos % window]`). Bridging the "
-                "two is the last piece of the port; see "
-                ".autohelix/notes/iter-1.md section 4c for the two candidate "
-                "designs and why writing into the paged layout (rather than "
-                "allocating a private ring) is the one that keeps prefix "
-                "caching sound."
-            )
         kv = self.kv_norm(self.wkv(x))
         kv = torch.cat([kv[..., :-rd], apply_rotary_emb(kv[..., -rd:], freqs_cis)], -1)
         kv = act_quant_dequant(kv, 32)
 
-        if start_pos == 0:
-            # Prefill attends over this chunk and seeds the ring for decode.
-            if seqlen <= win:
-                self.window_kv_cache[:bsz, :seqlen] = kv
-            else:
-                cutoff = seqlen % win
-                tail_a, tail_b = kv[:, -win:].split([win - cutoff, cutoff], dim=1)
-                self.window_kv_cache[:bsz, cutoff:win] = tail_a
-                self.window_kv_cache[:bsz, :cutoff] = tail_b
-            window_kv = kv
-        else:
-            self.window_kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
-            window_kv = self.window_kv_cache[:bsz]
-        return window_kv, window_topk_idxs(win, bsz, seqlen, start_pos, x.device)
+        paged.write(self.window_kv_cache, kv.reshape(seqlen, self.head_dim))
+
+        lo = max(0, start_pos - win + 1)
+        span = start_pos + seqlen - lo
+        positions = lo + torch.arange(span, device=x.device)
+        window_kv = paged.gather(
+            self.window_kv_cache.view(-1, self.head_dim), positions
+        ).reshape(1, span, self.head_dim)
+        return window_kv, window_topk_idxs(win, seqlen, start_pos, lo, x.device)
 
     def _compress_kv(
         self,
@@ -986,17 +1398,25 @@ class Attention(nn.Module):
         start_pos: int,
         offset: int,
         shared: SharedAttentionState,
+        paged: PagedSpan,
         tp_group,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """The shared compressed KV and the compressed slots each query sees."""
+        """The shared compressed KV and the compressed slots each query sees.
+
+        Paged like the window (`PagedSpan`), with group `j`'s latent at the slot
+        of token `j * compress_ratio`. That is what makes the cache correct
+        under prefix caching: a shared prefix produces the same latents in the
+        same blocks, and a divergent suffix writes to different blocks because
+        the block table diverges.
+        """
         bsz, seqlen, _ = x.shape
         ratio = self.compress_ratio
         rd = self.rope_head_dim
         compress_len = (start_pos + seqlen) // ratio
 
-        latent = None
+        latent, group_positions = None, None
         if self.is_kv_source:
-            latent = self.compressor(x, start_pos)
+            latent, group_positions = self.compressor(x, start_pos, paged)
             shared.compress_kv = self.compress_kv_cache
 
         # The indexer needs the latent *before* RoPE, so it runs before the
@@ -1008,39 +1428,40 @@ class Attention(nn.Module):
                 )
             else:
                 idxs = self.indexer(
-                    x, qr, latent, start_pos, offset, shared, tp_group
+                    x, qr, latent, group_positions, start_pos, offset, shared,
+                    paged, tp_group,
                 )
             shared.topk_idxs = idxs
         else:
             idxs = shared.topk_idxs
 
         if latent is not None:
-            freqs = (
-                slice_freqs(self.freqs_cis, slice(None, seqlen - seqlen % ratio, ratio))
-                if start_pos == 0
-                else slice_freqs(
-                    self.freqs_cis, slice(start_pos + 1 - ratio, start_pos + 2 - ratio)
-                )
-            )
+            freqs = slice_freqs(self.freqs_cis, group_positions)
             rotated = torch.cat(
                 [latent[..., :-rd], apply_rotary_emb(latent[..., -rd:], freqs)], -1
             )
             # Compressed KV uses 16-wide groups with e4m3 scales; the indexer
             # above uses 32 with e8m0. Not interchangeable.
             rotated = fp4_quant_dequant(rotated, 16, scale_e4m3=True)
-            self.compress_kv_cache[
-                :bsz, start_pos // ratio : start_pos // ratio + rotated.size(1)
-            ] = rotated
+            paged.put(
+                self.compress_kv_cache,
+                group_positions,
+                rotated.reshape(rotated.size(1), -1),
+            )
 
-        # Read after the write, so this does not depend on the slice aliasing
-        # the cache.
-        return shared.compress_kv[:bsz, :compress_len], idxs
+        # Read after the write, so a query sees the groups this call completed.
+        group_pos = torch.arange(compress_len, device=x.device) * ratio
+        compress_kv = paged.gather(shared.compress_kv, group_pos).reshape(
+            1, compress_len, -1
+        )
+        return compress_kv, idxs
 
     def forward(
         self,
         x: torch.Tensor,
         start_pos: int,
         shared: SharedAttentionState,
+        paged: PagedSpan,
         tp_group=None,
     ) -> torch.Tensor:
         """`x` is the normalized sublayer input `[b, s, hidden]`."""
@@ -1052,10 +1473,10 @@ class Attention(nn.Module):
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
         q = torch.cat([q[..., :-rd], apply_rotary_emb(q[..., -rd:], freqs_cis)], -1)
 
-        kv, topk_idxs = self._window_kv(x, freqs_cis, start_pos)
+        kv, topk_idxs = self._window_kv(x, freqs_cis, start_pos, paged)
         if self.compress_ratio:
             compress_kv, compress_idxs = self._compress_kv(
-                x, qr, start_pos, kv.size(1), shared, tp_group
+                x, qr, start_pos, kv.size(1), shared, paged, tp_group
             )
             kv = torch.cat([kv, compress_kv], dim=1)
             topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
@@ -1068,16 +1489,18 @@ class Attention(nn.Module):
         )
 
         # `wo_a` is block-diagonal over groups — each projects only its own
-        # heads — hence an einsum and not a Linear. The checkpoint stores it
-        # fp8; the reference runs it dequantized to bf16 with no activation
-        # quantization, which is what `dequantized()` without `act_quant`
-        # reproduces.
-        o = o.reshape(bsz, seqlen, self.n_local_groups, -1)
-        wo_a = self.wo_a.dequantized(torch.float32).view(
-            self.n_local_groups, self.o_lora_rank, -1
-        )
-        o = torch.einsum("bsgd,grd->bsgr", o.float(), wo_a)
-        out = self.wo_b(o.flatten(2).to(x.dtype))
+        # heads — so it is `n_local_groups` independent GEMMs sharing one
+        # buffer, one `grouped()` kernel call each, rather than a dense einsum
+        # against a dequantized `[groups*rank, group_in]` weight.
+        o = o.reshape(bsz * seqlen, self.n_local_groups, -1)
+        o = torch.cat(
+            [
+                self.wo_a.grouped(o[:, g], g, self.o_lora_rank)
+                for g in range(self.n_local_groups)
+            ],
+            dim=-1,
+        ).reshape(bsz, seqlen, -1)
+        out = self.wo_b(o)
         if self.world_size > 1 and tp_group is not None:
             # `wo_b` is row-parallel, so each rank holds a partial sum. The
             # reference reduces in fp32.
@@ -1118,7 +1541,12 @@ class Gate(nn.Module):
     def forward(
         self, x: torch.Tensor, image_mask: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        scores = F.linear(x.float(), self.weight.float())
+        # The router's GEMM goes through the bf16 NKI kernel. That is not a
+        # precision concession: `self.weight` is stored bf16, `x` is the bf16
+        # residual stream, and the kernel accumulates in fp32 — so it computes
+        # the same thing as the reference's `linear(x.float(), w.float())`
+        # modulo summation order, with no rounding the reference does not have.
+        scores = nki_linear(x, self.weight, None, "bf16").float()
         if self.scoring_func == "softmax":
             scores = scores.softmax(dim=-1)
         elif self.scoring_func == "sigmoid":
@@ -1130,7 +1558,7 @@ class Gate(nn.Module):
         if image_mask is not None:
             bias = torch.where(image_mask.unsqueeze(-1), self.bias_vl, bias)
 
-        indices = (scores + bias).topk(self.topk, dim=-1)[1]
+        indices = nki_topk(scores + bias, self.topk)[1]
         weights = scores.gather(1, indices)
         if self.norm_topk_prob and self.topk > 1:
             # 1e-20 here is the training constant, not `rms_norm_eps`, even
@@ -1561,7 +1989,10 @@ class Engram(nn.Module):
         from the store; `token_mask`: `[B, L]`, False shuts the gate.
         """
         kv = self.wkv(rows.flatten(-2))
-        key, value = kv.split([self.hc_mult * self.hidden_size, self.hidden_size], -1)
+        # Sliced, not `split` — see `HyperConnections.mixes`.
+        width = self.hc_mult * self.hidden_size
+        key = kv[..., :width]
+        value = kv[..., width : width + self.hidden_size]
         key = key.float().unflatten(-1, (self.hc_mult, self.hidden_size))
         # q and k gains are only ever used as a product.
         weight = self.q_weight.float() * self.k_weight.float()
@@ -1571,9 +2002,14 @@ class Engram(nn.Module):
             key.square().mean(-1) + self.eps
         )
         dot = (h * weight * key).sum(-1) * rstd * self.hidden_size**-0.5
-        gate = torch.sigmoid(
-            torch.copysign(dot.abs().clamp_min(self.clamp_value).sqrt(), dot)
-        )
+        # `torch.where`, not `torch.copysign`: the latter has no lowering in
+        # this backend and the graph dies at execution time with
+        # "FATAL: Unknown custom-call API version enum value: 0
+        # (API_VERSION_UNSPECIFIED)", naming the node but not the reason.
+        # Identical for every `dot` except negative zero, where copysign would
+        # return `-magnitude` and this returns `+magnitude`.
+        magnitude = dot.abs().clamp_min(self.clamp_value).sqrt()
+        gate = torch.sigmoid(torch.where(dot < 0, -magnitude, magnitude))
         if token_mask is not None:
             gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
         return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
@@ -1625,9 +2061,17 @@ class HyperConnections(nn.Module):
         statistic per token, not per copy.
         """
         hc = self.hc_mult
-        flat = x.flatten(2).float()
-        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(flat, self.fn) * rsqrt
+        flat = x.flatten(2)
+        rsqrt = torch.rsqrt(
+            flat.float().square().mean(-1, keepdim=True) + self.norm_eps
+        )
+        # `fn` is the one weight the checkpoint stores fp32. It is handed over
+        # as stored and narrowed inside the kernel — see
+        # `kernels/blockquant.fp32w_linear` for why neither the caller nor the
+        # traced forward can do the cast. Rounding it to bf16 costs ~2e-3
+        # relative on 24 coefficients that then pass through a sigmoid or a
+        # softmax, the same order as the GEMM error already present.
+        mixes = nki_linear(flat, self.fn, None, "fp32w").float() * rsqrt
 
         # Transcribed from `hc_split_sinkhorn_kernel` in `vendor/kernel.py`, not
         # inferred: the three slices get different nonlinearities (`pre` a
@@ -1636,13 +2080,24 @@ class HyperConnections(nn.Module):
         # outside it, so there are `iters` column passes but only `iters - 1`
         # row passes after the softmax. Getting either of those wrong leaves a
         # model that runs and drifts.
-        raw_pre, raw_post, raw_comb = mixes.split([hc, hc, hc * hc], dim=-1)
-        base_pre, base_post, base_comb = self.base.split([hc, hc, hc * hc])
+        # Explicit slices, not `Tensor.split([hc, hc, hc * hc], -1)`. The
+        # `vllm_neuron` backend miscompiles a multi-size `split`: measured on
+        # this exact tensor, the compiled graph's `pre` came out at cosine
+        # 0.436 against the recorded reference while the identical expression
+        # written with slices came out at 0.9999999. Nothing in the error path
+        # reports it — the graph compiles, loads and runs. Every `split` on the
+        # execution path in this file is written out for that reason.
+        raw_pre = mixes[..., :hc]
+        raw_post = mixes[..., hc : 2 * hc]
+        raw_comb = mixes[..., 2 * hc : 2 * hc + hc * hc]
+        base_pre = self.base[:hc]
+        base_post = self.base[hc : 2 * hc]
+        base_comb = self.base[2 * hc : 2 * hc + hc * hc]
 
-        pre = torch.sigmoid(raw_pre * self.scale[0] + base_pre) + self.hc_eps
-        post = 2.0 * torch.sigmoid(raw_post * self.scale[1] + base_post)
+        pre = torch.sigmoid(raw_pre * self.scale[0:1] + base_pre) + self.hc_eps
+        post = 2.0 * torch.sigmoid(raw_post * self.scale[1:2] + base_post)
 
-        comb = (raw_comb * self.scale[2] + base_comb).unflatten(-1, (hc, hc))
+        comb = (raw_comb * self.scale[2:3] + base_comb).unflatten(-1, (hc, hc))
         comb = comb.softmax(dim=-1) + self.hc_eps
         comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
         for _ in range(self.iters - 1):
@@ -1652,8 +2107,19 @@ class HyperConnections(nn.Module):
 
     @staticmethod
     def pre(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
-        """Collapse the copies into one sublayer input, weighted by `pre_mix`."""
-        return torch.sum(pre_mix.unsqueeze(-1) * x.float(), dim=2).to(x.dtype)
+        """Collapse the copies into one sublayer input, weighted by `pre_mix`.
+
+        `kernels/hc_collapse.py`, the shipped `HyperConnectCollapse` kernel,
+        generalized to a ragged row count. The torch equivalent is
+        `torch.sum(pre_mix.unsqueeze(-1) * x.float(), dim=2).to(x.dtype)`; the
+        kernel accumulates in fp32 and narrows on the store, which is the same
+        arithmetic.
+        """
+        if x.dim() != 4:
+            raise ValueError(f"hc_pre wants [batch, tokens, hc, dim], got {tuple(x.shape)}")
+        if pre_mix.dtype is not torch.float32:
+            raise TypeError(f"hc_pre wants fp32 coefficients, got {pre_mix.dtype}")
+        return _nki_entry("hc_collapse")(x, pre_mix)
 
     @staticmethod
     def post(
@@ -1664,10 +2130,23 @@ class HyperConnections(nn.Module):
     ) -> torch.Tensor:
         """Expand the sublayer output back out and mix the residual through
         `comb`. `x`: `[B,L,dim]`, `residual`: `[B,L,hc,dim]`.
+
+        `kernels/hc_attn_out.py`, the shipped `HyperConnectSublayerOut` kernel,
+        generalized to a ragged row count. The torch equivalent is
+
+            broadcast = post.unsqueeze(-1) * x.unsqueeze(-2)
+            mixed = torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+            (broadcast + mixed).type_as(x)
+
+        and note which `hc` axis of `comb` is summed over: the first one, so
+        the kernel reads `comb[i * hc + j]` against copy `i` into output copy
+        `j`.
         """
-        broadcast = post.unsqueeze(-1) * x.unsqueeze(-2)
-        mixed = torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
-        return (broadcast + mixed).type_as(x)
+        if post.dtype is not torch.float32 or comb.dtype is not torch.float32:
+            raise TypeError(
+                f"hc_post wants fp32 coefficients, got {post.dtype}/{comb.dtype}"
+            )
+        return _nki_entry("hc_attn_out")(x, residual, post, comb)
 
 
 # =============================================================================
@@ -1714,6 +2193,7 @@ class Block(nn.Module):
         pre_mix: torch.Tensor,
         image_mask: torch.Tensor | None,
         shared: SharedAttentionState,
+        paged: PagedSpan,
         weight_store,
         tp_group=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1731,7 +2211,7 @@ class Block(nn.Module):
         attn_pre, attn_post, attn_comb = self.hc_attn.mixes(x)
         y = HyperConnections.pre(x, pre_mix)
         y = self.attn_norm(y)
-        y = self.attn(y, start_pos, shared, tp_group)
+        y = self.attn(y, start_pos, shared, paged, tp_group)
         x = HyperConnections.post(y, residual, attn_post, attn_comb)
 
         residual = x
@@ -1744,24 +2224,21 @@ class Block(nn.Module):
 
 
 def dspark_topk_idxs(
-    window_size: int, bsz: int, block_size: int, start_pos: int, device
+    window_rows: int, bsz: int, block_size: int, device
 ) -> torch.Tensor:
     """Which slots a draft query attends to. `vendor/model.py`'s
-    `get_dspark_topk_idxs`.
+    `get_dspark_topk_idxs`, renumbered for the paged read.
 
-    Every position in the draft block sees the same set: the whole ring (as far
-    as it has filled) plus **all** `block_size` draft positions, with no causal
+    Every position in the draft block sees the same set: every row of the
+    gathered window plus **all** `block_size` draft positions, with no causal
     mask among them — the draft block is scored jointly, which is the point of
-    predicting a block at once.
+    predicting a block at once. `window_rows` is how many positions the gather
+    returned, so the draft rows start there rather than at a fixed
+    `window_size`.
     """
-    if start_pos <= 0:
+    if window_rows <= 0:
         raise ValueError("the DSpark draft path only runs during decode")
-    matrix = torch.cat(
-        [
-            torch.arange(min(window_size, start_pos + 1), device=device),
-            window_size + torch.arange(block_size, device=device),
-        ]
-    )
+    matrix = torch.arange(window_rows + block_size, device=device)
     return matrix.int().view(1, 1, -1).expand(bsz, block_size, -1).contiguous()
 
 
@@ -1782,6 +2259,7 @@ class DSparkAttention(Attention):
         start_pos: int,
         main_x: torch.Tensor,
         shared: SharedAttentionState | None = None,
+        paged: PagedSpan | None = None,
         tp_group=None,
     ) -> torch.Tensor:
         if self.compress_ratio:
@@ -1802,15 +2280,14 @@ class DSparkAttention(Attention):
         )
         main_kv = act_quant_dequant(main_kv, 32)
 
+        if paged is None:
+            raise RuntimeError(
+                f"DSpark stage {self.layer_id} needs the paged KV addressing; "
+                "forward_spec must pass the PagedSpan it was given"
+            )
         if start_pos == 0:
-            # Prefill only seeds the ring; the draft stream passes through.
-            if seqlen <= win:
-                self.window_kv_cache[:bsz, :seqlen] = main_kv
-            else:
-                cutoff = seqlen % win
-                tail_a, tail_b = main_kv[:, -win:].split([win - cutoff, cutoff], 1)
-                self.window_kv_cache[:bsz, cutoff:win] = tail_a
-                self.window_kv_cache[:bsz, :cutoff] = tail_b
+            # Prefill only seeds the window; the draft stream passes through.
+            paged.write(self.window_kv_cache, main_kv.reshape(seqlen, self.head_dim))
             return x
 
         bsz, block_size, _ = x.shape
@@ -1830,20 +2307,32 @@ class DSparkAttention(Attention):
         )
         kv = act_quant_dequant(kv, 32)
 
-        topk = dspark_topk_idxs(win, bsz, block_size, start_pos, x.device)
-        self.window_kv_cache[:bsz, start_pos % win] = main_kv.squeeze(1)
-        kv = torch.cat([self.window_kv_cache[:bsz], kv], dim=1)
+        # The accepted token's KV joins the window at its own slot, then the
+        # window is gathered back out of the paged allocation and the draft
+        # block's own KV is concatenated after it.
+        paged.write(self.window_kv_cache, main_kv.reshape(seqlen, self.head_dim))
+        lo = max(0, start_pos - win + 1)
+        window_rows = start_pos + seqlen - lo
+        positions = lo + torch.arange(window_rows, device=x.device)
+        window_kv = paged.gather(
+            self.window_kv_cache.view(-1, self.head_dim), positions
+        ).reshape(1, window_rows, self.head_dim)
+        topk = dspark_topk_idxs(window_rows, bsz, block_size, x.device)
+        kv = torch.cat([window_kv, kv], dim=1)
 
         o = sparse_attn(q, kv, self.attn_sink, topk, self.softmax_scale)
         o = torch.cat(
             [o[..., :-rd], apply_rotary_emb(o[..., -rd:], freqs, True)], dim=-1
         )
-        o = o.reshape(bsz, block_size, self.n_local_groups, -1)
-        wo_a = self.wo_a.dequantized(torch.float32).view(
-            self.n_local_groups, self.o_lora_rank, -1
-        )
-        o = torch.einsum("bsgd,grd->bsgr", o.float(), wo_a)
-        out = self.wo_b(o.flatten(2).to(x.dtype))
+        o = o.reshape(bsz * block_size, self.n_local_groups, -1)
+        o = torch.cat(
+            [
+                self.wo_a.grouped(o[:, g], g, self.o_lora_rank)
+                for g in range(self.n_local_groups)
+            ],
+            dim=-1,
+        ).reshape(bsz, block_size, -1)
+        out = self.wo_b(o)
         if self.world_size > 1 and tp_group is not None:
             out = out.float()
             tp_group.all_reduce(out)
@@ -1904,19 +2393,20 @@ class DSparkBlock(Block):
         pre_mix: torch.Tensor,
         main_x: torch.Tensor,
         shared: SharedAttentionState,
+        paged: PagedSpan,
         weight_store,
         tp_group=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One draft stage. Prefill only seeds the ring and passes through."""
         if start_pos == 0:
-            self.attn(x, start_pos, main_x, shared, tp_group)
+            self.attn(x, start_pos, main_x, shared, paged, tp_group)
             return x, pre_mix
 
         residual = x
         attn_pre, attn_post, attn_comb = self.hc_attn.mixes(x)
         y = HyperConnections.pre(x, pre_mix)
         y = self.attn_norm(y)
-        y = self.attn(y, start_pos, main_x, shared, tp_group)
+        y = self.attn(y, start_pos, main_x, shared, paged, tp_group)
         x = HyperConnections.post(y, residual, attn_post, attn_comb)
 
         residual = x
@@ -2031,7 +2521,7 @@ class DSparkMarkovHead(nn.Module):
         )
         if self.world_size > 1 and self._tp_group is not None:
             self._tp_group.all_reduce(embed)
-        logits = F.linear(embed.float(), self.head_weight.float())
+        logits = nki_linear(embed, self.head_weight, None, "bf16").float()
         if self.world_size > 1 and self._tp_group is not None:
             logits = self._tp_group.all_gather(logits, dim=-1)
         return logits, embed
@@ -2051,8 +2541,8 @@ class DSparkConfidenceHead(nn.Module):
     def forward(
         self, hidden: torch.Tensor, markov_embed: torch.Tensor
     ) -> torch.Tensor:
-        joined = torch.cat([hidden, markov_embed], dim=-1).float()
-        return F.linear(joined, self.proj_weight.float()).squeeze(-1)
+        joined = torch.cat([hidden, markov_embed], dim=-1)
+        return nki_linear(joined, self.proj_weight, None, "bf16").float().squeeze(-1)
 
 
 # =============================================================================
@@ -2116,8 +2606,26 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.ngram_hash: NgramHashState | None = None
 
         self._shard_plan = self._build_shard_plan()
+        self._check_kernel_constants()
 
     # ── Construction ──────────────────────────────────────────────────────
+
+    def _check_kernel_constants(self) -> None:
+        """`kernels/hc_expand.py` bakes `hc_mult` in; make sure it agrees.
+
+        That kernel emits the one-hot `pre_mix` and the broadcast width as part
+        of its instruction stream, so the value cannot be a runtime argument.
+        A disagreement would silently produce the wrong number of residual
+        streams, which is exactly the class of thing `config-matches-official`
+        cannot see.
+        """
+        from .kernels import hc_expand
+
+        if hc_expand.HC != self.config.hc_mult:
+            raise ValueError(
+                f"kernels/hc_expand.py is built for hc_mult={hc_expand.HC} but "
+                f"this config says {self.config.hc_mult}"
+            )
 
     @classmethod
     def from_configs(
@@ -2328,16 +2836,21 @@ class DeepseekV41ForCausalLM(nn.Module):
         block manager handles, and `sliding_window_size` is how it is told the
         window never grows.
 
-        *Out* — the compressed KV and the index keys. Those are **shared across
-        layers**, not per-layer: the four `kv_source_layer_ids` produce them and
-        every other layer reads the same cache. A `KVSpec` entry describes
-        storage owned by one layer, so expressing a cache that four layers write
-        and 36 read would either duplicate it 40 times (40x the memory for one
-        copy of the data) or lie about who owns it. They are therefore
-        model-owned buffers sized by `max_model_len / compress_ratio`, allocated
-        in `bind_kv_cache` next to the window caches — small enough for that to
-        be the right call: 8224 positions at ratio 2 is 2 MiB of latent per
-        source layer.
+        *Out* — the compressed KV, the index keys and the compressor's
+        per-token pooling inputs. Those are **shared across layers**, not
+        per-layer: the four `kv_source_layer_ids` produce them and every other
+        layer reads the same cache. A `KVSpec` entry describes storage owned by
+        one layer, so expressing a cache that four layers write and 36 read
+        would either duplicate it 40 times (40x the memory for one copy of the
+        data) or lie about who owns it.
+
+        They are therefore model-owned buffers allocated in `bind_kv_cache` —
+        but **paged the same way and addressed by the same `block_table`**, one
+        row per slot of the runtime's own allocation rather than one row per
+        batch index. That is not a memory decision, it is a correctness one:
+        prefix caching is on by default here, so a cache row has to be
+        identified by *which tokens* produced it, not by where its request
+        happens to sit in this step's running batch. See `PagedSpan`.
         """
         dtype = self.config.torch_dtype
         layers = []
@@ -2385,25 +2898,30 @@ class DeepseekV41ForCausalLM(nn.Module):
 
         max_len = self._max_sequence_length()
         device = self.norm.weight.device
+        # The runtime's own allocation fixes the slot space: a window cache is
+        # `[num_blocks, num_kv_heads, block_size, head_size]`, so a slot id runs
+        # to `num_blocks * block_size`. Everything this model caches per
+        # position is sized the same way and addressed by the same
+        # `block_table`, which is what makes it correct under prefix caching
+        # (see `PagedSpan`).
+        window = self.layers[0].attn.window_kv_cache
+        num_slots = window.shape[0] * window.shape[2]
         for name, attn in attentions:
             if attn.is_kv_source:
-                ratio = max(attn.compress_ratio, 1)
                 attn.compress_kv_cache = torch.zeros(
-                    self._max_batch_size(),
-                    max_len // ratio,
+                    num_slots,
                     attn.head_dim,
                     dtype=self.config.torch_dtype,
                     device=device,
                 )
                 attn.index_k_cache = torch.zeros(
-                    self._max_batch_size(),
-                    max_len // ratio,
+                    num_slots,
                     self.config.index_head_dim,
                     dtype=self.config.torch_dtype,
                     device=device,
                 )
                 if attn.compressor is not None:
-                    attn.compressor.allocate_state(device)
+                    attn.compressor.allocate_state(device, num_slots)
             # RoPE tables last, so an indexer picks up the index-key cache that
             # was just allocated above.
             attn.build_freqs_cis(max_len, device)
@@ -2510,8 +3028,14 @@ class DeepseekV41ForCausalLM(nn.Module):
         return out
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Vocab-parallel unembedding, gathered to full width."""
-        logits = F.linear(hidden_states.float(), self.head_weight.float())
+        """Vocab-parallel unembedding, gathered to full width.
+
+        The widest GEMM in the model (5120 x 129280 per rank at TP=1) and the
+        one that most needs to be on the device, so it goes through the bf16
+        NKI kernel. `head_weight` is stored bf16, so an fp32 torch `linear`
+        would only differ in summation order.
+        """
+        logits = nki_linear(hidden_states, self.head_weight, None, "bf16").float()
         if self.world_size > 1:
             logits = self.tp_group.all_gather(logits, dim=-1)
         return logits
@@ -2536,17 +3060,33 @@ class DeepseekV41ForCausalLM(nn.Module):
         """tokens -> logits, through all 40 layers and the three DSpark stages.
 
         > **Test status, stated plainly: this method has not yet produced a
-        > token.** Every component it calls is checked against
-        > `partition_artifact/trace/` — see the table in
-        > `.autohelix/notes/iter-1.md`, including a whole decoder layer at
-        > cos 1.000000 — but the assembly below, and in particular the
-        > `_sequence_spans` bridge from vLLM's flat batch to the reference's
-        > per-sequence `start_pos`, has only been reasoned about. Treat a
-        > `verifier` failure as information about *this* method, not about the
-        > parts.
+        > token.** Its components have, on the device, against the recorded
+        > traces — see the module docstring and `.autohelix/notes/iter-2.md`
+        > section 3 — but two things between here and a token are not done:
+        >
+        >   1. `_sequence_spans` reads `positions` on the host, and
+        >      `fullgraph=True` rejects that outright — dynamo traces *through*
+        >      the read and then cannot guard the boundary test
+        >      (`Could not guard on data-dependent expression Ne(u1, u0 + 1)`).
+        >      The fix is the same restructuring as (2): a span list cannot
+        >      exist inside a single graph, so the per-layer compute has to be
+        >      the compiled unit and the span loop has to sit outside it.
+        >   2. The per-layer work below is plain Python calling into
+        >      `nn.Module`s. The GEMMs inside those modules are NKI kernels and
+        >      run on the device, but the pointwise glue between them only runs
+        >      on the device if the *enclosing* call is compiled, and this
+        >      method does not compile its layers — it cannot, as written,
+        >      because it interleaves host I/O (streaming experts and engram
+        >      rows) with compute. `iter-2.md` section 7 has the three-phase
+        >      split that fixes both.
+        >
+        > The KV layout is no longer one of them: the sliding window, the
+        > compressed KV, the index keys and the compressor's pooling inputs all
+        > live in vLLM's paged allocation now, and both attention variants are
+        > checked against the recorded traces that way (`iter-2.md` section 5).
         >
         > Do not read "the code is here" as "the computation has run". The
-        > constraint that decides that is `verifier`.
+        > constraint that decides that is `verifier`, and it does not pass.
 
         Shape of the computation, from `vendor/model.py`'s `Transformer.forward`:
 
@@ -2577,21 +3117,18 @@ class DeepseekV41ForCausalLM(nn.Module):
                 "the routed experts and the engram tables are streamed, not "
                 "resident."
             )
-        # Checked up front, before any work, so the failure the engine reports
-        # is this sentence rather than whatever dynamo says several hundred
-        # traced nodes later.
-        self._require_ring_kv_layout()
-
         spans = self._sequence_spans(input_ids, positions)
+        paged = self._paged_spans(spans, attn_metadata)
 
         # ── embed -> hc_expand ────────────────────────────────────────────
         hidden = self.embed_input_ids(input_ids)
         hidden = NF.merge_prompt_embeds(hidden, inputs_embeds, is_token_ids)
         # `hc_expand`: one hidden state becomes hc_mult copies, with a one-hot
         # pre_mix so the first layer's hc_pre returns copy 0 unchanged.
-        stream = hidden.unsqueeze(1).repeat(1, self.hc_mult, 1)
-        pre_mix = stream.new_zeros(stream.shape[0], self.hc_mult, dtype=torch.float32)
-        pre_mix[:, 0] = 1.0
+        # `kernels/hc_expand.py` is the shipped kernel for it — pure DMA, so the
+        # copies come out bit-identical — generalized to a ragged row count.
+        stream, pre_mix = _nki_entry("hc_expand")(hidden.unsqueeze(0))
+        stream, pre_mix = stream.squeeze(0), pre_mix.squeeze(0)
 
         # ── engram hash ids, once for the whole batch ─────────────────────
         hashes = self._engram_hashes(input_ids, spans)
@@ -2617,7 +3154,9 @@ class DeepseekV41ForCausalLM(nn.Module):
                 # The DSpark head reads the attention *input* of its target
                 # layers, not their output, and averaged over the hc copies.
                 main_hiddens.append(stream.float().mean(dim=1))
-            stream, pre_mix = self._run_block(block, stream, pre_mix, spans, shared)
+            stream, pre_mix = self._run_block(
+                block, stream, pre_mix, spans, paged, shared
+            )
 
         # ── collapse -> norm -> head ──────────────────────────────────────
         collapsed = HyperConnections.pre(stream.unsqueeze(0), pre_mix.unsqueeze(0))
@@ -2628,7 +3167,9 @@ class DeepseekV41ForCausalLM(nn.Module):
             # The DSpark draft path. Only reachable under a speculative config;
             # the reference's own `Transformer.forward` likewise collects
             # `main_hiddens` and leaves `forward_spec` to the caller.
-            return self.forward_spec(input_ids, main_hidden, spans, shared)
+            return self.forward_spec(
+                input_ids, main_hidden, spans, paged, shared
+            )
 
         selected = collapsed
         if sampling_positions is not None:
@@ -2637,37 +3178,47 @@ class DeepseekV41ForCausalLM(nn.Module):
 
     # ── Forward helpers ───────────────────────────────────────────────────
 
-    def _require_ring_kv_layout(self) -> None:
-        """Refuse to run against a KV cache this attention cannot address.
+    def _paged_spans(
+        self, spans: list[tuple[int, int, int]], attn_metadata: object | None
+    ) -> list[PagedSpan]:
+        """One `PagedSpan` per scheduled sequence.
 
-        `get_kv_spec` declares 43 sliding-window layers and the runtime
-        allocates them paged — `[num_blocks, num_kv_heads, block_size,
-        head_size]` — while `Attention._window_kv` indexes a contiguous
-        `[batch, sliding_window, head_dim]` ring, the way the reference does.
-        Bridging the two is the last piece of this port.
-
-        Raised here rather than left to fail inside the ring indexing so the
-        engine's error names the cause. See `.autohelix/notes/iter-1.md`
-        section 5a for the design that closes it, and section 4b for the
-        `fullgraph=True` graph-break problem that sits in front of it.
+        `attn_metadata` is keyed by layer name and every layer in a KV cache
+        group shares one dict, so the window layers and the three `mtp` stages
+        all read the same `slot_mapping` and `block_table_tensor` — which is
+        what lets a draft stage address the backbone's slots. Row `k` of the
+        block table is the `k`-th scheduled sequence, which is the `k`-th span:
+        the runner builds both from the same request order.
         """
-        cache = self.layers[0].attn.window_kv_cache
-        if cache is None:
+        if attn_metadata is None:
             raise RuntimeError(
-                "bind_kv_cache() has not run; forward() has no KV cache."
+                "forward() needs attn_metadata: the sliding window, the "
+                "compressed KV and the index keys all live in vLLM's paged "
+                "allocation and are addressed through its slot_mapping and "
+                "block_table (see PagedSpan)."
             )
-        expected = (self.config.sliding_window, self.layers[0].attn.head_dim)
-        if tuple(cache.shape[-2:]) != expected:
-            raise NotImplementedError(
-                "this port cannot yet run against vLLM's paged KV layout "
-                f"{tuple(cache.shape)}. It indexes a contiguous ring "
-                f"[batch, {expected[0]}, {expected[1]}], which is what the "
-                "reference uses and what every component check in "
-                ".autohelix/notes/iter-1.md was run against. Writing the "
-                "sliding window, the compressed KV and the index keys through "
-                "`slot_mapping`/`block_table` instead is the remaining work — "
-                "see that file, section 5a."
+        name = f"layers.{0}.attn"
+        try:
+            meta = attn_metadata[name]
+        except (TypeError, KeyError) as exc:
+            raise RuntimeError(
+                f"attn_metadata has no entry for {name!r}; get_kv_spec() "
+                "declared it, so this is a runtime/spec mismatch "
+                f"({type(exc).__name__}: {exc})"
+            ) from exc
+        block_size = int(meta["block_size"])
+        block_table = meta["block_table_tensor"]
+        slot_mapping = meta["slot_mapping"]
+        return [
+            PagedSpan(
+                block_table=block_table[row],
+                block_size=block_size,
+                slot_mapping=slot_mapping[begin : begin + length],
+                start_pos=start_pos,
+                length=length,
             )
+            for row, (begin, length, start_pos) in enumerate(spans)
+        ]
 
     def _sequence_spans(
         self, input_ids: torch.Tensor, positions: torch.Tensor
@@ -2725,6 +3276,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         stream: torch.Tensor,
         pre_mix: torch.Tensor,
         spans: list[tuple[int, int, int]],
+        paged: list[PagedSpan],
         shared: SharedAttentionState,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One layer over a flat `[T, hc, dim]` stream covering several
@@ -2745,9 +3297,9 @@ class DeepseekV41ForCausalLM(nn.Module):
         normed = block.attn_norm(collapsed)
 
         attn_out = torch.empty_like(normed)
-        for begin, length, start_pos in spans:
+        for (begin, length, start_pos), span in zip(spans, paged):
             attn_out[:, begin : begin + length] = block.attn(
-                normed[:, begin : begin + length], start_pos, shared, tp_group
+                normed[:, begin : begin + length], start_pos, shared, span, tp_group
             )
         batched = HyperConnections.post(attn_out, residual, attn_post, attn_comb)
 
@@ -2766,6 +3318,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         main_hidden: torch.Tensor | None,
         spans: list[tuple[int, int, int]],
+        paged: list[PagedSpan],
         shared: SharedAttentionState,
     ):
         """The DSpark draft path over the `mtp.*` stages.
@@ -2798,6 +3351,7 @@ class DeepseekV41ForCausalLM(nn.Module):
                 ".autohelix/notes/iter-1.md section 5a."
             )
         (begin, length, start_pos), = spans
+        (span,) = paged
 
         # The accepted token this draft continues from: the last real token.
         last_id = input_ids[begin + length - 1].reshape(1)
@@ -2815,8 +3369,8 @@ class DeepseekV41ForCausalLM(nn.Module):
         draft_pos = start_pos + length - 1
         for stage in self.mtp:
             stream, pre_mix = stage(
-                stream, draft_pos, pre_mix, main_x, shared, self.weight_store,
-                tp_group,
+                stream, draft_pos, pre_mix, main_x, shared, span,
+                self.weight_store, tp_group,
             )
 
         last = self.mtp[-1]

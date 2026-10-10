@@ -1,6 +1,12 @@
-"""`layers.0.hc_attn_out` — `HyperConnectSublayerOut`, the mHC `hc_post`: expand a sublayer's
-output back to `hc` copies of the residual stream, with the residual stream mixed back in.
-Broadcast plus a 4x4 stream mix, no parameters. Whole module on one core; no collective.
+"""`hc_attn_out` — `HyperConnectSublayerOut`, the mHC `hc_post`: expand a sublayer's output back
+to `hc` copies of the residual stream, with the residual stream mixed back in through the
+doubly-stochastic `comb`. Broadcast plus an `hc x hc` stream mix, no parameters. Whole module on
+one core; no collective.
+
+Generalized from the partition-trace version the same way `hc_collapse.py` is: the tail row tile
+is handled outside `nl.affine_range` (whose index is symbolic, so a Python `min()` on it cannot
+size a tile) and the free-axis chunk is a divisor of `dim` rather than a fixed 1024. The mix
+accumulates in fp32 and only the store narrows, matching `HyperConnections.post`.
 """
 
 import nki
@@ -9,15 +15,29 @@ import nki.language as nl
 
 PMAX = 128
 
-CHUNK = 1024
+CHUNKS = (1024, 512, 256, 128, 64, 32)
+
+
+def _chunk(dim):
+    for cand in CHUNKS:
+        if dim % cand == 0:
+            return cand
+    return dim
 
 
 @nki.jit
 def kernel(input_0, input_1, input_2, input_3):
+    """`post[..., j, None] * x + sum(comb[..., i, j] * residual[..., i, :] for i)`.
+
+    `input_0` is the sublayer output `[batch, seqlen, dim]`, `input_1` the residual stream
+    `[batch, seqlen, hc, dim]`, `input_2` the `post` coefficients `[batch, seqlen, hc]` and
+    `input_3` the Sinkhorn-normalized `comb` `[batch, seqlen, hc, hc]`. Note the orientation:
+    the *first* `hc` axis of `comb` is the one summed over.
+    """
     batch, seqlen, dim = input_0.shape
     hc = input_2.shape[-1]
     rows = batch * seqlen
-    assert dim % CHUNK == 0
+    chunk = _chunk(dim)
 
     out_hbm = nl.ndarray((batch, seqlen, hc, dim), dtype=input_0.dtype,
                          buffer=nl.shared_hbm)
@@ -28,30 +48,24 @@ def kernel(input_0, input_1, input_2, input_3):
     comb_hbm = input_3.reshape((rows, hc * hc))
     y_hbm = out_hbm.reshape((rows, hc, dim))
 
-    n_tiles = (rows + PMAX - 1) // PMAX
-    n_chunks = dim // CHUNK
-
-    for tile_idx in nl.affine_range(n_tiles):
-        row0 = tile_idx * PMAX
-        nr = min(PMAX, rows - row0)
-
+    def body(row0, nr):
         post = nl.load(post_hbm[nl.ds(row0, nr), 0:hc])
         comb = nl.load(comb_hbm[nl.ds(row0, nr), 0:hc * hc])
 
-        for chunk_idx in nl.affine_range(n_chunks):
-            col0 = chunk_idx * CHUNK
+        for c in nl.static_range(dim // chunk):
+            col0 = c * chunk
 
-            xg = nl.ndarray((nr, CHUNK), dtype=input_0.dtype, buffer=nl.sbuf)
-            nisa.dma_copy(dst=xg, src=x_hbm[nl.ds(row0, nr), nl.ds(col0, CHUNK)],
+            xg = nl.ndarray((nr, chunk), dtype=input_0.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=xg, src=x_hbm[nl.ds(row0, nr), nl.ds(col0, chunk)],
                           dge_mode=nisa.dge_mode.none)
 
-            rg = nl.ndarray((nr, hc, CHUNK), dtype=input_1.dtype, buffer=nl.sbuf)
+            rg = nl.ndarray((nr, hc, chunk), dtype=input_1.dtype, buffer=nl.sbuf)
             nisa.dma_copy(dst=rg,
-                          src=res_hbm[nl.ds(row0, nr), 0:hc, nl.ds(col0, CHUNK)],
+                          src=res_hbm[nl.ds(row0, nr), 0:hc, nl.ds(col0, chunk)],
                           dge_mode=nisa.dge_mode.none)
 
-            og = nl.ndarray((nr, hc, CHUNK), dtype=input_0.dtype, buffer=nl.sbuf)
-            acc = nl.ndarray((nr, hc, CHUNK), dtype=nl.float32, buffer=nl.sbuf)
+            og = nl.ndarray((nr, hc, chunk), dtype=input_0.dtype, buffer=nl.sbuf)
+            acc = nl.ndarray((nr, hc, chunk), dtype=nl.float32, buffer=nl.sbuf)
 
             for j in nl.static_range(hc):
                 nisa.tensor_scalar(dst=acc[:, j, :], data=rg[:, 0, :],
@@ -68,7 +82,14 @@ def kernel(input_0, input_1, input_2, input_3):
                                           op0=nl.multiply, operand0=post[:, j:j + 1],
                                           op1=nl.add, operand1=acc[:, j, :])
 
-            nisa.dma_copy(dst=y_hbm[nl.ds(row0, nr), 0:hc, nl.ds(col0, CHUNK)], src=og,
+            nisa.dma_copy(dst=y_hbm[nl.ds(row0, nr), 0:hc, nl.ds(col0, chunk)], src=og,
                           dge_mode=nisa.dge_mode.none)
+
+    full = rows // PMAX
+    tail = rows - full * PMAX
+    for t in nl.affine_range(full):
+        body(t * PMAX, PMAX)
+    if tail:
+        body(full * PMAX, tail)
 
     return out_hbm
