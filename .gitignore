@@ -3,3 +3,6 @@
 vllm_neuron.egg-info/
 .venv/
 __pycache__
+
+# Written by the verifier on every run (see verifier/run_verifier.py DEFAULT_REPORT).
+vllm_neuron/model/deepseek_v41_timeshare/verifier/verifier_report.json
