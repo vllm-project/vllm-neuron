@@ -226,8 +226,36 @@ class DeepseekV41Config:
             return dict(value) if isinstance(value, dict) else {}
 
         text = _as_dict(raw.get("text_config"))
+        # `storage_quantization_config` is where `DeepseekV41HFConfig` parks the
+        # checkpoint's `quantization_config` block, so that vLLM does not read
+        # it as a request for one of its own quantization backends. Either
+        # spelling is accepted: raw checkpoint JSON has the first, a config that
+        # went through transformers has the second.
         quant = _as_dict(raw.get("quantization_config"))
-        vision = _as_dict(raw.get("vision_config"))
+        # `vision_tower_config` is where `DeepseekV41HFConfig` parks the
+        # checkpoint's `vision_config`, so the Neuron platform does not switch
+        # on a vision tower this port does not build. Either spelling is
+        # accepted: raw checkpoint JSON has the first, a config that went
+        # through transformers has the second.
+        vision = _as_dict(raw.get("vision_config")) or _as_dict(
+            raw.get("vision_tower_config")
+        )
+
+        # transformers 5 standardizes RoPE: it folds `rope_theta` *into*
+        # `rope_scaling` and re-exposes the pair as `rope_parameters`, so a
+        # config that round-tripped through `PretrainedConfig` no longer spells
+        # `rope_theta` or `rope_scaling` at all. Unfold it back, so the values
+        # below come from the checkpoint either way instead of silently falling
+        # back to these defaults. Checkpoint JSON read straight off disk still
+        # has both keys and takes this path as a no-op.
+        for scope in (text, raw):
+            params = _as_dict(scope.get("rope_parameters"))
+            if not params:
+                continue
+            scaling = {k: v for k, v in params.items() if k != "rope_theta"}
+            scope.setdefault("rope_scaling", scaling)
+            if "rope_theta" in params:
+                scope.setdefault("rope_theta", params["rope_theta"])
 
         # text_config wins over top level for LM fields; a flat config (no
         # text_config) still works, which is what makes a hand-written dict or
@@ -235,6 +263,7 @@ class DeepseekV41Config:
         merged: dict = {**raw, **text, **quant}
         merged.pop("text_config", None)
         merged.pop("quantization_config", None)
+        merged.pop("vision_tower_config", None)
         merged.pop("vision_config", None)
 
         field_names = {f.name for f in cls.__dataclass_fields__.values()}
