@@ -5,7 +5,7 @@
 The onboarding guide's smoke test with more inputs and a judge. Two pass
 conditions, both required:
 
-  1. **Nothing raised.** Engine construction and all 11 generations complete
+  1. **Nothing raised.** Engine construction and all 4 generations complete
      without an exception.
   2. **Nothing gibberish.** A Sonnet 5 judge at medium effort reads every
      completion and finds each one reasonable rather than gibberish.
@@ -13,11 +13,12 @@ conditions, both required:
 Exits 0 only when both hold. Prints `##verifier[passed=1]` on success and
 `##verifier[passed=0]` otherwise, so a queue can grep for it.
 
-Inputs: all 9 of TranSonic's sample prompts (6 short, 3 long at 2k/8k/16k),
-the guide's `"Hello, my name is"`, and `"What is the capital of France?"`.
-32 tokens each, greedy. The TranSonic sets are copied into `inputs/` beside
-this file and read via a path anchored to this package, so the verifier needs
-nothing outside its own directory.
+Inputs: 4 prompts — TranSonic's `short-prose` and its 8192-token
+`long-needle-8192-0`, the guide's `"Hello, my name is"`, and `"What is the
+capital of France?"`. 32 tokens each, greedy. The TranSonic sets are copied
+into `inputs/` beside this file and read via a path anchored to this package,
+so the verifier needs nothing outside its own directory; `prompts.SELECTED_IDS`
+picks which rows of them to use.
 
     python -m vllm_neuron.model.deepseek_v41_timeshare.verifier.run_verifier \\
         --model <checkpoint-dir>
@@ -61,15 +62,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "this repository is baked in). Use the local copy rather than "
         "re-downloading — see the port's references/INDEX.md.",
     )
-    p.add_argument("--tensor-parallel-size", type=int, default=8)
+    p.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=None,
+        help="engine tensor-parallel degree. Defaults to the port's own "
+        "`config.TENSOR_PARALLEL_SIZE`, so the parallelism is the "
+        "implementation's choice rather than the verifier's; pass this only to "
+        "override it for one run.",
+    )
     p.add_argument("--max-num-seqs", type=int, default=4)
     p.add_argument(
         "--max-model-len",
         type=int,
-        default=16384 + MAX_TOKENS,
-        help="must fit the 16k long prompt plus the generation (default: 16416)",
+        default=8192 + MAX_TOKENS,
+        help="must fit the longest selected prompt plus the generation "
+        "(default: 8224, for the 8192-token case)",
     )
-    p.add_argument("--max-num-batched-tokens", type=int, default=16384)
+    p.add_argument("--max-num-batched-tokens", type=int, default=8192)
     p.add_argument(
         "--chat-template",
         default=CHAT_TEMPLATE,
@@ -92,6 +102,27 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
+    # The port owns its parallelism (see `config.TENSOR_PARALLEL_SIZE`). Read at
+    # run time, not import time, so it tracks whatever the implementation
+    # currently says. A nonsensical value is rejected here rather than becoming
+    # an obscure engine failure several minutes in.
+    tensor_parallel_size = args.tensor_parallel_size
+    source = "--tensor-parallel-size"
+    if tensor_parallel_size is None:
+        from ..config import TENSOR_PARALLEL_SIZE
+
+        tensor_parallel_size = TENSOR_PARALLEL_SIZE
+        source = "config.TENSOR_PARALLEL_SIZE"
+    if not isinstance(tensor_parallel_size, int) or tensor_parallel_size < 1:
+        print(
+            f"verifier: {source} = {tensor_parallel_size!r}, which is not a positive "
+            "integer",
+            file=sys.stderr,
+        )
+        print("##verifier[passed=0]")
+        return 1
+    print(f"verifier: tensor_parallel_size={tensor_parallel_size} (from {source})")
+
     from .prompts import build_cases
 
     # Long prompts are dropped (and recorded) rather than overflowing the context.
@@ -104,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
         "model": args.model,
         "max_tokens": MAX_TOKENS,
         "temperature": TEMPERATURE,
-        "tensor_parallel_size": args.tensor_parallel_size,
+        "tensor_parallel_size": tensor_parallel_size,
         "max_model_len": args.max_model_len,
         "notes": list(case_set.notes),
         "cases": [],
@@ -127,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
             max_num_seqs=args.max_num_seqs,
             max_model_len=args.max_model_len,
             max_num_batched_tokens=args.max_num_batched_tokens,
-            tensor_parallel_size=args.tensor_parallel_size,
+            tensor_parallel_size=tensor_parallel_size,
         )
         sampling = SamplingParams(max_tokens=MAX_TOKENS, temperature=TEMPERATURE)
 

@@ -43,6 +43,22 @@ from transformers import PretrainedConfig
 
 from vllm_neuron.model.neuron_config import NeuronConfig
 
+#: Tensor-parallel degree to launch the engine with. **Yours to tune** — unlike
+#: every field of `DeepseekV41Config` below, this is not an architectural
+#: parameter and nothing checks it against the official config. Pick whatever
+#: parallelism this port runs best at.
+#:
+#: It has to live out here rather than inside the model because
+#: `tensor_parallel_size` is an *engine-construction* argument: it travels
+#: `LLM(tensor_parallel_size=...)` -> `EngineArgs` ->
+#: `VllmConfig.parallel_config` -> `NeuronPlatform.check_and_update_config` ->
+#: worker spawn, and only then is this model class instantiated, once per rank,
+#: inside an already-parallelized engine. So the model cannot choose its own
+#: world size; it can only be told. The verifier reads this value as the default
+#: for `--tensor-parallel-size`, which is how the choice stays yours.
+
+TENSOR_PARALLEL_SIZE = 4
+
 
 @dataclass
 class DeepseekV41Config:

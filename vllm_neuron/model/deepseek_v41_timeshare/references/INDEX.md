@@ -33,8 +33,8 @@ Local: ~/workspace/partition_artifact/hf. Do not redownload from huggingface.
         - `reviews-*` and `notes-*`: autohelix notes and reviews at each iteration.
 
 ### Local Environment (use uv)
-- ~/workspace/.venv: venv for Neuron SDK 2.32.0 for standard NKI development
-- ~/workspace/vllm-neuron/.venv: venv for vLLM Neuron with libtorch-neuronx-lite wrapper
+- ~/workspace/.venv: venv for Neuron SDK 2.32.0 for standard NKI development we used previously
+- ~/workspace/vllm-neuron/.venv: venv for vLLM Neuron with more components and features
 
 ### Website/Documentations/Code Repo Index
 
@@ -69,6 +69,8 @@ Local: ~/workspace/partition_artifact/hf. Do not redownload from huggingface.
 - hc_attn_out -> hc-sublayer-out-short
 - hc_collapse -> hc-collapse
 - hc_expand -> hcexpand
+- hc_attn_in_short -> hc-sublayer-in-short
+- hc_attn_in_long -> hc-sublater-in-long
 - l2_attn -> layer-2-attention-long
 - l3_attn -> layer-0-attention-b
 - l20_attn -> layer-20-attention-long

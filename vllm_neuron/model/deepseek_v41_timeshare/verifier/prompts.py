@@ -1,15 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 """The verifier's input set.
 
-Three sources, 11 cases:
+Three sources, 4 cases:
 
-  - **TranSonic's sample inputs** (9): all 6 of `short.jsonl` and all 3 of
-    `long.jsonl` (needle-in-a-haystack at 2k / 8k / 16k tokens). These are the
-    prompts the partition loop traces and verifies against, so a reasonable
-    answer here is comparable to that loop's recorded goldens.
+  - **TranSonic's sample inputs** (2): `short-prose` and the 8192-token
+    needle-in-a-haystack `long-needle-8192-0`. These are the prompts the
+    partition loop traces and verifies against, so a reasonable answer here is
+    comparable to that loop's recorded goldens.
   - **The onboarding guide's smoke test** (1): `"Hello, my name is"`, verbatim.
   - **A trivia question** (1): `"What is the capital of France?"` — the cheapest
     possible check that the model knows anything at all.
+
+One short and one long, not all nine. Every prompt costs a full pass over 475
+GiB of timeshared weights, so the input set is where runtime is decided; two
+TranSonic cases keep both a chat-templated short prompt and a long-context
+retrieval while the other seven were re-measuring the same code path. Dropping
+the 16k case also halves `max_model_len`, which is what the KV cache is sized
+from. The unselected rows stay in `inputs/` — switching one line below widens
+the set again without re-copying anything.
 
 The TranSonic sets are **copied into `inputs/` beside this file**, byte-for-byte
 from their source, and read from there by a path anchored to this package.
@@ -43,6 +51,13 @@ INPUTS_DIR = Path(__file__).resolve().parent / "inputs"
 
 SHORT_JSONL = INPUTS_DIR / "short.jsonl"
 LONG_JSONL = INPUTS_DIR / "long.jsonl"
+
+#: Which rows of the copied sets to use, by `id`. One short and one long:
+#: `short-prose` is chat-templated (`role: user`), `long-needle-8192-0` is a raw
+#: 8192-token continuation carrying a needle, so between them the two exercise
+#: both prompt paths. Add ids here to widen the set — every file in `inputs/` is
+#: still present, so nothing needs re-copying.
+SELECTED_IDS = ("short-prose", "long-needle-8192-0")
 
 #: Verbatim from the onboarding guide's smoke test.
 SMOKE_TEST_PROMPT = "Hello, my name is"
@@ -99,7 +114,7 @@ def build_cases(max_prompt_tokens: int | None = None) -> CaseSet:
     """Assemble the full verifier input set.
 
     Reads the copied sets at `INPUTS_DIR`; there is no path argument, so
-    every run uses the same 11 prompts.
+    every run uses the same 4 prompts.
 
     Args:
         max_prompt_tokens: If set, drop long cases whose `target_tokens`
@@ -109,12 +124,21 @@ def build_cases(max_prompt_tokens: int | None = None) -> CaseSet:
             full one.
 
     Returns:
-        A `CaseSet` of 11 cases (fewer if long prompts are filtered out).
+        A `CaseSet` of 4 cases (fewer if long prompts are filtered out).
+
+    Raises:
+        FileNotFoundError: if an input set is missing.
+        KeyError: if `SELECTED_IDS` names a row the sets do not contain — a
+            typo there would otherwise silently shrink the verifier.
     """
     out = CaseSet()
+    seen_ids: set[str] = set()
 
     for path in (SHORT_JSONL, LONG_JSONL):
         for row in _load_jsonl(path):
+            if row["id"] not in SELECTED_IDS:
+                continue
+            seen_ids.add(row["id"])
             target = row.get("target_tokens")
             if (
                 max_prompt_tokens is not None
@@ -136,6 +160,14 @@ def build_cases(max_prompt_tokens: int | None = None) -> CaseSet:
                     expected_substring=row.get("expected_substring"),
                 )
             )
+
+    unknown = sorted(set(SELECTED_IDS) - seen_ids)
+    if unknown:
+        raise KeyError(
+            f"SELECTED_IDS names {unknown}, which is not in {SHORT_JSONL.name} or "
+            f"{LONG_JSONL.name}. Fix the id rather than letting the verifier run a "
+            "smaller set than it reports."
+        )
 
     out.cases.append(
         Case(

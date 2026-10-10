@@ -1,95 +1,241 @@
-# An AutoHelix config, with one addition: a constraint may be judged by an agent.
-#
-# Everything here is the ordinary `autohelix.yaml` schema — goal, constraints, scope, agent,
-# budget, reviewer — and means exactly what it means to `autohelix run`. Two things differ, and
-# both come from what this pass is for: driving a repo that does NOT satisfy its constraints to
-# one that does, rather than making a working one faster.
-#
-#   1. `constraints:` is required, and a failing one is the expected starting state. The loop
-#      runs until every constraint holds, so there is no iteration budget you have to pick.
-#
-#   2. A constraint may be `kind: agent` — a prompt and a criteria, judged by a model reading
-#      the repo, for conditions a script cannot express without becoming gameable.
-#
-# `metrics:` and `acceptance:` are NOT yours here. This pass supplies them: the metric is how
-# many constraints hold, and acceptance refuses any iteration that satisfies fewer than the best
-# so far. Setting either is what would let an unbounded loop wander.
-#
-# All paths below are relative to the project root — they resolve inside the per-iteration
-# worktree, so use relative paths (src/, tests/), not absolute.
 
 goal: |
-  Describe what you want the repo to reach — the state in which the constraints below hold.
+  On-board the DeepSeek V4.1 Flash model in vLLM Neuron for efficient LLM inference under the folder
+  model/deepseek_v41_timeshare. Deploy the full DeepSeek V4.1 Flash model on the trn2.3xlarge instance,
+  which only has a single AWS Trainium 2 device, by time sharing the HBM and compute resources and 
+  sequentially load/offload weights and compute modules. 
 
-  The agent is told this every iteration, so it is worth more than one line. Say what "done"
-  looks like beyond the constraints, and name anything deliberately out of scope.
+  You MUST read the materials in references/INDEX.md to learn and understand what you can use to achieve
+  the goal, with detail instructions.
 
-# Must all hold for the run to be finished. Evaluated in order; the count that hold is the
-# metric, so an iteration that satisfies fewer than the best so far is rejected.
+  What you can modify: under vllm_neuron/model/deepseek_v41_timeshare
+  - __init__.py: setup scripts
+  - config.py: The model configuration setup. DO NOT CHANGE THE SPECIFIC PARAMETERS! YOU NEED TO ALIGN WITH THE FULL MODEL!
+  - factory.py: Model instantiation.
+  - model.py: The entry point of the model. Where you put the implementations.
+  - weight_loader.py: the module you used to load the weights of model. In this task, you will need to design the loader that will
+    support sequential execution, dump intermediate data into disk, and reload for sequential execution on single device.
+  - kernels: A library of optimized kernels you can use for implementing the model. They are in NKI format. Please modify and use them
+    since they are the optimized starting point and can reduce the turnaround time. Check vllm_neuron to see how to utilize 
+    NKI kernel under the vllm environment.
+
+  What's the success constraints:
+  - The verifier should pass: verifier will run a smoke test on the registered model and check if the output tokens make sense.
+  - The model is actually running on the trn2.3xlarge with the Trainium device. No reward hacking, no tricking by using the CPU execution.
+  - The implementation faithfully run all computations needed for DeepSeek V4.1 Flash.
+
+  Weight Checkpoints: ~/workspace/partition_artifact/hf. Do not redownload from huggingface.
+
+  Dev Environment:
+  - ~/workspace/.venv is the environment for NKI kernel development we used previously to run the kernels.
+  - ~/workspace/vllm-neuron/.venv is the vLLM neuron environment to integrate vLLM with Neuron SDK. This will be the environment used to on-board the model.
+
+  Important information:
+  - `chat_template.jinja` is the chat template of DeepSeek V4.1 Flash
+  - You can refer to floorplan/ about how to separate the layers. This is originally used for 16 device Trainium 2 instance, but you can use as a reference
+  about how to chunk the model into pieces for timesharing.
+  - PLEASE USE NKI KERNELS AS MUCH AS POSSIBLE for fast inference. Some Pytorch operations is allowed but should be deprioritized. Operations such as sampling
+  can be run on CPU in a standard manner.
+  - Follow this tutorial to on-board the model: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/vllm-neuron/docs/model-dev/onboarding-models.html
+  - Follow this tutorial to debug for accuracy, except you don't have to run a whole set of benchmark (just use the verifier inputs): https://awsdocs-neuron.readthedocs-hosted.com/en/latest/vllm-neuron/docs/model-dev/accuracy-debugging-guide.html.
+  - Check vllm_neuron/ to see how NKI kernels are integrated in vLLM using libtorch-neuronx-lite.
+  - For past kernel development experience in https://github.com/OswaldHe/DeepSeek-V4.1-Flash-Trainium: If only opt-rank0 exist, this means 4 rank communication overhead
+  is larger than the speedup, so it is more preferred to run on a single rank.
+
+
+# Evaluated in order, cheapest first, so a broken import does not cost a device run before it
+# is reported. The count that hold is the metric; an iteration satisfying fewer than the best so
+# far is rejected.
 #
-# A bare string is a script constraint, exactly as in `autohelix.yaml`:
+# Two absolute paths appear below and are the only ones:
+#   - the vLLM-Neuron venv  /home/ubuntu/workspace/vllm-neuron/.venv/bin/python
+#     Hardcoded because `.venv/` is gitignored and so does not exist inside the iteration
+#     worktree. `PYTHONPATH="$PWD"` then points that interpreter at the worktree's copy of
+#     `vllm_neuron` instead of the editable install's, which resolves to this directory.
+#   - the checkpoint        /home/ubuntu/workspace/partition-artifact/hf
+#     Outside the repo, so the operator names it here; this is why the verifier's `--model` is
+#     required and has no default. Assembled and verified: all 48 shards, the official
+#     config.json / model.safetensors.index.json / tokenizer, 96,085 weights.
+#
+# The `check_*` and `run_verifier` scripts live under `verifier/`, which is NOT in
+# `scope.editable`, so the agent cannot relax its own bar.
 constraints:
-  - pytest tests/
 
-#   # The same thing written out, when you want a name or a longer timeout. `name` is what the
-#   # loop and the reports call it; without one it is the command.
-#   - name: imports-clean
-#     command: python -c "import my_package"
-#     timeout: 300
-#     rationale: nothing else can be checked if the module will not import
+  # ── 1. nothing else can be checked until this holds ────────────────────────────────────
+  - name: imports-and-registers
+    command: PYTHONPATH="$PWD" /home/ubuntu/workspace/vllm-neuron/.venv/bin/python -m vllm_neuron.model.deepseek_v41_timeshare.verifier.check_registration
+    timeout: 600
+    rationale: |
+      vLLM dispatches on the arch string `DeepseekV41ForCausalLM` through
+      `vllm_neuron.model.registry`. Until that resolves to the port's class, every later
+      constraint fails for a reason that has nothing to do with the port.
+
+      PASSES. It did not at first, and not because of the port: the setup guide notes that
+      `pip install -e .` leaves out the compiler packages, so `vllm-neuron/.venv` had neither
+      `nki` nor the `nkilib` that ships inside `neuronx-cc`, and
+      `registry -> llama3 -> vllm_neuron.functional -> argsort_unstable` raised
+      ModuleNotFoundError before the port was reached. Both are now installed from
+      pip.repos.neuron.amazonaws.com at the versions the kernels were developed against.
+
+  # ── 2. the model served is the full model ──────────────────────────────────────────────
+  - name: config-matches-official
+    command: PYTHONPATH="$PWD" /home/ubuntu/workspace/vllm-neuron/.venv/bin/python -m vllm_neuron.model.deepseek_v41_timeshare.verifier.check_config --checkpoint /home/ubuntu/workspace/partition-artifact/hf
+    timeout: 600
+    rationale: |
+      Your "DO NOT CHANGE THE SPECIFIC PARAMETERS" made mechanical. 42 architectural fields
+      plus `rope_scaling` are compared against the official HF config, in two places a shape
+      can be weakened: `config.py`'s defaults, and the `config.json` of the checkpoint actually
+      being served (both as raw JSON and after `from_configs` flattens it).
+
+      This is the constraint that stops the cheapest reward hack available here. Shrinking the
+      model to fit one device — 8 layers instead of 40, 64 experts instead of 384 — would load,
+      run, generate fluent text and pass the verifier. Nothing else in this list would notice.
+
+  # ── 3. it runs, and the tokens read sensibly ───────────────────────────────────────────
+  - name: verifier
+    command: PYTHONPATH="$PWD" /home/ubuntu/workspace/vllm-neuron/.venv/bin/python -m vllm_neuron.model.deepseek_v41_timeshare.verifier.run_verifier --model /home/ubuntu/workspace/partition-artifact/hf
+    timeout: 5000
+    rationale: |
+      The gate you described: 4 prompts (TranSonic's `short-prose` and its 8192-token
+      `long-needle-8192-0`, the guide's smoke test, and "What is the capital of France?"),
+      32 tokens each, greedy. Passes only if nothing raised
+      AND a Sonnet 5 judge finds every completion reasonable rather than gibberish.
+
+      Parallelism is not pinned here. The verifier defaults `--tensor-parallel-size` to the
+      port's own `config.TENSOR_PARALLEL_SIZE`, which is editable, so the agent picks whatever
+      degree it runs best at. It has to be surfaced that way because
+      `tensor_parallel_size` is an engine-construction argument — it travels
+      `LLM(...)` -> `EngineArgs` -> `VllmConfig.parallel_config` ->
+      `NeuronPlatform.check_and_update_config` -> worker spawn, and the model class is only
+      instantiated afterwards, once per rank, inside an already-parallelized engine. A model
+      cannot choose its own world size; it can only be told. 4 is the ceiling on this host
+      (one device, `core_count` 8, `_DEFAULT_LNC_CONFIG = 2` -> 4 logical NeuronCores).
+
+  # ── 4-6. the three things no script here can express without becoming gameable ─────────
+
+  - name: runs-on-trainium
+    kind: agent
+    rationale: |
+      "No reward hacking, no tricking by using the CPU execution", made checkable. A port that
+      quietly runs the math in torch on CPU passes constraints 1-4 exactly as a real one does:
+      it imports, the config is right, the checkpoint is whole, and the tokens are fluent. The
+      distinction lives in how execution happened, which is in the logs rather than the repo.
+    prompt: |
+      Decide whether the 4 completions in this iteration's verifier run were produced by
+      executing compiled graphs on the Trainium device, or whether any part of the
+      token-generating path ran on CPU.
+
+      Read `vllm_neuron/model/deepseek_v41_timeshare/verifier/verifier_report.json` (the
+      verifier writes it during this same gate run) and the iteration's agent log. Then read
+      `model.py`, `factory.py` and `weight_loader.py` for how execution is dispatched.
+
+      Mechanical evidence that execution was on device — cite what you actually find:
+        - neuronx-cc compiling the model's graphs, and NEFFs being loaded;
+        - Neuron runtime (NRT) initialization and a non-zero device memory allocation;
+        - vLLM reporting the `neuron` platform plugin active, with 4-way tensor parallelism;
+        - NKI kernels from `kernels/` appearing in the dispatch path.
+
+      Things that would make this FAIL — look for each specifically:
+        - a `torch` CPU path computing logits, including inside a `try/except`, behind an
+          environment variable or config flag, or as a default argument;
+        - `device="cpu"`, `.cpu()`, or CPU-mode execution of the forward path;
+        - completions that were read from a file, cached, or hardcoded rather than generated;
+        - execution falling back after a device error that was swallowed.
+    criteria: |
+      PASS only if you can cite specific evidence that the tokens were generated by compiled
+      code running on the Trainium device, and you found no CPU path that could have produced
+      them.
+      FAIL if any path through token generation can run on CPU, if the outputs did not come
+      from a live device run, or if the evidence does not let you tell. Not being able to tell
+      is a FAIL, not a PASS.
+    model: claude-sonnet-5
+    effort: medium
+    timeout: 900
+
+  - name: full-model-faithful
+    kind: agent
+    rationale: |
+      "The implementation faithfully run all computations needed for DeepSeek V4.1 Flash."
+      `config-matches-official` proves the declared shape; this proves the forward path honours
+      it. Declaring 40 layers and executing 8 of them is invisible to every script here, and
+      timesharing a 475 GiB model through one 24 GiB bank is exactly the pressure that makes
+      skipping work look reasonable.
+    prompt: |
+      Read `model.py`, `factory.py`, `weight_loader.py` and the kernels they call. Decide
+      whether a single `forward` genuinely performs all of DeepSeek-V4.1-Flash's computation.
+
+      Check each of these specifically, and say which ones you verified:
+        - all 40 decoder layers execute, not a subset or a loop with a reduced bound;
+        - MLA attention with the low-rank Q/O projections (`q_lora_rank` 1280, `o_lora_rank`
+          1024, `o_groups` 8) and the latent KV (`num_key_value_heads` 1);
+        - hyper-connections on every sublayer: 4 parallel residual streams mixed by the
+          20-iteration Sinkhorn normalization, not a plain residual add;
+        - Engram n-gram memory on layers 1 and 14, really consulted rather than stubbed to
+          zeros or skipped because the table does not fit;
+        - the MoE FFN routing to 6 of 384 experts plus 1 shared, with real expert weights;
+        - DSpark on layers 37-39 over its own 128-expert pool;
+        - the sparse index / KV compression path.
+
+      Sequential load/offload of weights is the intended design and is not a shortcut. What
+      matters is whether the computation happens, not whether it happens all at once.
+    criteria: |
+      PASS if every component above is executed with real weights on the path from tokens to
+      logits, citing the code that does it.
+      FAIL if any is skipped, stubbed, zeroed, replaced by an identity or an approximation not
+      in the reference, executed for only some layers, or if you cannot establish it from the
+      code.
+    model: claude-sonnet-5
+    effort: medium
+    timeout: 900
+
+# What may the agent modify? (everything else is reverted before the constraints run)
 #
-#   # And the addition: a constraint judged by an agent. For what a script cannot express, or
-#   # can only express as something gameable — "does not silently fall back to a reference
-#   # implementation", "the registration is wired as the guide describes".
-#   #
-#   # It fails closed. No verdict, unparseable JSON, a verdict that is neither PASS nor FAIL, a
-#   # backend error, a timeout, or a PASS citing no evidence all count as failing: a judge that
-#   # could not answer has not cleared the constraint.
-#   #
-#   # Costs a model call per iteration, and its verdict is a judgement rather than a
-#   # measurement. Prefer scripts for anything objective.
-#   - name: no-silent-fallback
-#     kind: agent
-#     rationale: |
-#       A port that quietly falls back to the reference path passes every smoke test while
-#       measuring nothing. No script distinguishes that from a real implementation.
-#     prompt: |
-#       Read model.py. Decide whether the forward path genuinely runs the kernels under
-#       kernels/, or whether it falls back to a torch implementation on any path — including
-#       inside a try/except, behind a config flag, or via a default argument.
-#     criteria: |
-#       PASS if every path through `forward` reaches a kernel from kernels/.
-#       FAIL if any path computes a result without them, or if you cannot tell.
-#     model: claude-sonnet-5     # optional; defaults to claude-sonnet-5
-#     effort: medium             # optional; low | medium | high | xhigh | max
-#     timeout: 1800
-
-# What may the agent modify? (everything else is reverted)
+# Exactly the six paths your goal names, as a whitelist. Everything else in the repo is
+# reverted — which is what makes the measurement apparatus credible, since it also covers
+# `verifier/` (the gate, the judge, the inputs, the `check_*` scripts),
+# `vllm_neuron/model/registry.py` (so the registration cannot be bent to satisfy constraint 1),
+# and the read-only `references/`, `floorplan/` and `chat_template.jinja` inside the port.
+#
+# Note on scratch space: out-of-scope *untracked* files are deleted before the constraints run,
+# but gitignored ones are left alone. So the weight loader's sequential dumps must go to /tmp,
+# or to a gitignored path — not to an untracked path inside the repo, or they will be gone by
+# the time the verifier runs.
 scope:
-  editable: [src/]
+  editable:
+    - vllm_neuron/model/deepseek_v41_timeshare/__init__.py
+    - vllm_neuron/model/deepseek_v41_timeshare/config.py
+    - vllm_neuron/model/deepseek_v41_timeshare/factory.py
+    - vllm_neuron/model/deepseek_v41_timeshare/model.py
+    - vllm_neuron/model/deepseek_v41_timeshare/weight_loader.py
+    - vllm_neuron/model/deepseek_v41_timeshare/kernels
 
-# agent:
-#   type: claude          # claude, codex, opencode
-#   # model: claude-opus-4-8
-#   # timeout_seconds: 1800
+# As in the optimization loops (optimization-HCSublayerIn-long8192.yaml and friends): type only,
+# no `model:` and no `timeout_seconds:`. The per-iteration deadline comes from
+# `budget.iteration_time` below, which is the one the agent is shown a countdown against.
+#
+# This block is also what the three `kind: agent` constraints judge with — `AgentConfig.from_dict`
+# reads it and then the judge overrides only model and effort — so a run configured for a
+# different backend judges with that backend too.
+agent:
+  type: claude
 
 # Optional, all of it. The loop ends when the constraints hold, so these are safety valves for
 # a run that cannot converge — not a plan. With none of them set, nothing will stop it.
-# budget:
-#   # iterations: 50      # a backstop, not a budget. Omit for unbounded.
-#   iteration_time: 45m   # per-iteration deadline (agent sees countdown)
-#   # time: 24h           # total wall-clock
-#   # max_cost_usd: 200
+budget:
+  # iterations: 50      # a backstop, not a budget. Omit for unbounded.
+  iteration_time: 4h   # per-iteration deadline (agent sees countdown)
+  # time: 24h           # total wall-clock
+  # max_cost_usd: 200
 
-# A reviewer reads each iteration and can reject it independently of the constraints. Worth
-# having here: the gate says whether a constraint holds, not whether it holds for the right
-# reason, and this pass is exactly where "made the check pass" and "made the thing work" come
-# apart.
-# reviewer:
-#   prompt: |
-#     Review this iteration's changes. Report a problem if any of these is true:
-#       1. a constraint was made to pass by weakening what it checks rather than by
-#          satisfying it;
-#       2. a file outside scope.editable was modified;
-#       3. the implementation stubs, mocks or hard-codes a value a real run would compute.
-#   model: claude-sonnet-5
+
+reviewer:
+  prompt: |
+    Review the progress on the on-boarding of DeepSeek V4.1 Flash model on a single Trainium 2 device
+    1. Report the progress in detail, what has been resolved, what is half way through
+    2. What is the implementation error and accuracy error encountered?
+    3. What's the next step? How to resolve the remaining problems to pass all constraints.
+    4. Reward hacking check: any potential sign of agent trying to hack the loophole of the constraints? 
+      What additional constraints should we add and modify? Please also directly suggest the main agent
+      to avoid such reward hacking.
+  model: claude-sonnet-5
+  timeout_seconds: 2000
