@@ -24,16 +24,61 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 
 
 class DeepseekV41ForCausalLM(nn.Module):
-    """Validates config and selects the DeepSeek-V4.1-Flash implementation."""
+    """Validates config and selects the DeepSeek-V4.1-Flash implementation.
+
+    Also the class vLLM *inspects*. `ModelConfig` resolves this architecture
+    through `vllm.ModelRegistry` and asks `is_text_generation_model(cls)`
+    whether it can serve `--runner generate`; that check reads four things off
+    the class — a `vllm_config` keyword on `__init__`, an `embed_input_ids`
+    method, `input_ids`/`positions` keywords on `forward`, and a
+    `compute_logits` method — and rejects the model with
+
+        This model does not support `--runner generate`
+
+    if any is missing. The three methods below exist to answer that question
+    truthfully; the Neuron runtime never calls them, because it builds the model
+    through `from_configs` and drives `forward` itself. Every other
+    architecture this backend serves is also in vLLM's in-tree registry, so
+    vLLM inspects *its* class instead and the requirement never surfaces.
+    """
 
     def __init__(
-        self, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None
+        self,
+        hf_config: PretrainedConfig | None = None,
+        neuron_config: NeuronConfig | None = None,
+        *,
+        vllm_config=None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
+        # vLLM's generic construction signature, accepted so the interface
+        # check sees it. Only the Neuron path (hf_config/neuron_config, or
+        # `from_configs`) is actually exercised.
+        if hf_config is None:
+            if vllm_config is None:
+                raise ValueError(
+                    "DeepseekV41ForCausalLM needs either hf_config (the Neuron "
+                    "path) or vllm_config."
+                )
+            hf_config = vllm_config.model_config.hf_config
         self._model = self._select_implementation(hf_config, neuron_config)
 
-    def forward(self, *args, **kwargs):
-        return self._model(*args, **kwargs)
+    def forward(
+        self,
+        input_ids=None,
+        positions=None,
+        *args,
+        **kwargs,
+    ):
+        return self._model(input_ids, positions, *args, **kwargs)
+
+    def embed_input_ids(self, input_ids):
+        """Token embeddings, as vLLM's `VllmModel` protocol names them."""
+        return self._model.embed_input_ids(input_ids)
+
+    def compute_logits(self, hidden_states):
+        """Unembedding, as vLLM's `VllmModelForTextGeneration` names it."""
+        return self._model.compute_logits(hidden_states)
 
     @classmethod
     def from_configs(
