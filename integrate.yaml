@@ -36,6 +36,13 @@ goal: |
   about how to chunk the model into pieces for timesharing.
   - PLEASE USE NKI KERNELS AS MUCH AS POSSIBLE for fast inference. Some Pytorch operations is allowed but should be deprioritized. Operations such as sampling
   can be run on CPU in a standard manner.
+  - The DSpark/MTP stages are the model's own speculative decoder, not decoration. They already
+  compute a draft on every forward and it is thrown away, because nothing proposes it to the
+  scheduler. `drafter.py` is now in your editable scope and its docstring states the interface
+  `NeuronModelRunner` expects; registering a proposer there is how inference comes to use
+  DSpark rather than merely execute it. Speculative decoding must not change the output: the
+  same prompts with it on and off have to produce identical tokens, and a faster run that
+  answers differently is a bug, not a trade.
   - Follow this tutorial to on-board the model: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/vllm-neuron/docs/model-dev/onboarding-models.html
   - Follow this tutorial to debug for accuracy, except you don't have to run a whole set of benchmark (just use the verifier inputs): https://awsdocs-neuron.readthedocs-hosted.com/en/latest/vllm-neuron/docs/model-dev/accuracy-debugging-guide.html.
   - Check vllm_neuron/ to see how NKI kernels are integrated in vLLM using libtorch-neuronx-lite.
@@ -245,6 +252,12 @@ scope:
     - vllm_neuron/model/deepseek_v41_timeshare/model.py
     - vllm_neuron/model/deepseek_v41_timeshare/weight_loader.py
     - vllm_neuron/model/deepseek_v41_timeshare/kernels
+    # The model's own speculative drafter. Named here, rather than the whole package being
+    # opened up, so `verifier/` stays out: the scope is what makes the measurement credible.
+    # It lives under the model because `vllm_neuron/vllm/` is not editable, and a drafter kept
+    # there is one no iteration could work on. `NeuronModelRunner` now builds whatever a model
+    # registers in `vllm_neuron.vllm.spec_decode.PROPOSERS`.
+    - vllm_neuron/model/deepseek_v41_timeshare/drafter.py
 
 # As in the optimization loops (optimization-HCSublayerIn-long8192.yaml and friends): type only,
 # no `model:` and no `timeout_seconds:`. The per-iteration deadline comes from

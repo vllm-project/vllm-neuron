@@ -73,6 +73,7 @@ from vllm_neuron.model.neuron_config import (
 )
 from libtorch_neuronx_lite.compile.capture_backend import CaptureComplete
 from vllm_neuron.vllm.sample.rejection_sampler import RejectionSampler
+from vllm_neuron.vllm.spec_decode import PROPOSERS, get_proposer
 from vllm_neuron.vllm.spec_decode.eagle import EagleProposer
 from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE
 from vllm_neuron.utils.bucket_utils import (
@@ -744,16 +745,28 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self._async_spec_transition_full_draft_cache: dict[str, torch.Tensor] = {}
 
         if self.speculative_config:
-            # TODO add more spec decode methods
-            if self.speculative_config.method == "eagle3":
+            method = self.speculative_config.method
+            proposer_cls = get_proposer(method)
+            if method == "eagle3":
                 self.is_eagle3_spec = True
                 self.drafter = EagleProposer(
                     self.vllm_config, self.device, self.on_device_sampling
                 )
                 self.rejection_sampler = RejectionSampler()
+            elif proposer_cls is not None:
+                # A proposer registered by the model package: its draft path is inside the
+                # target model, so there is no second model to load. It is handed a way to
+                # reach the target, because the drafter is built here and `self.model` is not
+                # loaded until `load_model` below.
+                self.drafter = proposer_cls(
+                    self.vllm_config, self.device, self.on_device_sampling
+                )
+                self.drafter.target_model_provider = lambda: self.model
+                self.rejection_sampler = RejectionSampler()
             else:
                 raise ValueError(
-                    f"Unsupported speculative decoding method: {self.speculative_config.method}"
+                    f"Unsupported speculative decoding method: {method}. Built in: 'eagle3'. "
+                    f"Registered by a model: {sorted(PROPOSERS) or 'none'}."
                 )
 
         # InputBatch is initialized in initialize_kv_cache once KV cache groups are known
@@ -1543,8 +1556,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     inner_model.visual, vision_modules, subdirectory="vision"
                 )
 
-        # Draft model capture
-        if self.drafter is not None:
+        # Draft model capture. Eagle only: an in-model drafter's `.model` *is* the target, so
+        # capturing it again under `draft/` would duplicate the target's own capture.
+        if self.drafter is not None and self.is_eagle3_spec:
             draft_modules = getattr(capture_config, "draft_modules", None)
             self._draft_tensor_capture = self._setup_capture(
                 self.drafter.model, draft_modules or [], subdirectory="draft"
