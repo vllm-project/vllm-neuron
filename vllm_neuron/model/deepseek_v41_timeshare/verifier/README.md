@@ -37,7 +37,7 @@ never a pass by default. A judge that cannot answer has not cleared the model.
 |---|---|
 | TranSonic `short.jsonl` | `short-prose` (chat-templated) |
 | TranSonic `long.jsonl` | `long-needle-8192-0` — needle-in-a-haystack at 8192 tokens |
-| onboarding guide | `smoke-test` — `"Hello, my name is"`, verbatim |
+| onboarding guide | `smoke-test` — `"Hello, what is your name?"`, chat-templated (the guide's raw `"Hello, my name is"` made a reasoning-tuned model degenerate into a repeat loop) |
 | trivia | `trivia-capital-france` — `"What is the capital of France?"` |
 
 The TranSonic sets are **copied into `inputs/`**, byte-for-byte from their
@@ -50,10 +50,17 @@ full pass over 475 GiB of timeshared weights. The unselected rows stay in
 `inputs/`, so widening the set is a one-line change and needs no re-copying. `inputs/long.provenance.json` travels
 with the copies, recording how `long.jsonl` was generated (seed 20260920).
 
-`max_model_len` defaults to 8224 — the 8192-token prompt plus 32 generated
-tokens. Set it lower and the long case is **skipped and recorded in `notes`**, so
-a short run cannot silently look like a full one. A typo in `SELECTED_IDS` raises
-instead, for the same reason.
+`max_model_len` is **measured, not assumed**: `prompts.render` encodes every selected
+prompt with the checkpoint's own tokenizer — chat template applied, since that changes the
+count — and the default is `longest + 32 + 64` headroom. For the current set that is 9424.
+
+This used to be `8192 + 32 = 8224`, taken from `long-needle-8192-0`'s `target_tokens`. That
+field is the length the sample was generated to *target*; it encodes to **9328**, so the gate
+rejected its own prompt with `VLLMValidationError` before a single token and the `verifier`
+constraint was unsatisfiable regardless of the port. Nominal lengths are not lengths.
+
+Pass `--max-model-len` to override. A value too small **skips** the cases that do not fit and
+records each in `notes`, against measured lengths, so a short run cannot look like a full one.
 
 Cases marked `role: user` get the port's `chat_template.jinja` applied; `raw`
 cases are plain continuations. A chat-template failure is recorded as a note and

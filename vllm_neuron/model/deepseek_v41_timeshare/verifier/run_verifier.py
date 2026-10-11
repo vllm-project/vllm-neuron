@@ -14,8 +14,8 @@ Exits 0 only when both hold. Prints `##verifier[passed=1]` on success and
 `##verifier[passed=0]` otherwise, so a queue can grep for it.
 
 Inputs: 4 prompts — TranSonic's `short-prose` and its 8192-token
-`long-needle-8192-0`, the guide's `"Hello, my name is"`, and `"What is the
-capital of France?"`. 32 tokens each, greedy. The TranSonic sets are copied
+`long-needle-8192-0`, `"Hello, what is your name?"` and `"What is the capital
+of France?"`. 32 tokens each, greedy. The TranSonic sets are copied
 into `inputs/` beside this file and read via a path anchored to this package,
 so the verifier needs nothing outside its own directory; `prompts.SELECTED_IDS`
 picks which rows of them to use.
@@ -41,6 +41,11 @@ from pathlib import Path
 
 #: Per the spec: 32 tokens, greedy so a rerun is comparable.
 MAX_TOKENS = 32
+
+#: Slack above `longest prompt + MAX_TOKENS`, so a context sized to the exact sum does not
+#: leave the scheduler with zero room. Small, because context costs KV cache, and on this
+#: port KV cache competes with the graph set for the same HBM.
+CONTEXT_HEADROOM = 64
 TEMPERATURE = 0.0
 
 #: Anchored to this file's own location: no hardcoded absolute path to break if
@@ -75,11 +80,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--max-model-len",
         type=int,
-        default=8192 + MAX_TOKENS,
-        help="must fit the longest selected prompt plus the generation "
-        "(default: 8224, for the 8192-token case)",
+        default=None,
+        help="engine context length. Default: measured — the longest selected prompt as "
+        f"the real tokenizer encodes it, plus {MAX_TOKENS} generated tokens plus "
+        f"{CONTEXT_HEADROOM} headroom. Pass this only to override, and note that a value "
+        "too small drops cases rather than failing, which is recorded in the report's notes.",
     )
-    p.add_argument("--max-num-batched-tokens", type=int, default=8192)
+    p.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=None,
+        help="default: the resolved max_model_len, so the longest prompt prefills in one chunk",
+    )
     p.add_argument(
         "--chat-template",
         default=CHAT_TEMPLATE,
@@ -123,10 +135,50 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(f"verifier: tensor_parallel_size={tensor_parallel_size} (from {source})")
 
-    from .prompts import build_cases
+    from .prompts import build_cases, render
 
-    # Long prompts are dropped (and recorded) rather than overflowing the context.
-    case_set = build_cases(max_prompt_tokens=max(args.max_model_len - MAX_TOKENS, 0))
+    case_set = build_cases()
+
+    # Render and measure with the real tokenizer *before* the engine exists, because
+    # `max_model_len` is an engine-construction argument and the only thing that knows how long
+    # a prompt is, is the tokenizer that will encode it.
+    #
+    # The earlier version sized the context from `target_tokens` and had vLLM reject its own
+    # prompt: `long-needle-8192-0` is named for the 8192 tokens it was *generated to target* and
+    # encodes to 9328 here, so a `8192 + MAX_TOKENS` context was 1136 short, the gate failed
+    # with `VLLMValidationError` before a single token, and the `verifier` constraint was
+    # unsatisfiable no matter what the port did. Nominal lengths are not lengths.
+    prompts, render_notes = render(case_set, args.model, Path(args.chat_template))
+    case_set.notes.extend(render_notes)
+    lengths = [n for _, n in prompts]
+
+    if args.max_model_len is not None:
+        max_model_len = args.max_model_len
+    else:
+        max_model_len = (max(lengths) if lengths else 0) + MAX_TOKENS + CONTEXT_HEADROOM
+        print(
+            f"verifier: max_model_len={max_model_len} "
+            f"(longest prompt {max(lengths) if lengths else 0} tok + {MAX_TOKENS} generated "
+            f"+ {CONTEXT_HEADROOM} headroom)"
+        )
+
+    # Only now can a case be dropped honestly, against the budget it actually has to fit.
+    budget = max_model_len - MAX_TOKENS
+    kept: list[tuple[str, int]] = []
+    kept_cases = []
+    for case, (text, n) in zip(list(case_set.cases), prompts):
+        if n > budget:
+            case_set.notes.append(
+                f"skipped {case.id}: {n} prompt tokens exceeds "
+                f"max_model_len {max_model_len} - {MAX_TOKENS} generated = {budget}"
+            )
+            continue
+        kept.append((text, n))
+        kept_cases.append(case)
+    case_set.cases = kept_cases
+
+    max_num_batched_tokens = args.max_num_batched_tokens or max_model_len
+
     print(f"verifier: {len(case_set)} case(s)")
     for note in case_set.notes:
         print(f"  note: {note}")
@@ -136,7 +188,8 @@ def main(argv: list[str] | None = None) -> int:
         "max_tokens": MAX_TOKENS,
         "temperature": TEMPERATURE,
         "tensor_parallel_size": tensor_parallel_size,
-        "max_model_len": args.max_model_len,
+        "max_model_len": max_model_len,
+        "prompt_tokens": [n for _, n in kept],
         "notes": list(case_set.notes),
         "cases": [],
         "execution_error": None,
@@ -156,38 +209,15 @@ def main(argv: list[str] | None = None) -> int:
         llm = LLM(
             model=args.model,
             max_num_seqs=args.max_num_seqs,
-            max_model_len=args.max_model_len,
-            max_num_batched_tokens=args.max_num_batched_tokens,
+            max_model_len=max_model_len,
+            max_num_batched_tokens=max_num_batched_tokens,
             tensor_parallel_size=tensor_parallel_size,
         )
         sampling = SamplingParams(max_tokens=MAX_TOKENS, temperature=TEMPERATURE)
 
-        tokenizer = llm.get_tokenizer()
-        chat_template = None
-        tpl = Path(args.chat_template)
-        if tpl.is_file():
-            chat_template = tpl.read_text()
+        outputs = llm.generate([text for text, _ in kept], sampling)
 
-        prompts: list[str] = []
-        for case in case_set.cases:
-            text = case.prompt
-            if case.role == "user" and chat_template is not None:
-                try:
-                    text = tokenizer.apply_chat_template(
-                        [{"role": "user", "content": case.prompt}],
-                        chat_template=chat_template,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
-                except Exception as exc:  # noqa: BLE001 - recorded, not fatal
-                    report["notes"].append(
-                        f"{case.id}: chat template failed ({exc}); sent raw"
-                    )
-            prompts.append(text)
-
-        outputs = llm.generate(prompts, sampling)
-
-        for case, out in zip(case_set.cases, outputs):
+        for (case, (_, n_prompt)), out in zip(zip(case_set.cases, kept), outputs):
             completion = out.outputs[0]
             results.append(
                 {
@@ -197,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:
                     "expected_substring": case.expected_substring,
                     "prompt_excerpt": case.excerpt(),
                     "prompt_chars": len(case.prompt),
+                    "prompt_tokens": n_prompt,
                     "text": completion.text,
                     "num_tokens": len(completion.token_ids),
                     "finish_reason": completion.finish_reason,

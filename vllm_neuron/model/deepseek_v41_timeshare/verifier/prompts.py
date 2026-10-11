@@ -53,8 +53,13 @@ LONG_JSONL = INPUTS_DIR / "long.jsonl"
 #: paths. Add ids to widen the set.
 SELECTED_IDS = ("short-prose", "long-needle-8192-0")
 
-#: Verbatim from the onboarding guide's smoke test.
-SMOKE_TEST_PROMPT = "Hello, my name is"
+#: The onboarding guide's smoke test is the raw fragment `"Hello, my name is"`. This asks the
+#: question instead, through the chat template, because the raw fragment made a
+#: reasoning-tuned model degenerate: greedy continuation of five untemplated tokens came back
+#: `" not\nHello, my name is not\nHello, my name is not..."`, which a judge scores as
+#: gibberish without that being a fault in the port. A templated question exercises the same
+#: path and has a right answer.
+SMOKE_TEST_PROMPT = "Hello, what is your name?"
 
 #: The trivia check.
 TRIVIA_PROMPT = "What is the capital of France?"
@@ -104,21 +109,20 @@ def _load_jsonl(path: Path) -> list[dict]:
         return [json.loads(line) for line in fh if line.strip()]
 
 
-def build_cases(max_prompt_tokens: int | None = None) -> CaseSet:
+def build_cases() -> CaseSet:
     """Assemble the full verifier input set.
 
     Reads the copied sets at `INPUTS_DIR`; there is no path argument, so
     every run uses the same 4 prompts.
 
-    Args:
-        max_prompt_tokens: If set, drop long cases whose `target_tokens`
-            exceeds it, so a verifier run with a small `max_model_len` skips
-            what it cannot fit instead of failing mid-generation. Recorded in
-            `notes` either way, so a short run can never silently look like a
-            full one.
+    Takes no budget and drops nothing. Deciding what fits needs a token count, and only the
+    tokenizer has one — `render` measures, and `run_verifier` drops against the measurement.
+    An earlier version filtered here on `target_tokens`, which is the length a sample was
+    generated to *target* rather than its length, so it kept a 9328-token prompt under an
+    8192-token budget and the engine rejected it.
 
     Returns:
-        A `CaseSet` of 4 cases (fewer if long prompts are filtered out).
+        A `CaseSet` of all 4 selected cases.
 
     Raises:
         FileNotFoundError: if an input set is missing.
@@ -134,16 +138,6 @@ def build_cases(max_prompt_tokens: int | None = None) -> CaseSet:
                 continue
             seen_ids.add(row["id"])
             target = row.get("target_tokens")
-            if (
-                max_prompt_tokens is not None
-                and target is not None
-                and target > max_prompt_tokens
-            ):
-                out.notes.append(
-                    f"skipped {row['id']}: target_tokens={target} exceeds "
-                    f"max_prompt_tokens={max_prompt_tokens}"
-                )
-                continue
             out.cases.append(
                 Case(
                     id=row["id"],
@@ -167,8 +161,8 @@ def build_cases(max_prompt_tokens: int | None = None) -> CaseSet:
         Case(
             id="smoke-test",
             prompt=SMOKE_TEST_PROMPT,
-            role="raw",
-            source="onboarding-guide",
+            role="user",
+            source="onboarding-guide (adapted: templated question)",
         )
     )
     out.cases.append(
@@ -181,3 +175,45 @@ def build_cases(max_prompt_tokens: int | None = None) -> CaseSet:
         )
     )
     return out
+
+
+def render(
+    case_set: CaseSet, model_path: str, chat_template_path: Path
+) -> tuple[list[tuple[str, int]], list[str]]:
+    """Render each case to the exact string the engine will see, and measure it.
+
+    Returns `[(text, n_tokens), ...]` parallel to `case_set.cases`, plus notes.
+
+    This exists because `max_model_len` is an engine-construction argument, so the context has
+    to be sized *before* there is an engine to ask — and the only thing that knows how many
+    tokens a prompt is, is the tokenizer that will encode it. Measuring here rather than
+    trusting `target_tokens` is what stops the verifier rejecting its own prompts: that field
+    is the length a sample was *generated to target*, and `long-needle-8192-0` encodes to 9328.
+
+    The chat template is applied here too, not after the engine is built, because it changes
+    the token count — measuring the untemplated prompt would reintroduce the same error in
+    miniature.
+    """
+    from transformers import AutoTokenizer
+
+    notes: list[str] = []
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    template = chat_template_path.read_text() if chat_template_path.is_file() else None
+    if template is None:
+        notes.append(f"no chat template at {chat_template_path}; `role: user` cases sent raw")
+
+    out: list[tuple[str, int]] = []
+    for case in case_set.cases:
+        text = case.prompt
+        if case.role == "user" and template is not None:
+            try:
+                text = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": case.prompt}],
+                    chat_template=template,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - recorded, not fatal
+                notes.append(f"{case.id}: chat template failed ({exc}); sent raw")
+        out.append((text, len(tokenizer(text)["input_ids"])))
+    return out, notes
