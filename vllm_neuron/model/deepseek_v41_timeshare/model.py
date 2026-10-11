@@ -118,6 +118,7 @@ cannot run it raises and names the reason.
 from __future__ import annotations
 
 import functools
+import gc
 import logging
 
 import torch
@@ -903,7 +904,22 @@ def span_freqs(
 EMPTY_SLOT = -1
 
 #: How many queries share one gather. See `sparse_attn`.
-_ATTN_QUERY_TILE = 128
+#:
+#: **This is a compile-time constant, not an accuracy one, and 512 rather than
+#: 128 because of what the compiler does with the unrolled loop.** The loop in
+#: `sparse_attn` is a Python `range`, so dynamo unrolls it into the graph: at a
+#: 128-wide tile an 8192-token prefill segment is 64 copies of
+#: gather/mask/kernel-call, which is a 1330-line FX graph with 155 kernel calls,
+#: and `neuronx-cc`'s `Tensorizer/MaskPropagation` pass took **>16 minutes**
+#: on one of them, single-threaded, with 39 more to go
+#: (`.autohelix/notes/iter-5.md` §10c). At 512 it is 16 copies.
+#:
+#: It cannot change a digit of the output: each tile is a separate call with
+#: its own softmax over its own query rows' slots, every reduction inside
+#: `kernels/sparse_attn.gathered_attn` is per token, and the kernel derives
+#: `heads = q.shape[0] // bias.shape[0]` so it takes the tile width from its
+#: arguments and asserts nothing about it.
+_ATTN_QUERY_TILE = 512
 
 #: The slot-list granularity `kernels/sparse_attn` works in (its partition
 #: width). The caller pads the top-k list up to a multiple of this with empty
@@ -946,6 +962,162 @@ _COMPRESS_TILE = 128
 #: addressed by absolute position within a sequence's own context, so a sequence
 #: needs its whole context resident.
 _KV_CAP_MAX_SLOTS = 131072
+
+
+def _hbm_used_bytes() -> int | None:
+    """Device HBM in use, straight from the Neuron runtime's own counters.
+
+    `NeuronWorker._query_runtime_memory_stats` makes exactly this call; it is
+    read here so a forward can account for its own allocations per layer rather
+    than inferring them from `/tmp/neuron_mem_table_device_*.log`, which is
+    written only when an allocation *fails* and carries one number per core.
+
+    The obvious alternatives are both unavailable in this venv, which is worth
+    recording because it cost an iteration's planning:
+    `libtorch_neuronx_lite._compiler` exposes `empty_cache()` and
+    `get_device_properties()`, but its extension fails to import here —
+    ``undefined symbol: PyObject_ClearManagedDict`` — and it is the only handle
+    on a caching allocator. The execution path does not go through it:
+    `lib/libtorchneuron.so` registers `aten::empty` for the neuron device
+    directly, so a device tensor is an `nrt_tensor_allocate` and dropping the
+    last reference frees it. There is nothing to empty, and these counters are
+    the live set.
+
+    Returns None rather than raising: this is instrumentation, and a forward
+    must not fail because a counter was unreadable.
+    """
+    global _HBM_RUNTIME
+    try:
+        if _HBM_RUNTIME is None:
+            _HBM_RUNTIME = torch.classes.neuron.Runtime()
+        used, _free = _HBM_RUNTIME.get_vnc_memory_stats()
+        return int(used)
+    except Exception:  # noqa: BLE001 - instrumentation, never fatal
+        return None
+
+
+#: Cached `torch.classes.neuron.Runtime` handle for `_hbm_used_bytes`.
+_HBM_RUNTIME = None
+
+#: How many forwards log their HBM use per layer. After that each forward logs
+#: one summary line. The per-layer detail is what identifies *which* step grows
+#: the live set; the summary is what shows whether it comes back down.
+_HBM_TRACE_FORWARDS = 6
+
+#: `[steps seen, previous reading, previous layer id]` for `_hbm_mark`.
+_HBM_STATE = [0, None, -1]
+
+#: Rows below which `_collect_layer_garbage` is not worth its own cost. A
+#: decode step's whole stream is a few hundred KiB; a collection costs tens of
+#: milliseconds and would be paid 43 times per generated token.
+_GC_MIN_ROWS = 64
+
+#: Layers at which `_census_device_tensors` reports. Early, middle and late, so
+#: the difference between them is what the layer loop accumulates.
+_CENSUS_LAYERS = frozenset({4, 20, 39})
+
+
+def _collect_layer_garbage() -> None:
+    """Free the previous layer's device tensors, including the ones in cycles.
+
+    **This is the fix for the wall every iteration since 3 has hit.** A layer's
+    intermediates are dead the moment `_run_block` returns — the stream and the
+    `pre_mix` are rebound, everything else goes out of scope — but a measured
+    ~90 KiB *per token per layer* was not coming back:
+
+        HBM  11.105 GiB (     +0.0 MiB) at layer 0 of forward 0, 512 rows
+        HBM  11.648 GiB (    +46.8 MiB) at layer 4 of forward 0, 512 rows
+        HBM  13.430 GiB (    +55.7 MiB) at layer 39 of forward 0, 512 rows
+
+    — +2.33 GiB over 40 layers at a 512-token bucket, monotonic, never
+    released. Scaled to the verifier's 9328-token prompt that is **~37 GiB on a
+    24 GiB bank**, and it is why the wall did not move when the KV cache halved,
+    when tensor parallelism quartered the weights, or when the prefill segment
+    halved (`.autohelix/notes/iter-5.md` §6 measured all three): the per-layer
+    footprint is proportional to `layers x tokens`, so chunking the prefill
+    moves it between steps without reducing it, and every run died at whatever
+    was left of the bank.
+
+    Refcounting alone does not collect it because the frames that held those
+    tensors are reachable from reference *cycles* — a graph break leaves dynamo
+    holding frame state, and a caught exception's traceback holds its frame,
+    both of which are cyclic. The tensors are garbage; nothing had asked for
+    them to be collected.
+
+    So this asks, once per layer, from host code the compiled graphs have
+    already been broken out of. `nrt_tensor_free` really does return the memory:
+    the Lite backend registers `aten::empty` for the neuron device directly and
+    has no caching allocator in the way (`_hbm_used_bytes`).
+
+    It is not free — a full collection over this process's heap is tens of
+    milliseconds — so it is skipped for the small shapes where there is nothing
+    worth collecting. A decode step moves ~90 KiB per layer; a prefill segment
+    moves hundreds of MiB.
+    """
+    gc.collect()
+
+
+def _census_device_tensors(layer_id: int) -> None:
+    """Log what is alive on the device, by shape, biggest first.
+
+    The counterpart to `_hbm_used_bytes`: that says how much is held, this says
+    what is holding it. Walks the GC's object graph, which every `torch.Tensor`
+    is tracked in, so it sees tensors reachable from anywhere — a module
+    buffer, a dynamo cache entry, a compiled graph's constants — without
+    needing to guess which.
+
+    Expensive (one full heap walk), so it is called at a handful of layers
+    rather than all of them.
+    """
+    sizes: dict[tuple, list[int]] = {}
+    for obj in gc.get_objects():
+        try:
+            if not isinstance(obj, torch.Tensor) or obj.device.type != "neuron":
+                continue
+            key = (tuple(obj.shape), str(obj.dtype).replace("torch.", ""))
+        except Exception:  # noqa: BLE001 - a half-built object, skip it
+            continue
+        entry = sizes.setdefault(key, [0, 0])
+        entry[0] += 1
+        entry[1] += obj.numel() * obj.element_size()
+    ranked = sorted(sizes.items(), key=lambda kv: -kv[1][1])[:10]
+    total = sum(v[1] for v in sizes.values())
+    logger.info(
+        "deepseek_v41_timeshare: live device tensors at layer %d: %.3f GiB in "
+        "%d shapes", layer_id, total / 1024**3, len(sizes),
+    )
+    for (shape, dtype), (count, nbytes) in ranked:
+        logger.info(
+            "deepseek_v41_timeshare:   %8.1f MiB  x%-5d %s %s",
+            nbytes / 1024**2, count, dtype, shape,
+        )
+
+
+def _hbm_mark(layer_id: int, rows: int) -> None:
+    """Log HBM use at one layer of a forward, with the delta since the last.
+
+    A layer id that does not advance means a new forward started, which is how
+    the step count is kept without a call in `forward` itself — see
+    `MoE._route_plan` for why there must not be one.
+    """
+    if layer_id <= _HBM_STATE[2]:
+        _HBM_STATE[0] += 1
+        _HBM_STATE[1] = None
+    _HBM_STATE[2] = layer_id
+    if _HBM_STATE[0] >= _HBM_TRACE_FORWARDS:
+        return
+    used = _hbm_used_bytes()
+    if used is None:
+        return
+    previous = _HBM_STATE[1]
+    _HBM_STATE[1] = used
+    logger.info(
+        "deepseek_v41_timeshare: HBM %7.3f GiB (%+9.1f MiB) at layer %d of "
+        "forward %d, %d rows",
+        used / 1024**3,
+        0.0 if previous is None else (used - previous) / 1024**2,
+        layer_id, _HBM_STATE[0], rows,
+    )
 
 
 def _compress_read_len(compress_len: int) -> int:
@@ -1070,9 +1242,24 @@ def sparse_attn(
     b, s, h, d = q.shape
     n = kv.size(1)
     topk = topk_idxs.size(-1)
-    out = torch.empty_like(q)
     if topk == 0 or n == 0:
-        return out.zero_()
+        return torch.zeros_like(q)
+
+    # The per-tile results are collected and concatenated rather than written
+    # into slices of one `empty_like(q)`, and that is a compiler decision.
+    # `out[:, lo:hi] = ...` over an uninitialized buffer is the one pattern
+    # `neuronx-cc`'s integer-set analysis is worst at: proving a set of partial
+    # writes covers a tensor is `IntegerSetAnalysis.cover_whole_tensor`, which
+    # is both where the `islpy` version mismatch aborted the compile outright
+    # (`__init__.warn_on_unsupported_islpy`) and where `Tensorizer/
+    # MaskPropagation` spent **>12 minutes per graph** on this model's prefill
+    # shapes (`.autohelix/notes/iter-5.md` §10c). A `cat` is one op with
+    # nothing to prove.
+    #
+    # Numerically identical: the tiles partition `range(0, s)` exactly, each
+    # one is a separate kernel call over its own query rows, and concatenating
+    # them in order is the same tensor the slice writes produced.
+    tiles: list[torch.Tensor] = []
 
     kpad = -(-topk // _ATTN_SLOT_TILE) * _ATTN_SLOT_TILE
     sink = attn_sink.float().reshape(h, 1)
@@ -1109,14 +1296,16 @@ def sparse_attn(
                 [bias, bias.new_full((b, t, kpad - topk), _NEG_BOUND)], dim=2
             )
 
-        out[:, lo:hi] = _nki_entry("sparse_attn", "gathered_attn")(
-            q[:, lo:hi].reshape(-1, d),
-            gathered.reshape(-1, d),
-            bias.reshape(-1, kpad),
-            sink,
-            scale,
-        ).reshape(b, t, h, d)
-    return out
+        tiles.append(
+            _nki_entry("sparse_attn", "gathered_attn")(
+                q[:, lo:hi].reshape(-1, d),
+                gathered.reshape(-1, d),
+                bias.reshape(-1, kpad),
+                sink,
+                scale,
+            ).reshape(b, t, h, d)
+        )
+    return tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=1)
 
 
 def select_candidate_blocks(
@@ -2104,6 +2293,20 @@ def _select_rows(x, rows):
     return torch.index_select(x, 0, rows)
 
 
+def _post_into(out, ffn_out, residual, ffn_post, ffn_comb):
+    """`HyperConnections.post`, written into `out` rather than returned.
+
+    A free function so `_compiled` keys it on the function and **one** graph
+    serves all 43 layers; the point of writing into `out` is that the one graph
+    then retains one `[tokens, hc, dim]` buffer instead of one per layer. See
+    `Block.attn_half`'s `out_residual` for the measurement that makes this
+    matter. `out` and `residual` are different buffers, and `attn_half` has
+    finished before this runs, so nothing here reads a buffer it is writing.
+    """
+    out.copy_(HyperConnections.post(ffn_out, residual, ffn_post, ffn_comb).squeeze(0))
+    return out
+
+
 def _one_hot_pre_mix(stream, hc):
     """The draft stream's initial hyper-connection coefficients: copy 0 only.
 
@@ -2362,7 +2565,24 @@ class MoE(nn.Module):
         numerically identical and it is `n_routed_experts / num_experts_per_tok`
         = **64x** the arithmetic — 8.1 PFLOP for one 8192-token prefill against
         129 TFLOP. Keep the host read.
+
+        It is also the per-layer HBM probe (`_hbm_mark`), because it is called
+        exactly once per MoE layer from host code dynamo has already broken out
+        of. **That placement is the point.** The first attempt put the marks in
+        `forward`'s layer loop, which looks like uncompiled host code and is
+        not: dynamo partitions that frame into subgraphs around its existing
+        breaks, so an extra host call there is an extra break, every cache key
+        downstream of it changes, and one of the new fragments turned out to
+        crash the compiler outright (`[NCC_ISMP902] Simplifier error:
+        is_subset()`). Instrumentation must go where a break already is.
         """
+        rows = int(indices.shape[0])
+        if rows >= _GC_MIN_ROWS:
+            _collect_layer_garbage()
+        _hbm_mark(self.layer_id, rows)
+        if _HBM_STATE[0] == 0 and self.layer_id in _CENSUS_LAYERS:
+            _census_device_tensors(self.layer_id)
+
         ids = indices if live_rows is None else indices[:live_rows]
         wts = weights if live_rows is None else weights[:live_rows]
         # `.cpu()` before `.float()`, not after. A dtype cast on a Neuron tensor
@@ -3008,9 +3228,27 @@ class Block(nn.Module):
     # expression in the same order.
 
     def attn_half(
-        self, stream, pre_mix, slices, paged, shared: list, tp_group
+        self, stream, pre_mix, slices, paged, shared: list, tp_group,
+        out_residual=None, out_normed=None,
     ):
         """Everything from the stream to the MoE's normalized input.
+
+        `out_residual` and `out_normed` are **the same two buffers for every
+        layer**, and that is a memory decision rather than a style one. There
+        is one of these graphs per block — there has to be, while the layer's
+        weights are captured parameters, since dynamo guards on parameter
+        identity — and the Neuron executor holds the tensors it last ran with
+        from C++, where no Python reference drop can reach them. So each
+        layer's graph was keeping its own copy of this function's inputs and
+        outputs alive: measured at **92.8 KiB per token per layer**, which is
+        36 GiB of a 24 GiB bank for the verifier's 9328-token prompt
+        (`.autohelix/notes/iter-5.md` §4). Writing the two big results into
+        buffers that every layer shares makes 43 executors retain one storage
+        instead of 43.
+
+        They are optional so that `Block.forward` — the reference-shaped path,
+        which runs one layer at a time and has no accumulation to avoid — keeps
+        working unchanged.
 
         Attention runs per sequence, because the window and the compressed
         history are per sequence; the hyper-connection coefficients and both
@@ -3057,7 +3295,15 @@ class Block(nn.Module):
         residual = batched
         ffn_pre, ffn_post, ffn_comb = self.hc_ffn.mixes(batched)
         normed = self.ffn_norm(HyperConnections.pre(batched, attn_pre))
-        return normed, residual, ffn_pre, ffn_post, ffn_comb
+        if out_residual is None:
+            return normed, residual, ffn_pre, ffn_post, ffn_comb
+        # Written, not returned: an output aliased to an input is what the
+        # backend's `aliasing_output_rewrite` pass maps into `io_map`, so the
+        # graph hands back the buffer it was given rather than a fresh
+        # allocation. Same mechanism the paged KV writes already use.
+        out_residual.copy_(residual)
+        out_normed.copy_(normed)
+        return out_normed, out_residual, ffn_pre, ffn_post, ffn_comb
 
     def ffn_half(self, ffn_out, residual, ffn_post, ffn_comb):
         """The MoE's output mixed back into the residual streams."""
@@ -3479,6 +3725,11 @@ class DeepseekV41ForCausalLM(nn.Module):
         #: tokenizer reachable. Produces the row indices `Engram` looks up; see
         #: `NgramHashState` for why it cannot be derived from the weights.
         self.ngram_hash: NgramHashState | None = None
+
+        #: `(rows, dtype, device) -> (stream, residual, normed)`, filled by
+        #: `_layer_io`. One set of per-layer I/O buffers shared by every block,
+        #: which is what keeps the live set off `layers x tokens`.
+        self._layer_io_slots: dict[tuple, tuple[torch.Tensor, ...]] = {}
 
         # On-device sampling, if the runner asked for it. This is not a
         # preference the model gets to express: `NeuronModelRunner` reads
@@ -4384,6 +4635,50 @@ class DeepseekV41ForCausalLM(nn.Module):
             per_span.append(self.ngram_hash(ids, span))
         return torch.cat(per_span, dim=1)
 
+    @torch._dynamo.disable
+    def _layer_io(
+        self, stream: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The three per-layer buffers every block shares, for this shape.
+
+        `(stream_out [T, hc, dim], residual [1, T, hc, dim], normed
+        [1, T, dim])`. One set per `(rows, dtype, device)`, allocated on first
+        use and kept — 720 MiB at an 8192-token segment, against the ~31 GiB
+        the per-block graphs were each retaining a private copy of
+        (`Block.attn_half`).
+
+        **Dynamo-disabled, and called before anything traced in `_run_block`.**
+        `torch.empty` is a traceable op, so inlined it would be pulled into the
+        surrounding graph; and an added break *between* traced ops rewrites
+        every cache key downstream of it, which is how iteration 5 crashed the
+        compiler (`.autohelix/notes/iter-5.md` §5). At the top of `_run_block`
+        there is nothing traced before it to split.
+
+        Not a `register_buffer`: these hold no checkpoint state, they are keyed
+        by a shape that is only known once the scheduler picks a bucket, and
+        `state_dict` has no business carrying them.
+        """
+        rows = int(stream.shape[0])
+        key = (rows, stream.dtype, str(stream.device))
+        slots = self._layer_io_slots.get(key)
+        if slots is None:
+            hc, dim = int(stream.shape[1]), int(stream.shape[2])
+            opts = {"dtype": stream.dtype, "device": stream.device}
+            slots = (
+                torch.empty(rows, hc, dim, **opts),
+                torch.empty(1, rows, hc, dim, **opts),
+                torch.empty(1, rows, dim, **opts),
+            )
+            self._layer_io_slots[key] = slots
+            logger.info(
+                "deepseek_v41_timeshare: allocated the shared per-layer I/O "
+                "buffers for %d rows (%.1f MiB, one set for all %d blocks)",
+                rows,
+                sum(t.numel() * t.element_size() for t in slots) / 1024**2,
+                len(self.layers),
+            )
+        return slots
+
     def _run_block(
         self,
         block: Block,
@@ -4409,9 +4704,12 @@ class DeepseekV41ForCausalLM(nn.Module):
         re-stream 276 GiB per sequence.
         """
         tp_group = self.tp_group if self.world_size > 1 else None
+        # The shared per-shape buffers, resolved before anything traced runs so
+        # this adds no graph break (see `_layer_io`).
+        io_stream, io_residual, io_normed = self._layer_io(stream)
         normed, residual, ffn_pre, ffn_post, ffn_comb = _block_entry(
             block, "attn_half"
-        )(stream, pre_mix, slices, paged, shared, tp_group)
+        )(stream, pre_mix, slices, paged, shared, tp_group, io_residual, io_normed)
         ffn_out = block.ffn(normed, None, self.weight_store, tp_group, live_rows)
         # `HyperConnections.post` directly, not `_block_entry(block,
         # "ffn_half")`. They compute the same thing — `ffn_half`'s whole body is
@@ -4425,8 +4723,13 @@ class DeepseekV41ForCausalLM(nn.Module):
         # `.autohelix/notes/iter-3.md` §5b-ter. `Block.ffn_half` is kept for the
         # reference-shaped `Block.forward` path and for symmetry with
         # `attn_half`, whose per-block weights leave it no such option.
-        batched = HyperConnections.post(ffn_out, residual, ffn_post, ffn_comb)
-        return batched.squeeze(0), ffn_pre.squeeze(0)
+        #
+        # Through `_post_into` rather than `HyperConnections.post` directly, so
+        # the next layer's input is the *same tensor* every layer: the stream is
+        # the largest of the three things each per-block graph was retaining.
+        return _compiled(_post_into)(
+            io_stream, ffn_out, residual, ffn_post, ffn_comb
+        ), ffn_pre.squeeze(0)
 
     @torch.no_grad()
     def forward_spec(
