@@ -90,7 +90,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--max-num-batched-tokens",
         type=int,
         default=None,
-        help="default: the resolved max_model_len, so the longest prompt prefills in one chunk",
+        help="default: the largest supported KV segment size below the resolved max_model_len, "
+        "which is what auto-enables segmented prefill. A value >= max_model_len is single-shot "
+        "prefill, which this build only accepts with prefix caching off — the verifier turns it "
+        "off for you in that case.",
     )
     p.add_argument(
         "--chat-template",
@@ -177,7 +180,38 @@ def main(argv: list[str] | None = None) -> int:
         kept_cases.append(case)
     case_set.cases = kept_cases
 
-    max_num_batched_tokens = args.max_num_batched_tokens or max_model_len
+    # Chunked prefill, at the largest segment this context can use.
+    #
+    # The default used to be `max_model_len` — single-shot prefill — which this build rejects
+    # before any model code runs, so the constraint was unsatisfiable regardless of the port for
+    # a second reason after the nominal-length one above. Two rules collide:
+    # `resolve_segmented_prefill_config` reads `max_num_batched_tokens >= max_model_len` as
+    # single-shot and returns no `kv_segment_size_buckets`, and `neuron_model_runner` requires
+    # those buckets whenever prefix caching is on — which vLLM 0.24 defaults to. The raise is in
+    # `NeuronModelRunner.__init__`, upstream of `load_model`, so no model code could have
+    # intervened. Every invocation in the repo's own `docs/` passes one or the other.
+    #
+    # `SUPPORTED_KV_SEGMENT_SIZES` rather than a literal 8192: the segment has to be a size the
+    # attention kernel has buckets for, and strictly below `max_model_len` or it is single-shot
+    # again — which is why this is not simply `or 8192`. A `--max-model-len 544` run would then
+    # ask for a segment larger than its own context and fail the same way.
+    from vllm_neuron.utils.bucket_utils import SUPPORTED_KV_SEGMENT_SIZES
+
+    segments = sorted(s for s in SUPPORTED_KV_SEGMENT_SIZES if s < max_model_len)
+    if args.max_num_batched_tokens is not None:
+        max_num_batched_tokens = args.max_num_batched_tokens
+    else:
+        max_num_batched_tokens = segments[-1] if segments else max_model_len
+
+    # Prefix caching needs segmented prefill. When the configuration is single-shot anyway —
+    # the caller asked for it, or the context is below the smallest segment — turn APC off
+    # instead of letting engine construction raise. This is the remedy the error names first.
+    enable_prefix_caching = max_num_batched_tokens < max_model_len
+    print(
+        f"verifier: max_num_batched_tokens={max_num_batched_tokens} "
+        f"({'segmented' if enable_prefix_caching else 'single-shot'} prefill, "
+        f"prefix caching {'on' if enable_prefix_caching else 'off'})"
+    )
 
     print(f"verifier: {len(case_set)} case(s)")
     for note in case_set.notes:
@@ -189,6 +223,10 @@ def main(argv: list[str] | None = None) -> int:
         "temperature": TEMPERATURE,
         "tensor_parallel_size": tensor_parallel_size,
         "max_model_len": max_model_len,
+        # In the report because `runs-on-trainium`'s judge reads it, and because which prefill
+        # mode ran is the difference between a 9k-token segment and a short one.
+        "max_num_batched_tokens": max_num_batched_tokens,
+        "enable_prefix_caching": enable_prefix_caching,
         "prompt_tokens": [n for _, n in kept],
         "notes": list(case_set.notes),
         "cases": [],
@@ -212,6 +250,7 @@ def main(argv: list[str] | None = None) -> int:
             max_model_len=max_model_len,
             max_num_batched_tokens=max_num_batched_tokens,
             tensor_parallel_size=tensor_parallel_size,
+            enable_prefix_caching=enable_prefix_caching,
         )
         sampling = SamplingParams(max_tokens=MAX_TOKENS, temperature=TEMPERATURE)
 
