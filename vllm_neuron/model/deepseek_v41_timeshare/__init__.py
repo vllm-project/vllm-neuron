@@ -562,6 +562,102 @@ def require_segmented_prefill(vllm_config) -> None:
     )
 
 
+#: Above this many KV slots the ceiling below declines to act, for the reason
+#: `model._cap_kv_cache_blocks` gives: `num_gpu_blocks_override` is applied in
+#: either direction, so a configuration whose working set is genuinely large
+#: must be left to vLLM's memory-based sizing rather than handed a number that
+#: does not fit. Kept equal to `model._KV_CAP_MAX_SLOTS`.
+KV_CEILING_MAX_SLOTS = 131072
+
+
+def require_kv_cache_ceiling(vllm_config) -> None:
+    """Cap the KV cache where the engine actually sizes it.
+
+    `model._cap_kv_cache_blocks` has the arithmetic and the argument for it:
+    vLLM sizes the cache from the memory free when it profiles, which is after
+    the weights load and *before* any of this port's ~120 NEFFs are loaded, so
+    it hands out a cache many times larger than the scheduler can fill and the
+    graphs then have nowhere to go. The ceiling is one full `max_model_len` per
+    sequence times the running batch — a ceiling, not a reduction below what
+    correctness needs, since one sequence cannot reference more slots than its
+    own context.
+
+    **What is new here is the process it runs in, and it was a silent bug.**
+    `_cap_kv_cache_blocks` runs from `load_weights`, i.e. in a *worker*, and
+    sets `cache_config.num_gpu_blocks_override` on the worker's own
+    `VllmConfig`. The code that reads that field — `get_kv_cache_config`,
+    `vllm/v1/core/kv_cache_utils.py` — runs in the **EngineCore** process. At
+    one rank those are the same process, because `world_size == 1` selects the
+    in-process `uni` executor, so the mutation is visible and the cap works. At
+    four ranks the workers are separate processes with unpickled copies, so the
+    mutation goes nowhere and **the cap silently stops applying**. Measured on
+    this host, a four-rank run of the verifier's own arguments:
+
+        capping the KV cache at 1184 blocks of 32 (37888 slots)   <- the worker
+        GPU KV cache size: 91,098 tokens                          <- EngineCore
+        Maximum concurrency for 9,424 tokens per request: 9.67x
+
+    — no `Overriding num_gpu_blocks=...` line at all, and a device-tensor
+    census at layer 4 finding 43 cache tensors of `(2, 2523, 1, 32, 512)` where
+    the cap had named 1184 blocks. That is 6.6 GiB of KV plus 1.1 GiB of
+    index/window buffers against the 3.1 + 0.5 GiB the cap intends: **4.1 GiB
+    of a 24 GiB bank**, which is most of what sharding the weights across four
+    ranks had just freed.
+
+    So the ceiling is declared here instead, from
+    `NeuronPlatform.check_and_update_config`, which runs once in the process
+    that builds the `VllmConfig` — before EngineCore, before the workers, and
+    before anything reads the field. Workers get it by unpickling.
+    `_cap_kv_cache_blocks` stays where it is and becomes a no-op when this has
+    acted (it returns early if the override is already set), so a path that
+    reaches `load_weights` without this hook still gets capped.
+
+    Only ever lowers, only for this port, and inert if the operator set
+    `num_gpu_blocks_override` themselves.
+    """
+    if not _serves_this_port(vllm_config):
+        return
+    cache = getattr(vllm_config, "cache_config", None)
+    scheduler = getattr(vllm_config, "scheduler_config", None)
+    model_config = getattr(vllm_config, "model_config", None)
+    if cache is None or scheduler is None or model_config is None:
+        return
+    if getattr(cache, "num_gpu_blocks_override", None) is not None:
+        return
+
+    # The block size the cache is **laid out** with, which is not necessarily
+    # the one `cache_config` carries now: `update_block_size_for_backend` runs
+    # later and settles on 32 unless the operator named one. Dividing by a
+    # stale 16 is what made the worker-side cap realize half the reduction it
+    # named, before iteration 5 fixed it; the same rule is applied here.
+    block = int(getattr(cache, "block_size", None) or 32)
+    if not getattr(cache, "user_specified_block_size", False):
+        block = 32
+    max_model_len = int(getattr(model_config, "max_model_len", 0) or 0)
+    max_num_seqs = int(getattr(scheduler, "max_num_seqs", 0) or 0)
+    if max_model_len <= 0 or max_num_seqs <= 0:
+        return
+    per_sequence = -(-max_model_len // block) + 1
+    blocks = per_sequence * max_num_seqs
+    if blocks * block > KV_CEILING_MAX_SLOTS:
+        logger.info(
+            "deepseek_v41_timeshare: leaving the KV cache to vLLM — this "
+            "configuration wants %d slots (%d per sequence x %d sequences), "
+            "which is not obviously oversized",
+            blocks * block, per_sequence, max_num_seqs,
+        )
+        return
+    cache.num_gpu_blocks_override = blocks
+    logger.info(
+        "deepseek_v41_timeshare: KV cache ceiling %d blocks of %d (%d slots) — "
+        "%d per sequence x %d sequences, one full context each. Declared here "
+        "rather than from load_weights because the engine sizes the cache in "
+        "the EngineCore process, which a worker's mutation does not reach; see "
+        "deepseek_v41_timeshare.require_kv_cache_ceiling",
+        blocks, block, blocks * block, per_sequence, max_num_seqs,
+    )
+
+
 def declare_prefill_requirements() -> None:
     """Install `require_segmented_prefill` on the platform's config hook.
 
@@ -585,6 +681,7 @@ def declare_prefill_requirements() -> None:
     def check_and_update_config(cls, vllm_config) -> None:
         original(vllm_config)
         require_segmented_prefill(vllm_config)
+        require_kv_cache_ceiling(vllm_config)
 
     platform_cls.check_and_update_config = classmethod(check_and_update_config)
     platform_cls._deepseek_v41_prefill_hook = True

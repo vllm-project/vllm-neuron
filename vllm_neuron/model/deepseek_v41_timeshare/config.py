@@ -52,27 +52,40 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 #: instantiated, once per rank. A model cannot choose its own world size, only
 #: be told.
 #:
-#: **1, deliberately.** The partition-specific kernels under `kernels/` were
-#: generated for 4 ranks and take a `replica_group`, which is where the old
-#: value of 4 came from — but the kernels actually on the execution path
-#: (`kernels/blockquant.py` and the three generalized `hc_*` ones) contain no
-#: collective and no rank constant, so nothing requires it any more. Against
-#: that, three things favour one rank for a *timeshared* model:
+#: **4, because HBM is the binding constraint and this is what buys HBM.**
+#: One Trainium2 device carries four 24 GiB HBM stacks, one per logical
+#: NeuronCore, and a rank addresses only its own stack — so one rank uses 24 of
+#: the device's 96 GiB and leaves 72 idle. Four ranks use all four stacks *and*
+#: divide the resident weights, measured at **10.60 -> 5.09 GiB a rank**
+#: (`.autohelix/notes/iter-5.md` §10h). The 8192-token prefill segment the
+#: verifier's longest prompt needs ran all 40 layers at one rank and then could
+#: not load the next NEFF with 2.8 GiB left (§10f); the 5.5 GiB a rank this
+#: frees is the headroom for it.
 #:
-#:   - the 9.83 GiB of resident weights fit a single 24 GiB bank whole, so
-#:     sharding buys no capacity — the 465 GiB that does not fit is streamed
-#:     either way;
-#:   - every graph would otherwise be compiled once per rank, and compile time
-#:     is already the binding cost (minutes per layer graph, §7 of
-#:     `.autohelix/notes/iter-2.md`);
-#:   - the task brief's own note from the kernel-optimization project: where
-#:     only an `opt-rank0` variant exists, the 4-rank collective overhead
-#:     exceeded the speedup.
+#: It was 1 for iterations 1-5, for reasons that the measurements have since
+#: overtaken and which are recorded here so the trade is legible:
+#:
+#:   - "the resident weights fit a single bank whole, so sharding buys no
+#:     capacity" — true of the *weights*, and beside the point. What does not
+#:     fit is the weights plus the activations of a 43-block stack plus the
+#:     loaded NEFFs of its graphs, and sharding the first of those three is how
+#:     the other two get room.
+#:   - "every graph is compiled once per rank, and compile time is the binding
+#:     cost" — still true and still the price: 88 cache keys / 36 compiles at
+#:     four ranks against 27 / 7 at one, for the same work (§10e, §10h). The
+#:     four ranks compile concurrently, so it costs wall clock rather than
+#:     multiplying it.
+#:   - "where only an `opt-rank0` kernel variant exists, the 4-rank collective
+#:     overhead exceeded the speedup" — that is the brief's guidance on
+#:     *throughput*, and it is why the kernels on the live path carry no
+#:     collective. It does not speak to capacity, which is what is short here.
 #:
 #: `weight_loader.py` shards correctly at either value — `verify_shard_plan`
-#: reports 0 problems at 1 and at 4 — so this is reversible by editing the
-#: number.
-TENSOR_PARALLEL_SIZE = 1
+#: reports 0 problems at 1 and at 4 — the collectives `MoE.forward` needs at
+#: four ranks go through `tp_all_reduce` / `tp_all_gather_last` in `model.py`,
+#: and a four-rank run has been taken through a whole 40-layer prefill (§10h).
+#: So this is still reversible by editing the number.
+TENSOR_PARALLEL_SIZE = 4
 
 
 @dataclass

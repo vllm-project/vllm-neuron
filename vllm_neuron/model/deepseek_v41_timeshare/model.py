@@ -3731,6 +3731,13 @@ class DeepseekV41ForCausalLM(nn.Module):
         #: which is what keeps the live set off `layers x tokens`.
         self._layer_io_slots: dict[tuple, tuple[torch.Tensor, ...]] = {}
 
+        #: `(shape, dtype, device) -> buffer`, filled by `_engram_rows`. The
+        #: same idea as `_layer_io_slots` applied to the gathered n-gram rows:
+        #: both engram layers hand their lookup to the same device buffer, so
+        #: the engram graph's retained input binding does not grow with the
+        #: number of engram layers.
+        self._engram_row_slots: dict[tuple, torch.Tensor] = {}
+
         # On-device sampling, if the runner asked for it. This is not a
         # preference the model gets to express: `NeuronModelRunner` reads
         # `neuron_config.on_device_sampling_config` itself
@@ -4487,7 +4494,20 @@ class DeepseekV41ForCausalLM(nn.Module):
         """
         ids = hashes.cpu()[:, :, index, :].contiguous()
         rows = self.weight_store.engram(layer_id, ids)
-        return rows.to(device)
+        # Into a buffer shared by both engram layers rather than a fresh
+        # device allocation each time, for the reason in `_layer_io`: the
+        # executor retains a binding to the tensors its last call was handed,
+        # so a fresh input per engram layer per forward is retained per engram
+        # layer. `[1, T, 24, 256]` bf16 is 12 KiB a token, i.e. 96 MiB a layer
+        # at the 8192-token prefill segment. Host-side and dynamo-disabled, so
+        # no traced code and no compiled graph is touched.
+        key = (tuple(rows.shape), rows.dtype, str(device))
+        buf = self._engram_row_slots.get(key)
+        if buf is None:
+            buf = torch.empty(rows.shape, dtype=rows.dtype, device=device)
+            self._engram_row_slots[key] = buf
+        buf.copy_(rows)
+        return buf
 
     def _attn_meta(self, attn_metadata: object | None) -> dict:
         """The one metadata dict every layer in the KV group shares.
