@@ -52,40 +52,30 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 #: instantiated, once per rank. A model cannot choose its own world size, only
 #: be told.
 #:
-#: **4, because HBM is the binding constraint and this is what buys HBM.**
-#: One Trainium2 device carries four 24 GiB HBM stacks, one per logical
-#: NeuronCore, and a rank addresses only its own stack — so one rank uses 24 of
-#: the device's 96 GiB and leaves 72 idle. Four ranks use all four stacks *and*
-#: divide the resident weights, measured at **10.60 -> 5.09 GiB a rank**
-#: (`.autohelix/notes/iter-5.md` §10h). The 8192-token prefill segment the
-#: verifier's longest prompt needs ran all 40 layers at one rank and then could
-#: not load the next NEFF with 2.8 GiB left (§10f); the 5.5 GiB a rank this
-#: frees is the headroom for it.
+#: **1. Four wedges the device.** Four ranks do buy capacity -- resident weights
+#: 10.60 -> 5.09 GiB a rank, and a four-rank run took an 8192-token segment
+#: through all 40 layers at 15.7 GiB -- but twice it then hung the *instance*,
+#: both times just past layer 39, each needing a reboot.
 #:
-#: It was 1 for iterations 1-5, for reasons that the measurements have since
-#: overtaken and which are recorded here so the trade is legible:
+#: Three timeouts, ordered wrong. Graphs compile mid-forward here -- warmup is
+#: skipped and the shape set is router-dependent -- and:
 #:
-#:   - "the resident weights fit a single bank whole, so sharding buys no
-#:     capacity" — true of the *weights*, and beside the point. What does not
-#:     fit is the weights plus the activations of a 43-block stack plus the
-#:     loaded NEFFs of its graphs, and sharding the first of those three is how
-#:     the other two get room.
-#:   - "every graph is compiled once per rank, and compile time is the binding
-#:     cost" — still true and still the price: 88 cache keys / 36 compiles at
-#:     four ranks against 27 / 7 at one, for the same work (§10e, §10h). The
-#:     four ranks compile concurrently, so it costs wall clock rather than
-#:     multiplying it.
-#:   - "where only an `opt-rank0` kernel variant exists, the 4-rank collective
-#:     overhead exceeded the speedup" — that is the brief's guidance on
-#:     *throughput*, and it is why the kernels on the live path carry no
-#:     collective. It does not speak to capacity, which is what is short here.
+#:     collective RX gives up     960 s   (`CCOM WARN Timeout waiting for RX`)
+#:     a measured compile        1045, 1161, 1167 s
+#:     NEFF cache lock gives up  1200 s   (TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT)
 #:
-#: `weight_loader.py` shards correctly at either value — `verify_shard_plan`
-#: reports 0 problems at 1 and at 4 — the collectives `MoE.forward` needs at
-#: four ranks go through `tp_all_reduce` / `tp_all_gather_last` in `model.py`,
-#: and a four-rank run has been taken through a whole 40-layer prefill (§10h).
-#: So this is still reversible by editing the number.
-TENSOR_PARALLEL_SIZE = 4
+#: A rank compiling for 19 minutes outlasts the 16 minutes its peers will wait
+#: inside a collective. They time out, retry against a peer still compiling, and
+#: the collective's device-side state is left in a condition no process can
+#: clear -- hence the reboot. The lock path is 33 s from failing too, and did
+#: fail once (three `NKI cache lock timeout` + `Cleaned up on failure`). Tuning
+#: cannot fix this: the worst compile is unbounded.
+#:
+#: Safe at 4 only if no cold compile can coincide with a collective -- i.e.
+#: every graph compiled before the first collective executes. Or sidestep ranks
+#: entirely: drive the four cores SPMD from one process, collectives inside the
+#: NKI kernels, as `DeepSeek-V4.1-Flash-Trainium/engram-short/opt-1/` does.
+TENSOR_PARALLEL_SIZE = 1
 
 
 @dataclass
