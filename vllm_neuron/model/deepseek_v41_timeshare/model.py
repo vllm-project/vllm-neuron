@@ -123,6 +123,15 @@ import logging
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+# The functional collectives, imported at module level because dynamo will not
+# trace into the import machinery (see `_nki_entry`). `_resolve_group_name` is
+# the same private helper `vllm_neuron/functional/collectives/all_to_all.py`
+# uses to turn a process group into the name these ops take.
+from torch.distributed._functional_collectives import (
+    _resolve_group_name as _fc_resolve_group_name,
+    all_gather_tensor as _fc_all_gather_tensor,
+)
 from transformers import PretrainedConfig
 from vllm.distributed.parallel_state import get_tp_group
 
@@ -332,6 +341,60 @@ def _raise_dynamo_limits() -> None:
             setattr(torch._dynamo.config, name, 1 << 30)
 
 
+# =============================================================================
+# Tensor-parallel collectives
+# =============================================================================
+# `GroupCoordinator.all_reduce` reaches `torch.distributed.all_reduce`, which on
+# this stack only lowers while dynamo is tracing. Called from a region dynamo
+# broke out of — `MoE.forward` is one, because it streams expert weights off
+# disk mid-layer — it runs eagerly against a process group that has no backend
+# for a Trainium tensor, and the whole step dies with
+#
+#     RuntimeError: No backend type associated with device type neuron
+#
+# at `vllm/distributed/parallel_state.py` -> `base_device_communicator` ->
+# `torch.distributed.all_reduce`. Measured at TP=4: attention's reductions, which
+# are inside `attn_half`'s graph, went through fine and the MoE's did not
+# (`.autohelix/notes/iter-5.md` §5).
+#
+# The functional collectives do lower, because libtorch_neuronx_lite registers
+# XLA implementations for them (`overrides/xla_collectives.py`, logged as "Custom
+# XLA implementations registered via torch.library.impl"), and
+# `vllm_neuron/nn/rpl.py` uses them for exactly this. Compiling the one-op
+# wrapper keeps the collective inside a graph wherever it is called from.
+#
+# They are also *functional*: the result is returned, not written in place. The
+# previous form discarded the return value of a `GroupCoordinator.all_reduce`
+# that is out-of-place whenever `use_custom_op_call` is set, which would have
+# silently dropped the reduction.
+
+
+def _fc_sum(x: torch.Tensor, group_name: str) -> torch.Tensor:
+    """`x` summed across `group_name`'s ranks."""
+    out = torch.ops._c10d_functional.all_reduce(x, "sum", group_name)
+    return torch.ops._c10d_functional.wait_tensor(out)
+
+
+def _fc_gather_last(x: torch.Tensor, group_name: str) -> torch.Tensor:
+    """Every rank's `x` concatenated along the last axis."""
+    return _fc_all_gather_tensor(x, -1, group_name)
+
+
+def _group_name(tp_group) -> str:
+    """The functional-collective name of a `GroupCoordinator`'s device group."""
+    return _fc_resolve_group_name(tp_group.device_group)
+
+
+def tp_all_reduce(x: torch.Tensor, tp_group) -> torch.Tensor:
+    """Sum `x` across the tensor-parallel ranks. Returns the reduced tensor."""
+    return _compiled(_fc_sum)(x, _group_name(tp_group))
+
+
+def tp_all_gather_last(x: torch.Tensor, tp_group) -> torch.Tensor:
+    """Gather `x` across the tensor-parallel ranks on the last axis."""
+    return _compiled(_fc_gather_last)(x, _group_name(tp_group))
+
+
 @functools.lru_cache(maxsize=None)
 def _nki_entry(module: str, name: str = "kernel"):
     """A compiled entry point for `kernels.<module>.<name>`.
@@ -361,20 +424,24 @@ def _nki_entry(module: str, name: str = "kernel"):
     # whereas an import statement it handles.
     from .kernels import (
         blockquant,
+        engram_gate,
         hc_attn_out,
         hc_collapse,
         hc_expand,
         hc_mixes,
+        index_score,
         sparse_attn as sparse_attn_kernel,
     )
 
     _raise_dynamo_limits()
     modules = {
         "blockquant": blockquant,
+        "engram_gate": engram_gate,
         "hc_attn_out": hc_attn_out,
         "hc_collapse": hc_collapse,
         "hc_expand": hc_expand,
         "hc_mixes": hc_mixes,
+        "index_score": index_score,
         "sparse_attn": sparse_attn_kernel,
     }
     wrapped = wrap_nki(getattr(modules[module], name))
@@ -807,7 +874,7 @@ def slice_freqs(
 
 def span_freqs(
     freqs_cis: tuple[torch.Tensor, torch.Tensor],
-    start_pos: int,
+    start_pos: torch.Tensor,
     length: int,
     device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -819,6 +886,11 @@ def span_freqs(
     compile cache — ~45 recompiles per token, for graphs whose shapes are all
     identical. With the positions as a tensor the graph is the same at every
     position and only the data changes.
+
+    `start_pos` is the `[1]` device tensor `PagedSpan.pos` carries, **not** a
+    Python int, for the same reason one step further on: an int would be folded
+    into the graph as `operator.add(167, %arange)` and the graph at position 168
+    would again be a different one. See `PagedSpan.pos`.
 
     Numerically identical to the slice: `index_select` of consecutive indices.
     """
@@ -851,11 +923,29 @@ _ATTN_SLOT_TILE = 128
 _COMPRESS_TILE = 128
 
 #: Above this many KV slots, `_cap_kv_cache_blocks` leaves vLLM's memory-based
-#: sizing alone. The cap exists to claw back a cache that is obviously oversized
-#: for the configuration (measured: 76,250 slots for a 544-token context at one
-#: sequence); it must never *raise* the number, because
-#: `num_gpu_blocks_override` replaces vLLM's figure in either direction.
-_KV_CAP_MAX_SLOTS = 32768
+#: sizing alone — a backstop against a configuration so large that the cap's own
+#: arithmetic is the thing that is wrong.
+#:
+#: The number it guards has to cover the verifier's own defaults, which are
+#: `max_model_len=8224` at `max_num_seqs=4` and so want
+#: `(8224/16 + 1) * 4 * 2 = 4,120` blocks, i.e. 65,920 slots. At 32,768 the cap
+#: silently did not apply there, and vLLM then sized the cache from free memory
+#: — ~15,000 blocks, ~12 GiB of window KV — on top of which this port allocates
+#: its own per-slot buffers (compressed KV, index keys, the compressor's pooling
+#: inputs, the n-gram history) that vLLM's accounting cannot see, because they
+#: are not in `get_kv_spec`. That overruns the bank.
+#:
+#: Honest about the tradeoff, since `num_gpu_blocks_override` replaces vLLM's
+#: figure in *either* direction: what the cap computes is the number of slots
+#: the configuration can address, so it can only ever cut a cache that was
+#: larger than anything the scheduler could fill. If HBM were small enough that
+#: vLLM's own figure came out *below* that ceiling, this would raise it and the
+#: failure would move from "cache smaller than max_model_len" to an allocation
+#: error. That is a configuration this port cannot serve either way: every cache
+#: it keeps — window ring, compressed groups, index keys, pooling inputs — is
+#: addressed by absolute position within a sequence's own context, so a sequence
+#: needs its whole context resident.
+_KV_CAP_MAX_SLOTS = 131072
 
 
 def _compress_read_len(compress_len: int) -> int:
@@ -902,7 +992,7 @@ def _bound(x: torch.Tensor, value: float) -> torch.Tensor:
 
 
 def window_topk_idxs(
-    window_size: int, seqlen: int, start_pos: int, device
+    window_size: int, seqlen: int, start_pos: torch.Tensor, device
 ) -> torch.Tensor:
     """Which rows of the gathered window each query attends to; -1 is empty.
 
@@ -920,12 +1010,15 @@ def window_topk_idxs(
     the sequence started costs nothing — `kernels/sparse_attn` gives an empty
     slot a -1e30 bias, so it leaves the softmax.
 
+    `start_pos` is `PagedSpan.pos`, a `[1]` device tensor, so neither the shape
+    *nor the graph* depends on the decode position — see `span_freqs`.
+
     Causality is unchanged: query `start_pos + t` names positions
     `start_pos + t - window + 1 .. start_pos + t`, never a later one. Order
     within a row does not matter to `sparse_attn`, which treats every slot
     independently.
     """
-    base = start_pos - window_size + 1
+    base = start_pos - (window_size - 1)
     rows = torch.arange(seqlen, device=device).unsqueeze(1) + torch.arange(
         window_size, device=device
     )
@@ -1071,9 +1164,56 @@ class PagedSpan:
 
     `block_table` is one *row* of `block_table_tensor`: row `k` is the `k`-th
     scheduled sequence, which is the `k`-th span from `_sequence_spans`.
+
+    ── Why this object also carries the position, in two forms ──────────────
+
+    This is the single most important thing about the decode path's cost, so it
+    is written here rather than at the six call sites that depend on it.
+
+    `start_pos` is a Python int, and dynamo **specializes** on Python ints: a
+    graph traced at position 167 carries an `EQUALS_MATCH` guard for 167 and the
+    arithmetic folds in as a constant,
+
+        %positions : = call_function[target=operator.add](args = (167, %arange))
+
+    so position 168 is a different FX graph. Measured: a decode step recompiled
+    4 graphs *per step, forever* — 79 distinct cache keys over 18 steps, none of
+    them ever reused — and since every loaded NEFF reserves DMA rings, that was
+    also an unbounded HBM leak. Nothing about the shapes was changing; only the
+    constant.
+
+    So the position reaches a compiled graph in exactly two forms, and the split
+    is the whole trick:
+
+    * **`pos`** — a `[1]` int64 device tensor, for every use of the position as
+      a *value* (RoPE offsets, window bases, which compressed groups are
+      reachable). A graph input, so the graph is identical at every position.
+    * **`read_lens` / `group_counts`** — Python ints, for the uses that are
+      tensor *shapes* and so cannot be tensors. Both are bucketed
+      (`_compress_read_len`) or tiny (`group_counts` is 0 or 1 during decode), so
+      dynamo's guard on them holds for many consecutive steps instead of one.
+
+    Indexed by `compress_ratio`, which is 0, 1 or 2 (`config.compress_ratios`),
+    with slot 0 unused — a tuple index with a constant is the form dynamo
+    handles most predictably, and it keeps `Attention` from having to know
+    anything about how the plan was built.
+
+    `start_pos` itself stays for the host-side callers (`_engram_hashes`,
+    `forward_spec`) and must **not** be read from inside a compiled region.
     """
 
-    __slots__ = ("block_table", "block_size", "slot_mapping", "start_pos", "length")
+    __slots__ = (
+        "block_table",
+        "block_size",
+        "slot_mapping",
+        "start_pos",
+        "length",
+        "begin",
+        "pos",
+        "at_zero",
+        "read_lens",
+        "group_counts",
+    )
 
     def __init__(
         self,
@@ -1082,12 +1222,35 @@ class PagedSpan:
         slot_mapping: torch.Tensor,
         start_pos: int,
         length: int,
+        pos: torch.Tensor | None = None,
+        begin: int = 0,
     ) -> None:
         self.block_table = block_table
         self.block_size = block_size
         self.slot_mapping = slot_mapping
         self.start_pos = start_pos
         self.length = length
+        #: Where this sequence's tokens start in the flat `[T]` token axis.
+        self.begin = begin
+        self.at_zero = start_pos == 0
+        self.pos = (
+            pos
+            if pos is not None
+            else torch.tensor(
+                [start_pos], dtype=torch.int64, device=slot_mapping.device
+            )
+        )
+        # Per-ratio shape plan. `compress_len` is how many compressed groups
+        # exist once this span's tokens are written; `read_len` rounds it up to
+        # a `_COMPRESS_TILE` bucket, and `group_counts` is how many groups this
+        # span *completes* (the compressor's output row count).
+        read_lens, counts = [0, 0, 0], [0, 0, 0]
+        for ratio in (1, 2):
+            compress_len = (start_pos + length) // ratio
+            read_lens[ratio] = _compress_read_len(compress_len)
+            counts[ratio] = compress_len - start_pos // ratio
+        self.read_lens = tuple(read_lens)
+        self.group_counts = tuple(counts)
 
     def slots(self, positions: torch.Tensor) -> torch.Tensor:
         """Flat cache rows for absolute `positions` in this sequence."""
@@ -1138,10 +1301,17 @@ class SharedAttentionState:
     """What attention layers hand down the stack instead of recomputing.
 
     `vendor/model.py`'s `SharedAttentionRuntime`. Layers run in order and every
-    source writes before its consumers read, so one slot each is enough:
-    `compress_kv` and `index_k` come from the four `kv_source_layer_ids`,
-    `topk_idxs` from the eight `index_source_layer_ids`, and `candidates` from
-    the single `candidate_source_layer_id`.
+    source writes before its consumers read, so one slot each is enough *per
+    sequence*: `compress_kv` and `index_k` come from the four
+    `kv_source_layer_ids`, `topk_idxs` from the eight `index_source_layer_ids`,
+    and `candidates` from the single `candidate_source_layer_id`.
+
+    **One instance per span, never one per batch.** `Block.attn_half` runs the
+    sequence loop, so a shared instance has each span overwriting the previous
+    one's published index list — and because the published width is derived
+    from the span's own position, the consumer then gathers past the end of its
+    own window. `forward` builds the list; `.autohelix/notes/iter-4.md` §2a has
+    the device error this produced.
     """
 
     __slots__ = ("compress_kv", "index_k", "topk_idxs", "candidates")
@@ -1213,7 +1383,7 @@ class Compressor(nn.Module):
             )
 
     def forward(
-        self, x: torch.Tensor, start_pos: int, paged: PagedSpan
+        self, x: torch.Tensor, start_pos: torch.Tensor, paged: PagedSpan
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Pool `compress_ratio` consecutive tokens into one latent.
 
@@ -1254,15 +1424,19 @@ class Compressor(nn.Module):
 
         # Groups this call completes. Group `g` covers tokens
         # `g*ratio .. g*ratio+ratio-1`, so it is complete once the chunk has
-        # reached `start_pos + seqlen - 1`. Both bounds are Python ints, which
-        # is what keeps the shapes below static.
-        group_lo = start_pos // ratio
-        group_hi = (start_pos + seqlen) // ratio
-        if group_hi <= group_lo:
+        # reached `start_pos + seqlen - 1`.
+        #
+        # The *count* has to be a Python int — it is the row count of everything
+        # below — and comes off the span's precomputed plan, where it is 0 or 1
+        # for a decode step and so guards stably. The *first group's index* is
+        # the position as a value, so it stays a tensor: `arange(group_lo,
+        # group_hi)` would fold `group_lo` into the graph and recompile this
+        # layer every `ratio` steps. See `PagedSpan`.
+        count = paged.group_counts[ratio]
+        if count <= 0:
             return None, None
-        count = group_hi - group_lo
 
-        firsts = torch.arange(group_lo, group_hi, device=device) * ratio
+        firsts = (start_pos // ratio + torch.arange(count, device=device)) * ratio
         members = firsts.unsqueeze(1) + torch.arange(ratio, device=device)
         slots = paged.slots(members.reshape(-1))
         # fp32 for the pooling itself, which is where the reference's fp32
@@ -1324,7 +1498,7 @@ class Indexer(nn.Module):
         qr: torch.Tensor,
         latent: torch.Tensor | None,
         group_positions: torch.Tensor | None,
-        start_pos: int,
+        start_pos: torch.Tensor,
         offset: int,
         shared: SharedAttentionState,
         paged: PagedSpan,
@@ -1342,7 +1516,6 @@ class Indexer(nn.Module):
         assert self.freqs_cis is not None
         bsz, seqlen, _ = x.shape
         ratio, rd = self.compress_ratio, self.rope_head_dim
-        end_pos = start_pos + seqlen
 
         if self.owns_k:
             # Published whether or not this step completed a group. The cache
@@ -1386,34 +1559,73 @@ class Indexer(nn.Module):
 
         # The compressed positions that exist so far, gathered out of the paged
         # index-key cache: group j lives at the slot of token j * ratio.
-        compress_len = end_pos // ratio
-        read_len = _compress_read_len(compress_len)
+        #
+        # `read_len` is the bucketed Python int off the span's plan (a shape);
+        # the clamp bound is the position as a *value*, so it is a tensor. See
+        # `PagedSpan` for why mixing those up recompiles every layer every step.
+        read_len = paged.read_lens[ratio]
+        compress_len = (start_pos + seqlen) // ratio
         group_pos = (
-            torch.arange(read_len, device=x.device).clamp_max(max(compress_len - 1, 0))
+            torch.minimum(
+                torch.arange(read_len, device=x.device),
+                (compress_len - 1).clamp_min(0),
+            )
             * ratio
         )
-        index_k = paged.gather(shared.index_k, group_pos).reshape(1, read_len, -1)
+        index_k = paged.gather(shared.index_k, group_pos).reshape(read_len, -1)
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
-        index_score = torch.einsum("bshd,btd->bsht", q.float(), index_k.float())
-        index_score = (index_score.relu() * weights.float().unsqueeze(-1)).sum(dim=2)
+        # The score, the rectification and the weighted head sum, fused:
+        # `kernels/index_score.weighted_scores`. The torch form was
+        #
+        #     index_score = torch.einsum("bshd,btd->bsht", q.float(), k.float())
+        #     index_score = (index_score.relu() * weights...).sum(dim=2)
+        #
+        # whose first line *names* a `[s, heads, read_len]` fp32 intermediate —
+        # 11.2 GB for one layer of the verifier's 9,328-token prompt — for a
+        # value the second line reduces away. The kernel's live set is one
+        # `[heads, tile]` psum tile instead, and it is exact to fp32 against
+        # that expression (checked under `nki.simulate`: max relative error
+        # 2e-7 at every shape the model produces).
+        #
+        # Measured honestly: this did **not** reduce HBM use, so neuronx-cc was
+        # already fusing the einsum into the reduce. `.autohelix/notes/iter-5.md`
+        # §4 has the before/after memory tables. What it buys is not depending
+        # on the compiler finding that fusion, the arithmetic in one place, and
+        # one NKI call where there were three torch ops.
+        #
+        # `w` goes in head-major because the weighted sum contracts over heads;
+        # the transpose is `[s, 32]`, and doing it here is cheaper than a
+        # per-token transpose inside the kernel. Both products contract on
+        # `index_head_dim`, which the kernel transposes for.
+        index_score = _nki_entry("index_score", "weighted_scores")(
+            q.reshape(-1, self.index_head_dim),
+            index_k,
+            weights.reshape(seqlen, self.n_local_heads).t().contiguous().float(),
+        ).reshape(1, seqlen, read_len)
         if self.world_size > 1 and tp_group is not None:
             # Heads are split across ranks and the score sums over heads, so the
             # partial sums have to be added before the top-k — a per-rank top-k
             # would pick from a different score.
-            tp_group.all_reduce(index_score)
+            index_score = tp_all_reduce(index_score, tp_group)
 
         # How many compressed positions a query can see: a group becomes visible
-        # once the query has passed its last token. One expression for both the
-        # prefill and the decode case, and it also removes the groups past
-        # `compress_len` that `read_len` added — `arange(read_len) >=
+        # once the query has passed its last token. Query `t` of this span sits
+        # at absolute position `start_pos + t`, so it can see
+        # `(start_pos + t + 1) // ratio` groups — one expression covering the
+        # prefill and the decode case, which also removes the groups past
+        # `compress_len` that `read_len` added: `arange(read_len) >=
         # compress_lens` is true for every one of them, so a padded group can
         # never win the top-k.
-        if start_pos == 0:
-            compress_lens = (
-                torch.arange(1, seqlen + 1, device=x.device) // ratio
-            ).unsqueeze(-1)
-        else:
-            compress_lens = end_pos // ratio
+        #
+        # This replaces a `if start_pos == 0` split whose `else` branch used the
+        # span's *last* position for every query. That is right for a decode
+        # step (`seqlen == 1`, the only case it ran in) and would have been
+        # wrong for a chunked prefill, which hits the same branch and would have
+        # let an early query reach a group it cannot see yet. The tensor form is
+        # per query, so the branch is gone and with it the guard on `start_pos`.
+        compress_lens = (
+            (start_pos + torch.arange(1, seqlen + 1, device=x.device)) // ratio
+        ).unsqueeze(-1)
         index_score = index_score.masked_fill(
             torch.arange(read_len, device=x.device) >= compress_lens,
             _bound(index_score, _NEG_BOUND),
@@ -1570,7 +1782,7 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
-        start_pos: int,
+        start_pos: torch.Tensor,
         paged: PagedSpan,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """This layer's sliding-window K, and the slots every query may see.
@@ -1609,7 +1821,7 @@ class Attention(nn.Module):
         paged.write(self.window_kv_cache, kv.reshape(seqlen, self.head_dim))
 
         span = win + seqlen - 1
-        base = start_pos - win + 1
+        base = start_pos - (win - 1)
         positions = (base + torch.arange(span, device=x.device)).clamp_min(0)
         window_kv = paged.gather(
             self.window_kv_cache.view(-1, self.head_dim), positions
@@ -1620,7 +1832,7 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         qr: torch.Tensor,
-        start_pos: int,
+        start_pos: torch.Tensor,
         offset: int,
         shared: SharedAttentionState,
         paged: PagedSpan,
@@ -1637,8 +1849,10 @@ class Attention(nn.Module):
         bsz, seqlen, _ = x.shape
         ratio = self.compress_ratio
         rd = self.rope_head_dim
+        # Shape from the span's bucketed plan, value as a tensor — `PagedSpan`
+        # says why the two cannot be the same quantity.
+        read_len = paged.read_lens[ratio]
         compress_len = (start_pos + seqlen) // ratio
-        read_len = _compress_read_len(compress_len)
 
         latent, group_positions = None, None
         if self.is_kv_source:
@@ -1648,7 +1862,10 @@ class Attention(nn.Module):
         # The indexer needs the latent *before* RoPE, so it runs before the
         # cache write below.
         if self.is_index_source:
-            if compress_len == 0:
+            # `read_len`, not `compress_len`: `read_len == 0` exactly when
+            # `compress_len <= 0`, and it is the bucketed int, so this branch
+            # does not read the raw position (see `PagedSpan`).
+            if read_len == 0:
                 idxs = torch.empty(
                     bsz, seqlen, 0, dtype=torch.int32, device=x.device
                 )
@@ -1694,7 +1911,10 @@ class Attention(nn.Module):
         # and are never named by `idxs`, because `Indexer.forward` maps any pick
         # at or beyond `compress_len` to `EMPTY_SLOT`.
         group_pos = (
-            torch.arange(read_len, device=x.device).clamp_max(max(compress_len - 1, 0))
+            torch.minimum(
+                torch.arange(read_len, device=x.device),
+                (compress_len - 1).clamp_min(0),
+            )
             * ratio
         )
         compress_kv = paged.gather(shared.compress_kv, group_pos).reshape(
@@ -1705,12 +1925,17 @@ class Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        start_pos: int,
+        start_pos: torch.Tensor,
         shared: SharedAttentionState,
         paged: PagedSpan,
         tp_group=None,
     ) -> torch.Tensor:
-        """`x` is the normalized sublayer input `[b, s, hidden]`."""
+        """`x` is the normalized sublayer input `[b, s, hidden]`.
+
+        `start_pos` is `paged.pos`, the `[1]` device tensor — not a Python int.
+        See `PagedSpan` for why that distinction decides whether a decode step
+        costs four NEFF compiles or none.
+        """
         bsz, seqlen, _ = x.shape
         freqs_cis = span_freqs(self.freqs_cis, start_pos, seqlen, x.device)
         rd = self.rope_head_dim
@@ -1750,8 +1975,7 @@ class Attention(nn.Module):
         if self.world_size > 1 and tp_group is not None:
             # `wo_b` is row-parallel, so each rank holds a partial sum. The
             # reference reduces in fp32.
-            out = out.float()
-            tp_group.all_reduce(out)
+            out = tp_all_reduce(out.float(), tp_group)
             out = out.to(x.dtype)
         return out
 
@@ -2229,7 +2453,7 @@ class MoE(nn.Module):
         if tp_group is not None and self.n_local_experts != self.n_routed_experts:
             # Each rank holds the partial sum over its own experts. The
             # reference reduces in fp32, before the shared expert joins.
-            tp_group.all_reduce(y)
+            y = tp_all_reduce(y, tp_group)
 
         shared = self.shared_experts
         y = _compiled(_shared_expert_step)(
@@ -2357,18 +2581,24 @@ class NgramHashState(nn.Module):
         numpy's PCG64 seeded `10007 * layer_id` and are forced odd.
 
     `cache` carries the compressed ids across the prefill/decode split, which is
-    what lets a decode step hash an n-gram reaching back into the prompt.
+    what lets a decode step hash an n-gram reaching back into the prompt. It is
+    **slot-addressed**, through `PagedSpan`, exactly like the window KV and the
+    compressed latents: one flat `[num_slots]` row per KV slot rather than a
+    `[batch, position]` rectangle.
+
+    That is not a detail. A `[batch, position]` cache has to be indexed by a
+    request's position *in the running batch*, and this port only ever sees
+    `batch == 1` here because `_engram_hashes` hashes one span at a time — so
+    with more than one sequence scheduled (the verifier's default is
+    `max_num_seqs=4`) every sequence wrote its ids over row 0 and the next one
+    hashed against them. Addressing by slot makes the history live in the
+    blocks the sequence owns, which also makes it correct under prefix caching:
+    a shared prefix is the same ids in the same blocks.
     """
 
     DEAD = -1
 
-    def __init__(
-        self,
-        config: DeepseekV41Config,
-        tokenizer,
-        max_batch_size: int,
-        max_seq_len: int,
-    ) -> None:
+    def __init__(self, config: DeepseekV41Config, tokenizer) -> None:
         super().__init__()
         import numpy as np
 
@@ -2417,36 +2647,60 @@ class NgramHashState(nn.Module):
         )
         self.register_buffer("multipliers", torch.stack(rows), persistent=False)
         self.register_buffer("token_map", torch.tensor(token_map), persistent=False)
-        self.register_buffer(
-            "cache",
-            torch.empty(max_batch_size, max_seq_len, dtype=torch.int64),
-            persistent=False,
+        # Allocated by `allocate_state` once the KV slot count is known.
+        self.register_buffer("cache", None, persistent=False)
+
+    def allocate_state(self, device, num_slots: int) -> None:
+        """The per-slot compressed-id history.
+
+        `DEAD` rather than zeros: an unwritten slot must read as "no token
+        here", which blocks the look-back and pads the n-gram, rather than as
+        compressed id 0 — which is a real token and would hash a bucket nothing
+        put anything in. `int64` because the ids feed the hash multipliers.
+        """
+        self.cache = torch.full(
+            (num_slots,), self.DEAD, dtype=torch.int64, device=device
         )
 
     @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
-        start_pos: int,
+        paged: PagedSpan,
         token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Returns `[B, L, n_engram_layers, n_hash_cols]` row indices.
 
         `token_mask` is `[B, L]`, False for tokens that take no part in an
         n-gram (image spans). Text-only serving passes None.
+
+        The position comes off `paged.pos` as a tensor. Both uses of it used to
+        be Python-int expressions — a `cache[:, start_pos : start_pos + seqlen]`
+        slice assignment and an `arange(start_pos, start_pos + seqlen)` — and
+        each baked the decode position into this graph as a constant, so the
+        hash state recompiled once per token. See `PagedSpan`.
         """
+        if self.cache is None:
+            raise RuntimeError(
+                "the n-gram hash state has no slot cache; "
+                "allocate_state() must run before forward()"
+            )
         batch, seqlen = input_ids.shape
         compressed = self.token_map[input_ids]
         if token_mask is not None:
             compressed = torch.where(token_mask, compressed, self.DEAD)
-        self.cache[:batch, start_pos : start_pos + seqlen] = compressed
 
-        positions = torch.arange(
-            start_pos, start_pos + seqlen, device=input_ids.device
-        ).expand(batch, seqlen)
+        positions = paged.pos + torch.arange(seqlen, device=input_ids.device)
+        paged.write_flat(self.cache, compressed.reshape(seqlen))
+
+        positions = positions.unsqueeze(0).expand(batch, seqlen)
         tokens, blocked = [], torch.zeros_like(positions, dtype=torch.bool)
         for shift in range(self.max_ngram_size):
-            source = self.cache[:batch].gather(1, (positions - shift).clamp_min(0))
+            # Read back through the block table, so the look-back reaches this
+            # sequence's own history and no one else's.
+            source = self.cache.index_select(
+                0, paged.slots((positions - shift).clamp_min(0).reshape(-1))
+            ).reshape(batch, seqlen)
             blocked = blocked | (positions < shift) | (source == self.DEAD)
             tokens.append(torch.where(blocked, self.pad_id, source))
         stacked = torch.stack(tokens, dim=-1)
@@ -2474,13 +2728,18 @@ class Engram(nn.Module):
     rather than returning anything if a row is unreachable.
     """
 
+    #: The floor under `|dot|` before the gate's square root, so its derivative
+    #: at zero stays finite. `vendor/kernel.py`'s own constant, which
+    #: `kernels/engram_gate` bakes in and `_check_kernel_constants` compares
+    #: against this.
+    CLAMP_VALUE = 1e-6
+
     def __init__(self, config: DeepseekV41Config, layer_id: int) -> None:
         super().__init__()
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         self.hc_mult = config.hc_mult
         self.eps = config.rms_norm_eps
-        self.clamp_value = 1e-6
         self.head_dim = config.engram_head_dim
         self.n_hash_cols = (config.engram_max_ngram_size - 1) * config.engram_n_heads
 
@@ -2511,26 +2770,39 @@ class Engram(nn.Module):
         width = self.hc_mult * self.hidden_size
         key = kv[..., :width]
         value = kv[..., width : width + self.hidden_size]
-        key = key.float().unflatten(-1, (self.hc_mult, self.hidden_size))
         # q and k gains are only ever used as a product.
-        weight = self.q_weight.float() * self.k_weight.float()
-        h = x.float()
-        # Normalized per (token, hc copy) over `dim`, NOT jointly over copies.
-        rstd = torch.rsqrt(h.square().mean(-1) + self.eps) * torch.rsqrt(
-            key.square().mean(-1) + self.eps
-        )
-        dot = (h * weight * key).sum(-1) * rstd * self.hidden_size**-0.5
-        # `torch.where`, not `torch.copysign`: the latter has no lowering in
-        # this backend and the graph dies at execution time with
-        # "FATAL: Unknown custom-call API version enum value: 0
-        # (API_VERSION_UNSPECIFIED)", naming the node but not the reason.
-        # Identical for every `dot` except negative zero, where copysign would
-        # return `-magnitude` and this returns `+magnitude`.
-        magnitude = dot.abs().clamp_min(self.clamp_value).sqrt()
-        gate = torch.sigmoid(torch.where(dot < 0, -magnitude, magnitude))
+        weight = (self.q_weight.float() * self.k_weight.float()).reshape(1, width)
+        # The gate and the gated add: `kernels/engram_gate.gated_add`, which is
+        # `engram_short.py`'s arithmetic generalized to a ragged token count.
+        # It computes, per (token, hc copy) and over `dim`,
+        #
+        #     rstd = rsqrt(mean(h^2) + eps) * rsqrt(mean(key^2) + eps)
+        #     dot  = sum(h * weight * key) * rstd * dim**-0.5
+        #     out  = h + sigmoid(sign(dot) * sqrt(max(|dot|, clamp))) * value
+        #
+        # — normalized per copy, not jointly over the copies. The torch form
+        # this replaces is in the kernel's docstring; it agrees with it to fp32
+        # under `nki.simulate` (max relative error 0 at `rows <= 128`, 2e-5
+        # above it, which is the bf16 rounding of the result).
+        #
+        # `sign` is `2 * (dot >= 0) - 1`, which is `torch.where(dot < 0, ...)`
+        # and *not* `copysign`: the latter has no lowering in this backend and
+        # the graph dies at execution time with "FATAL: Unknown custom-call API
+        # version enum value: 0", naming the node but not the reason. The two
+        # differ only at negative zero.
+        out = _nki_entry("engram_gate", "gated_add")(
+            x.reshape(-1, width),
+            key.reshape(-1, width),
+            value.reshape(-1, self.hidden_size),
+            weight,
+        ).reshape(x.shape)
         if token_mask is not None:
-            gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
-        return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
+            # The mask shut the gate, and a shut gate leaves the stream
+            # untouched — so selecting `x` is the same value. Nothing on the
+            # live path passes a mask (`forward` passes None); it exists for
+            # the reference's image spans.
+            out = torch.where(token_mask.unsqueeze(-1).unsqueeze(-1), out, x)
+        return out
 
 
 # =============================================================================
@@ -2687,7 +2959,7 @@ class Block(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        start_pos: int,
+        start_pos: torch.Tensor,
         pre_mix: torch.Tensor,
         image_mask: torch.Tensor | None,
         shared: SharedAttentionState,
@@ -2705,11 +2977,18 @@ class Block(nn.Module):
 
         Returns `(stream, next_pre_mix)`.
         """
+        if int(start_pos) != paged.start_pos:
+            raise ValueError(
+                f"start_pos {int(start_pos)} disagrees with the PagedSpan's "
+                f"{paged.start_pos}; the span owns the position now (it carries "
+                "it as a tensor as well as the bucketed shape plan), so the two "
+                "have to be the same sequence"
+            )
         residual = x
         attn_pre, attn_post, attn_comb = self.hc_attn.mixes(x)
         y = HyperConnections.pre(x, pre_mix)
         y = self.attn_norm(y)
-        y = self.attn(y, start_pos, shared, paged, tp_group)
+        y = self.attn(y, paged.pos, shared, paged, tp_group)
         x = HyperConnections.post(y, residual, attn_post, attn_comb)
 
         residual = x
@@ -2728,12 +3007,33 @@ class Block(nn.Module):
     # each is compiled on its own (`_block_entry`). The arithmetic is the same
     # expression in the same order.
 
-    def attn_half(self, stream, pre_mix, spans, paged, shared, tp_group):
+    def attn_half(
+        self, stream, pre_mix, slices, paged, shared: list, tp_group
+    ):
         """Everything from the stream to the MoE's normalized input.
 
         Attention runs per sequence, because the window and the compressed
         history are per sequence; the hyper-connection coefficients and both
         norms are per token and run over the whole flat batch at once.
+
+        `slices` is `(begin, length)` per span and deliberately carries **no
+        start_pos**: this is a compiled entry point, and an int argument is a
+        value dynamo specializes on, so a span list with the position in it
+        would re-trace this graph at every decode step even though every shape
+        in it is unchanged. The position comes off `span.pos` as a tensor
+        instead — see `PagedSpan`.
+
+        `shared` is **one `SharedAttentionState` per span**, zipped with
+        `slices` and `paged`. It cannot be one instance for the batch: the
+        sequence loop is in here, so a single instance would have span N
+        overwriting what spans 0..N-1 published and every consumer layer would
+        read the last span's index list for all of them. That is not a quiet
+        accuracy bug — the published width depends on the span's own position
+        (`read_len`), so a 256-wide list read against a 128-row window is an
+        out-of-bounds device gather (`nrta status=1006`). See
+        `.autohelix/notes/iter-4.md` §2a. `compress_kv`/`index_k` are
+        layer-wide cache tensors and so are identical in every instance; only
+        the index lists were ever per sequence.
         """
         batched = stream.unsqueeze(0)
         residual = batched
@@ -2744,9 +3044,13 @@ class Block(nn.Module):
         # `live_rows`, so an uninitialized buffer carried allocator garbage into
         # the hyper-connection mix and from there into the router.
         attn_out = torch.zeros_like(normed)
-        for (begin, length, start_pos), span in zip(spans, paged):
+        for (begin, length), span, span_shared in zip(slices, paged, shared):
             attn_out[:, begin : begin + length] = self.attn(
-                normed[:, begin : begin + length], start_pos, shared, span, tp_group
+                normed[:, begin : begin + length],
+                span.pos,
+                span_shared,
+                span,
+                tp_group,
             )
         batched = HyperConnections.post(attn_out, residual, attn_post, attn_comb)
 
@@ -2786,7 +3090,7 @@ def _block_entry(block: nn.Module, name: str):
 
 
 def dspark_topk_idxs(
-    window_rows: int, base: int, bsz: int, block_size: int, device
+    window_rows: int, base: torch.Tensor, bsz: int, block_size: int, device
 ) -> torch.Tensor:
     """Which slots a draft query attends to. `vendor/model.py`'s
     `get_dspark_topk_idxs`, renumbered for the paged read.
@@ -2824,7 +3128,7 @@ class DSparkAttention(Attention):
     def forward(
         self,
         x: torch.Tensor,
-        start_pos: int,
+        start_pos: torch.Tensor,
         main_x: torch.Tensor,
         shared: SharedAttentionState | None = None,
         paged: PagedSpan | None = None,
@@ -2851,7 +3155,11 @@ class DSparkAttention(Attention):
                 f"DSpark stage {self.layer_id} needs the paged KV addressing; "
                 "forward_spec must pass the PagedSpan it was given"
             )
-        if start_pos == 0:
+        # `paged.at_zero`, not `start_pos == 0`: `start_pos` is a tensor now, and
+        # a `.item()` here would be a device sync inside the graph. The span
+        # carries the prefill/decode split as a bool, which dynamo guards on in
+        # two variants rather than one per position (see `PagedSpan`).
+        if paged.at_zero:
             # Prefill only seeds the window; the draft stream passes through.
             paged.write(self.window_kv_cache, main_kv.reshape(seqlen, self.head_dim))
             return x
@@ -2880,7 +3188,7 @@ class DSparkAttention(Attention):
         # a length that grows with `start_pos` is a tensor shape, and a shape
         # that changes every decode step recompiles the stage every step.
         window_rows = win + seqlen - 1
-        base = start_pos - win + 1
+        base = start_pos - (win - 1)
         positions = (base + torch.arange(window_rows, device=x.device)).clamp_min(0)
         window_kv = paged.gather(
             self.window_kv_cache.view(-1, self.head_dim), positions
@@ -2902,8 +3210,7 @@ class DSparkAttention(Attention):
         ).reshape(bsz, block_size, -1)
         out = self.wo_b(o)
         if self.world_size > 1 and tp_group is not None:
-            out = out.float()
-            tp_group.all_reduce(out)
+            out = tp_all_reduce(out.float(), tp_group)
             out = out.to(x.dtype)
         return out
 
@@ -2957,7 +3264,7 @@ class DSparkBlock(Block):
     def forward(
         self,
         x: torch.Tensor,
-        start_pos: int,
+        start_pos: torch.Tensor,
         pre_mix: torch.Tensor,
         main_x: torch.Tensor,
         shared: SharedAttentionState,
@@ -2966,7 +3273,7 @@ class DSparkBlock(Block):
         tp_group=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One draft stage. Prefill only seeds the ring and passes through."""
-        if start_pos == 0:
+        if paged.at_zero:
             self.attn(x, start_pos, main_x, shared, paged, tp_group)
             return x, pre_mix
 
@@ -3088,10 +3395,10 @@ class DSparkMarkovHead(nn.Module):
             ((token_ids < start) | (token_ids >= end)).unsqueeze(-1), 0
         )
         if self.world_size > 1 and self._tp_group is not None:
-            self._tp_group.all_reduce(embed)
+            embed = tp_all_reduce(embed, self._tp_group)
         logits = nki_linear(embed, self.head_weight, None, "bf16").float()
         if self.world_size > 1 and self._tp_group is not None:
-            logits = self._tp_group.all_gather(logits, dim=-1)
+            logits = tp_all_gather_last(logits, self._tp_group)
         return logits, embed
 
     #: Set by the model, which owns the process group.
@@ -3203,17 +3510,18 @@ class DeepseekV41ForCausalLM(nn.Module):
     # ── Construction ──────────────────────────────────────────────────────
 
     def _check_kernel_constants(self) -> None:
-        """Four constants the kernels bake in; make sure the config agrees.
+        """The constants the kernels bake in; make sure the config agrees.
 
         `hc_expand` emits the one-hot `pre_mix` and the broadcast width as part
-        of its instruction stream, and `hc_mixes` has the Sinkhorn iteration
-        count as a loop bound and the two epsilons as instruction immediates, so
-        none of the four can be a runtime argument. A disagreement would
-        silently produce the wrong number of residual streams or the wrong
-        number of normalization passes, which is exactly the class of thing
-        `config-matches-official` cannot see.
+        of its instruction stream, `hc_mixes` has the Sinkhorn iteration count
+        as a loop bound and the two epsilons as instruction immediates, and
+        `engram_gate` has the normalization epsilon and the gate's clamp floor
+        the same way, so none of them can be a runtime argument. A disagreement
+        would silently produce the wrong number of residual streams, the wrong
+        number of normalization passes or an unnormalized gate — exactly the
+        class of thing `config-matches-official` cannot see.
         """
-        from .kernels import hc_expand, hc_mixes
+        from .kernels import engram_gate, hc_expand, hc_mixes
 
         baked = {
             "hc_mult": (hc_expand.HC, self.config.hc_mult),
@@ -3223,6 +3531,11 @@ class DeepseekV41ForCausalLM(nn.Module):
             ),
             "hc_eps": (hc_mixes.HC_EPS, self.config.hc_eps),
             "rms_norm_eps": (hc_mixes.NORM_EPS, self.config.rms_norm_eps),
+            "rms_norm_eps (engram_gate)": (
+                engram_gate.EPS,
+                self.config.rms_norm_eps,
+            ),
+            "engram clamp": (engram_gate.CLAMP, Engram.CLAMP_VALUE),
         }
         for name, (in_kernel, in_config) in baked.items():
             if in_kernel != in_config:
@@ -3510,6 +3823,17 @@ class DeepseekV41ForCausalLM(nn.Module):
         # (see `PagedSpan`).
         window = self.layers[0].attn.window_kv_cache
         num_slots = window.shape[0] * window.shape[2]
+        # What this costs, logged rather than estimated. The runtime's memory
+        # table reports one `Tensors` figure per NeuronCore with no breakdown
+        # (`.autohelix/notes/iter-5.md` §6), and HBM is the binding constraint
+        # on this port, so the two allocations the model can actually account
+        # for should say how large they are.
+        kv_bytes = sum(
+            t.numel() * t.element_size()
+            for pair in kv_caches.values()
+            for t in pair
+        )
+        own_bytes = 0
         for name, attn in attentions:
             if attn.is_kv_source:
                 attn.compress_kv_cache = torch.zeros(
@@ -3526,14 +3850,29 @@ class DeepseekV41ForCausalLM(nn.Module):
                 )
                 if attn.compressor is not None:
                     attn.compressor.allocate_state(device, num_slots)
+                own_bytes += sum(
+                    t.numel() * t.element_size()
+                    for t in (attn.compress_kv_cache, attn.index_k_cache)
+                )
             # RoPE tables last, so an indexer picks up the index-key cache that
             # was just allocated above.
             attn.build_freqs_cis(max_len, device)
 
         if self.config.engram_layer_ids and self.ngram_hash is None:
-            self.ngram_hash = self._build_ngram_hash(
-                self._max_batch_size(), max_len, device
-            )
+            self.ngram_hash = self._build_ngram_hash(device)
+            self.ngram_hash.allocate_state(device, num_slots)
+
+        logger.info(
+            "deepseek_v41_timeshare: %d KV slots — vLLM's window caches are "
+            "%.2f GiB over %d layers, this model's own per-slot caches "
+            "(compressed KV, index keys) are %.2f GiB. Neither is in "
+            "`get_kv_spec`'s accounting for the second of those; see "
+            "model.get_kv_spec",
+            num_slots,
+            kv_bytes / 2**30,
+            len(kv_caches),
+            own_bytes / 2**30,
+        )
 
 
     def allocate_staging_buffers(self, device: torch.device) -> None:
@@ -3553,9 +3892,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         for block in list(self.layers) + list(self.mtp):
             block.ffn.expert_slot.allocate(device)
 
-    def _build_ngram_hash(
-        self, max_batch_size: int, max_seq_len: int, device
-    ) -> NgramHashState:
+    def _build_ngram_hash(self, device) -> NgramHashState:
         """Build the n-gram hash state, which needs the *tokenizer*.
 
         The compressed token map is a function of the tokenizer's vocabulary —
@@ -3571,7 +3908,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         tokenizer = AutoTokenizer.from_pretrained(
             model_config.tokenizer or model_config.model
         )
-        state = NgramHashState(self.config, tokenizer, max_batch_size, max_seq_len)
+        state = NgramHashState(self.config, tokenizer)
         return state.to(device)
 
     def _max_sequence_length(self) -> int:
@@ -3628,7 +3965,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         out = F.embedding(local, self.embed_weight)
         out = out.masked_fill(off_rank.unsqueeze(-1), 0)
         if self.world_size > 1:
-            self.tp_group.all_reduce(out)
+            out = tp_all_reduce(out, self.tp_group)
         return out
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -3641,7 +3978,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         """
         logits = nki_linear(hidden_states, self.head_weight, None, "bf16").float()
         if self.world_size > 1:
-            logits = self.tp_group.all_gather(logits, dim=-1)
+            logits = tp_all_gather_last(logits, self.tp_group)
         return logits
 
     # ── Execution ─────────────────────────────────────────────────────────
@@ -3695,23 +4032,29 @@ class DeepseekV41ForCausalLM(nn.Module):
         are checked against the recorded traces that way (`iter-2.md` §5).
 
         **Test status, stated precisely, because "the code is here" is not "the
-        computation has run".** As of `.autohelix/notes/iter-3.md`: a prefill
-        runs end to end on the device — all 40 decoder layers, the engram
-        lookups off the 94.6 GiB table, the MoE with real streamed fp4 experts,
-        the DSpark stages, the head and the sampler — and the *decode* step does
-        not complete. It fails loading one more compiled graph:
+        computation has run".** As of `.autohelix/notes/iter-4.md`: prefill and
+        decode both run end to end on the device — all 40 decoder layers, the
+        engram lookups off the 94.6 GiB table, the MoE with real streamed fp4
+        experts, the DSpark stages, the head and the on-device sampler — and
+        decode steps now run back to back instead of recompiling. iter-3's wall
+        was that every position-derived Python int was folded into the graph as
+        a *constant*, so each decode step was a fresh set of graphs (measured:
+        4 compiles per minute indefinitely, 79 cache keys, none reused) and the
+        loaded NEFFs' DMA rings exhausted HBM. `PagedSpan` documents the fix.
 
-            RuntimeError: Could not load the model status=4 message=Allocation
-            Failure
+        **The `verifier` constraint still does not pass, and at its default
+        arguments it cannot** — for a reason upstream of this model. Its
+        `long-needle-8192-0` case records `target_tokens = 8192` but tokenizes
+        to **9328** tokens with this model's tokenizer, while the same verifier
+        passes `max_model_len = 8192 + 32`. vLLM rejects the prompt during
+        rendering, before the engine is asked for anything. The length filter
+        that exists to skip oversized cases compares the *recorded* 8192, so it
+        cannot fire. `.autohelix/notes/iter-4.md` §3 has the measurement and the
+        three ways to fix it; none of them is in this file, and none of them
+        should be faked here.
 
-        (and, with a little more headroom, `Failed to schedule neff execution`
-        at 121 loaded graphs) because this port loads ~120 NEFFs — one per block
-        per shape set — whose DMA rings are ~4.4 GiB of HBM, against a KV cache
-        that vLLM sized from the memory that was free before any of them
-        existed. `iter-3.md` §5b-ter has the memory table and the fix, which is
-        to make the per-layer compute one graph for all layers by passing the
-        weights as arguments. **The `verifier` constraint does not pass**, and no
-        completion has been produced.
+        What *is* measured here: a run at `--max-model-len 544` serves the
+        verifier's other three prompts through this path.
 
         Shape of the computation, from `vendor/model.py`'s `Transformer.forward`:
 
@@ -3745,6 +4088,11 @@ class DeepseekV41ForCausalLM(nn.Module):
         meta = self._attn_meta(attn_metadata)
         spans = self._sequence_spans(positions, meta["slot_mapping"])
         paged = self._paged_spans(spans, meta)
+        # `(begin, length)` only — the position is deliberately left out of what
+        # the compiled per-layer graph is handed, because dynamo specializes on
+        # int arguments and a position in here is a recompile per decode step.
+        # It travels as `span.pos`, a tensor. See `PagedSpan`.
+        slices = [(begin, length) for begin, length, _ in spans]
         # Where the real tokens stop. Everything after it is buffer padding the
         # runner did not clear; see `_sequence_spans`.
         live_rows = sum(length for _, length, _ in spans)
@@ -3760,10 +4108,14 @@ class DeepseekV41ForCausalLM(nn.Module):
         stream, pre_mix = stream.squeeze(0), pre_mix.squeeze(0)
 
         # ── engram hash ids, once for the whole batch ─────────────────────
-        hashes = self._engram_hashes(input_ids, spans)
+        hashes = self._engram_hashes(input_ids, paged)
 
         # ── the 40 decoder layers ─────────────────────────────────────────
-        shared = SharedAttentionState()
+        # One per span, not one per batch: `attn_half` runs the sequence loop
+        # inside the compiled graph, so a single instance lets the last span
+        # overwrite what the earlier ones published. §2a of
+        # `.autohelix/notes/iter-4.md` has the out-of-bounds this caused.
+        shared = [SharedAttentionState() for _ in paged]
         main_hiddens: list[torch.Tensor] = []
         target_layers = set(self.config.dspark_target_layer_ids)
 
@@ -3794,7 +4146,7 @@ class DeepseekV41ForCausalLM(nn.Module):
                 # layers, not their output, and averaged over the hc copies.
                 main_hiddens.append(_compiled(_dspark_tap)(stream))
             stream, pre_mix = self._run_block(
-                block, stream, pre_mix, spans, paged, shared, live_rows
+                block, stream, pre_mix, slices, paged, shared, live_rows
             )
 
         # ── collapse -> norm -> head ──────────────────────────────────────
@@ -3824,8 +4176,10 @@ class DeepseekV41ForCausalLM(nn.Module):
             _compiled(_concat_last)(main_hiddens) if main_hiddens else None
         )
         drafts = [
-            self.forward_spec(input_ids, main_hidden, [meta], [span], shared)
-            for meta, span in zip(spans, paged)
+            self.forward_spec(
+                input_ids, main_hidden, [meta], [span], span_shared
+            )
+            for meta, span, span_shared in zip(spans, paged, shared)
         ]
         self.last_draft = drafts
         if spec_decode_metadata is not None:
@@ -3910,6 +4264,7 @@ class DeepseekV41ForCausalLM(nn.Module):
             ) from exc
         return meta
 
+    @torch._dynamo.disable
     def _paged_spans(
         self, spans: list[tuple[int, int, int]], meta: dict
     ) -> list[PagedSpan]:
@@ -3917,10 +4272,19 @@ class DeepseekV41ForCausalLM(nn.Module):
 
         Row `k` of the block table is the `k`-th scheduled sequence, which is
         the `k`-th span: the runner builds both from the same request order.
+
+        Dynamo-disabled, like the other host boundaries, because each span's
+        `pos` is a host-built `[1]` tensor moved to the device: inside a graph
+        that transfer would be a constant again, which is the whole thing
+        `PagedSpan.pos` exists to avoid. One `[1]` int64 per sequence per step.
         """
         block_size = int(meta["block_size"])
         block_table = meta["block_table_tensor"]
         slot_mapping = meta["slot_mapping"]
+        device = slot_mapping.device
+        starts = torch.tensor(
+            [start_pos for _, _, start_pos in spans], dtype=torch.int64
+        ).to(device)
         return [
             PagedSpan(
                 block_table=block_table[row],
@@ -3928,6 +4292,8 @@ class DeepseekV41ForCausalLM(nn.Module):
                 slot_mapping=slot_mapping[begin : begin + length],
                 start_pos=start_pos,
                 length=length,
+                pos=starts[row : row + 1],
+                begin=begin,
             )
             for row, (begin, length, start_pos) in enumerate(spans)
         ]
@@ -3991,7 +4357,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         return spans
 
     def _engram_hashes(
-        self, input_ids: torch.Tensor, spans: list[tuple[int, int, int]]
+        self, input_ids: torch.Tensor, paged: list[PagedSpan]
     ) -> torch.Tensor:
         """n-gram row indices for every token, `[1, T, n_engram_layers, 24]`.
 
@@ -3999,6 +4365,11 @@ class DeepseekV41ForCausalLM(nn.Module):
         a sequence boundary — and `NgramHashState` keeps the compressed ids of
         earlier chunks in its own cache, which is what lets a decode step hash
         an n-gram reaching back into its prompt.
+
+        Driven off the `PagedSpan`s rather than the raw span tuples, so the
+        position reaches `NgramHashState.forward` as its `pos` tensor: this
+        compiles as its own graph, and a Python int here recompiled it once per
+        decode step (see `PagedSpan`).
         """
         if self.ngram_hash is None:
             raise RuntimeError(
@@ -4007,9 +4378,10 @@ class DeepseekV41ForCausalLM(nn.Module):
                 "state; bind_kv_cache builds it from the tokenizer."
             )
         per_span = []
-        for begin, length, start_pos in spans:
+        for span in paged:
+            length, begin = span.length, span.begin
             ids = input_ids[begin : begin + length].reshape(1, length)
-            per_span.append(self.ngram_hash(ids, start_pos))
+            per_span.append(self.ngram_hash(ids, span))
         return torch.cat(per_span, dim=1)
 
     def _run_block(
@@ -4017,9 +4389,9 @@ class DeepseekV41ForCausalLM(nn.Module):
         block: Block,
         stream: torch.Tensor,
         pre_mix: torch.Tensor,
-        spans: list[tuple[int, int, int]],
+        slices: list[tuple[int, int]],
         paged: list[PagedSpan],
-        shared: SharedAttentionState,
+        shared: list[SharedAttentionState],
         live_rows: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One layer over a flat `[T, hc, dim]` stream covering several
@@ -4039,7 +4411,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         tp_group = self.tp_group if self.world_size > 1 else None
         normed, residual, ffn_pre, ffn_post, ffn_comb = _block_entry(
             block, "attn_half"
-        )(stream, pre_mix, spans, paged, shared, tp_group)
+        )(stream, pre_mix, slices, paged, shared, tp_group)
         ffn_out = block.ffn(normed, None, self.weight_store, tp_group, live_rows)
         # `HyperConnections.post` directly, not `_block_entry(block,
         # "ffn_half")`. They compute the same thing — `ffn_half`'s whole body is
@@ -4094,7 +4466,7 @@ class DeepseekV41ForCausalLM(nn.Module):
                 "per-sequence slotting problem as the backbone's, see "
                 ".autohelix/notes/iter-1.md section 5a."
             )
-        (begin, length, start_pos), = spans
+        (begin, length, _), = spans
         (span,) = paged
 
         # The accepted token this draft continues from: the last real token.
@@ -4107,7 +4479,9 @@ class DeepseekV41ForCausalLM(nn.Module):
         pre_mix = _compiled(_one_hot_pre_mix)(stream, self.hc_mult)
 
         tp_group = self.tp_group if self.world_size > 1 else None
-        draft_pos = start_pos + length - 1
+        # A tensor, like every other position on the compiled path: the draft
+        # block starts at the accepted token's own position. See `PagedSpan`.
+        draft_pos = span.pos + (length - 1)
         for stage in self.mtp:
             stream, pre_mix = stage(
                 stream, draft_pos, pre_mix, main_x, shared, span,
@@ -4158,12 +4532,24 @@ class DeepseekV41ForCausalLM(nn.Module):
             RuntimeError: Failed to schedule neff execution. status=4
             message=Allocation Failure
 
-        So the cap is `max_model_len / block_size` blocks per sequence, doubled
-        for prefix-cache headroom. **It is a ceiling, not a reduction below what
+        So the cap is `max_model_len / block_size + 1` blocks per sequence,
+        times the running batch. **It is a ceiling, not a reduction below what
         correctness needs**: one sequence cannot reference more slots than its
         own context, and the compressed caches and index keys are addressed by
         absolute position within that context. What it gives up is cross-request
-        prefix reuse capacity beyond 2x the running batch.
+        prefix *retention* beyond the running batch's own contexts.
+
+        **`cache.block_size` is 16 here and 32 by the time the cache is laid
+        out.** The runner logs the resolution — `KV cache block_size resolved:
+        cache_config=32, per_group=[32]` — and it happens after this, so
+        dividing by what `cache_config` currently says produced about twice the
+        slot count the arithmetic named, and the cap barely bit: at the
+        verifier's own defaults it took vLLM's 2523 blocks down to 2360, 9
+        sequences' worth for a scheduler that runs 4. The block size is now
+        taken from `NeuronPlatform.update_block_size_for_backend`'s rule
+        instead, which is the one that will be applied, so the cap realizes
+        what it says: one full `max_model_len` per sequence, which is the part
+        correctness needs.
 
         `num_gpu_blocks_override` is honoured at
         `vllm/v1/core/kv_cache_utils.py:945`, which runs after
@@ -4190,9 +4576,30 @@ class DeepseekV41ForCausalLM(nn.Module):
         if cache.num_gpu_blocks_override is not None:
             return
 
-        block = int(cache.block_size or 32)
+        # The block size to divide by is the one the cache is **laid out** with,
+        # which is not the one `cache_config` carries at this point. The rule
+        # is `NeuronPlatform.update_block_size_for_backend`'s, applied here
+        # rather than guessed: 32 unless the operator named a block size, and
+        # that method runs after this one.
+        #
+        # Dividing by the 16 that is still in `cache_config` made the realized
+        # cache twice the size this formula intends. Measured at the verifier's
+        # own `max_model_len = 9424, max_num_seqs = 4`:
+        #
+        #     capping the KV cache at 2360 blocks of 16 (37760 nominal slots)
+        #     Overriding num_gpu_blocks=2523 with num_gpu_blocks_override=2360
+        #     GPU KV cache size: 85,213 tokens
+        #     Maximum concurrency for 9,424 tokens per request: 9.04x
+        #
+        # — a 6% reduction where the intent was 50%, and 9 sequences' worth of
+        # cache for a scheduler that runs 4. That overage is ~2 GB of window KV
+        # and per-slot buffers, and it is what the `nrt_tensor_allocate
+        # status=4` at an 8192-token prefill segment was spending.
+        block = int(getattr(cache, "block_size", None) or 32)
+        if not getattr(cache, "user_specified_block_size", False):
+            block = 32
         per_sequence = -(-int(model.max_model_len) // block) + 1
-        blocks = per_sequence * int(sched.max_num_seqs) * 2
+        blocks = per_sequence * int(sched.max_num_seqs)
         # Only ever *reduce*. `num_gpu_blocks_override` is applied blindly — it
         # replaces the number vLLM computed from available memory, in either
         # direction — so a configuration whose working set is genuinely large
@@ -4211,8 +4618,9 @@ class DeepseekV41ForCausalLM(nn.Module):
         cache.num_gpu_blocks_override = blocks
         logger.info(
             "deepseek_v41_timeshare: capping the KV cache at %d blocks of %d "
-            "(%d slots) — %d per sequence x %d sequences x 2. The rest of HBM "
-            "is needed for this port's ~120 compiled graphs; see "
+            "(%d slots) — %d per sequence x %d sequences, one full context "
+            "each. The rest of HBM is needed for this port's compiled graphs "
+            "and its per-slot buffers, which vLLM's own sizing cannot see; see "
             "model._cap_kv_cache_blocks",
             blocks, block, blocks * block, per_sequence, sched.max_num_seqs,
         )
