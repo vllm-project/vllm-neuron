@@ -31,17 +31,6 @@ goal: |
   - ~/workspace/vllm-neuron/.venv is the vLLM neuron environment to integrate vLLM with Neuron SDK. This will be the environment used to on-board the model.
 
   Important information:
-  - THE DEVICE HAS 96 GB OF HBM, NOT 24. One Trainium2 device carries 4 HBM stacks of 24 GB,
-  one per logical NeuronCore (8 physical cores at LNC=2 -> 4 logical), and all 4 are yours to
-  use on this single device. A rank addresses only its own stack, so `TENSOR_PARALLEL_SIZE = 1`
-  caps you at 24 GB and leaves ~72 GB idle — which is why the runtime's memory table reports a
-  single `ND 0 HBM 2` row filling at ~23.9 GB. If HBM is the binding constraint, raising the
-  tensor-parallel degree is the first thing to consider: at 4 ranks the resident weights and the
-  per-NEFF DMA rings are each divided as well as the total being quadrupled, and
-  `verify_shard_plan` already reports 0 problems at both TP=1 and TP=4. It is not free — sharded
-  weights need the reductions a single rank does not, and `vllm_neuron/functional/collectives/`
-  plus `nki.collectives` are how this repo does them — but treat 24 GB as a choice you made
-  rather than as the hardware.
   - `chat_template.jinja` is the chat template of DeepSeek V4.1 Flash
   - You can refer to floorplan/ about how to separate the layers. This is originally used for 16 device Trainium 2 instance, but you can use as a reference
   about how to chunk the model into pieces for timesharing.
