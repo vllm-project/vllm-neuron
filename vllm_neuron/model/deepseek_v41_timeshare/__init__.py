@@ -62,6 +62,39 @@ from .factory import DeepseekV41ForCausalLM
 # spawned.
 os.environ.setdefault("NEURON_SKIP_EFA_AFFINITY", "1")
 
+# A timeshared model's `forward` streams weights off disk between compute
+# steps, so it is `@torch._dynamo.disable`d and the per-step compute is
+# compiled underneath it (see `model.DeepseekV41ForCausalLM.forward`). Dynamo
+# refuses to inline a disabled function under `fullgraph=True` —
+#
+#     Unsupported: Skip inlining torch.compiler.disable()d function
+#
+# and `NeuronModelRunner.load_model` sets `fullgraph = not
+# VLLM_NEURON_DEBUG_MODE`, so this variable is how a model asks for the
+# `fullgraph=False` outer compile it needs.
+#
+# **The name is misleading and worth stating plainly: it does not move anything
+# to the host and it relaxes no numerics.** Its only two effects in this repo
+# are `fullgraph` here and whether the graph-capture backend is constructed
+# (`envs.py`, `neuron_model_runner.py:1431-1442`, `spec_decode/eagle.py:376`).
+# Every compute step still compiles to a NEFF and runs on the device; what
+# changes is that dynamo is allowed to end a graph at the host boundaries
+# instead of raising.
+os.environ.setdefault("VLLM_NEURON_DEBUG_MODE", "1")
+
+# Warmup is a cheap pre-compile for an ordinary model and a 251 GiB disk read
+# for this one. `NeuronModelRunner` warms up by running a prefill at the
+# batched-token bucket; at 512 tokens that routes to most of the 384 experts in
+# all 37 MoE layers, so it would stream the whole expert population off disk
+# *before serving anything* — ~230 s at the measured 1.1 GB/s — and then throw
+# the activations away.
+#
+# Skipping it loses nothing but the pre-compile: the graphs warmup would have
+# built are built by the first real request instead, out of the same
+# `~/.cache/neuron_libtorch` compilation cache, and the first request's own
+# weight streaming is work it had to do anyway.
+os.environ.setdefault("VLLM_NEURON_SKIP_PREFILL_DECODE_WARMUP", "1")
+
 __all__ = [
     "DeepseekV41ForCausalLM",
     "DeepseekV41HFConfig",

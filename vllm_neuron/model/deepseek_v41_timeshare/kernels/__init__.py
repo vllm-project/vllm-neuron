@@ -3,11 +3,14 @@
 
 Two populations live here and they are used differently:
 
-* `blockquant.py` — shape-general kernels for the arithmetic that dominates
-  this model: the block-quantized fp8 and fp4 GEMMs and the plain bf16 one.
+* `blockquant.py`, `sparse_attn.py`, `hc_mixes.py` and the three generalized
+  `hc_*` ones — shape-general kernels for all of this model's arithmetic.
+  `blockquant` is the block-quantized fp8/fp4 GEMMs and the plain bf16 one, and
   `model.py` routes every projection, every routed and shared expert, the
-  router, the engram read-out and the unembedding through these, so they run on
-  whatever shape the scheduler produces.
+  router, the engram read-out and the unembedding through them; `sparse_attn` is
+  the attention score/softmax/weighted-sum; `hc_mixes` is the hyper-connection
+  coefficients including the Sinkhorn. All of them take their shapes from their
+  arguments, so they run on whatever the scheduler produces.
 
 * `l2_attn.py`, `moe_short.py`, `engram_long.py`, … — 16 kernels generated
   against single partition traces during the device-optimization project that
