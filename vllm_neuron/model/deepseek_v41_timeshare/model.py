@@ -2321,6 +2321,91 @@ def _one_hot_pre_mix(stream, hc):
     return pre_mix
 
 
+class _RejectionView:
+    """The three fields `vllm_neuron.nn.rejection_sampler` reads off a
+    `SpecDecodeMetadata`, carried without the dataclass.
+
+    At module level rather than inside `_rejection_sample`, because a `class`
+    statement in a traced frame is a graph break dynamo cannot take:
+
+        torch._dynamo.exc.Unsupported: Attempted to call function marked as
+        skipped ... qualname: __build_class__
+    """
+
+    __slots__ = ("draft_token_ids", "cu_num_draft_tokens", "max_spec_len")
+
+
+def _rejection_sample(sampled, draft_token_ids, cu_num_draft_tokens, num_draft_tokens):
+    """Verify this step's drafts against the target's own tokens, on the device.
+
+    `vllm_neuron.nn.rejection_sampler`, which is what the Neuron runner expects
+    an on-device-sampling model to have already applied when a
+    `spec_decode_metadata` is present: it hands back
+    `[batch, 1 + max_spec_len]` with `-1` where a draft was rejected, and
+    `NeuronModelRunner._parse_rejection_sampling_output` trims on that.
+
+    Greedy acceptance, so **the output is exactly what the target would have
+    produced on its own**: draft position `i` is kept only if it equals the
+    token the target sampled at position `i - 1`, and the first mismatch takes
+    the target's token and stops. That is the whole reason speculation here is
+    an optimisation rather than an approximation.
+
+    The sampler reads three fields off `SpecDecodeMetadata`, and they are passed
+    as plain tensors and a tuple of ints rather than as the dataclass because
+    this is a `_compiled` entry point: dynamo guards an opaque object's
+    attributes one by one, where a locally built view traces cleanly.
+    `num_draft_tokens` arrives as a tuple so dynamo treats it as a constant —
+    it is `(k,) * batch` on every verify step.
+    """
+    from vllm_neuron.nn.rejection_sampler import rejection_sampler
+
+    view = _RejectionView()
+    view.draft_token_ids = draft_token_ids
+    view.cu_num_draft_tokens = cu_num_draft_tokens
+    view.max_spec_len = max(num_draft_tokens)
+    return rejection_sampler(view, sampled.reshape(-1))
+
+
+def _accepted_tail(accepted):
+    """`(last accepted token, how many were accepted)` per sequence.
+
+    `accepted` is the rejection sampler's `[batch, 1 + max_spec_len]`, padded
+    with `-1`. The DSpark draft for the next step hangs off the last token this
+    step actually committed, so both the seed token and the row of the step the
+    draft is anchored at come from this count. Tensors throughout: the count is
+    data, and a `.item()` here would be a device sync in the middle of a step.
+    """
+    valid = (accepted >= 0).sum(dim=-1)
+    seeds = accepted.gather(1, (valid - 1).clamp_min(0).unsqueeze(1)).reshape(-1)
+    return seeds, valid.to(torch.int64)
+
+
+def _greedy_rows(logits):
+    """`argmax` over the vocabulary, as a compiled step."""
+    return logits.argmax(dim=-1)
+
+
+def _tap_rows(valid, lengths, rows_per_seq: int):
+    """Which row of this step each sequence's draft block hangs off.
+
+    `rows_per_seq` is how many of the span's rows the sampler scored: 1 without
+    speculation (one logits row per sequence, at its last token) and `1 + k` on
+    a verify step, where it equals the span's whole length. `valid` is how many
+    tokens the step committed for that sequence — 1, or the rejection sampler's
+    accepted count. So the anchor is the last *committed* row:
+
+        no speculation   lengths - 1 + (1 - 1)     = the span's last row
+        verify step      lengths - lengths + v - 1 = v - 1, inside the block
+
+    The `minimum` is a guard for a batch where a request carried fewer drafts
+    than the padded width, which would otherwise anchor a draft past the
+    sequence's own rows. A compiled step rather than inline arithmetic: `_draft`
+    is an uncompiled frame, and `sub`/`minimum` there would go to the backend's
+    eager fallback.
+    """
+    return torch.minimum(lengths - rows_per_seq + valid - 1, lengths - 1)
+
+
 def _moe_narrow(y, dtype):
     """The accumulator back down to the stream's dtype. Also its own step: a
     dtype cast is the one thing the backend's eager fallback does not implement
@@ -3365,16 +3450,28 @@ class DSparkAttention(Attention):
     KV appended, and no compressed KV at all (`compress_ratio == 0` for every
     `mtp` stage, since `compress_ratios` ends `[..., 0, 0, 0]`).
 
-    The asymmetry worth noticing: `main_x` is one *real* token, and `x` is the
-    `dspark_block_size = 5` draft positions. The real token's KV goes into the
-    ring (so the next step sees it); the draft positions' KV is used for this
-    step only and never cached.
+    The asymmetry worth noticing: `main_x` is the step's *real* tokens, and `x`
+    is the `dspark_block_size = 5` draft positions. The real tokens' KV goes
+    into the window (so the next step sees it); the draft positions' KV is used
+    for this step only and never cached.
+
+    **`start_pos` and `draft_pos` are two different positions, and conflating
+    them is wrong as soon as speculation is on.** `start_pos` is where this
+    step's real tokens begin — `main_x` has one row per scheduled token, which
+    is 1 on a plain decode step, `1 + num_speculative_tokens` on a verify step
+    and the whole prompt at prefill — and `draft_pos` is the position of the
+    last *accepted* token, which is where the draft block hangs off. In
+    `vendor/model.py` the main stream is always one row during decode, so the
+    reference has only `start_pos` and derives the draft block's positions as
+    `start_pos + seqlen`; that identity breaks under rejection sampling, where
+    the step carries `1 + k` rows of which only a prefix was accepted.
     """
 
     def forward(
         self,
         x: torch.Tensor,
         start_pos: torch.Tensor,
+        draft_pos: torch.Tensor,
         main_x: torch.Tensor,
         shared: SharedAttentionState | None = None,
         paged: PagedSpan | None = None,
@@ -3411,9 +3508,12 @@ class DSparkAttention(Attention):
             return x
 
         bsz, block_size, _ = x.shape
-        freqs = span_freqs(
-            self.freqs_cis, start_pos + seqlen, block_size, x.device
-        )
+        # The draft block starts one past the last accepted token, not one past
+        # this step's last row: under speculation the rows after the accepted
+        # prefix hold rejected drafts, and drafting from them would place the
+        # block at a position the sequence never reached. See the class
+        # docstring.
+        freqs = span_freqs(self.freqs_cis, draft_pos + 1, block_size, x.device)
 
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
@@ -3426,15 +3526,22 @@ class DSparkAttention(Attention):
         )
         kv = act_quant_dequant(kv, 32)
 
-        # The accepted token's KV joins the window at its own slot, then the
-        # window is gathered back out of the paged allocation and the draft
+        # This step's real tokens' KV joins the window at their own slots, then
+        # the window is gathered back out of the paged allocation and the draft
         # block's own KV is concatenated after it.
+        #
+        # Every row is written, including the ones after the accepted prefix on
+        # a verify step: their slots are rewritten by the next step, which
+        # starts at the accepted position and is `1 + k` rows long, so it covers
+        # every slot this one may have written speculatively. That is the same
+        # argument vLLM's own paged KV relies on, and the window *read* below
+        # never looks past `draft_pos`, so nothing reads a speculative slot.
         paged.write(self.window_kv_cache, main_kv.reshape(seqlen, self.head_dim))
         # Fixed-size window read, for the same reason as `Attention._window_kv`:
         # a length that grows with `start_pos` is a tensor shape, and a shape
         # that changes every decode step recompiles the stage every step.
-        window_rows = win + seqlen - 1
-        base = start_pos - (win - 1)
+        window_rows = win
+        base = draft_pos - (win - 1)
         positions = (base + torch.arange(window_rows, device=x.device)).clamp_min(0)
         window_kv = paged.gather(
             self.window_kv_cache.view(-1, self.head_dim), positions
@@ -3511,6 +3618,7 @@ class DSparkBlock(Block):
         self,
         x: torch.Tensor,
         start_pos: torch.Tensor,
+        draft_pos: torch.Tensor,
         pre_mix: torch.Tensor,
         main_x: torch.Tensor,
         shared: SharedAttentionState,
@@ -3518,16 +3626,16 @@ class DSparkBlock(Block):
         weight_store,
         tp_group=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One draft stage. Prefill only seeds the ring and passes through."""
+        """One draft stage. Prefill only seeds the window and passes through."""
         if paged.at_zero:
-            self.attn(x, start_pos, main_x, shared, paged, tp_group)
+            self.attn(x, start_pos, draft_pos, main_x, shared, paged, tp_group)
             return x, pre_mix
 
         residual = x
         attn_pre, attn_post, attn_comb = self.hc_attn.mixes(x)
         y = HyperConnections.pre(x, pre_mix)
         y = self.attn_norm(y)
-        y = self.attn(y, start_pos, main_x, shared, paged, tp_group)
+        y = self.attn(y, start_pos, draft_pos, main_x, shared, paged, tp_group)
         x = HyperConnections.post(y, residual, attn_post, attn_comb)
 
         residual = x
@@ -4320,29 +4428,23 @@ class DeepseekV41ForCausalLM(nn.Module):
         are checked against the recorded traces that way (`iter-2.md` §5).
 
         **Test status, stated precisely, because "the code is here" is not "the
-        computation has run".** As of `.autohelix/notes/iter-4.md`: prefill and
-        decode both run end to end on the device — all 40 decoder layers, the
-        engram lookups off the 94.6 GiB table, the MoE with real streamed fp4
-        experts, the DSpark stages, the head and the on-device sampler — and
-        decode steps now run back to back instead of recompiling. iter-3's wall
-        was that every position-derived Python int was folded into the graph as
-        a *constant*, so each decode step was a fresh set of graphs (measured:
-        4 compiles per minute indefinitely, 79 cache keys, none reused) and the
-        loaded NEFFs' DMA rings exhausted HBM. `PagedSpan` documents the fix.
+        computation has run".** As of `.autohelix/notes/iter-7.md`, the
+        verifier's own four prompts are served end to end on the device and
+        judged sound: all 40 decoder layers, the engram lookups off the 94.6 GiB
+        table, the MoE with real streamed fp4 experts, the three DSpark stages,
+        the head and the on-device sampler — and, since iteration 7, speculative
+        decoding through those stages, with 35-44% of the drafts accepted. The
+        2008-token needle's access code is retrieved at a distance of ~1,900
+        tokens, which is the long-context path (compressed latents, index keys,
+        top-512-of-2048 sparse attention) being right rather than merely
+        running.
 
-        **The `verifier` constraint still does not pass, and at its default
-        arguments it cannot** — for a reason upstream of this model. Its
-        `long-needle-8192-0` case records `target_tokens = 8192` but tokenizes
-        to **9328** tokens with this model's tokenizer, while the same verifier
-        passes `max_model_len = 8192 + 32`. vLLM rejects the prompt during
-        rendering, before the engine is asked for anything. The length filter
-        that exists to skip oversized cases compares the *recorded* 8192, so it
-        cannot fire. `.autohelix/notes/iter-4.md` §3 has the measurement and the
-        three ways to fix it; none of them is in this file, and none of them
-        should be faked here.
-
-        What *is* measured here: a run at `--max-model-len 544` serves the
-        verifier's other three prompts through this path.
+        Two things that cost whole iterations to find and are easy to undo:
+        every position-derived Python int folded into the graph as a *constant*,
+        so each decode step was a fresh set of graphs (`PagedSpan` documents the
+        fix), and the runner's decode block table is *trimmed* for a
+        sliding-window group while this port addresses every cache by absolute
+        position (`_paged_spans` documents that one).
 
         Shape of the computation, from `vendor/model.py`'s `Transformer.forward`:
 
@@ -4441,6 +4543,11 @@ class DeepseekV41ForCausalLM(nn.Module):
         collapsed = HyperConnections.pre(stream.unsqueeze(0), pre_mix.unsqueeze(0))
         collapsed = self.norm(collapsed).squeeze(0)
 
+        selected = collapsed
+        if sampling_positions is not None:
+            selected = _compiled(_select_rows)(collapsed, sampling_positions)
+        logits = self.compute_logits(selected)
+
         # ── the DSpark stack, on every forward ────────────────────────────
         # The three `mtp.*` stages are part of this model, not an optional
         # accelerator: checkpoint layers 40-42, each a hyper-connected block
@@ -4449,13 +4556,25 @@ class DeepseekV41ForCausalLM(nn.Module):
         # each scheduled sequence gets its own draft — the draft block is per
         # sequence, like the backbone's attention.
         #
-        # What vLLM does with the result is the part that depends on the
-        # configuration. Under a speculative config the proposal is the return
-        # value. Without one the scheduler has nowhere to put draft tokens, so
-        # they are recorded on the model (`last_draft`) and the step returns the
-        # backbone's logits. They cost three layers of a 43-layer model and
-        # ~161 MiB of expert traffic per step; the alternative is a forward that
-        # silently runs 40 of the checkpoint's 43 layers.
+        # **They run after the sampler, not before, and that ordering is the
+        # whole correctness of the draft.** The first MTP stage is conditioned
+        # on the token the step just *committed* — the sample at the sequence's
+        # last position, or under speculation the last token the rejection
+        # sampler accepted — and the draft block hangs off that token's
+        # position. Running the stages before the sampler, as this file did
+        # through iteration 6, could only seed them with `input_ids[-1]`: the
+        # token fed *in* at the last position rather than the one sampled from
+        # it, which puts the whole draft block one position early and makes
+        # every draft token a prediction of something already known. The
+        # reference (`vendor/model.py`'s `Transformer.forward_spec`) is called
+        # from the generation loop with the sampled token, for the same reason.
+        #
+        # `DSparkProposer` (`drafter.py`) reads `last_draft` and hands it to the
+        # scheduler, so these drafts are proposed and verified rather than
+        # computed and dropped. Without a speculative config there is nowhere
+        # to put them and the step returns the backbone's own tokens — the
+        # stages still run, because the alternative is a forward that silently
+        # executes 40 of the checkpoint's 43 layers.
         #
         # Each stage writes into *its own* paged allocation — `get_kv_spec`
         # declares `mtp.{stage}.attn` beside the 40 backbone layers — so a draft
@@ -4463,22 +4582,22 @@ class DeepseekV41ForCausalLM(nn.Module):
         main_hidden = (
             _compiled(_concat_last)(main_hiddens) if main_hiddens else None
         )
-        drafts = [
-            self.forward_spec(
-                input_ids, main_hidden, [meta], [span], span_shared
-            )
-            for meta, span, span_shared in zip(spans, paged, shared)
-        ]
-        self.last_draft = drafts
-        if spec_decode_metadata is not None:
-            return drafts[0]
 
-        selected = collapsed
-        if sampling_positions is not None:
-            selected = _compiled(_select_rows)(collapsed, sampling_positions)
-        logits = self.compute_logits(selected)
         if self.sampler is None:
+            # No on-device sampling: the runner samples on the host, and under a
+            # speculative config does the rejection sampling there too
+            # (`NeuronModelRunner.sample_tokens`'s CPU branch), which needs the
+            # logits of every verify position — so the step returns them. The
+            # stages still run, seeded from the greedy token: that is the
+            # sampler's own choice at the verifier's `temperature = 0`, and
+            # where it is not, a mis-seeded draft costs acceptance rate and
+            # never output, because every draft is verified against the target.
+            self.last_draft = self._draft(
+                _compiled(_greedy_rows)(logits), None, spans, paged, shared,
+                main_hidden, sampling_positions is not None,
+            )
             return logits
+
         # The sampler is the repo's own on-device one; `logit_mask` and the
         # per-request `sampling_params` come from the runner. The second
         # element is the logits the runner keeps for its debug/spec paths —
@@ -4491,6 +4610,30 @@ class DeepseekV41ForCausalLM(nn.Module):
         sampled = _block_entry(self.sampler, "forward")(
             logits, sampling_params, logit_mask, rank
         )
+
+        # Under a speculative config this step is a *verify* step: it was handed
+        # `1 + k` tokens per sequence, of which `k` are the previous step's
+        # drafts, and the Neuron runner expects an on-device-sampling model to
+        # return the rejection sampler's verdict rather than raw samples
+        # (`neuron_model_runner.py:8131`, "Model already performed rejection
+        # sampling on-device"). Greedy acceptance keeps exactly the prefix the
+        # target would have emitted unaided, so the tokens are identical to a
+        # run with speculation off.
+        accepted = None
+        if spec_decode_metadata is not None:
+            accepted = _compiled(_rejection_sample)(
+                sampled,
+                spec_decode_metadata.draft_token_ids,
+                spec_decode_metadata.cu_num_draft_tokens,
+                tuple(spec_decode_metadata.num_draft_tokens),
+            )
+
+        self.last_draft = self._draft(
+            sampled, accepted, spans, paged, shared, main_hidden,
+            sampling_positions is not None,
+        )
+        if accepted is not None:
+            return accepted
         return sampled, logits
 
     # ── Forward helpers ───────────────────────────────────────────────────
@@ -4814,28 +4957,114 @@ class DeepseekV41ForCausalLM(nn.Module):
         ), ffn_pre.squeeze(0)
 
     @torch.no_grad()
-    def forward_spec(
+    def _draft(
         self,
-        input_ids: torch.Tensor,
-        main_hidden: torch.Tensor | None,
+        sampled: torch.Tensor,
+        accepted: torch.Tensor | None,
         spans: list[tuple[int, int, int]],
         paged: list[PagedSpan],
+        shared: list[SharedAttentionState],
+        main_hidden: torch.Tensor | None,
+        gathered: bool,
+    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """One DSpark draft per scheduled sequence, seeded from this step's own
+        committed token.
+
+        Two things are worked out here rather than in `forward_spec`, because
+        both are per-sequence and both have to stay tensors:
+
+        * **the seed** — the token the draft continues from. Without
+          speculation that is the sample at the sequence's last position; with
+          it, the *last token the rejection sampler accepted*, which is the one
+          the sequence will actually continue from.
+        * **the anchor** — which row of this step the draft block hangs off.
+          Without speculation the last row (`length - 1`). On a verify step the
+          step's rows are `[accepted token, draft_1 ... draft_k]`, so the
+          accepted count indexes straight into the block: `valid - 1`. The
+          `_tap_rows` has the arithmetic and the guard for a padded batch.
+
+        `gathered` says whether `sampled` has one row per sequence, which it
+        does whenever the runner passed `sampling_positions` — every path it
+        actually takes — or one row per token.
+
+        **Not `@torch._dynamo.disable`d, and that matters.** `disable` is
+        recursive: with it on this method, `forward_spec` and every module it
+        calls ran *eagerly*, and the first eager dtype cast inside
+        `BlockQuantLinear` died on
+
+            RuntimeError: Expected self.dtype() == dst.dtype() to be true
+
+        — the backend's eager fallback, which implements almost nothing. Like
+        `forward`, this frame is one dynamo *skips* (the span loop breaks at the
+        MoE's host I/O) and its callees are still intercepted and compiled,
+        which is the whole structure `forward`'s docstring describes. The two
+        small host-built index tensors are the same pattern, and the same cost,
+        as `_paged_spans`' `starts`.
+        """
+        device = sampled.device
+        lengths = torch.tensor(
+            [length for _, length, _ in spans], dtype=torch.int64, device=device
+        )
+        ones = torch.ones(len(spans), dtype=torch.int64, device=device)
+        if accepted is not None:
+            seeds, valid = _compiled(_accepted_tail)(accepted)
+            # The rejection sampler's batch is the runner's *padded* one: on a
+            # verify step `_build_spec_decode_metadata` appends fake full-spec
+            # requests up to the decode bucket, so with 3 scheduled sequences in
+            # a batch of 4 `accepted` has four rows where `spans` has three. The
+            # real requests come first, in span order.
+            seeds, valid = seeds[: len(spans)], valid[: len(spans)]
+            rows_per_seq = int(accepted.shape[1])
+        else:
+            if gathered:
+                picks = torch.arange(len(spans), dtype=torch.int64, device=device)
+            else:
+                picks = torch.tensor(
+                    [begin + length - 1 for begin, length, _ in spans],
+                    dtype=torch.int64,
+                    device=device,
+                )
+            seeds = _compiled(_select_rows)(sampled.reshape(-1), picks)
+            valid, rows_per_seq = ones, 1
+        taps = _compiled(_tap_rows)(valid, lengths, rows_per_seq)
+        return [
+            self.forward_spec(
+                seeds[row : row + 1], taps[row : row + 1],
+                main_hidden, meta, span, span_shared,
+            )
+            for row, (meta, span, span_shared) in enumerate(
+                zip(spans, paged, shared)
+            )
+        ]
+
+    def forward_spec(
+        self,
+        seed_ids: torch.Tensor,
+        tap: torch.Tensor,
+        main_hidden: torch.Tensor | None,
+        span: tuple[int, int, int],
+        paged: PagedSpan,
         shared: SharedAttentionState,
     ):
-        """The DSpark draft path over the `mtp.*` stages.
+        """The DSpark draft path over the `mtp.*` stages, for one sequence.
 
         `vendor/model.py`'s `Transformer.forward_spec`: build the draft stream
-        from the accepted token and the projected `main_hidden`, run it through
+        from the committed token and the projected `main_hidden`, run it through
         the three `mtp` stages (each a hyper-connected block over the 128-expert
         pool at top-3), then the shared LM head with the Markov bias folded in
-        per draft position, and the confidence head.
+        per draft position, and the confidence head. Returns
+        `(output_ids [1, 1 + k], logits, confidence)` — `output_ids[0]` is the
+        seed and the rest are the drafts, which is the `[1 + k]` row
+        `DSparkProposer.propose` hands the scheduler.
 
-        Not reachable from the verifier's configuration — it has no speculative
-        config, so `spec_decode_metadata` is None, and the reference's own
-        `Transformer.forward` likewise only collects `main_hiddens`. Implemented
-        because the 128-expert pool and the two heads are part of the
-        architecture; checked against the trace's `mtp.*` records rather than by
-        running it here.
+        `main_hidden` is handed over **whole for this span**, not just the
+        anchor row, and the reason is the window cache: `DSparkAttention` writes
+        one window entry per scheduled token at its own slot, so every real
+        token this step saw is in the draft stages' window for later steps. The
+        reference does the same thing — its `forward_spec` is called with the
+        prompt's full `main_hidden` at `start_pos == 0` and one row per step
+        afterwards — and passing only the last row made a prefill broadcast a
+        single position's KV across all of the prompt's slots.
         """
         if main_hidden is None:
             raise RuntimeError(
@@ -4843,40 +5072,30 @@ class DeepseekV41ForCausalLM(nn.Module):
                 f"{list(self.config.dspark_target_layer_ids)}; forward() "
                 "collected none, so the target-layer tap did not run"
             )
-        if len(spans) != 1:
-            raise NotImplementedError(
-                "DSpark drafting is implemented for one sequence per call "
-                f"(got {len(spans)} spans). The draft block is per sequence and "
-                "the ring index is per sequence; batching it is the same "
-                "per-sequence slotting problem as the backbone's, see "
-                ".autohelix/notes/iter-1.md section 5a."
-            )
-        (begin, length, _), = spans
-        (span,) = paged
-
-        # The accepted token this draft continues from: the last real token.
-        last_id = input_ids[begin + length - 1].reshape(1)
-        main = main_hidden[begin + length - 1].reshape(1, 1, -1)
+        begin, length, _ = span
+        main = main_hidden[begin : begin + length].unsqueeze(0)
 
         stage0 = self.mtp[0]
         stage0.embed_fn = self.embed_input_ids
-        stream, main_x = stage0.forward_embed(main, last_id)
+        stream, main_x = stage0.forward_embed(main, seed_ids)
         pre_mix = _compiled(_one_hot_pre_mix)(stream, self.hc_mult)
 
         tp_group = self.tp_group if self.world_size > 1 else None
-        # A tensor, like every other position on the compiled path: the draft
-        # block starts at the accepted token's own position. See `PagedSpan`.
-        draft_pos = span.pos + (length - 1)
+        # Tensors, like every other position on the compiled path: this step's
+        # real tokens start at `paged.pos`, and the draft block hangs off the
+        # committed token at `paged.pos + tap`. See `PagedSpan` for why neither
+        # may be a Python int, and `DSparkAttention` for why they differ.
+        draft_pos = paged.pos + tap
         for stage in self.mtp:
             stream, pre_mix = stage(
-                stream, draft_pos, pre_mix, main_x, shared, span,
+                stream, paged.pos, draft_pos, pre_mix, main_x, shared, paged,
                 self.weight_store, tp_group,
             )
 
         last = self.mtp[-1]
         last.head_fn = self.compute_logits
         last.markov_head._tp_group = tp_group
-        return last.forward_head(stream, pre_mix, last_id)
+        return last.forward_head(stream, pre_mix, seed_ids)
 
     # ── Weights ───────────────────────────────────────────────────────────
 

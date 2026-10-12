@@ -658,6 +658,127 @@ def require_kv_cache_ceiling(vllm_config) -> None:
     )
 
 
+#: Set to "1" to serve this checkpoint without speculative decoding. Only for
+#: the A/B that proves speculation changes nothing: the same prompts with it on
+#: and off have to produce identical tokens, and the only way to show that is to
+#: run both. Speculation is **on by default** — the `mtp.*` stages are the
+#: model's own drafter and they run on every forward either way, so declining to
+#: propose their draft buys nothing but the verification step.
+NO_SPEC_DECODE_ENV = "DEEPSEEK_V41_NO_SPEC_DECODE"
+
+
+def require_dspark_speculation(vllm_config) -> None:
+    """Give the engine the speculative config that turns the MTP draft into a
+    proposal.
+
+    **Why a hook and not an engine argument.** `speculative_config` is settled
+    in `VllmConfig.__post_init__`, before any model class exists, so a caller
+    who does not pass `--speculative-config` gets none — and the verifier does
+    not pass one, deliberately: what is being checked is this port's own
+    inference path, not an operator's ability to configure it. The platform's
+    `check_and_update_config` is the one point a model package can speak before
+    EngineCore and the workers, which is where `require_segmented_prefill` and
+    `require_kv_cache_ceiling` already act from.
+
+    `attach_speculative_config` builds it, checks that a proposer is registered
+    for the method (so a missing `register_proposer` raises here instead of
+    several minutes into the first forward), and redoes
+    `_set_max_num_scheduled_tokens`, which `__post_init__` ran when there was no
+    speculative config to account for.
+
+    **What it costs, stated plainly**: `decode_token_threshold` becomes
+    `1 + num_speculative_tokens`, so a decode step is padded to 6 tokens per
+    request and keys decode graphs a non-speculative run never built. That is
+    real compile time on the first run of a new shape set. What it buys is up to
+    5 tokens per target forward, and on this port a forward streams 7.3 GiB of
+    routed experts per layer — so a verified draft is close to free.
+
+    **It does not change what the model emits.** The draft is verified against
+    the target's own logits by `vllm_neuron.nn.rejection_sampler` under greedy
+    acceptance (`model.py`'s `_rejection_sample`), which keeps exactly the
+    prefix the target would have produced unaided.
+
+    Inert if the operator supplied their own `speculative_config`, and skipped
+    entirely when `DEEPSEEK_V41_NO_SPEC_DECODE=1`.
+    """
+    if not _serves_this_port(vllm_config):
+        return
+    if getattr(vllm_config, "speculative_config", None) is not None:
+        logger.info(
+            "deepseek_v41_timeshare: a speculative config is already set "
+            "(method=%s); leaving it alone",
+            getattr(vllm_config.speculative_config, "method", "?"),
+        )
+        return
+    if os.environ.get(NO_SPEC_DECODE_ENV) == "1":
+        logger.warning(
+            "deepseek_v41_timeshare: %s=1, so the mtp.* stages' draft is "
+            "computed and not proposed. This is the control arm of the "
+            "speculation A/B, not a configuration to serve in.",
+            NO_SPEC_DECODE_ENV,
+        )
+        return
+
+    from .config import DeepseekV41Config
+    from .drafter import METHOD
+
+    num_speculative_tokens = int(DeepseekV41Config.dspark_block_size)
+    try:
+        from vllm_neuron.vllm.spec_decode import attach_speculative_config
+    except ImportError as exc:  # noqa: BLE001 - reported at error level, never silent
+        logger.error(
+            "deepseek_v41_timeshare: this build of vllm_neuron.vllm.spec_decode "
+            "has no attach_speculative_config (%s), so the DSpark draft cannot "
+            "be proposed to the scheduler and inference will decode one token "
+            "at a time. Everything else is unaffected.",
+            exc,
+        )
+        return
+    # Speculation here is synchronous, and that is a correctness requirement
+    # rather than a preference.
+    #
+    # With `async_scheduling` on, `NeuronModelRunner.take_draft_token_ids` hands
+    # the *scheduler* `[-1] * num_spec` placeholders instead of the drafts and
+    # relies on the runner to fill the real tokens in from device futures before
+    # anything reads them. Every path that does that filling in this build is
+    # Eagle-specific: `_uses_async_eagle3_transition_cache` is literally
+    # `use_async_scheduling and self.is_eagle3_spec`, and the
+    # `num_computed_tokens` correction prologue needs a model decorated with
+    # `@async_speculative_decoding`. This port is neither, so the drafts would
+    # reach the device as placeholders and verify against nothing.
+    #
+    # There is also nothing here for async scheduling to overlap. Its point is
+    # to run the host's bookkeeping under the *next* NEFF, and on this port a
+    # forward streams gigabytes of routed experts off disk — the host work is
+    # noise beside it — while the draft comes out of the target's own forward
+    # rather than a second NEFF to pipeline against.
+    #
+    # The practical tell that the async path is not meant for an in-model
+    # drafter: `propose` is handed the rejection output as a *device* tensor, and
+    # every host-side read of it (including the runner's own bonus-token
+    # extraction) then goes through the backend's eager fallback, which raised
+    # `Expected self.dtype() == dst.dtype()` on the first verify step.
+    scheduler = getattr(vllm_config, "scheduler_config", None)
+    if scheduler is not None and getattr(scheduler, "async_scheduling", False):
+        scheduler.async_scheduling = False
+        logger.info(
+            "deepseek_v41_timeshare: async scheduling off — the DSpark draft is "
+            "proposed synchronously; see "
+            "deepseek_v41_timeshare.require_dspark_speculation"
+        )
+
+    spec = attach_speculative_config(
+        vllm_config, METHOD, num_speculative_tokens
+    )
+    logger.info(
+        "deepseek_v41_timeshare: speculative decoding through the mtp.* stages "
+        "— method=%s, %d draft tokens per step, drafted by DSparkProposer from "
+        "the stages this forward already runs; see "
+        "deepseek_v41_timeshare.require_dspark_speculation",
+        getattr(spec, "method", METHOD), num_speculative_tokens,
+    )
+
+
 def declare_prefill_requirements() -> None:
     """Install `require_segmented_prefill` on the platform's config hook.
 
@@ -682,6 +803,7 @@ def declare_prefill_requirements() -> None:
         original(vllm_config)
         require_segmented_prefill(vllm_config)
         require_kv_cache_ceiling(vllm_config)
+        require_dspark_speculation(vllm_config)
 
     platform_cls.check_and_update_config = classmethod(check_and_update_config)
     platform_cls._deepseek_v41_prefill_hook = True
@@ -696,13 +818,14 @@ def register_draft_proposer() -> None:
     a speculative config names the method — so it is done unconditionally here, where
     the rest of the port's hooks are installed.
 
-    **This does not yet make inference speculative, and `drafter.py`'s module docstring
-    says why**: in this build the only path that calls `propose` is gated on
-    `is_eagle3_spec` (`neuron_model_runner.py:5915`) and asserts
-    `isinstance(self.drafter, EagleProposer)` (`:8325`), both in a directory the loop
-    may not edit. Until those two lines admit a registered proposer, supplying a
-    `speculative_config` would build a proposer nothing calls — so
-    `require_kv_cache_ceiling`'s neighbour hook deliberately does not supply one.
+    Registering is also what arms the `SpeculativeConfig` patch for a drafter with no
+    draft *model* (`vllm_neuron/vllm/patches/in_model_proposer_patch.py`), so it has to
+    happen before `require_dspark_speculation` builds the config — which it does, since
+    that runs from the platform hook and this runs at import.
+
+    The other half is `require_dspark_speculation`, which supplies the
+    `speculative_config` that makes `NeuronModelRunner` build this class and call
+    `propose`. Registering alone would leave the drafts computed and dropped.
 
     The import is local and guarded: `drafter` imports `config`, and this module is
     imported from `vllm_neuron.model.registry` during platform start-up, so an import
