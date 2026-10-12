@@ -36,7 +36,9 @@ goal: |
     decoding here is not batch-shape invariant in bf16, because a speculative step verifies `1 + k` rows
     where a plain step verifies one — but the distribution must not drift (both arms of equivalent
     quality, agreeing wherever there is a right answer) and the acceptance rate must be high enough that
-    the drafter pays for itself.
+    the drafter pays for itself. Aim for exactness anyway: two arms agreeing token for token is better
+    evidence than two arms agreeing in quality, so narrowing that gap is real progress and worth
+    reporting. It is unenforced only because it may not be reachable on this port.
   - The workload and the data are distributed over 4 ranks (TP=4). The device carries 4 HBM stacks of 24 GB,
     one per logical NeuronCore, and a rank addresses only its own — so one rank is 24 GB and four is 96 GB,
     with resident weights and per-NEFF DMA rings each divided. This does NOT have to be vLLM's
@@ -82,6 +84,8 @@ goal: |
   non-speculative tokens exactly — on this port it cannot, since a speculative step verifies
   `1 + k` rows and bf16 sum reductions are not row-count invariant. It has to be *worth having*:
   a real acceptance rate, and a distribution that has not drifted from the non-speculative arm.
+  Getting the two arms closer is still worth doing and still counts as progress — row-count-invariant
+  reductions are the lever — it is just no longer the pass/fail line, because it may be unreachable.
   - Follow this tutorial to on-board the model: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/vllm-neuron/docs/model-dev/onboarding-models.html
   - Follow this tutorial to debug for accuracy, except you don't have to run a whole set of benchmark (just use the verifier inputs): https://awsdocs-neuron.readthedocs-hosted.com/en/latest/vllm-neuron/docs/model-dev/accuracy-debugging-guide.html.
   - Check vllm_neuron/ to see how NKI kernels are integrated in vLLM using libtorch-neuronx-lite.
@@ -322,6 +326,14 @@ constraints:
       there is a different piece of work from making speculation *useful*. What this constraint
       wants instead is that the distribution does not drift: the two runs should be of
       equivalent quality and should agree wherever there is a right answer.
+
+      To be clear about the direction, though: **exactness is still what we want, it is just not
+      what we enforce.** The closer the two arms agree, the stronger the evidence that the
+      drafter and the verifier are both right, and a port where they agree token for token is
+      better than one where they merely agree in quality. So work that narrows the gap is
+      welcome and worth reporting — row-count-invariant reductions being the obvious lever. What
+      changed is only that falling short of bit-identical is no longer a failure, because it may
+      not be reachable here at all.
     criteria: |
       PASS if a live run in this iteration shows drafts from the MTP stages proposed and
       verified on the token-generating path, AND both of these hold:
@@ -335,7 +347,9 @@ constraints:
           have to match token for token. They do have to be of equivalent quality, and they
           have to agree where there is a verifiable answer: the needle's access code, the
           capital of France. One run answering correctly while the other does not is a drift
-          failure; different wording of the same correct answer is not.
+          failure; different wording of the same correct answer is not. Say how close the arms
+          came — matching prefix length, or how many of the four prompts matched outright —
+          because exactness is still the direction of travel even though it is not the bar.
 
       FAIL if the drafter is a stub, if the drafts are discarded, if no run shows the path
       being taken, if acceptance is near zero, if the spec-on output is materially worse, or if
