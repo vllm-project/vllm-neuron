@@ -114,6 +114,122 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _phases(cases, kept, args) -> list[dict]:
+    """Split the cases into one-engine-each groups: the longest alone, the rest together.
+
+    The longest case is the one whose context and graph set dominate, and the one whose
+    failures have historically taken the others down with it. Everything else shares a phase so
+    the multi-sequence paths stay covered -- iteration 4's three state bugs (`SharedAttentionState`
+    per batch, the n-gram hash cache shared between sequences, the indexer's mask under chunked
+    prefill) were all invisible at `max_num_seqs=1`.
+
+    An explicit `--max-model-len` is an override of the whole run, so it collapses to a single
+    phase: the caller asked for a specific configuration and splitting it would silently not
+    deliver it. `--max-num-seqs` is read the same way when it is distinguishable from the
+    default.
+    """
+    pairs = list(zip(cases, kept))
+    overridden = args.max_model_len is not None or getattr(
+        args, "max_num_seqs_explicit", False
+    )
+    if overridden:
+        return [{
+            "name": "all",
+            "cases": pairs,
+            "max_model_len": None,          # resolved by the caller's own arguments
+            "max_num_seqs": args.max_num_seqs,
+        }]
+    if len(pairs) < 2:
+        return [{"name": "all", "cases": pairs, "max_model_len": None,
+                 "max_num_seqs": args.max_num_seqs}]
+
+    longest = max(pairs, key=lambda p: p[1][1])
+    rest = [p for p in pairs if p is not longest]
+
+    def context_for(group) -> int:
+        """The phase's context: what its own prompts need, floored so a segment fits under it.
+
+        Without the floor a phase of 37-to-158-token prompts asks for 254, no
+        `SUPPORTED_KV_SEGMENT_SIZES` entry is below that, and it silently becomes a single-shot
+        prefill with prefix caching off -- a path the gate's own default never takes. The floor
+        keeps every phase on segmented prefill, which is the one the port is built for and the
+        one its graphs are cached for.
+        """
+        from vllm_neuron.utils.bucket_utils import SUPPORTED_KV_SEGMENT_SIZES
+
+        need = max(n for _, (_, n) in group) + MAX_TOKENS + CONTEXT_HEADROOM
+        floor = min(SUPPORTED_KV_SEGMENT_SIZES) + MAX_TOKENS + CONTEXT_HEADROOM
+        return max(need, floor)
+
+    return [
+        {"name": longest[0].id, "cases": [longest],
+         "max_model_len": context_for([longest]), "max_num_seqs": 1},
+        {"name": "short", "cases": rest,
+         "max_model_len": context_for(rest), "max_num_seqs": args.max_num_seqs},
+    ]
+
+
+def _run_phase(phase: dict, args, tensor_parallel_size: int) -> list[dict]:
+    """One engine, one `generate`, then tear it down so its HBM comes back."""
+    import gc
+
+    from vllm import LLM, SamplingParams
+    from vllm_neuron.utils.bucket_utils import SUPPORTED_KV_SEGMENT_SIZES
+
+    max_model_len = phase["max_model_len"] or args.max_model_len
+    segments = sorted(s for s in SUPPORTED_KV_SEGMENT_SIZES if s < max_model_len)
+    if args.max_num_batched_tokens is not None:
+        mnbt = args.max_num_batched_tokens
+    else:
+        mnbt = segments[-1] if segments else max_model_len
+    apc = mnbt < max_model_len
+
+    print(f"\nverifier: phase {phase['name']} — max_model_len={max_model_len}, "
+          f"max_num_batched_tokens={mnbt}, max_num_seqs={phase['max_num_seqs']}, "
+          f"prefix caching {'on' if apc else 'off'}")
+    phase.update(max_model_len=max_model_len, max_num_batched_tokens=mnbt,
+                 enable_prefix_caching=apc)
+
+    llm = LLM(
+        model=args.model,
+        max_num_seqs=phase["max_num_seqs"],
+        max_model_len=max_model_len,
+        max_num_batched_tokens=mnbt,
+        tensor_parallel_size=tensor_parallel_size,
+        enable_prefix_caching=apc,
+    )
+    try:
+        outputs = llm.generate(
+            [text for _, (text, _) in phase["cases"]],
+            SamplingParams(max_tokens=MAX_TOKENS, temperature=TEMPERATURE),
+        )
+        out = []
+        for (case, (_, n_prompt)), o in zip(phase["cases"], outputs):
+            completion = o.outputs[0]
+            out.append({
+                "id": case.id,
+                "phase": phase["name"],
+                "source": case.source,
+                "role": case.role,
+                "expected_substring": case.expected_substring,
+                "prompt_excerpt": case.excerpt(),
+                "prompt_chars": len(case.prompt),
+                "prompt_tokens": n_prompt,
+                "text": completion.text,
+                "num_tokens": len(completion.token_ids),
+                "finish_reason": completion.finish_reason,
+            })
+        return out
+    finally:
+        # `del` then collect: the engine holds the device until its process exits, and vLLM v1
+        # runs EngineCore out of process, so dropping the last reference is what releases HBM.
+        # Without this the next phase builds its engine alongside this one's resident graphs,
+        # which is the accumulation the split exists to avoid.
+        del llm
+        gc.collect()
+        print(f"verifier: phase {phase['name']} torn down")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
@@ -240,48 +356,54 @@ def main(argv: list[str] | None = None) -> int:
         report_path.write_text(json.dumps(report, indent=2) + "\n")
 
     # ── Condition 1: nothing raised ───────────────────────────────────────
+    #
+    # One engine per phase, torn down between them, because HBM does not come
+    # back any other way. A phase's cost is not its own prompts' alone: every
+    # prefill arrives with a different `read_len` as the cache fills, so each
+    # keys its own `attn_half` graphs, and a graph stays resident with its code,
+    # DMA rings and scratchpad. Measured across four prefills in one engine:
+    # 13.3 -> 19.0 GiB of a 24 GiB bank, with the long prompt itself accounting
+    # for 13.3 of it. The runtime scrubs HBM when a process attaches (the
+    # driver logs `ncdev_hbm_scrub_start` on every `npid_attach`), so a second
+    # engine starts from a clean bank rather than inheriting the first one's.
+    #
+    # It also sizes each phase for its own prompts. `max_model_len` is set by
+    # the longest case in the phase and the KV ceiling is one of those per
+    # sequence times the batch, so grouping a 2008-token needle with three
+    # 37-to-158-token prompts made the short ones reserve the needle's context
+    # four times over.
+    #
+    # And it isolates failure. Previously all four went through one `generate`,
+    # so an engine that died on the long prompt returned `cases: []` and the
+    # three that work produced no evidence at all.
+    phases = _phases(case_set.cases, kept, args)
+    report["phases"] = [
+        {k: v for k, v in p.items() if k != "cases"} for p in phases
+    ]
+    print(f"verifier: {len(phases)} phase(s), one engine each")
+    for p in phases:
+        print(f"  {p['name']}: {len(p['cases'])} case(s), "
+              f"max_model_len={p['max_model_len']}, max_num_seqs={p['max_num_seqs']}")
+
     results: list[dict] = []
-    try:
-        from vllm import LLM, SamplingParams
-
-        llm = LLM(
-            model=args.model,
-            max_num_seqs=args.max_num_seqs,
-            max_model_len=max_model_len,
-            max_num_batched_tokens=max_num_batched_tokens,
-            tensor_parallel_size=tensor_parallel_size,
-            enable_prefix_caching=enable_prefix_caching,
-        )
-        sampling = SamplingParams(max_tokens=MAX_TOKENS, temperature=TEMPERATURE)
-
-        outputs = llm.generate([text for text, _ in kept], sampling)
-
-        for (case, (_, n_prompt)), out in zip(zip(case_set.cases, kept), outputs):
-            completion = out.outputs[0]
-            results.append(
-                {
-                    "id": case.id,
-                    "source": case.source,
-                    "role": case.role,
-                    "expected_substring": case.expected_substring,
-                    "prompt_excerpt": case.excerpt(),
-                    "prompt_chars": len(case.prompt),
-                    "prompt_tokens": n_prompt,
-                    "text": completion.text,
-                    "num_tokens": len(completion.token_ids),
-                    "finish_reason": completion.finish_reason,
-                }
-            )
-    except Exception:  # noqa: BLE001 - any exception is a verifier failure
-        report["execution_error"] = traceback.format_exc()
-        report["cases"] = results
-        _write()
-        print(report["execution_error"], file=sys.stderr)
-        print(f"\nverifier: execution FAILED — report at {report_path}")
-        print("##verifier[passed=0]")
-        return 1
+    errors: list[str] = []
+    for phase in phases:
+        try:
+            results.extend(_run_phase(phase, args, tensor_parallel_size))
+        except Exception:  # noqa: BLE001 - a phase failing is a verifier failure
+            errors.append(f"phase {phase['name']}:\n{traceback.format_exc()}")
+            print(f"\nverifier: phase {phase['name']} FAILED", file=sys.stderr)
+            print(traceback.format_exc(), file=sys.stderr)
 
     report["cases"] = results
+    if errors:
+        report["execution_error"] = "\n\n".join(errors)
+        _write()
+        print(f"\nverifier: execution FAILED in {len(errors)} of {len(phases)} "
+              f"phase(s) — report at {report_path}")
+        print(f"  {len(results)} completion(s) from the phases that did run")
+        print("##verifier[passed=0]")
+        return 1
 
     print("\n" + "=" * 72)
     for r in results:
