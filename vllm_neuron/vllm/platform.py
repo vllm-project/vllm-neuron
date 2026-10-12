@@ -358,6 +358,16 @@ class NeuronPlatform(Platform):
             # TODO: Move all Neuron specific config overrides into a separate function
             # TODO: Can vLLM to vLLM Neuron config mapping be done here after the overrides are applied?
 
+        # Host memory, before the ranks are spawned: every other memory check in this
+        # backend is about device HBM, and a 4-rank run of a weight-streaming model died
+        # of host RAM with HBM at 7 of 24 GiB a rank. See vllm/host_memory.py.
+        from vllm_neuron.vllm.host_memory import check_host_memory_budget
+
+        check_host_memory_budget(
+            parallel_config.world_size,
+            getattr(vllm_config.model_config, "model", ""),
+        )
+
         allowed_backends = ("mp", "uni")
         if parallel_config.distributed_executor_backend not in allowed_backends:
             # multi-process executor is now the default executor in vLLM. But want

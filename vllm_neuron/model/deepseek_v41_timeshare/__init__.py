@@ -127,6 +127,56 @@ PREFILL_SEGMENT_TOKENS = 8192
 # only how long the parent waits before declaring the worker dead.
 os.environ.setdefault("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "5400")
 
+# ── The three timeouts that wedged the instance at TP=4, re-ordered ──────────
+#
+# `config.TENSOR_PARALLEL_SIZE`'s note records the failure: graphs compile
+# mid-forward here, and a rank still compiling outlasts the peers waiting for it
+# inside a collective. They gave up, retried against a rank still compiling, and
+# left the collective's device-side state in a condition no process could clear
+# — two reboots. The ordering was
+#
+#     collective RX gives up     960 s   (`CCOM WARN Timeout waiting for RX`)
+#     a measured compile        1045, 1161, 1167 s
+#     NEFF cache lock gives up  1200 s
+#
+# A *waiting* rank is the one that has to be patient, so every wait here is
+# raised above any compile this model has produced. What this buys is not
+# speed — it converts an unrecoverable wedge into plain slowness, which a
+# `kill` recovers from, because a collective that is still waiting has not yet
+# entered the retry path that corrupts the device state.
+#
+#   `NEURON_CCOM_NO_INFINITE_TIMEOUT=0`
+#       `libnccom.so` registers a parameter `CCOM_NO_INFINITE_TIMEOUT`
+#       (`ccom_param_lock_NO_INFINITE_TIMEOUT` in the symbol table) beside the
+#       explicit env string `NEURON_CCOM_SOCK_TIMEOUT`. Turning it off asks the
+#       collective to wait rather than to retry. The `NEURON_`-prefixed spelling
+#       is the library's convention for its parameters; the bare one is set too,
+#       since the prefix is applied at runtime and only one of the two can be
+#       read — an ignored variable costs nothing.
+#   `NEURON_CCOM_SOCK_TIMEOUT`
+#       the socket wait the 960 s RX figure derives from.
+#   `NEURON_RT_EXEC_TIMEOUT`
+#       libtorch_neuronx_lite sets this to 300 s itself
+#       (`_compiler/__init__.py:88`). A graph whose only work is a collective
+#       executes for as long as its slowest peer takes to arrive, so at TP>1
+#       300 s is a limit on *other ranks' compile time*. 300 is overridden
+#       rather than `setdefault`ed because libtorch usually gets there first;
+#       any other value is treated as the operator's and left alone.
+#   `TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT`
+#       the four ranks share one compile cache and serialize on this lock
+#       (`cache_utils.get_lock_timeout`, default 1200 s). It was 33 s from
+#       failing and did fail once.
+#
+# None of this is a correctness knob and none of it has any effect at TP=1,
+# where there is no second rank to wait for: what is computed does not change,
+# only how long a process waits before declaring a peer dead.
+os.environ.setdefault("NEURON_CCOM_NO_INFINITE_TIMEOUT", "0")
+os.environ.setdefault("CCOM_NO_INFINITE_TIMEOUT", "0")
+os.environ.setdefault("NEURON_CCOM_SOCK_TIMEOUT", "7200")
+os.environ.setdefault("TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT", "7200")
+if os.environ.get("NEURON_RT_EXEC_TIMEOUT", "300") == "300":
+    os.environ["NEURON_RT_EXEC_TIMEOUT"] = "7200"
+
 __all__ = [
     "DeepseekV41ForCausalLM",
     "DeepseekV41HFConfig",
