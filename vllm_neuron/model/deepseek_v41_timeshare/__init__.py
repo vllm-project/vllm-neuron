@@ -687,6 +687,43 @@ def declare_prefill_requirements() -> None:
     platform_cls._deepseek_v41_prefill_hook = True
 
 
+def register_draft_proposer() -> None:
+    """Put `DSparkProposer` in `vllm_neuron.vllm.spec_decode.PROPOSERS`.
+
+    So that `speculative_config.method == "deepseek_mtp"` builds this model's own MTP
+    stages as the drafter instead of looking for a second checkpoint. Registering is
+    cheap and side-effect free — `NeuronModelRunner` only reaches for the registry when
+    a speculative config names the method — so it is done unconditionally here, where
+    the rest of the port's hooks are installed.
+
+    **This does not yet make inference speculative, and `drafter.py`'s module docstring
+    says why**: in this build the only path that calls `propose` is gated on
+    `is_eagle3_spec` (`neuron_model_runner.py:5915`) and asserts
+    `isinstance(self.drafter, EagleProposer)` (`:8325`), both in a directory the loop
+    may not edit. Until those two lines admit a registered proposer, supplying a
+    `speculative_config` would build a proposer nothing calls — so
+    `require_kv_cache_ceiling`'s neighbour hook deliberately does not supply one.
+
+    The import is local and guarded: `drafter` imports `config`, and this module is
+    imported from `vllm_neuron.model.registry` during platform start-up, so an import
+    error here would take registration down with it — which costs the port everything,
+    for a feature nothing can call yet.
+    """
+    try:
+        from vllm_neuron.vllm.spec_decode import register_proposer
+
+        from .drafter import METHOD, DSparkProposer
+    except ImportError as exc:  # noqa: BLE001 - reported, never silent
+        logger.warning(
+            "deepseek_v41_timeshare: DSpark proposer not registered (%s). Speculative "
+            "decoding through the mtp.* stages is unavailable; everything else is "
+            "unaffected.",
+            exc,
+        )
+        return
+    register_proposer(METHOD, DSparkProposer)
+
+
 #: The checkpoint's `architectures[0]`, and the key both registries use.
 ARCH = "DeepseekV41ForCausalLM"
 
@@ -696,3 +733,4 @@ register_hf_config()
 register_architecture()
 declare_storage_quantization()
 declare_prefill_requirements()
+register_draft_proposer()

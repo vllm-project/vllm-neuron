@@ -4004,12 +4004,40 @@ class DeepseekV41ForCausalLM(nn.Module):
         What is and is not in here, because the mapping is a design decision
         rather than a transcription:
 
-        *In* — the sliding window. Every one of the 43 attentions (40 backbone +
+        *In* — the window storage. Every one of the 43 attentions (40 backbone +
         3 DSpark) attends over a window of `sliding_window = 128` raw KV
         positions, one latent head of `head_dim = 512`. That is per-layer,
         per-sequence, bounded, and written once per token: exactly what vLLM's
-        block manager handles, and `sliding_window_size` is how it is told the
-        window never grows.
+        block manager handles.
+
+        **`sliding_window_size` is deliberately left None, so this is a
+        `FullAttentionSpec` and not a `SlidingWindowSpec`.** Declaring the
+        window would be describing the attention honestly and *managing* the
+        blocks wrongly, because vLLM reads that field as a licence to recycle:
+
+          - `SlidingWindowManager.remove_skipped_blocks` frees every block
+            older than the window on each step and overwrites the request's
+            entries with the shared **null block**. The window layers would not
+            miss them, but this model's own per-slot caches — compressed
+            latents, index keys, the compressor's pooling inputs, the n-gram
+            ids — live in the same paged space at the same slots, and they are
+            read at *every* earlier position, not just the last 128. The sum is
+            exact: `get_num_skipped_tokens(2008)` is
+            `2008 - sliding_window + 1 = 1881`, so 58 blocks are freed and the
+            needle's first 1,856 positions resolve to block 0. No error, just a
+            wrong answer, which is the worse failure of the two.
+          - `NeuronModelRunner` *trims* a sliding-window group's decode block
+            table to `num_swa_blocks` (8, at this window and block size) and
+            rebases it by `swa_kv_pos_offset`. `_paged_spans` reads the
+            untrimmed clone and so survives that, but there is no reason to
+            keep asking for a table the model then has to work around.
+
+        The cost of `FullAttentionSpec` is that a sequence's whole context
+        stays resident, which this port needs anyway and `_KV_CAP_MAX_SLOTS`
+        already says: every cache it keeps is addressed by absolute position
+        within a sequence's own context. The window being 128 is enforced where
+        it belongs — in the attention itself, which reads 128 slots back from
+        `pos` — not by asking the allocator to throw the rest away.
 
         *Out* — the compressed KV, the index keys and the compressor's
         per-token pooling inputs. Those are **shared across layers**, not
@@ -4036,7 +4064,9 @@ class DeepseekV41ForCausalLM(nn.Module):
                     num_kv_heads=1,
                     head_size=block.attn.head_dim,
                     dtype=dtype,
-                    sliding_window_size=self.config.sliding_window,
+                    # None on purpose; see this method's docstring. The window
+                    # is 128 and the attention enforces it.
+                    sliding_window_size=None,
                     chunk_size=None,
                 )
             )
@@ -4047,7 +4077,7 @@ class DeepseekV41ForCausalLM(nn.Module):
                     num_kv_heads=1,
                     head_size=block.attn.head_dim,
                     dtype=dtype,
-                    sliding_window_size=self.config.sliding_window,
+                    sliding_window_size=None,
                     chunk_size=None,
                 )
             )
@@ -4548,9 +4578,41 @@ class DeepseekV41ForCausalLM(nn.Module):
         `pos` is a host-built `[1]` tensor moved to the device: inside a graph
         that transfer would be a constant again, which is the whole thing
         `PagedSpan.pos` exists to avoid. One `[1]` int64 per sequence per step.
+
+        **`full_block_table_tensor`, not `block_table_tensor`.** The two differ
+        on exactly one step kind and that difference was a device out-of-bounds
+        for five iterations. `NeuronModelRunner._build_attention_metadata`
+        *trims* the decode block table for a sliding-window group
+        (`_compute_swa_decode_tensors`): row `k` becomes the `num_swa_blocks`
+        blocks that the window covers, gathered from `start_block` onward, and
+        `swa_kv_pos_offset = start_block * block_size` is handed over so a
+        consumer can rebase its positions into that frame. With
+        `sliding_window = 128` and `block_size = 32` the trimmed width is 8.
+
+        Every cache this model addresses — the window, the compressed latents,
+        the index keys, the n-gram ids — is indexed by *absolute* position
+        (`PagedSpan.slots`), so a trimmed row is the wrong table: at position
+        2008, `slots` computes `block_table[62]` against 8 entries and the
+        runtime reports
+
+            scatter/gather (indirect memory copy via scalar DGE)
+            out-of-bound access ... engine=GPSIMD
+            Source location: model.py:2921
+
+        in both the n-gram graph and layer 0's. It is silent below position
+        256, because there `start_block` clamps to 0 and the trimmed row *is*
+        the first 8 untrimmed entries — which is why every short prompt decodes
+        and the 2048-token needle does not.
+
+        The runner provides the untrimmed clone for this exact use ("for use
+        cases that need to compute slot indices into the *full* KV cache"), and
+        it is present on every path, prefill included, so there is nothing to
+        branch on. The `.get` fallback is for a metadata dict that predates it.
         """
         block_size = int(meta["block_size"])
-        block_table = meta["block_table_tensor"]
+        block_table = meta.get("full_block_table_tensor")
+        if block_table is None:
+            block_table = meta["block_table_tensor"]
         slot_mapping = meta["slot_mapping"]
         device = slot_mapping.device
         starts = torch.tensor(
