@@ -194,11 +194,35 @@ REPLICATE = ShardRule(None, "no free axis; every rank needs the whole tensor")
 
 
 class RMSNorm(nn.Module):
-    """`vendor/model.py`'s `RMSNorm`, including its fp32 interior.
+    """`vendor/model.py`'s `RMSNorm`, including its fp32 interior, as a NKI
+    kernel.
 
     `rms_norm_eps` is 1e-20 for this model — small enough that computing the
     variance in bf16 would make the epsilon a no-op and the reciprocal sqrt
     noisy, so the cast to fp32 is load-bearing rather than defensive.
+
+    **Why this is a kernel and not four torch ops.** The torch form was
+
+        variance = x.float().square().mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        return (self.weight.float() * x).to(dtype)
+
+    and `mean(-1)` is a sum over `dim` fp32 values *per row*, which is the one
+    reduction in this model whose accumulation order the compiler is free to
+    choose differently for a 1-row tensor than for a 6-row or 512-row one.
+    A different order is a different last bit in the reciprocal square root,
+    and an argmax over 129,280 near-tied logits turns that into a different
+    token — which is what makes a speculative verify step (`1 + k` rows where a
+    plain decode step has 1) emit different text from the same prompt. This is
+    ~258 calls per forward (6 per layer x 43), so it is the dominant term.
+
+    `kernels/rmsnorm.rms_norm` reduces each row in its own partition in
+    `dim // chunk` chunks whose width depends on `dim` alone, so a row's output
+    does not depend on how many rows the step carried. Checked under
+    `nki.simulate` against the torch expression above at `dim` 5120, 1536 and
+    128: **bit-identical to torch**, and row 0 of a 1-row call is bit-identical
+    to row 0 of 6-row and 130-row calls (`/tmp/iter8/ktest_rms.py`, recorded in
+    `.autohelix/notes/iter-8.md` §3).
     """
 
     def __init__(self, dim: int, eps: float, dtype: torch.dtype = torch.bfloat16):
@@ -208,11 +232,17 @@ class RMSNorm(nn.Module):
         self.register_buffer("weight", torch.ones(dim, dtype=dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        x = x.float()
-        variance = x.square().mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return (self.weight.float() * x).to(dtype)
+        shape = x.shape
+        flat = x.reshape(-1, self.dim)
+        # `eps` travels as a tensor because a kernel entry point takes tensors:
+        # a Python float would be baked into the kernel's cache key, which is
+        # harmless, but `wrap_nki` passes positional tensors through to the
+        # kernel and a scalar is not one of them.
+        eps = torch.full((1, 1), self.eps, dtype=torch.float32, device=x.device)
+        out = _nki_entry("rmsnorm", "rms_norm")(
+            flat, self.weight.reshape(1, self.dim), eps
+        )
+        return out.reshape(shape)
 
 
 #: fp8 e4m3's range, as `vendor/kernel.py`'s `act_quant_kernel` uses it. 448 is
@@ -386,9 +416,65 @@ def _group_name(tp_group) -> str:
     return _fc_resolve_group_name(tp_group.device_group)
 
 
+#: Largest all-reduce payload, in elements, handed to one collective call.
+#:
+#: **This is a host-memory lever, not a latency one, and it is the one piece of
+#: the TP=4 fix that lives in this file.** The measurement is in
+#: `.autohelix/hints.md` (2026-10-12 18:47): at four ranks the collectives'
+#: host-side comm/proxy buffer is ~18.7 GiB *per rank*, ~112 GiB of system
+#: commitment on a 124.8 GiB box, and that — not device HBM — is what wedged
+#: the instance twice. `NEURON_RT_CC_ALG_TYPES=INTRA_SINGLE_STEP_MESH_ALG`
+#: brings the whole 4-rank run down to ~30 GiB and the engine comes up, but the
+#: runtime then asserts `allr_sz <= ch_buf_split_sz`: one all-reduce payload has
+#: to fit one split of a channel buffer. `NEURON_RT_CC_CHANNEL_BUFFER_N` and
+#: `NEURON_RT_CC_CHUNK_SIZE` do not lift that split, so the payload is what has
+#: to come down — which is this constant.
+#:
+#: 262,144 elements is 1 MiB of fp32. The largest reduction this model performs
+#: is the MoE's `[T, 5120]` fp32 at the 512-token prefill bucket, 10.5 MiB, so
+#: that one becomes 11 collectives instead of 1; a decode step's `[6, 5120]` is
+#: one either way. Each chunk is a separate collective over the same group, and
+#: every rank derives the chunk count from the same shape, so the ranks stay in
+#: lockstep without any extra synchronization.
+#:
+#: **Untested at four ranks** — iteration 8 had no budget for a 4-rank run (see
+#: `.autohelix/notes/iter-8.md` §4) and this is dead code at TP=1, where
+#: `world_size == 1` means no collective runs at all. If a 4-rank run still
+#: trips the assert, lower this; the value that matters is the runtime's split
+#: size, which it does not report.
+_ALLREDUCE_CHUNK_ELEMS = 1 << 18
+
+
 def tp_all_reduce(x: torch.Tensor, tp_group) -> torch.Tensor:
-    """Sum `x` across the tensor-parallel ranks. Returns the reduced tensor."""
-    return _compiled(_fc_sum)(x, _group_name(tp_group))
+    """Sum `x` across the tensor-parallel ranks. Returns the reduced tensor.
+
+    Chunked at `_ALLREDUCE_CHUNK_ELEMS`, for the host-memory reason documented
+    there. The chunking is exact: a sum over ranks is elementwise, so splitting
+    the payload and concatenating the reduced pieces is the same tensor,
+    bit for bit, as reducing it whole.
+    """
+    name = _group_name(tp_group)
+    if x.numel() <= _ALLREDUCE_CHUNK_ELEMS:
+        return _compiled(_fc_sum)(x, name)
+    return _compiled(_fc_sum_chunked)(x, name, _ALLREDUCE_CHUNK_ELEMS)
+
+
+def _fc_sum_chunked(x: torch.Tensor, group_name: str, chunk: int) -> torch.Tensor:
+    """`_fc_sum` over `x` in `chunk`-element pieces, as one compiled step.
+
+    The splitting and the `cat` are *inside* the compiled region on purpose.
+    `tp_all_reduce`'s callers include `MoE.forward`, which dynamo has broken out
+    of, so a `reshape`/slice written in the caller would be an eager op on a
+    Neuron tensor — the backend's fallback, which is where iteration 7 lost a
+    run to `Expected self.is_contiguous() to be true` on exactly that pattern
+    (iter-7 §2f). In a traced graph they are ordinary views.
+    """
+    flat = x.reshape(-1)
+    parts = [
+        _fc_sum(flat[lo : lo + chunk], group_name)
+        for lo in range(0, flat.numel(), chunk)
+    ]
+    return torch.cat(parts).reshape(x.shape)
 
 
 def tp_all_gather_last(x: torch.Tensor, tp_group) -> torch.Tensor:
@@ -431,6 +517,7 @@ def _nki_entry(module: str, name: str = "kernel"):
         hc_expand,
         hc_mixes,
         index_score,
+        rmsnorm,
         sparse_attn as sparse_attn_kernel,
     )
 
@@ -443,6 +530,7 @@ def _nki_entry(module: str, name: str = "kernel"):
         "hc_expand": hc_expand,
         "hc_mixes": hc_mixes,
         "index_score": index_score,
+        "rmsnorm": rmsnorm,
         "sparse_attn": sparse_attn_kernel,
     }
     wrapped = wrap_nki(getattr(modules[module], name))
@@ -3610,7 +3698,7 @@ class DSparkBlock(Block):
 
         if stage == config.num_nextn_predict_layers - 1:
             self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-            self.markov_head = DSparkMarkovHead(config, tp_size)
+            self.markov_head = DSparkMarkovHead(config, tp_size, tp_rank)
             self.confidence_head = DSparkConfidenceHead(config)
 
 
@@ -3719,7 +3807,9 @@ def sample_tokens(logits: torch.Tensor, temperature: float = 0.0):
 class DSparkMarkovHead(nn.Module):
     """A rank-256 token-conditioned logit bias plus the embedding it reads."""
 
-    def __init__(self, config: DeepseekV41Config, tp_size: int) -> None:
+    def __init__(
+        self, config: DeepseekV41Config, tp_size: int, tp_rank: int = 0
+    ) -> None:
         super().__init__()
         rank = config.dspark_markov_rank
         self.vocab_size = config.vocab_size
@@ -3733,7 +3823,14 @@ class DSparkMarkovHead(nn.Module):
             torch.empty(self.part_vocab_size, rank, dtype=torch.bfloat16),
         )
         self.world_size = tp_size
-        self.rank_in_group = 0
+        # This rank's slice of the vocab, and it has to be *this* rank's: both
+        # tables are sharded on dim 0 (`_build_shard_plan`), so a hardcoded 0
+        # made every rank above the first subtract the wrong offset, look up
+        # rows it does not own and mask out the ones it does — a wrong Markov
+        # bias on every draft token at TP > 1, which costs acceptance rate
+        # without ever being visible at TP = 1. Inert at one rank, where
+        # `rank_in_group` is 0 anyway.
+        self.rank_in_group = tp_rank
 
     def forward(self, token_ids: torch.Tensor):
         """A rank-256 embedding of the previous draft token, and the logit bias
@@ -4617,8 +4714,16 @@ class DeepseekV41ForCausalLM(nn.Module):
         # return the rejection sampler's verdict rather than raw samples
         # (`neuron_model_runner.py:8131`, "Model already performed rejection
         # sampling on-device"). Greedy acceptance keeps exactly the prefix the
-        # target would have emitted unaided, so the tokens are identical to a
-        # run with speculation off.
+        # target would have emitted unaided — exact as a *rule*, and measured
+        # as 2 of the verifier's 4 prompts byte-identical with speculation on
+        # and off, the other two flipping one near-tied token each. The gap is
+        # the arithmetic rather than the rule: `1 + k` rows per sequence where
+        # a plain decode step has 1, and the torch sum-reductions that are left
+        # on the live path (`Gate`'s 384-wide softmax, the compressor's
+        # pooling) tile differently at a different row count. `RMSNorm` was the
+        # largest of them and is now a row-invariant kernel; see
+        # `.autohelix/notes/iter-8.md` §3c-§3d for the measurement and for the
+        # one change that would close the rest at once.
         accepted = None
         if spec_decode_metadata is not None:
             accepted = _compiled(_rejection_sample)(

@@ -743,10 +743,16 @@ def require_dspark_speculation(vllm_config) -> None:
     5 tokens per target forward, and on this port a forward streams 7.3 GiB of
     routed experts per layer — so a verified draft is close to free.
 
-    **It does not change what the model emits.** The draft is verified against
-    the target's own logits by `vllm_neuron.nn.rejection_sampler` under greedy
-    acceptance (`model.py`'s `_rejection_sample`), which keeps exactly the
-    prefix the target would have produced unaided.
+    **What it does to what the model emits, measured.** The draft is verified
+    against the target's own logits by `vllm_neuron.nn.rejection_sampler` under
+    greedy acceptance (`model.py`'s `_rejection_sample`), which keeps exactly
+    the prefix the target would have produced unaided — so the *rule* is
+    exact. The arithmetic is not yet: a verify step computes `1 + k` rows per
+    sequence, and the torch sum-reductions still on the live path tile
+    differently at a different row count. On the verifier's four prompts, same
+    tree and same cache, 2 of 4 are byte-identical with speculation on and off
+    and 2 flip one near-tied token each (`.autohelix/notes/iter-8.md` §3c).
+    That is a bug with a known fix (iter-8 §3d), not a trade.
 
     Inert if the operator supplied their own `speculative_config`, and skipped
     entirely when `DEEPSEEK_V41_NO_SPEC_DECODE=1`.

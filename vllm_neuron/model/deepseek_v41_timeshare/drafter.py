@@ -23,14 +23,29 @@ all of them live:
 4. The next step arrives with `spec_decode_metadata`, the target verifies the `1 + k` tokens in
    one forward, and `model.py`'s `_rejection_sample` keeps the accepted prefix.
 
-**Exactness.** Speculative decoding here is exactness-preserving the way it always is: the
-target verifies every draft token and the rejection sampler keeps only the prefix that matches
-what the target would have sampled anyway. So a *poor* draft costs acceptance rate and never
-output -- which is what makes the draft's seeding a performance question rather than a
-correctness one. Through iteration 6 the seed was `input_ids[begin + length - 1]`, the token
-fed *in* at the last position rather than the one sampled from it, which anchored the whole
-block one position early; `model._draft` now seeds from the sampler's own output (and under
-speculation from the last token the rejection sampler accepted) and anchors the block there.
+**Exactness, as measured rather than as hoped.** The *acceptance rule* is exact: the target
+verifies every draft token and the rejection sampler keeps only the prefix that matches what
+the target would have sampled anyway, so no draft token can reach the output without the
+target agreeing with it, and a *poor* draft costs acceptance rate rather than correctness.
+(Through iteration 6 the seed was `input_ids[begin + length - 1]`, the token fed *in* at the
+last position rather than the one sampled from it, which anchored the whole block one position
+early; `model._draft` now seeds from the sampler's own output -- under speculation from the
+last token the rejection sampler accepted -- and anchors the block there.)
+
+What that argument does **not** cover is the arithmetic: a verify step computes `1 + k` rows
+per sequence where a plain decode step computes 1, and an op whose per-row reduction the
+compiler tiles differently at a different row count gives a different last bit, which an
+argmax over 129,280 logits can turn into a different token. Measured on the verifier's own
+four prompts, same tree, same cache, speculation the only difference
+(`.autohelix/notes/iter-8.md` §3c): **2 of 4 byte-identical, 2 diverging once each** — one
+digit of a sector number 20 tokens into the needle, and token ~5 of the France trivia. It was
+1 of 4 before `RMSNorm` became a row-count-invariant NKI kernel (`kernels/rmsnorm.py`), which
+is the first of the reductions behind this to be fixed and the largest. The remaining ones are
+listed in iter-8 §3d, as is the change that would close the gap for all of them at once
+(padding the decode token axis to a fixed bucket so the shapes stop depending on the batch).
+
+So: exactness-preserving in its acceptance rule, and **not yet** token-identical on every
+prompt. That is a bug to finish fixing, not a trade to accept.
 
 **What the runner calls.** Duck-typed; `spec_decode/eagle.py` is the reference implementation,
 and the consumption side -- `_build_spec_decode_metadata`, the scheduler's
