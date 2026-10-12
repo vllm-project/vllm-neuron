@@ -27,15 +27,22 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-#: Peak `Committed_AS` of a single-rank run of the timeshare port, minus idle: measured
-#: 13.7/13.6/12.8/14.3 GB across four samples of a run that generated tokens, against
-#: 1.7 GB idle. Override with `NEURON_HOST_MEM_PER_RANK_GIB` when you have a number for
-#: your own model.
-DEFAULT_PER_RANK_GIB = 14.0
+#: Host commitment a rank of the timeshare port holds, measured two ways:
+#:
+#:   TP=1, whole run    13-14 GB of `Committed_AS` (four samples, against 1.7 GB idle)
+#:   TP=4, per worker   24.5 GB of *resident* anonymous heap (`VmData == VmRSS`), with
+#:                      stacks at 140 KB and 97 threads — so it is neither stacks nor
+#:                      glibc arenas but NEFF/kbin host images and DMA descriptors,
+#:                      which every rank loads in full because the NEFF is not sharded
+#:
+#: The larger figure is the one to budget with, since it is what a multi-rank run
+#: actually holds. Override with `NEURON_HOST_MEM_PER_RANK_GIB` for another model.
+DEFAULT_PER_RANK_GIB = 24.5
 
 #: Host memory a run should not eat into, so that ssh, journald and the agent survive a
-#: run that misbehaves.
-RESERVE_GIB = 8.0
+#: run that misbehaves. A second margin on top of the real one: `CommitLimit` is itself
+#: set below physical RAM, so there is already RAM that no commitment can reach.
+RESERVE_GIB = 6.0
 
 
 def _meminfo() -> dict[str, float]:
@@ -106,6 +113,19 @@ def check_host_memory_budget(world_size: int, model_name: str = "") -> None:
             "/etc/sysctl.d/99-neuron-host-memory.conf.",
             _overcommit_mode(),
         )
+
+    # `check_and_update_config` runs in every process that builds a platform -- the
+    # driver *and* each spawned worker. Only the first of those sees an idle machine, and
+    # only it can meaningfully project the whole world's demand: by the time rank 3 asks,
+    # ranks 0-2 hold 24 GB each and the projection would always fail. So the later
+    # processes report and leave the decision to the one that went first.
+    if info.get("Committed_AS", 0.0) > per_rank:
+        logger.info(
+            "Host memory: %.1f GiB already committed, so a rank is up and this process "
+            "is not the one that budgets for the run; not enforcing here.",
+            info.get("Committed_AS", 0.0),
+        )
+        return
 
     if projected + RESERVE_GIB > grantable:
         raise RuntimeError(
