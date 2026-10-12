@@ -73,7 +73,7 @@ from vllm_neuron.model.neuron_config import (
 )
 from libtorch_neuronx_lite.compile.capture_backend import CaptureComplete
 from vllm_neuron.vllm.sample.rejection_sampler import RejectionSampler
-from vllm_neuron.vllm.spec_decode import PROPOSERS, get_proposer
+from vllm_neuron.vllm.spec_decode import PROPOSERS, resolve_proposer
 from vllm_neuron.vllm.spec_decode.eagle import EagleProposer
 from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE
 from vllm_neuron.utils.bucket_utils import (
@@ -746,7 +746,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         if self.speculative_config:
             method = self.speculative_config.method
-            proposer_cls = get_proposer(method)
+            proposer_cls = resolve_proposer(method)
             if method == "eagle3":
                 self.is_eagle3_spec = True
                 self.drafter = EagleProposer(
@@ -5911,8 +5911,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         )
 
         # If spec decode enabled, log acceptance stats and propose draft tokens.
-        # aux_hidden_states is None when eagle3 is not active.
-        if self.is_eagle3_spec and aux_hidden_states is not None:
+        #
+        # eagle3 proposes from the target's auxiliary hidden states, so it has nothing to
+        # propose from until the target emits them. A proposer registered by a model package
+        # drafts *inside* the target forward and receives no hidden states here, so requiring
+        # them would disable it silently — the drafter would be built and never called.
+        if self.drafter is not None and (
+            aux_hidden_states is not None or not self.is_eagle3_spec
+        ):
             max_position = positions.max().item() if positions.numel() > 0 else 0
             num_spec_tokens = self.drafter.num_speculative_tokens
             # Stop proposing early enough that the scheduler never trims
@@ -8320,9 +8326,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         logits_indices: torch.Tensor | None = None,
         raw_sampled_token_ids: torch.Tensor | None = None,
     ) -> list[list[int]] | torch.Tensor:
-        # TODO: now only supports EAGLE speculative decoding
-        # Add more when needed
-        assert isinstance(self.drafter, EagleProposer)
+        # Everything below is proposer-agnostic except the hidden states, which only eagle3
+        # produces: the indices, the sampled-token tensor and the return shapes are the same
+        # contract for a proposer registered by a model package.
+        assert self.drafter is not None
 
         num_reqs = self.input_batch.num_reqs
 
@@ -8378,8 +8385,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # single concatenated [T, 3*hidden_size] device tensor (the cat is
         # done on the target side, inside its compile boundary). Passing
         # it through as-is avoids any Python-side op between the target
-        # NEFF and the draft NEFF.
-        assert aux_hidden_states is not None
+        # NEFF and the draft NEFF. An in-model proposer has its draft from
+        # the target's own forward and is handed None.
+        if self.is_eagle3_spec:
+            assert aux_hidden_states is not None
 
         async_spec_kwargs = {}
         if self._model_is_async_spec_decoded() and spec_decode_metadata is not None:
@@ -8617,10 +8626,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # This binds the cache tensors to the model
         self.model.bind_kv_cache(kv_caches)
 
-        if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
-            # This binds the cache tensors to the draft model
-            self.drafter.model.bind_kv_cache(kv_caches)
+        if self.drafter is not None:
+            # Only a *separate* draft model needs its own binding. An in-model proposer's
+            # `.model` is the target, bound just above, and binding it twice would register
+            # the same caches on the same module twice.
+            draft_model = getattr(self.drafter, "model", None)
+            if draft_model is not None and draft_model is not self.model:
+                # This binds the cache tensors to the draft model
+                draft_model.bind_kv_cache(kv_caches)
             # validate all draft model layers belong to the same kv cache group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
 
@@ -8684,10 +8697,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 )
             all_kv_cache_specs[layer_name] = spec
 
-        if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
-
-            drafter_kv_spec = self.drafter.model.get_kv_spec()
+        # A separate draft model declares KV caches of its own. An in-model proposer does
+        # not: its stages are layers of the target, so the target's `get_kv_spec` already
+        # named them, and re-adding them here would overwrite those entries.
+        draft_model = getattr(self.drafter, "model", None) if self.drafter else None
+        if draft_model is not None and draft_model is not self.model:
+            drafter_kv_spec = draft_model.get_kv_spec()
             for layer in drafter_kv_spec.layers:
                 layer_name = layer.name
                 all_kv_cache_specs[layer_name] = FullAttentionSpec(
