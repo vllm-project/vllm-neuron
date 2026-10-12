@@ -342,10 +342,27 @@ class SafetensorsIndex:
         streamed tensor is copied to the device immediately and never read
         twice, telling the kernel so keeps the cache flat.
 
-        `MADV_DONTNEED` wants a page-aligned start, so the range is widened
-        down to the page below and up to the page above; the few bytes of a
-        neighbouring tensor that may share those pages are re-faulted if they
-        are read again, which costs a page fault and not correctness.
+        **`posix_fadvise` on the file, not only `madvise` on the mapping.**
+        `MADV_DONTNEED` was doing nothing here and the docstring used to claim
+        it did. For a *shared file-backed* mapping it tears down this process's
+        page-table entries and leaves the page cache exactly as it was — it is
+        `MAP_PRIVATE` anonymous memory that MADV_DONTNEED frees. Measured during
+        the verifier run of 2026-10-12: `Cached:` climbed back to 44-59 GiB
+        within a minute of every manual `drop_caches`, i.e. ~10-15 GiB a minute
+        of expert bytes, with this method being called after every single read.
+        `POSIX_FADV_DONTNEED` on the descriptor is the call that evicts clean
+        page-cache pages for a byte range, and these pages are always clean
+        (the mapping is `ACCESS_READ`).
+
+        Both are issued: the madvise still releases the PTEs, which is cheap and
+        keeps this process's resident size down, and the fadvise is what the
+        page cache answers to. Neither is load-bearing for correctness — a
+        dropped page is re-read, and the only cost of a refusal is a fuller
+        cache — so both are best-effort.
+
+        The range is widened to whole pages (down to the page below, up to the
+        page above). A neighbouring tensor sharing those pages is re-faulted if
+        it is read again, which costs a page fault and not correctness.
         """
         ref = self.ref(key)
         mapping = self._maps.get(ref.shard)
@@ -359,6 +376,16 @@ class SafetensorsIndex:
         except (OSError, ValueError):
             # Not fatal: the kernel is free to refuse, and the only cost is a
             # fuller page cache.
+            pass
+        handle = self._files.get(ref.shard)
+        fileno = getattr(handle, "fileno", None)
+        if fileno is None:
+            return
+        try:
+            os.posix_fadvise(
+                fileno(), begin, end - begin, os.POSIX_FADV_DONTNEED
+            )
+        except (OSError, ValueError, AttributeError):
             pass
 
     def close(self) -> None:
@@ -381,30 +408,140 @@ def staged_cache_root(checkpoint_path: str | os.PathLike) -> Path | None:
 
     Throughput, measured on this instance, is why any of this exists:
 
-        /            (EBS)            131 MB/s, and it does not scale with
-                                      parallel readers
-        /mnt/nvme    (instance store) 1.1 GB/s with O_DIRECT
+        /            (EBS)            131-139 MB/s, and it does **not** scale
+                                      with parallel readers — 8 concurrent
+                                      O_DIRECT readers over 8 shards gave
+                                      129 MB/s aggregate
+        /mnt/nvme    (instance store) 2.3 GB/s written with O_DIRECT; ~730 MB/s
+                                      effective through this module's mmap
 
-    One streaming pass over the 286 GiB of dense weights is 37 minutes at the
-    first rate and 4.3 minutes at the second, against a verifier that has to
-    finish 4 prompts inside its budget.
+    A layer's 384 experts are 7.3 GiB, so the per-layer cost of one prefill
+    forward is ~55 s unstaged against ~10 s staged, and a 40-layer prefill is
+    **64 minutes against 7.5** (both measured, 2026-10-12). The verifier's
+    budget for all four prompts is 5000 s, so the staged copy is not a
+    performance nicety here: unstaged, the gate cannot pass.
+
+    **The volume is an instance store and does not survive a stop/start.** It
+    was found empty, with no filesystem at all, at the start of iteration 6 —
+    after five iterations had attributed the resulting slowness to the model.
+    Hence the error-level log below rather than a warning: an iteration that
+    misses this loses an hour per run.
     """
     cache = TIMESHARE_CACHE_ROOT
     index_file = Path(checkpoint_path) / "model.safetensors.index.json"
     if not cache.is_dir() or not index_file.is_file():
         if not cache.is_dir():
-            logger.warning(
-                "no staged checkpoint at %s; reading everything from %s at "
-                "~131 MB/s. One streaming pass over the dense weights is ~37 "
-                "min instead of ~4 min.",
+            logger.error(
+                "NO STAGED CHECKPOINT at %s — every weight read will come off "
+                "EBS at ~131 MB/s, which is 8x slower and makes a 40-layer "
+                "prefill ~64 min instead of ~7.5. Check `df -h %s`; if the "
+                "instance store is unmounted (it does not survive a "
+                "stop/start) then mkfs+mount it and copy shards 1-46 of %s "
+                "there, which takes ~38 min of pure wall clock and can run in "
+                "the background. See .autohelix/notes/iter-6.md section 4a.",
+                cache,
                 cache,
                 checkpoint_path,
             )
         return None
     wanted = set(json.loads(index_file.read_text())["weight_map"].values())
     if not any((cache / name).is_file() for name in wanted):
+        logger.error(
+            "the staged checkpoint directory %s exists but holds none of the "
+            "48 shards this checkpoint names; reading everything from %s at "
+            "~131 MB/s. Same remedy as above.",
+            cache,
+            checkpoint_path,
+        )
         return None
     return cache
+
+
+def stage_checkpoint(
+    checkpoint_path: str | os.PathLike, max_shards: int = 46
+) -> int:
+    """Copy the checkpoint's shards onto `TIMESHARE_CACHE_ROOT`. Returns how
+    many it staged.
+
+    An operational entry point, called by hand and by nothing in the serving
+    path — `staged_cache_root` only *reads* what this put there. It exists in
+    this module rather than as a shell script because the admission rule it has
+    to satisfy lives here: `_resolve_shard` accepts a staged shard only on an
+    exact size match against the original, and a half-written file that happened
+    to match would yield silently wrong tensors. So the copy goes to `.part` and
+    is renamed only after its size is checked, which makes the whole thing
+    interruptible and resumable — re-running it skips what is already whole.
+
+        python -c "import vllm_neuron.model.deepseek_v41_timeshare.weight_loader as w; \\
+                   w.stage_checkpoint('/home/ubuntu/workspace/partition-artifact/hf')"
+
+    The mount is the caller's job, since it needs root:
+
+        sudo mkfs.ext4 -F -m 0 -E lazy_itable_init=1,lazy_journal_init=1 /dev/nvme1n1
+        sudo mount -o noatime /dev/nvme1n1 /mnt/nvme
+        sudo mkdir -p /mnt/nvme/hf && sudo chown -R "$USER" /mnt/nvme
+
+    `max_shards=46` is the default because this checkpoint's last two shards are
+    the two 94.6 GiB engram tables: 286 GiB of dense weights and experts fit on
+    the 430 GiB volume and 476 GiB does not, and the engram path reads 256-byte
+    rows at random, which is an IOPS workload that a faster volume helps far
+    less. Raise it if the volume is bigger.
+
+    Reads are `O_DIRECT` so that staging ~286 GiB does not leave ~286 GiB in the
+    page cache — the same concern as `release_pages`, and the reason this does
+    not simply call `shutil.copyfile`.
+    """
+    source = Path(checkpoint_path)
+    target = TIMESHARE_CACHE_ROOT
+    index_file = source / "model.safetensors.index.json"
+    if not target.is_dir():
+        raise RuntimeError(
+            f"{target} is not a directory; mount the fast volume there first "
+            "(see this function's docstring)"
+        )
+    names = sorted(set(json.loads(index_file.read_text())["weight_map"].values()))
+    block = 8 << 20
+    staged = 0
+    for name in names[:max_shards]:
+        src, dst = source / name, target / name
+        want = src.stat().st_size
+        if dst.is_file() and dst.stat().st_size == want:
+            continue
+        part = dst.with_suffix(dst.suffix + ".part")
+        # O_DIRECT needs an aligned buffer, which `os.preadv` into a memoryview
+        # of a page-aligned mmap gives us without a third-party dependency.
+        flags = os.O_RDONLY | getattr(os, "O_DIRECT", 0)
+        fd = os.open(src, flags)
+        try:
+            with open(part, "wb") as out:
+                buffer = mmap.mmap(-1, block)
+                try:
+                    offset = 0
+                    while offset < want:
+                        got = os.preadv(fd, [buffer], offset)
+                        if got <= 0:
+                            break
+                        out.write(memoryview(buffer)[: min(got, want - offset)])
+                        offset += got
+                finally:
+                    buffer.close()
+                out.flush()
+                os.fsync(out.fileno())
+        finally:
+            os.close(fd)
+        written = part.stat().st_size
+        if written != want:
+            part.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"staging {name} produced {written} bytes, expected {want}; "
+                "removed the partial copy rather than leaving one that "
+                "_resolve_shard might accept"
+            )
+        part.rename(dst)
+        staged += 1
+        logger.info("staged %s (%d MiB)", name, want >> 20)
+    logger.info("staged %d shard(s) under %s", staged, target)
+    return staged
 
 
 # =============================================================================
