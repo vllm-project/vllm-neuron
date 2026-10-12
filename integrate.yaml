@@ -31,9 +31,12 @@ goal: |
   - The implementation faithfully run all computations needed for DeepSeek V4.1 Flash.
   - Inference uses DSpark for speculative decoding. The MTP stages already compute a draft on every
     forward and it is discarded; the draft has to be proposed to the scheduler and verified, so the tokens
-    the model emits come through the speculative path. Speculation is exactness-preserving: the same
-    prompts with it on and off must produce identical tokens, and a faster run that answers differently is
-    a bug, not a trade.
+    the model emits come through the speculative path. What makes it count is the acceptance rate and
+    the quality, not bit-exactness: the tokens may differ between speculation on and off — greedy
+    decoding here is not batch-shape invariant in bf16, because a speculative step verifies `1 + k` rows
+    where a plain step verifies one — but the distribution must not drift (both arms of equivalent
+    quality, agreeing wherever there is a right answer) and the acceptance rate must be high enough that
+    the drafter pays for itself.
   - The workload and the data are distributed over 4 ranks (TP=4). The device carries 4 HBM stacks of 24 GB,
     one per logical NeuronCore, and a rank addresses only its own — so one rank is 24 GB and four is 96 GB,
     with resident weights and per-NEFF DMA rings each divided. This does NOT have to be vLLM's
@@ -75,9 +78,10 @@ goal: |
   compute a draft on every forward and it is thrown away, because nothing proposes it to the
   scheduler. `drafter.py` is now in your editable scope and its docstring states the interface
   `NeuronModelRunner` expects; registering a proposer there is how inference comes to use
-  DSpark rather than merely execute it. Speculative decoding must not change the output: the
-  same prompts with it on and off have to produce identical tokens, and a faster run that
-  answers differently is a bug, not a trade.
+  DSpark rather than merely execute it. Speculation does not have to reproduce the
+  non-speculative tokens exactly — on this port it cannot, since a speculative step verifies
+  `1 + k` rows and bf16 sum reductions are not row-count invariant. It has to be *worth having*:
+  a real acceptance rate, and a distribution that has not drifted from the non-speculative arm.
   - Follow this tutorial to on-board the model: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/vllm-neuron/docs/model-dev/onboarding-models.html
   - Follow this tutorial to debug for accuracy, except you don't have to run a whole set of benchmark (just use the verifier inputs): https://awsdocs-neuron.readthedocs-hosted.com/en/latest/vllm-neuron/docs/model-dev/accuracy-debugging-guide.html.
   - Check vllm_neuron/ to see how NKI kernels are integrated in vLLM using libtorch-neuronx-lite.
@@ -301,15 +305,42 @@ constraints:
         - drafts computed and dropped: `self.last_draft` written and never read by anything
           that feeds the scheduler;
         - a proposer registered but never built, because no `speculative_config` was supplied;
-        - speculation that changes the output. It is an exactness-preserving optimisation, so
-          tokens differing between speculation on and off is a bug, not a trade;
+        - an acceptance rate so low the drafter costs more than it saves — every rejected token
+          still pays for a target forward over `1 + k` padded positions, so a draft that is
+          almost never accepted is a regression dressed as a feature;
+        - output that degrades with speculation on: a verifiable answer that comes out right
+          without it and wrong with it, or completions that turn repetitive, truncated or
+          off-topic;
         - acceptance numbers asserted in prose with no run behind them.
+
+      **Token-level divergence between speculation on and off is expected, and is not a
+      failure.** Earlier versions of this constraint demanded identical tokens. That was the
+      wrong bar: greedy decoding on this port is not batch-shape invariant in bf16, because a
+      speculative step verifies `1 + k` rows where a plain step verifies one, and the sum
+      reductions on the path (`RMSNorm` alone runs ~258 times a forward over 5120 values) do
+      not give bit-identical per-row results at different row counts. Chasing bit-exactness
+      there is a different piece of work from making speculation *useful*. What this constraint
+      wants instead is that the distribution does not drift: the two runs should be of
+      equivalent quality and should agree wherever there is a right answer.
     criteria: |
-      PASS only if you can cite a live run in this iteration where drafts from the MTP stages
-      were proposed and verified on the token-generating path, and the generated tokens match
-      what the same prompts produce without speculation.
-      FAIL if the drafter is a stub, if the drafts are discarded, if no run shows the path being
-      taken, if speculation changes the output, or if the evidence does not let you tell.
+      PASS if a live run in this iteration shows drafts from the MTP stages proposed and
+      verified on the token-generating path, AND both of these hold:
+
+        - **acceptance is real.** Cite the rate from the rejection sampler's own counts as
+          accepted draft tokens per verify step against the `num_speculative_tokens` ceiling.
+          At or above ~1.5 of 5 (30%) is working. Below ~1 of 5 the drafter is costing more
+          than it saves, and that is a FAIL even though the output is fine.
+        - **the distribution has not drifted.** Compare the same prompts with speculation on
+          and off — `DEEPSEEK_V41_NO_SPEC_DECODE=1` is the control arm. The completions do not
+          have to match token for token. They do have to be of equivalent quality, and they
+          have to agree where there is a verifiable answer: the needle's access code, the
+          capital of France. One run answering correctly while the other does not is a drift
+          failure; different wording of the same correct answer is not.
+
+      FAIL if the drafter is a stub, if the drafts are discarded, if no run shows the path
+      being taken, if acceptance is near zero, if the spec-on output is materially worse, or if
+      the evidence does not let you tell. Do NOT fail it for tokens differing between the two
+      arms.
 
       A FAIL is expected while this is being built — say plainly which half exists (the stages
       computing drafts, or the proposer consuming them) so the next iteration knows what is
