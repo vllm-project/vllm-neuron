@@ -17,6 +17,13 @@
    "what": "trimmed 9328 -> 8149 tokens by dropping filler lines only",
    "why": "a prompt over max_num_batched_tokens=8192 needs a second prefill segment, which is a second set of graphs to compile; <=8192 keeps it to one chunk",
    "preserved": "header, the needle line (9423-G36) at its original ~52.6% depth, the question and the 'Answer:' tail"
+  },
+  {
+   "date": "2026-10-12",
+   "id": "long-needle-2048-0",
+   "what": "trimmed 2355 -> 2008 tokens, filler lines only",
+   "why": "its target_tokens said 2048 but it encoded to 2355, so it needed a second prefill segment. 2048 is past the indexer threshold (index_topk=512 against compressed positions, so ratio-2 layers need >1024) and leaves ~10 GB of the bank spare.",
+   "preserved": "header, needle (5591-C67) at its original depth, question, 'Answer:' tail"
   }
  ]
 }

@@ -51,7 +51,7 @@ LONG_JSONL = INPUTS_DIR / "long.jsonl"
 #: Which rows of the copied sets to use. `short-prose` is chat-templated,
 #: `long-needle-8192-0` is a raw continuation, so the two cover both prompt
 #: paths. Add ids to widen the set.
-SELECTED_IDS = ("short-prose", "long-needle-8192-0")
+SELECTED_IDS = ("short-prose", "long-needle-2048-0")
 
 #: The onboarding guide's smoke test is the raw fragment `"Hello, my name is"`. This asks the
 #: question instead, through the chat template, because the raw fragment made a
