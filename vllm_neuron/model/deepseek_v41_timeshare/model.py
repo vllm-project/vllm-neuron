@@ -590,6 +590,7 @@ def _nki_entry(module: str, name: str = "kernel"):
     # whereas an import statement it handles.
     from .kernels import (
         blockquant,
+        compress_pool,
         engram_gate,
         hc_attn_out,
         hc_collapse,
@@ -603,6 +604,7 @@ def _nki_entry(module: str, name: str = "kernel"):
     _raise_dynamo_limits()
     modules = {
         "blockquant": blockquant,
+        "compress_pool": compress_pool,
         "engram_gate": engram_gate,
         "hc_attn_out": hc_attn_out,
         "hc_collapse": hc_collapse,
@@ -1940,15 +1942,24 @@ class Compressor(nn.Module):
         firsts = (start_pos // ratio + torch.arange(count, device=device)) * ratio
         members = firsts.unsqueeze(1) + torch.arange(ratio, device=device)
         slots = paged.slots(members.reshape(-1))
-        # fp32 for the pooling itself, which is where the reference's fp32
-        # interior actually matters: the softmax over `ratio` members and the
-        # weighted sum. The *storage* is bf16 and widening it here is exact —
-        # see `allocate_state`.
-        kv = self.pool_kv.index_select(0, slots).reshape(count, ratio, -1).float()
-        score = (
-            self.pool_score.index_select(0, slots).reshape(count, ratio, -1).float()
+        # The pooling itself — the softmax over the `ratio` members and the
+        # weighted sum — is `kernels/compress_pool.softmax_pool`, which is
+        # `legacy/l2_attn.py:1044-1062` with the member count taken off the
+        # operand. It loads the bf16 storage and reduces in fp32, which is the
+        # reference's fp32 interior; widening on the way in is exact (see
+        # `allocate_state`) and the kernel's output is fp32, so the single
+        # rounding back to bf16 below is the reference's own.
+        #
+        # What stays in torch here is the *gather*: `index_select` into the two
+        # paged pooling buffers, and the `reshape` that groups the members. Data
+        # movement and a view, inside this layer's enclosing graph —
+        # `kernels/sparse_attn.py`'s module docstring draws the same line for
+        # the same reason.
+        kv = self.pool_kv.index_select(0, slots).reshape(count, ratio, self.head_dim)
+        score = self.pool_score.index_select(0, slots).reshape(
+            count, ratio, self.head_dim
         )
-        pooled = (kv * score.softmax(dim=1)).sum(dim=1).unsqueeze(0)
+        pooled = _nki_entry("compress_pool", "softmax_pool")(kv, score).unsqueeze(0)
         return self.norm(pooled.to(dtype)), firsts
 
 
@@ -2587,6 +2598,37 @@ def _swiglu_expert(x, weights, w1, s1, w2, s2, w3, s3, storage, limit):
     routing weight, or None for a shared expert — multiplies *before* `w2`,
     which is what makes a zero routing weight contribute exactly zero, since
     `w2` has no bias.
+
+    **The five lines between the GEMMs are the one piece of expert arithmetic
+    still in torch, and `kernels/swiglu.py` is the kernel that replaces them —
+    written, measured on the device, and deliberately not wired.** Iteration 13
+    wired it, passed the gate's verifier with it at four ranks
+    (`/tmp/iter13/v13b.json`, 4/4 `REASONABLE`), and then took it back out,
+    because the thing it costs is not accuracy but *ties*: the kernel differs
+    from this expression by one bf16 step on about 1 value in 100,000, that is
+    280 expert calls a forward, and the greedy argmax over 129,280 logits then
+    lands differently often enough that
+
+      * the needle case answered correctly and stopped emitting EOS (19 tokens
+        `stop` -> 32 tokens `length`), and
+      * speculation on and off stopped producing identical tokens — two of the
+        three short cases still matched exactly, `smoke-test` diverged after 80
+        characters.
+
+    That second one is the property `uses-dspark-speculation` is judged on, and
+    it is empirical rather than structural: nothing in the port guarantees that
+    a 6-row verify step and a 1-row decode step agree bit for bit, so perturbing
+    any value anywhere re-rolls it. Keeping torch here keeps iteration 12's
+    numbers exactly.
+
+    **And the kernel cannot be made exact, which is why this is a decision and
+    not a TODO.** Half the difference was a multiply order and is fixed; the
+    rest is `silu`, where two equally valid fp32 formulations of
+    `x * sigmoid(x)` — `F.silu` and the literal product, both torch — disagree
+    in the last bit on 22% of values and on 4.5e-06 of them after a bf16 cast.
+    `.autohelix/notes/iter-13.md` §3b-bis has that measurement and argues that
+    the thing to fix is `blockquant`'s row-count-dependent GEMM blocking, after
+    which this kernel costs nothing to wire.
     """
     dtype = x.dtype
     gate = nki_linear(x, w1, s1, storage).float()
