@@ -120,6 +120,7 @@ from __future__ import annotations
 import functools
 import gc
 import logging
+import os
 
 import torch
 import torch.nn.functional as F
@@ -418,17 +419,14 @@ def _group_name(tp_group) -> str:
 
 #: Largest all-reduce payload, in elements, handed to one collective call.
 #:
-#: **This is a host-memory lever, not a latency one, and it is the one piece of
-#: the TP=4 fix that lives in this file.** The measurement is in
-#: `.autohelix/hints.md` (2026-10-12 18:47): at four ranks the collectives'
-#: host-side comm/proxy buffer is ~18.7 GiB *per rank*, ~112 GiB of system
-#: commitment on a 124.8 GiB box, and that — not device HBM — is what wedged
-#: the instance twice. `NEURON_RT_CC_ALG_TYPES=INTRA_SINGLE_STEP_MESH_ALG`
-#: brings the whole 4-rank run down to ~30 GiB and the engine comes up, but the
-#: runtime then asserts `allr_sz <= ch_buf_split_sz`: one all-reduce payload has
-#: to fit one split of a channel buffer. `NEURON_RT_CC_CHANNEL_BUFFER_N` and
-#: `NEURON_RT_CC_CHUNK_SIZE` do not lift that split, so the payload is what has
-#: to come down — which is this constant.
+#: **It exists so that one all-reduce payload fits one split of a channel
+#: buffer.** With the single-step mesh algorithm selected the runtime asserts
+#: `allr_sz <= ch_buf_split_sz` on entry, and neither
+#: `NEURON_RT_CC_CHANNEL_BUFFER_N` nor `NEURON_RT_CC_CHUNK_SIZE` lifts that
+#: split (both tested at four ranks), so the payload is the only thing that can
+#: come down — which is this constant. It was added by iteration 8 as a
+#: host-memory lever; iteration 9 ran it at four ranks and it is not one, which
+#: the next block records.
 #:
 #: 262,144 elements is 1 MiB of fp32. The largest reduction this model performs
 #: is the MoE's `[T, 5120]` fp32 at the 512-token prefill bucket, 10.5 MiB, so
@@ -437,12 +435,30 @@ def _group_name(tp_group) -> str:
 #: every rank derives the chunk count from the same shape, so the ranks stay in
 #: lockstep without any extra synchronization.
 #:
-#: **Untested at four ranks** — iteration 8 had no budget for a 4-rank run (see
-#: `.autohelix/notes/iter-8.md` §4) and this is dead code at TP=1, where
-#: `world_size == 1` means no collective runs at all. If a 4-rank run still
-#: trips the assert, lower this; the value that matters is the runtime's split
-#: size, which it does not report.
-_ALLREDUCE_CHUNK_ELEMS = 1 << 18
+#: **Iteration 9 measured the boundary on the device, at four ranks.** The
+#: assert is real and it is a cliff, not a gradient — with
+#: `NEURON_RT_CC_ALG_TYPES=INTRA_SINGLE_STEP_MESH_ALG` selected:
+#:
+#:     1 << 18   (1 MiB fp32)    runs; all 40 layers reduce correctly
+#:     1 << 20   (4 MiB fp32)    `Assertion 'allr_sz <= ch_buf_split_sz' failed`
+#:     1 << 21   (8 MiB fp32)    same assert
+#:     unchunked (10.5 MiB)      same assert
+#:
+#: so the split this runtime gives is somewhere in (1 MiB, 4 MiB] and 1 << 18 is
+#: the largest power of two that is safely inside it. Under the runtime's
+#: *default* `INTRA_RING_ALG` there is no assert at any size, and the port no
+#: longer selects the mesh (see `__init__.py`), so chunking is not strictly
+#: needed today — it is kept, and kept as the default, because it is the value
+#: that works under *either* algorithm and the cost is immeasurable: a rank's
+#: host commitment at layer 23 was 6.4-6.8 GiB chunked and 6.4-6.8 GiB
+#: unchunked, i.e. the same. The thing that does cost 13 GiB a rank is the
+#: runtime's debug-info graph, which has nothing to do with this constant.
+#:
+#: Tunable from the environment so that sweep needed no edit of this file. Dead
+#: code at TP=1, where `world_size == 1` means no collective runs at all.
+_ALLREDUCE_CHUNK_ELEMS = int(
+    os.environ.get("DEEPSEEK_V41_ALLREDUCE_CHUNK_ELEMS", 1 << 18)
+)
 
 
 def tp_all_reduce(x: torch.Tensor, tp_group) -> torch.Tensor:
@@ -3963,6 +3979,24 @@ class DeepseekV41ForCausalLM(nn.Module):
         if ods is not None:
             from vllm_neuron.nn.sampler import Sampler
 
+            # The group stays, and the *other* side of its contract is what
+            # iteration 9 fixed: it is handed `logits_shard` rather than the
+            # gathered row, so the vocab-shard offset
+            # `functional/argmax` applies is the right one. See `logits_shard`
+            # for the arithmetic of the TP=2 corruption this resolves.
+            #
+            # Dropping the group instead — which is the one-line version of the
+            # same fix — does not work, and the reason is worth keeping:
+            # `functional/sampling._top_k_filter` branches on it, and the
+            # no-group branch is `torch.topk`, which this backend lowers to a
+            # NKI kernel returning **uint32** indices. Those propagate (the
+            # `.to(torch.int32)` at the end of `sample` does not stop them) into
+            # `nn/rejection_sampler`'s `torch.cat([output, int32_full])`, and
+            # the compile dies with `RuntimeError: Promotion for uint16, uint32,
+            # uint64 types is not supported, attempted to promote UInt32 and
+            # Int` — measured, in the needle phase, on this tree. The
+            # group-bearing branch is `functional.topk.topk`, whose indices are
+            # int32, so keeping the group is also what keeps the dtypes sane.
             self.sampler = Sampler(
                 ods, process_group=getattr(tp_group, "device_group", None)
             )
@@ -4461,18 +4495,48 @@ class DeepseekV41ForCausalLM(nn.Module):
             out = tp_all_reduce(out, self.tp_group)
         return out
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Vocab-parallel unembedding, gathered to full width.
+    def logits_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This rank's columns of the logits: `[T, part_vocab_size]`.
 
         The widest GEMM in the model (5120 x 129280 per rank at TP=1) and the
         one that most needs to be on the device, so it goes through the bf16
         NKI kernel. `head_weight` is stored bf16, so an fp32 torch `linear`
         would only differ in summation order.
+
+        Split out from `compute_logits` because the sampler and the runner want
+        *different* tensors, and giving the sampler the wrong one is a bug with
+        a measured signature. `vllm_neuron.nn.Sampler` takes a process group to
+        mean "the logits I am handed are this group's shard of the vocab"
+        (`functional/sampling.sample`: "the function expects the logits to be
+        sharded along vocab dim"), and `functional/argmax` then adds an offset
+        of `rank * tensor.shape[gather_dim]` — the width of what it was handed.
+        Hand it a tensor that `compute_logits` has already gathered and that
+        offset is applied twice: rank r returns `r * vocab_size + local` and the
+        global tie-break over four identical maxima picks a non-zero rank. That
+        is the TP=2 failure the operator recorded, to the token —
+        `max=140391` on a 129280 vocab, and 140391 - 129280 = 11111 = what a
+        TP=1 run emits for the same prompt (" Paris.").
+        `logit_mask`'s sharding in `Sampler.forward` wants the shard too.
+
+        At one rank this is the whole logits row and `gather_logits` returns it
+        unchanged, so the two spellings are the same tensor and the traced graph
+        is identical — which is what makes this safe to land without a
+        multi-rank run to check it against.
         """
-        logits = nki_linear(hidden_states, self.head_weight, None, "bf16").float()
-        if self.world_size > 1:
-            logits = tp_all_gather_last(logits, self.tp_group)
-        return logits
+        return nki_linear(hidden_states, self.head_weight, None, "bf16").float()
+
+    def gather_logits(self, logits_shard: torch.Tensor) -> torch.Tensor:
+        """Every rank's columns, concatenated: `[T, vocab_size]`."""
+        if self.world_size == 1:
+            return logits_shard
+        return tp_all_gather_last(logits_shard, self.tp_group)
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Vocab-parallel unembedding, gathered to full width.
+
+        vLLM's generic interface, and what `_sequence_spans`' `head_fn` calls.
+        """
+        return self.gather_logits(self.logits_shard(hidden_states))
 
     # ── Execution ─────────────────────────────────────────────────────────
 
@@ -4643,7 +4707,12 @@ class DeepseekV41ForCausalLM(nn.Module):
         selected = collapsed
         if sampling_positions is not None:
             selected = _compiled(_select_rows)(collapsed, sampling_positions)
-        logits = self.compute_logits(selected)
+        # The shard and the gathered row are both wanted, and by different
+        # consumers: the sampler is given *this rank's columns* (§ the comment
+        # on `logits_shard`), the runner is returned the full width. At one rank
+        # these are the same tensor and nothing extra is computed.
+        logits_shard = self.logits_shard(selected)
+        logits = self.gather_logits(logits_shard)
 
         # ── the DSpark stack, on every forward ────────────────────────────
         # The three `mtp.*` stages are part of this model, not an optional
@@ -4696,16 +4765,18 @@ class DeepseekV41ForCausalLM(nn.Module):
             return logits
 
         # The sampler is the repo's own on-device one; `logit_mask` and the
-        # per-request `sampling_params` come from the runner. The second
-        # element is the logits the runner keeps for its debug/spec paths —
-        # already full-width here, since `compute_logits` gathers.
+        # per-request `sampling_params` come from the runner. It is given
+        # `logits_shard`, this rank's columns, which is what its process group
+        # declares it will get and what makes `rank` mean something; the
+        # full-width `logits` is what the step *returns*, for the runner's
+        # debug and spec paths. At one rank the two are the same tensor.
         # Compiled, like every other step: `forward` is an uncompiled frame
         # (see the docstring), so an eager call here would be a host round trip
         # of a `[1, 129280]` logits row and a dtype cast the backend's fallback
         # cannot do. The goal permits sampling on the host; this is simply
         # cheaper and keeps the whole step on the device.
         sampled = _block_entry(self.sampler, "forward")(
-            logits, sampling_params, logit_mask, rank
+            logits_shard, sampling_params, logit_mask, rank
         )
 
         # Under a speculative config this step is a *verify* step: it was handed

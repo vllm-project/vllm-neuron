@@ -52,29 +52,73 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 #: instantiated, once per rank. A model cannot choose its own world size, only
 #: be told.
 #:
-#: **1. Four wedges the device.** Four ranks do buy capacity -- resident weights
-#: 10.60 -> 5.09 GiB a rank, and a four-rank run took an 8192-token segment
-#: through all 40 layers at 15.7 GiB -- but twice it then hung the *instance*,
-#: both times just past layer 39, each needing a reboot.
+#: **1, and the reason is now measured rather than inferred: HOST memory, by
+#: one allocation, in one place.** Everything else about four ranks works.
 #:
-#: Three timeouts, ordered wrong. Graphs compile mid-forward here -- warmup is
-#: skipped and the shape set is router-dependent -- and:
+#: What iteration 9 got, at `--tensor-parallel-size 4`, four times over
+#: (`.autohelix/notes/iter-9.md` §1-§3):
 #:
-#:     collective RX gives up     960 s   (`CCOM WARN Timeout waiting for RX`)
-#:     a measured compile        1045, 1161, 1167 s
-#:     NEFF cache lock gives up  1200 s   (TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT)
+#:     four ranks up, one NEFF shared by all four (one cache key, rank 0
+#:       compiles and ranks 1-3 take the artifact), collectives resolved inside
+#:       the traced graphs (`collective_replica_groups: resolved_count 5`)
+#:     resident weights   10.60 -> **4.33 GiB a rank**; head and embedding
+#:       sharded to (32320, 5120); 96 of 384 routed experts a rank
+#:     device HBM         6.25 GiB of 24 a rank, all 40 decoder layers
+#:     host commitment    ~50 GiB, flat, for the whole backbone
 #:
-#: A rank compiling for 19 minutes outlasts the 16 minutes its peers will wait
-#: inside a collective. They time out, retry against a peer still compiling, and
-#: the collective's device-side state is left in a condition no process can
-#: clear -- hence the reboot. The lock path is 33 s from failing too, and did
-#: fail once (three `NKI cache lock timeout` + `Cleaned up on failure`). Tuning
-#: cannot fix this: the worst compile is unbounded.
+#: It then dies in the same place every time: loading the graphs *after* layer
+#: 39 (the LM head and the three MTP stages), where each rank's host commitment
+#: jumps from ~9.7 GiB to ~26 GiB inside two seconds and all four jump at once.
+#: 4 x 26 + 9.5 GiB of other processes is past the 114.8 GiB `CommitLimit`, the
+#: kernel refuses, and the ranks die with `std::bad_alloc`. It is **one 13.1 GiB
+#: anonymous mapping a rank**, and `VmRSS` tracks it, so it is touched rather
+#: than reserved.
 #:
-#: Safe at 4 only if no cold compile can coincide with a collective -- i.e.
-#: every graph compiled before the first collective executes. Or sidestep ranks
-#: entirely: drive the four cores SPMD from one process, collectives inside the
-#: NKI kernels, as `DeepSeek-V4.1-Flash-Trainium/engram-short/opt-1/` does.
+#: **That mapping is the collectives' host-side buffer, and it scales with the
+#: peer count.** Two measurements, both on the device:
+#:
+#:   TP=2   the same graph load costs **2 GiB** a rank, not 16, and the largest
+#:          mapping stays at 0.5 GiB. One peer instead of three.
+#:   TP=4 + `NEURON_RT_DBG_CC_FORCE_SINGLE_RANK_RG=1` (every replica group
+#:          replaced by a self-only group, so the collectives are no-ops and the
+#:          numbers are wrong — a measurement, not a configuration): 6.9 GiB a
+#:          rank, `Committed_AS` ~55 instead of 112.9, no `bad_alloc`, and the
+#:          run walks straight past the wall.
+#:
+#: The `NDBG:ndebug_info_graph_build` message the failure prints is the *victim*
+#: that reports the exhaustion, not the owner; in the first probe a different
+#: allocation (`Failed to allocate kbin descriptors`) failed eight seconds
+#: earlier. Four things do NOT reduce it, each tested: the collective algorithm
+#: (`INTRA_SINGLE_STEP_MESH_ALG` and `INTRA_RING_ALG` give byte-identical
+#: mappings), all-reduce chunk size, `NEURON_RT_CC_CHANNEL_BUFFER_N` /
+#: `NEURON_RT_CC_CHUNK_SIZE`, and the `NEURON_RT_INSPECT_*` pair — though that
+#: last one plus glibc arena tuning does take a rank from 25.8 to 15.8 GiB,
+#: leaving the gap at about 1.7 GiB a rank.
+#:
+#: What got four ranks past it with the collectives *intact*:
+#: `NEURON_RT_DBG_FORCE_2DEV_PROXY=1` — `Committed_AS` peaked at 82.9 GiB rather
+#: than 112.9, no `bad_alloc`, and the run reached graphs no 4-rank attempt had
+#: ever compiled. It then lost a worker, with no diagnostic, ten minutes into
+#: one of those compiles, so it is a lead rather than a solution — but the
+#: obvious worry about it is settled: at TP=2, with the knob and without it, all
+#: three completions are **byte-identical** over 32 tokens each and the
+#: acceptance counts match step for step, so it changes how collective data
+#: moves and not what a collective computes. The worker crash is the one open
+#: question; `.autohelix/notes/iter-9.md` §8 says how to attack it.
+#:
+#: The earlier explanation here, three mis-ordered timeouts, was wrong; it is
+#: fixed in `__init__.py` anyway and the hang it described was always this
+#: allocation. A host-memory guard now makes the failure safe:
+#: `vm.overcommit_memory=2` with `CommitLimit` under physical RAM, so the run
+#: dies and the host lives.
+#:
+#: **TP=2 is not blocked at all**, and it is what this port has actually been
+#: run at multi-rank: weights 6.17 GiB a rank, all 43 layers, DSpark proposing
+#: and verifying, three coherent completions, two of them byte-identical to the
+#: TP=1 run's. Or sidestep ranks entirely: drive the four cores SPMD from one
+#: process, collectives inside the NKI kernels, as
+#: `DeepSeek-V4.1-Flash-Trainium/engram-short/opt-1/` does — the buffer is
+#: per *process*, so one process pays for it once where four pay four times.
 TENSOR_PARALLEL_SIZE = 1
 
 

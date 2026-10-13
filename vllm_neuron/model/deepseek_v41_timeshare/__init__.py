@@ -177,6 +177,73 @@ os.environ.setdefault("TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT", "7200")
 if os.environ.get("NEURON_RT_EXEC_TIMEOUT", "300") == "300":
     os.environ["NEURON_RT_EXEC_TIMEOUT"] = "7200"
 
+# ── Nothing is set for the collectives, and that is a measured choice ────────
+#
+# The block above is right about the ordering of the timeouts, and it was never
+# the cause of the TP=4 hangs. Iteration 9 took eleven 4-rank runs on the device
+# (`.autohelix/notes/iter-9.md`) and the cause is one host allocation: a 13.1 GiB
+# anonymous mapping per rank, appearing as the graphs after layer 39 load, all
+# four ranks within a second of each other. 4 x ~26 GiB at that instant is past
+# the 114.8 GiB `CommitLimit`, the kernel refuses, and the ranks die with
+# `std::bad_alloc`.
+#
+# It is **the collectives' host buffer, scaling with the peer count** — the
+# attribution in the hint of 2026-10-12 18:47 was right. At TP=2 (one peer) the
+# same graph load costs 2 GiB a rank; at TP=4 (three peers) it costs 16; and
+# with `NEURON_RT_DBG_CC_FORCE_SINGLE_RANK_RG=1`, which neuters every replica
+# group, it costs nothing and the run walks past the wall. The
+# `NDBG:ndebug_info_graph_build` message the crash prints is the victim, not the
+# owner. `config.TENSOR_PARALLEL_SIZE` has the full measurement.
+#
+# What was tried against it, and what each was worth — all of it inert at TP=1,
+# which is why none of it is set here:
+#
+#   `NEURON_RT_CC_ALG_TYPES=INTRA_SINGLE_STEP_MESH_ALG`  no help, and a net
+#       negative. The 13.1 GiB mapping is byte-identical under the default
+#       `INTRA_RING_ALG` and under the mesh, so the *algorithm* is not the lever
+#       even though the collectives are the consumer. Selecting the mesh costs
+#       something, though — it adds the `allr_sz <= ch_buf_split_sz` assert, so
+#       it needs `_ALLREDUCE_CHUNK_ELEMS` small, so more collectives. The
+#       runtime's own default is the better starting point, and leaving this
+#       unset is how you get it. (The ~30 GiB figure reported for the mesh was a
+#       run that asserted before the expensive graphs had loaded.)
+#   `NEURON_RT_DBG_FORCE_2DEV_PROXY=1`  **the lead worth following**, and the
+#       only thing that got four ranks past the allocation with the collectives
+#       intact: peak commitment 82.9 GiB instead of 112.9, no `bad_alloc`. It is
+#       an undocumented `NEURON_RT_DBG_*`, so its *semantics* were checked rather
+#       than assumed, at TP=2 where a known-good run exists to diff against: with
+#       and without it, all three completions are **byte-identical** over 32
+#       tokens each and the rejection sampler's acceptance counts match step for
+#       step. It moves collective data differently; it does not change what a
+#       collective computes. Not set here only because the 4-rank run that used
+#       it then lost a worker with no diagnostic ten minutes into a cache-miss
+#       compile — that crash, not the knob, is what the next 4-rank attempt has
+#       to explain.
+#   `NEURON_RT_CC_CHANNEL_BUFFER_N=2`, `NEURON_RT_CC_CHUNK_SIZE=8 MiB`  no
+#       change to the 13.1 GiB mapping.
+#   `NEURON_RT_INSPECT_ENABLE=0`, `NEURON_RT_INSPECT_PRECACHE_ENABLE=0`  a real
+#       but insufficient win: a rank's base commitment falls 13 -> 9.7 GiB. Not
+#       set here because it changes the TP=1 path that currently passes the gate,
+#       for a benefit only a multi-rank run needs.
+#   `MALLOC_ARENA_MAX=2`, `MALLOC_TRIM_THRESHOLD_`/`MALLOC_TOP_PAD_=128 KiB`
+#       the largest win measured: a rank at layer 39 holds 15.8 GiB instead of
+#       25.8. Still not enough — the *transient* inside the debug-info build is
+#       what overflows, and it peaked at 112.9 of 114.8 GiB anyway. Same reason
+#       for not setting it: it is glibc tuning for a run this port does not
+#       currently make.
+#
+# A 4-rank attempt should set the last two and go after the debug-info graph
+# itself; `config.TENSOR_PARALLEL_SIZE` lists the three ways in.
+#
+# `NEURON_HOST_MEM_PER_RANK_GIB` is deliberately not set either. The preflight's
+# `DEFAULT_PER_RANK_GIB = 24.5` looked far too conservative and is not: sampling
+# `/proc/<worker>/status` every three seconds gives a rank's `VmData` at 25.8
+# GiB with `VmRSS` tracking it, so the memory is touched rather than reserved and
+# 24.5 is right. Its refusal of 4 x 24.5 + 6 GiB is therefore correct, and
+# lowering the variable to get past it would defeat the check rather than satisfy
+# it — the run it admits then dies anyway, mid-forward. What has to come down is
+# the demand.
+
 __all__ = [
     "DeepseekV41ForCausalLM",
     "DeepseekV41HFConfig",
