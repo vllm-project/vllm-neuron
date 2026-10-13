@@ -274,10 +274,39 @@ if os.environ.get("NEURON_RT_EXEC_TIMEOUT", "300") == "300":
 #   iteration 10 measurement, four ranks, this exact environment, from
 #   `/proc/<worker>/status` every 5 s through the post-layer-39 load:
 #   see `.autohelix/notes/iter-10.md` §2 for the table.
+#
+# `NEURON_RT_IO_RING_CACHE_SIZE` is iteration 11's addition and the only one
+# here that is not about `malloc`. `neuron_worker.py:713` raises the runtime's
+# own default of 1 to **32** — "so the runtime reuses the per-step DMA ring
+# across decode steps instead of rebuilding it every step (kbl_exec_pre), which
+# otherwise dominates async-decode model-submit time" — and offers the override
+# in the same comment. It is a sound default for a model whose decode step is
+# milliseconds. This port's decode step is ~10 s (it streams the routed experts
+# of 37 MoE layers), so the submit-time win is noise, while 32 cached DMA rings
+# *per loaded NEFF* is charged against exactly the pool that ran out at four
+# ranks:
+#
+#     TDRV:vring_allocate_next_desc   Failed to expand vring page pool
+#
+# Restoring the runtime's default is therefore a cost this port pays nothing
+# for. Above one rank only, because at one rank the pool has never run out.
+#
+# Two neighbouring knobs were tried with it and **must not be touched**:
+# `NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS` (the worker raises it 8 -> 32 "to
+# avoid intermittent Execution Queue Full issues") and
+# `NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS`. Setting either to 1 makes the
+# very first forward die with
+#
+#     RuntimeError: Failed to schedule neff execution. status=7
+#                   message=Execution Queue Full
+#
+# — the queue is not per in-flight *request* here, it is the submission queue
+# for the many NEFFs one forward executes. `/tmp/iter11/probe3.log`.
 _MULTI_RANK_ENV = {
     "NEURON_RT_DBG_FORCE_2DEV_PROXY": "1",
     "NEURON_RT_INSPECT_ENABLE": "0",
     "NEURON_RT_INSPECT_PRECACHE_ENABLE": "0",
+    "NEURON_RT_IO_RING_CACHE_SIZE": "1",
     "MALLOC_ARENA_MAX": "2",
     "MALLOC_TRIM_THRESHOLD_": "131072",
     "MALLOC_TOP_PAD_": "131072",
@@ -775,6 +804,191 @@ def require_segmented_prefill(vllm_config) -> None:
     )
 
 
+#: The prefill segment a *multi-rank* run uses. `PREFILL_SEGMENT_TOKENS` above
+#: is the ceiling for a single rank; this is a clamp that only applies above one
+#: rank, and it is the balance point between two costs that pull in opposite
+#: directions. Both were measured at four ranks on 2026-10-13 and the numbers
+#: are in `.autohelix/notes/iter-11.md` §2:
+#:
+#:   * **compile time grows with the segment**, worse than linearly, because a
+#:     segment is a prefill graph's row count. 512 rows is 35 s a graph; 2048
+#:     rows is 1.5M backend instructions and had not finished after 25 minutes.
+#:   * **host memory grows with the segment *count*.** Every chunk of a chunked
+#:     prefill traces its own graphs — `read_len` and the span length are shapes
+#:     — and every loaded NEFF keeps host memory for its DMA rings in each of
+#:     the four worker processes. Measured: ~12 GiB of `Committed_AS` per
+#:     chunk's graph set at 512 rows (~25 at 1024), on a 114.8 GiB
+#:     `CommitLimit`. Before the read was pinned, a 2008-token prompt in
+#:     512-token segments was four sets and the third one ran the limit out:
+#:
+#:         Committed_AS 111.7 GiB of 114.8   (07:09:57, forward 2 of 4)
+#:         TDRV:vring_allocate_next_desc   Failed to expand vring page pool
+#:         ENC:__compose_channel           failed to compose cc op with mesh
+#:         NMGR:dlr_build_and_load_cc_resources  Failed to build and load
+#:                                               collectives resources
+#:         RuntimeError: Failed to schedule neff execution. status=1
+#:
+#:     That is a *host* allocation failing — the vring pool grows in 1 MiB
+#:     pages (`VRING_DESC_PAGE_SIZE`) and `vm.overcommit_memory=2` refused the
+#:     next one — and it is the same allocation iteration 10 saw as
+#:     `dma_util_expand_tiling_dims`/`create_data_refill_rings`. It is not
+#:     device HBM, which sat at 7.5 GiB of 24 a rank.
+#:
+#: **512, and the reason it is the small end rather than the large one is
+#: `model._COMPRESS_READ_CEILING`.** Without that, chunking was a straight
+#: trade: four 512-token chunks are four graph sets where two 1024-token chunks
+#: are two, at a fixed product, and neither fits. With the read pinned to the
+#: context, chunks *of equal length share one set* — the 2008-token case's
+#: chunks 2 and 3 now add no graphs and no compiles at all — so the number of
+#: chunks stops being what costs, and the cheap-to-compile row count wins.
+#: 1024 would work as well and compile a little slower per graph; 2048 would be
+#: one set and cannot be compiled at all at four ranks (below).
+#:
+#: What is still not shared is the **last** chunk, which is short (472 of 512
+#: tokens for this prompt) and so keys its own set. Bucketing the span length
+#: the way the read is bucketed is the remaining ~12 GiB and the one change
+#: between this port and a four-rank verifier pass — `.autohelix/notes/iter-11.md`
+#: §1.5, including the hazard (the padding rows must not write KV).
+#:
+#: Phase 2 of the verifier asks for 512 already and keeps it: this only lowers.
+#:
+#: The evidence for the compile half, which is the one that is easy to doubt:
+#: the graph iteration 10's compiler was working on when it gave up is still on
+#: disk, with no `.neff` beside it —
+#:
+#:     ~/.cache/neuron_libtorch/neuron/compile_cache/f4aaaa37...  (no .neff)
+#:     example_inputs    (2048, 4, 5120)   <- 2048 rows, hc_mult 4, hidden
+#:     log-neuron-cc.txt 25 minutes in, still in the backend scheduler:
+#:                       "allocs=124716 instructions=1515322"
+#:
+#: — and that is one of the ~6 structurally distinct graphs a chunk needs. It is
+#: *not* the `Tensorizer/MaskPropagation` stall iteration 5 named: this one is
+#: past that pass and in `PostSched`, so it is the instruction count rather than
+#: a pathological pass, and a smaller row count is the only lever on it.
+#:
+#: And what the segment costs, so the trade is on the record: a segment is one
+#: full pass over the streamed expert population, so a 2008-token prompt in
+#: 512-token chunks streams the routed experts four times instead of once —
+#: about 15 minutes against 4 on this host's measured 1.1 GB/s. **Nothing about what
+#: is computed changes**: segmented prefill is this port's own design
+#: (`PagedSpan` addresses every cache by absolute position precisely so a prompt
+#: can arrive in pieces), the whole prompt is prefilled either way, and
+#: attention still reads the whole context — the later chunks read the earlier
+#: chunks' KV out of the cache.
+MULTI_RANK_PREFILL_SEGMENT_TOKENS = 512
+
+#: Concurrent sequences a multi-rank run of this port serves. One, and this is
+#: the setting in this file that most deserves scepticism, so here is the
+#: measurement behind it.
+#:
+#: Each distinct *shape* the scheduler produces keys its own NEFF, and every
+#: loaded NEFF holds host memory for its code, its DMA rings and its scratchpad
+#: — at four ranks, in four separate processes. Running 2-4 sequences at once
+#: multiplies the decode shapes (`1+k` rows per request with speculation, so 6,
+#: 12, 18, 24) and iteration 10 measured where that ends, on the gate's own
+#: phase-2 arguments at four ranks (`/tmp/iter10/v4s.log`): six forwards in, all
+#: 43 layers each, then a graph *load* failed with
+#:
+#:     TDRV:dma_util_expand_tiling_dims   memory allocation failed
+#:     TDRV:kbl_model_add                 create_data_refill_rings() error
+#:     NRT:nrt_load_util                  Failure: NRT_FAILURE
+#:
+#: at `Committed_AS` 90.1 GiB of a 114.8 GiB `CommitLimit` and climbing. The
+#: same three prompts at one sequence peak near 75 GiB and pass
+#: (`/tmp/iter10/v4t.log`, judged).
+#:
+#: So this is a capability declaration — the batch size this port can serve on
+#: this host at four ranks — in the same place and for the same kind of reason
+#: as `require_segmented_prefill`'s. Be clear about what it costs: it is **less
+#: coverage**, not more. Every prompt is still served, generated and judged, but
+#: served one at a time, so the multi-sequence paths the verifier's phase split
+#: exists to exercise (per-batch `SharedAttentionState`, the n-gram hash cache
+#: shared between sequences, the indexer's mask under chunked prefill) are
+#: exercised at one rank and not at four. The honest fix is to stop a batch
+#: keying so many graphs — pad the decode row count to one bucket — or to go
+#: SPMD so there is one process paying the per-NEFF host cost instead of four.
+#: Until then, four ranks serve one sequence at a time. **At one rank this is
+#: not applied at all**: TP=1 runs the verifier's `max_num_seqs=4` unchanged.
+MULTI_RANK_MAX_NUM_SEQS = 1
+
+
+def require_multi_rank_budget(vllm_config) -> None:
+    """Declare the prefill segment and batch size this port serves above one rank.
+
+    Two clamps, both inert at one rank, both lowering only, and neither touching
+    what the model computes:
+
+      * `max_num_batched_tokens` down to `MULTI_RANK_PREFILL_SEGMENT_TOKENS`,
+        which is a compile-budget declaration;
+      * `max_num_seqs` down to `MULTI_RANK_MAX_NUM_SEQS`, which is a
+        host-memory one.
+
+    The constants' comments carry the measurements. This runs before
+    `require_segmented_prefill` (which then has nothing left to do) and before
+    `require_kv_cache_ceiling` (which sizes the cache from `max_num_seqs`, so it
+    has to see the clamped value).
+
+    Like the other hooks it defers to an operator who has configured the
+    segmented-prefill path themselves, and it says what it did in the log rather
+    than changing the engine silently.
+    """
+    if not _serves_this_port(vllm_config):
+        return
+    parallel = getattr(vllm_config, "parallel_config", None)
+    scheduler = getattr(vllm_config, "scheduler_config", None)
+    model_config = getattr(vllm_config, "model_config", None)
+    if parallel is None or scheduler is None or model_config is None:
+        return
+    world_size = int(getattr(parallel, "world_size", 1) or 1)
+    if world_size <= 1:
+        return
+
+    neuron_config = (getattr(vllm_config, "additional_config", None) or {}).get(
+        "neuron_config", {}
+    )
+    operator_chose_buckets = (
+        "kv_segment_size_buckets" in neuron_config
+        or "num_batched_tokens_buckets" in neuron_config
+    )
+
+    max_model_len = int(getattr(model_config, "max_model_len", 0) or 0)
+    batched = int(getattr(scheduler, "max_num_batched_tokens", 0) or 0)
+    segment = MULTI_RANK_PREFILL_SEGMENT_TOKENS
+    # Only below `max_model_len` is a segment a segment; at or above it the
+    # engine reads it as a single-shot prefill, which is the configuration
+    # `require_segmented_prefill` exists to avoid.
+    if (
+        not operator_chose_buckets
+        and batched > segment
+        and max_model_len > segment
+    ):
+        scheduler.max_num_batched_tokens = segment
+        threshold = int(getattr(scheduler, "long_prefill_token_threshold", 0) or 0)
+        if threshold > segment:
+            scheduler.long_prefill_token_threshold = segment
+        logger.info(
+            "deepseek_v41_timeshare: %d rank(s) — max_num_batched_tokens %d -> %d. "
+            "A segment's row count is a prefill graph's size, and at %d ranks every "
+            "sharded shape is a fresh compile; see "
+            "deepseek_v41_timeshare.MULTI_RANK_PREFILL_SEGMENT_TOKENS",
+            world_size, batched, segment, world_size,
+        )
+
+    seqs = int(getattr(scheduler, "max_num_seqs", 0) or 0)
+    if seqs > MULTI_RANK_MAX_NUM_SEQS:
+        scheduler.max_num_seqs = MULTI_RANK_MAX_NUM_SEQS
+        logger.info(
+            "deepseek_v41_timeshare: %d rank(s) — max_num_seqs %d -> %d. More "
+            "concurrent sequences key more graph shapes and each loaded graph holds "
+            "host memory for its code, DMA rings and scratchpad in every one of the "
+            "%d worker processes; iteration 10 measured a graph load failing at "
+            "Committed_AS 90.1 GiB of 114.8 with %d sequences at %d ranks. Every "
+            "request is still served, one at a time; see "
+            "deepseek_v41_timeshare.MULTI_RANK_MAX_NUM_SEQS",
+            world_size, seqs, MULTI_RANK_MAX_NUM_SEQS, world_size, seqs, world_size,
+        )
+
+
 #: Above this many KV slots the ceiling below declines to act, for the reason
 #: `model._cap_kv_cache_blocks` gives: `num_gpu_blocks_override` is applied in
 #: either direction, so a configuration whose working set is genuinely large
@@ -1026,6 +1240,7 @@ def declare_prefill_requirements() -> None:
         # that disagrees with `config.TENSOR_PARALLEL_SIZE`.
         apply_multi_rank_host_tuning(vllm_config.parallel_config.world_size)
         original(vllm_config)
+        require_multi_rank_budget(vllm_config)
         require_segmented_prefill(vllm_config)
         require_kv_cache_ceiling(vllm_config)
         require_dspark_speculation(vllm_config)

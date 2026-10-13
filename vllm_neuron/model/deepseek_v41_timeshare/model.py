@@ -1105,6 +1105,43 @@ _ATTN_SLOT_TILE = 128
 #: `EMPTY_SLOT`, which `kernels/sparse_attn` removes from the softmax.
 _COMPRESS_TILE = 128
 
+#: Context-sized floor for the same read, in **tokens**, or `None` to round to
+#: `_COMPRESS_TILE` and no further. Set once per engine by
+#: `bind_kv_caches` (`_bind_compress_read_ceiling`).
+#:
+#: **What it buys, and it is the largest single thing between this port and four
+#: ranks.** A chunked prefill traces a *new set of per-layer graphs for every
+#: chunk*, because `read_len` is a tensor shape and grows as the cache fills:
+#: chunk 1 of a 2008-token prompt reads 512 compressed groups, chunk 2 reads
+#: 1024, chunk 3 1536. Every one of those graphs then stays resident, and at
+#: four ranks it is resident in four worker processes — measured at ~12 GiB of
+#: host `Committed_AS` per chunk's graph set at 512 rows, against a 114.8 GiB
+#: `CommitLimit`, which is what killed every four-rank attempt at the
+#: verifier's long case (`.autohelix/notes/iter-11.md` §1.2).
+#:
+#: With the read pinned to the context instead, chunks of equal length trace
+#: *one* set between them: the 40 backbone layers' graphs become
+#: chunk-independent, and only the last, shorter chunk keys its own.
+#:
+#: **Why it is not an approximation.** `Indexer.forward` is already written for
+#: a `read_len` wider than the groups that exist — this only widens it further:
+#:
+#:   * `group_pos` clamps to `compress_len - 1`, so a padded group gathers a
+#:     valid slot rather than reading past the cache;
+#:   * `index_score` is `masked_fill`ed to `_NEG_BOUND` wherever
+#:     `arange(read_len) >= compress_lens`, so a padded group cannot win the
+#:     top-k;
+#:   * `topk = min(self.index_topk, read_len)` stays capped at `index_topk`
+#:     (512), so the *attention* reads exactly as many slots as before — only
+#:     the index score's own GEMM gets wider;
+#:   * any pick at or beyond `compress_lens` is mapped to `EMPTY_SLOT`, which
+#:     `kernels/sparse_attn` drops from the softmax.
+#:
+#: The same three mechanisms already run on every short prompt, where a
+#: 37-token prompt reads a 128-group tile with 19 live groups in it. This makes
+#: the padding bigger, not different.
+_COMPRESS_READ_CEILING: int | None = None
+
 #: Above this many KV slots, `_cap_kv_cache_blocks` leaves vLLM's memory-based
 #: sizing alone — a backstop against a configuration so large that the cap's own
 #: arithmetic is the thing that is wrong.
@@ -1287,11 +1324,97 @@ def _hbm_mark(layer_id: int, rows: int) -> None:
     )
 
 
-def _compress_read_len(compress_len: int) -> int:
-    """How many compressed groups to read for `compress_len` live ones."""
+def _heap_bytes() -> int:
+    """This process's `[heap]` mapping, in bytes, or 0 if it has none."""
+    try:
+        with open("/proc/self/maps") as handle:
+            for line in handle:
+                if line.rstrip().endswith("[heap]"):
+                    lo, hi = line.split(None, 1)[0].split("-")
+                    return int(hi, 16) - int(lo, 16)
+    except OSError:  # pragma: no cover - /proc is always there on Linux
+        pass
+    return 0
+
+
+_LIBC = None
+
+#: How often `forward`'s layer loop samples (and trims) the host heap. Every
+#: 20th of 40 layers: two `malloc_trim` calls and two log lines a forward, which
+#: is enough to notice the heap starting to grow and little enough to ignore.
+_HEAP_TRIM_EVERY = 20
+
+
+def host_heap_trim(tag: str, world_size: int) -> None:
+    """Instrument — and, where there is any, reclaim — the host heap.
+
+    Host `Committed_AS` is what bounds a four-rank run of this port
+    (`.autohelix/notes/iter-11.md` §1): it climbs ~12 GiB per prefill chunk
+    across the four workers and the long case ends at 114.8 GiB with
+
+        TDRV:vring_allocate_next_desc  Failed to expand vring page pool
+        LLVM ERROR: out of memory                     (neuronx-cc, mid-forward)
+        MemoryError                                   (worker, in execute_model)
+
+    This call answers one question about that climb — **is it the glibc heap?**
+    — and the answer, measured over a whole four-chunk prefill at four ranks, is
+    **no**: `[heap]` sits at 0.41 GiB from the first layer to the last and
+    `malloc_trim` returns nothing. So the growth is in the runtime's own
+    anonymous mappings (per-NEFF DMA rings and the vring pool), the glibc
+    tunables in `__init__.py` have nothing left to give, and a buffer pool in
+    the weight store would not help either. That is worth one log line a forward
+    to keep true, because it is the hypothesis three iterations have reached
+    for.
+
+    It cannot change a result: `malloc_trim` is pure allocator hygiene with no
+    effect on any tensor. Above one rank only — at one rank nothing has ever run
+    out, and TP=1 is what the gate's verifier runs, so a per-forward syscall
+    there is a change with nothing to buy.
+    """
+    global _LIBC
+    if world_size <= 1:
+        return
+    if _LIBC is None:
+        import ctypes
+
+        try:
+            _LIBC = ctypes.CDLL("libc.so.6")
+        except OSError as exc:  # pragma: no cover - glibc is always present
+            logger.info("deepseek_v41_timeshare: malloc_trim unavailable (%s)", exc)
+            _LIBC = False
+    if not _LIBC:
+        return
+    before = _heap_bytes()
+    try:
+        _LIBC.malloc_trim(0)
+    except Exception as exc:  # noqa: BLE001 - never fatal; it is only hygiene
+        logger.info("deepseek_v41_timeshare: malloc_trim failed (%s)", exc)
+        _LIBC = False
+        return
+    after = _heap_bytes()
+    logger.info(
+        "deepseek_v41_timeshare: host heap %.2f -> %.2f GiB after %s "
+        "(malloc_trim returned %.2f GiB)",
+        before / 1024**3, after / 1024**3, tag, (before - after) / 1024**3,
+    )
+
+
+def _compress_read_len(compress_len: int, ratio: int = 1) -> int:
+    """How many compressed groups to read for `compress_len` live ones.
+
+    Rounded up to `_COMPRESS_TILE`, and — when `_COMPRESS_READ_CEILING` is set
+    — up to the whole context's worth for this `ratio`, which makes the answer
+    the *same* for every chunk of a prefill and every decode step. See that
+    constant for why, and for why a wider read is exact rather than
+    approximate. Never returns less than `compress_len` rounded up, so a
+    position past the declared context still reads everything it needs.
+    """
     if compress_len <= 0:
         return 0
-    return -(-compress_len // _COMPRESS_TILE) * _COMPRESS_TILE
+    want = compress_len
+    if _COMPRESS_READ_CEILING:
+        want = max(want, -(-_COMPRESS_READ_CEILING // max(ratio, 1)))
+    return -(-want // _COMPRESS_TILE) * _COMPRESS_TILE
 
 #: The finite lower bound the reference kernel starts its running max at. A row
 #: whose every slot is empty would give exp(-inf - -inf) = NaN with a true -inf;
@@ -1603,7 +1726,7 @@ class PagedSpan:
         read_lens, counts = [0, 0, 0], [0, 0, 0]
         for ratio in (1, 2):
             compress_len = (start_pos + length) // ratio
-            read_lens[ratio] = _compress_read_len(compress_len)
+            read_lens[ratio] = _compress_read_len(compress_len, ratio)
             counts[ratio] = compress_len - start_pos // ratio
         self.read_lens = tuple(read_lens)
         self.group_counts = tuple(counts)
@@ -4507,6 +4630,7 @@ class DeepseekV41ForCausalLM(nn.Module):
             attn.window_kv_cache = kv_caches[name][0]
 
         max_len = self._max_sequence_length()
+        self._bind_compress_read_ceiling(max_len)
         device = self.norm.weight.device
         # The runtime's own allocation fixes the slot space: a window cache is
         # `[num_blocks, num_kv_heads, block_size, head_size]`, so a slot id runs
@@ -4603,6 +4727,42 @@ class DeepseekV41ForCausalLM(nn.Module):
         )
         state = NgramHashState(self.config, tokenizer)
         return state.to(device)
+
+    def _bind_compress_read_ceiling(self, max_len: int) -> None:
+        """Pin the compressed-group read to the context, above one rank.
+
+        See `_COMPRESS_READ_CEILING` for the whole argument. Two things about
+        *where* this is:
+
+        **Only above one rank.** The widened read is exact at any world size
+        and would help the compile count at one rank too, but it re-keys every
+        graph a single-rank run has cached, and a cold recompile of the
+        verifier's own shapes is most of an hour. One rank already fits its
+        graph sets in its host budget, so it gains nothing to pay for that
+        with. Lift the condition when there is an hour to spare for the
+        recompile and measure what it saves.
+
+        **Called from `bind_kv_cache`**, which runs once per engine after the
+        runtime has allocated the caches and before any `forward`, so no
+        `PagedSpan` is ever built against a half-set ceiling. It is a module
+        global rather than a field on the model because `_compress_read_len` is
+        reached from `PagedSpan.__init__`, which deliberately knows nothing
+        about the model.
+        """
+        global _COMPRESS_READ_CEILING
+        if self.world_size <= 1:
+            return
+        ceiling = int(max_len)
+        if ceiling <= 0 or _COMPRESS_READ_CEILING == ceiling:
+            return
+        _COMPRESS_READ_CEILING = ceiling
+        logger.info(
+            "deepseek_v41_timeshare: compressed-group read pinned to the "
+            "%d-token context (ratio 1 -> %d groups, ratio 2 -> %d) so every "
+            "prefill chunk and decode step share one set of per-layer graphs; "
+            "see model._COMPRESS_READ_CEILING",
+            ceiling, _compress_read_len(1, 1), _compress_read_len(1, 2),
+        )
 
     def _max_sequence_length(self) -> int:
         """The longest sequence this engine will serve.
@@ -4874,7 +5034,14 @@ class DeepseekV41ForCausalLM(nn.Module):
         main_hiddens: list[torch.Tensor] = []
         target_layers = set(self.config.dspark_target_layer_ids)
 
+        # Allocator hygiene, not arithmetic — see `host_heap_trim`. Every
+        # `_HEAP_TRIM_EVERY` layers, because the host heap grows *through* a
+        # forward (the layer loop streams this layer's experts off disk and
+        # drops the previous layer's) and at four ranks it is the host heap,
+        # four times over, that ends the run. A no-op at one rank.
         for layer_id, block in enumerate(self.layers):
+            if layer_id % _HEAP_TRIM_EVERY == 0:
+                host_heap_trim(f"layer {layer_id}", self.world_size)
             if block.engram is not None:
                 index = list(self.config.engram_layer_ids).index(layer_id)
                 rows = self._engram_rows(layer_id, hashes, index, stream.device)
