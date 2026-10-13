@@ -52,69 +52,68 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 #: instantiated, once per rank. A model cannot choose its own world size, only
 #: be told.
 #:
-#: **1, and the reason is now one number: host `Committed_AS`.** Everything
-#: about four ranks works except that the verifier's longest case does not fit
-#: in the host's commit limit. What four ranks does today, measured
-#: 2026-10-13 over five device runs (`.autohelix/notes/iter-11.md`, artifacts in
-#: `/tmp/iter11/`):
+#: **4, and the gate's own verifier passes there.** All four cases generated and
+#: judged at four ranks on 2026-10-13 — `"tensor_parallel_size": 4,
+#: "passed": true`, every verdict `REASONABLE`, including the 2008-token
+#: needle, whose planted access code comes back from ~1,900 tokens away.
+#: Measured over that run (`.autohelix/notes/iter-12.md`, artifacts in
+#: `/tmp/iter12/`):
 #:
-#:     resident weights   10.60 GiB a rank at TP=1 -> **4.33 GiB** a rank
-#:     head + embedding   sharded to (32384, 5120); 96 of 384 experts a rank
+#:     resident weights   10.60 GiB a rank at TP=1 -> **4.33 GiB** a rank,
+#:                        logged per rank as "rank 0/4" ... "rank 3/4"
+#:     head + embedding   sharded to (32384, 5120), i.e. 129536 / 4
+#:     routed experts     96 of 384 a rank, by id (`MoE.experts_start_idx`)
 #:     all 40 decoder layers and the 3 `mtp.*` stages execute, every forward
-#:     collectives resolved inside the traced graphs (`resolved_count 5`)
-#:     device HBM         7.5 GiB of 24 a rank — never the constraint
-#:     the three short    the gate's own phase 2, judge on: 3/3 complete,
-#:     verifier cases     coherent, "The capital of France is **Paris**"
-#:     speculation        **43 of 105 draft tokens accepted (41%)**
-#:     the 2008-token     all four prefill chunks complete, 40 layers each,
-#:     needle case        then the *first decode step* cannot load its graphs
+#:     collectives resolved inside the traced graphs (`resolved_count` 10-12)
+#:     device HBM         5.09 GiB of 24 a rank — never the constraint
+#:     speculation        live, 52% of drafts accepted on the needle case and
+#:                        40% over the short phase, and token-identical to the
+#:                        same prompts with speculation off
+#:     host Committed_AS  peak **89.5 GiB** of a 114.8 GiB CommitLimit
 #:
-#: THE WALL, and it is the same allocation every time. Four ranks mean four
-#: worker processes, and a loaded NEFF costs host memory roughly in proportion
-#: to its I/O bytes — measured ~12 GiB of `Committed_AS` per prefill chunk's
-#: graph set — against a `CommitLimit` of 114.8 GiB (124.8 GiB of RAM under
-#: `vm.overcommit_memory=2`, the guard an operator installed after two reboots;
-#: do not weaken it). The needle case needs ~120. It ends as
+#: WHAT THE BINDING CONSTRAINT IS, because it is not what it looks like. Device
+#: HBM sits at a fifth of capacity throughout; what runs out is *host*
+#: `Committed_AS` (`CommitLimit` 114.8 GiB, 124.8 GiB of RAM under
+#: `vm.overcommit_memory=2` — the guard an operator installed after two reboots;
+#: do not weaken it). A **loaded** NEFF costs 0.32-0.43 GiB of host memory for
+#: its code, DMA rings and scratchpad, per rank, measured directly
+#: (`/tmp/iter12/neffprobe2.py` loads NEFFs out of the compile cache with no
+#: model and no compiler — use it, it answers in two minutes what a device run
+#: answers in forty). Four ranks pay it four times, and a *cache hit* pays it in
+#: full: the run that could not finish had **zero compiles**. So the quantity to
+#: manage is the number of distinct graphs the forward keys, and it ends as one
+#: of three things —
 #:
 #:     TDRV:vring_allocate_next_desc  Failed to expand vring page pool
-#:     NMGR:dlr_build_and_load_cc_resources  Failed to build and load
-#:                                           collectives resources
-#:     RuntimeError: Failed to schedule neff execution. status=1
+#:     ENCD:init_sp_resource          failed to alloc TOP_SP host scratchpad
+#:     LLVM ERROR: out of memory      (neuronx-cc compiling mid-forward)
 #:
-#: or, when the thing that wants memory is `neuronx-cc` compiling mid-forward
-#: (it wants 10-20 GiB of its own), as `LLVM ERROR: out of memory`. Device HBM
-#: is at a third of its capacity throughout.
+#: and the first two surface on the *peers* as a collectives failure
+#: (`validate_rg_signature`, `status=2 message=Invalid`), which is misleading.
 #:
-#: WHAT MOVED IT, and these are in `__init__.py` and `model.py` now:
+#: WHAT MOVED IT, in `__init__.py` and `model.py`:
 #:
 #:   - `NEURON_RT_IO_RING_CACHE_SIZE=1` above one rank, ~10 GiB. The worker
 #:     raises the runtime's default of 1 to 32 to keep per-step DMA rings warm;
 #:     this port's decode step is ~10 s, so it buys nothing here.
 #:   - `model._COMPRESS_READ_CEILING`: pin the compressed-group read to the
-#:     context, so chunks of equal length share one set of per-layer graphs
-#:     instead of one set each. This is what got the whole four-chunk prefill
-#:     through for the first time — chunks 2 and 3 now add *nothing*.
+#:     context, so chunks of equal length share one set of per-layer graphs.
+#:   - `model._bucket_rows`: round a lone sequence's span up to the whole token
+#:     bucket, so the *short last chunk* of a chunked prefill is the same graph
+#:     as a full one. ~12 GiB.
+#:   - `model._MOE_LIVE_ROWS`: keep the MoE's live token count out of
+#:     `_run_block`'s arguments. `_run_block` is traced and dynamo specializes
+#:     on ints, so one int with two values was a second `Executor` on all 40
+#:     layer graphs — a cache hit, invisible in the compile log, ~13 GiB.
 #:   - `require_multi_rank_budget`: `max_num_seqs` 1 and the prefill segment
-#:     512 above one rank. The seqs clamp is what makes the short phase fit;
-#:     it is also less coverage, and `__init__.py` says so.
+#:     512 above one rank. The seqs clamp is less coverage and `__init__.py`
+#:     says so; with 25 GiB of headroom it is the next thing to give back.
 #:
-#: WHAT IS LEFT, ~10 GiB, in the order worth trying:
-#:
-#:   1. the last prefill chunk is short (472 of 512 tokens for this prompt) and
-#:      so keys its own graph set — ~12 GiB. Bucket the span length the way
-#:      `_COMPRESS_READ_CEILING` buckets the read and the whole prefill is one
-#:      set. The hard part is that the padding rows must not write KV; check
-#:      what the runner puts in `slot_mapping` for them first.
-#:   2. the same for the decode row count (`1+k` per request), which is what
-#:      makes `max_num_seqs > 1` expensive.
-#:   3. SPMD — one process driving four cores, so the per-NEFF host cost is
-#:      paid once instead of four times. `DeepSeek-V4.1-Flash-Trainium/*/opt-1/`
-#:      is the pattern.
-#:
-#: Why this stays 1 until then: the gate's verifier runs the needle case, so
-#: `4` would hand it a run that cannot finish, and a red `verifier` discards the
-#: iteration. Raise it the moment the needle case completes at four ranks.
-TENSOR_PARALLEL_SIZE = 1
+#: Retreating to 1 is a one-line change and restores the exact graph keys the
+#: single-rank verifier used: every change above is inert at `world_size <= 1`
+#: by construction, and `.autohelix/notes/iter-12.md` §6 lists why, clause by
+#: clause.
+TENSOR_PARALLEL_SIZE = 4
 
 
 @dataclass

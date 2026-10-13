@@ -1211,6 +1211,28 @@ _HBM_TRACE_FORWARDS = 6
 #: `[steps seen, previous reading, previous layer id]` for `_hbm_mark`.
 _HBM_STATE = [0, None, -1]
 
+#: `[live row count]`, the MoE's real token count while the backbone's layer
+#: loop is running, or `None`.
+#:
+#: **Why this travels in a box instead of in an argument.** `_run_block` is a
+#: dynamo-*traced* frame — the whole point of `_raise_dynamo_limits` is that it
+#: has one compiled variant per layer — and dynamo specializes on Python ints,
+#: so an int argument with two values is two variants of all 40 layer graphs.
+#: Above one rank `_bucket_rows` makes the span's row count the token bucket
+#: while the live count stays at the real tokens, so those are exactly two
+#: values, and the second set of variants is not a *compile* (the int never
+#: enters the FX graph, so the NEFF cache key is identical and the graph is a
+#: hit) — it is a second `Executor` on the same NEFF, i.e. a second copy of its
+#: host-side DMA rings. Measured at four ranks: `Committed_AS` 77.0 -> 90.0 GiB
+#: across the short chunk's 40 layers, against a `CommitLimit` of 114.8.
+#:
+#: So `_run_block` is handed the *graph's* row count, which is bucket-invariant
+#: and therefore one guard value, and `MoE._route_plan` — which is
+#: dynamo-disabled, so nothing it reads is traced — takes the live count from
+#: here. Set for the backbone loop only and cleared before `_draft`, because a
+#: DSpark stage's MoE has `1 + k` rows of its own and must route all of them.
+_MOE_LIVE_ROWS: list[int | None] = [None]
+
 #: Rows below which `_collect_layer_garbage` is not worth its own cost. A
 #: decode step's whole stream is a few hundred KiB; a collection costs tens of
 #: milliseconds and would be paid 43 times per generated token.
@@ -3007,6 +3029,12 @@ class MoE(nn.Module):
         if _HBM_STATE[0] == 0 and self.layer_id in _CENSUS_LAYERS:
             _census_device_tensors(self.layer_id)
 
+        # The backbone's live count, when `_bucket_rows` has made the argument
+        # the bucket width rather than the real token count. See
+        # `_MOE_LIVE_ROWS`; it is None at one rank and None for a DSpark stage.
+        override = _MOE_LIVE_ROWS[0]
+        if override is not None:
+            live_rows = override
         ids = indices if live_rows is None else indices[:live_rows]
         wts = weights if live_rows is None else weights[:live_rows]
         # `.cpu()` before `.float()`, not after. A dtype cast on a Neuron tensor
@@ -5001,16 +5029,32 @@ class DeepseekV41ForCausalLM(nn.Module):
                 "resident."
             )
         meta = self._attn_meta(attn_metadata)
-        spans = self._sequence_spans(positions, meta["slot_mapping"])
-        paged = self._paged_spans(spans, meta)
+        live_spans = self._sequence_spans(positions, meta["slot_mapping"])
+        # Where the real tokens stop. Everything after it is buffer padding the
+        # runner did not clear; see `_sequence_spans`. Consumed by `MoE`'s
+        # routing and by nothing else, and `MoE._route_plan` is dynamo-disabled,
+        # so this number never keys a graph — what it decides is how many
+        # experts a step streams off disk.
+        live_rows = sum(length for _, length, _ in live_spans)
+        # The row count the *graphs* see, which above one rank is the whole
+        # token bucket whether or not the scheduler filled it. See `_bucket_rows`.
+        spans, bucket_meta = self._bucket_rows(
+            live_spans, meta, int(input_ids.shape[0])
+        )
+        paged = self._paged_spans(spans, bucket_meta)
+        # The DSpark stages take the bucketed span like the backbone does — a
+        # 472-row tail keyed its own copy of the whole three-stage stack, worth
+        # ~13 GiB of host commitment across four ranks (measured: `mem.log`,
+        # 77.0 -> 90.0 GiB on entering the short chunk) — but their *anchor*
+        # stays on the last real token, which is what `live_lengths` carries
+        # into `_draft`.
+        live_lengths = [length for _, length, _ in live_spans]
         # `(begin, length)` only — the position is deliberately left out of what
         # the compiled per-layer graph is handed, because dynamo specializes on
         # int arguments and a position in here is a recompile per decode step.
         # It travels as `span.pos`, a tensor. See `PagedSpan`.
         slices = [(begin, length) for begin, length, _ in spans]
-        # Where the real tokens stop. Everything after it is buffer padding the
-        # runner did not clear; see `_sequence_spans`.
-        live_rows = sum(length for _, length, _ in spans)
+        bucket_rows = sum(length for _, length, _ in spans)
 
         # ── embed -> hc_expand ────────────────────────────────────────────
         hidden = self.embed_input_ids(input_ids)
@@ -5034,6 +5078,12 @@ class DeepseekV41ForCausalLM(nn.Module):
         main_hiddens: list[torch.Tensor] = []
         target_layers = set(self.config.dspark_target_layer_ids)
 
+        # The MoE's live token count, out of band for the backbone loop only:
+        # `_run_block` is traced and dynamo specializes on ints, so what it is
+        # *handed* has to be the bucket-invariant row count. `_MOE_LIVE_ROWS`
+        # has the measurement that forces this.
+        _MOE_LIVE_ROWS[0] = live_rows if live_rows != bucket_rows else None
+
         # Allocator hygiene, not arithmetic — see `host_heap_trim`. Every
         # `_HEAP_TRIM_EVERY` layers, because the host heap grows *through* a
         # forward (the layer loop streams this layer's experts off disk and
@@ -5045,22 +5095,26 @@ class DeepseekV41ForCausalLM(nn.Module):
             if block.engram is not None:
                 index = list(self.config.engram_layer_ids).index(layer_id)
                 rows = self._engram_rows(layer_id, hashes, index, stream.device)
-                # Only the live rows. `hashes` is built per span, so it covers
-                # `live_rows` tokens while the stream is the full batched-token
-                # bucket — a 158-token prompt in a 512-token bucket gave
+                # `bucket_rows`, not `live_rows`: `hashes` is built per span, so
+                # it is exactly as wide as the spans `paged` carries, and the
+                # stream is the full batched-token bucket. A 158-token prompt in
+                # a 512-token bucket gave
                 #
                 #     RuntimeError: Attempting to broadcast a dimension of
                 #     length 158 at -2! ... torch.Size([1, 158, 4]); but
                 #     expected shape should be broadcastable to [1, 512, 4]
                 #
-                # inside the engram's per-(token, copy) gate. Hashing the pad
-                # rows instead would be the other fix and costs 3x the random
-                # reads off the 94.6 GiB table for rows nothing consumes.
+                # inside the engram's per-(token, copy) gate. Above one rank the
+                # span is bucketed (`_bucket_rows`) and the two agree at the
+                # bucket width, so the splice below is skipped and this layer
+                # reuses the graphs a full chunk built — which costs 3x the
+                # random reads off the 94.6 GiB table for the bucket's stale
+                # tail, and buys a whole graph set back.
                 updated = block.engram(
-                    stream[:live_rows].unsqueeze(0), rows, None
+                    stream[:bucket_rows].unsqueeze(0), rows, None
                 ).squeeze(0)
-                if live_rows < stream.shape[0]:
-                    stream = _compiled(_splice_rows)(updated, stream[live_rows:])
+                if bucket_rows < stream.shape[0]:
+                    stream = _compiled(_splice_rows)(updated, stream[bucket_rows:])
                 else:
                     stream = updated
             if layer_id in target_layers:
@@ -5068,8 +5122,11 @@ class DeepseekV41ForCausalLM(nn.Module):
                 # layers, not their output, and averaged over the hc copies.
                 main_hiddens.append(_compiled(_dspark_tap)(stream))
             stream, pre_mix = self._run_block(
-                block, stream, pre_mix, slices, paged, shared, live_rows
+                block, stream, pre_mix, slices, paged, shared, bucket_rows
             )
+        # Back to no override, so a DSpark stage's MoE routes all `1 + k` of its
+        # own rows. See `_MOE_LIVE_ROWS`.
+        _MOE_LIVE_ROWS[0] = None
 
         # ── collapse -> norm -> head ──────────────────────────────────────
         collapsed = HyperConnections.pre(stream.unsqueeze(0), pre_mix.unsqueeze(0))
@@ -5130,8 +5187,9 @@ class DeepseekV41ForCausalLM(nn.Module):
             # where it is not, a mis-seeded draft costs acceptance rate and
             # never output, because every draft is verified against the target.
             self.last_draft = self._draft(
-                _compiled(_greedy_rows)(logits), None, spans, paged, shared,
-                main_hidden, sampling_positions is not None,
+                _compiled(_greedy_rows)(logits), None, spans, paged,
+                shared, main_hidden, sampling_positions is not None,
+                live_lengths,
             )
             return logits
 
@@ -5195,7 +5253,7 @@ class DeepseekV41ForCausalLM(nn.Module):
 
         self.last_draft = self._draft(
             sampled, accepted, spans, paged, shared, main_hidden,
-            sampling_positions is not None,
+            sampling_positions is not None, live_lengths,
         )
         if accepted is not None:
             return accepted
@@ -5340,6 +5398,123 @@ class DeepseekV41ForCausalLM(nn.Module):
         ]
 
     @torch._dynamo.disable
+    def _bucket_rows(
+        self,
+        spans: list[tuple[int, int, int]],
+        meta: dict,
+        total_rows: int,
+    ) -> tuple[list[tuple[int, int, int]], dict]:
+        """Round a lone sequence's span up to the whole token bucket, above one
+        rank, so a short prefill chunk reuses the graphs a full one built.
+
+        **What this is for.** A span's length is a tensor *shape* — `arange(472)`
+        against `arange(512)` — so the last chunk of any prompt, which is
+        `prompt_len % segment` tokens long, keys its own set of 40 per-layer
+        graphs. A loaded NEFF costs host memory (measured: 0.32-0.43 GiB of
+        `Committed_AS` for one of this model's larger graphs, per rank, and it is
+        *not* given back while the graph stays cached), and four ranks pay it
+        four times. For the verifier's 2008-token needle at a 512-token segment
+        that one short chunk was ~12 GiB of `Committed_AS` across the four
+        workers against a `CommitLimit` of 114.8, and it is why
+        `.autohelix/notes/iter-11.md` could complete the needle's four-chunk
+        prefill at four ranks and then not load the first decode step's graphs.
+        Bucketing the row count makes chunk 4 of 4 the *same graph* as chunk 1.
+        It is half the fix; `_MOE_LIVE_ROWS` is the other half, and that comment
+        has the table.
+
+        **Why the padded rows are harmless, step by step.** They are not
+        skipped — they compute, and their results are thrown away — so what
+        matters is that nothing live reads them:
+
+        * `slot_mapping` is extended with vLLM's own null block. `BlockPool`
+          pops block 0 out of the free queue and keeps it as `null_block`
+          (`vllm/v1/core/block_pool.py:191`), so slots 0-31 belong to no
+          sequence, and it is the same convention the runner's own
+          `_apply_decode_slot_mapping_padding` uses for a padded decode row.
+          Every per-token write — the window KV, the index keys, the
+          compressor's pooling inputs, the n-gram ids — goes through
+          `PagedSpan.write`/`write_flat`, i.e. through `slot_mapping`, so a
+          padded row writes to the null block and to nothing else.
+        * the *compressed* latents are the one write addressed by position
+          rather than by `slot_mapping` (`PagedSpan.put`), so padded groups do
+          land in this sequence's own blocks, at group positions past its last
+          real token. They are masked out of every read while they are stale —
+          `Indexer.forward`'s visibility bound is per query,
+          `(start_pos + arange(1, seqlen+1)) // ratio`, so a live query sees
+          exactly the groups its own position completed — and the real token
+          that eventually occupies such a position rewrites the group before any
+          query can see it.
+        * attention is causal per row, and the sliding window is addressed by
+          position, so a live row's reads are unchanged by rows after it.
+          Everything else on the path (norms, the hyper-connection mix, the MoE
+          router and its expert GEMMs) is per token.
+        * `live_rows` still stops at the real tokens, and that is what `MoE`
+          routes. Routing the bucket's stale tail would be the difference
+          between a handful of experts and most of 384 — i.e. hundreds of
+          17.9 MiB reads off disk per layer — which is a cost, not an error, and
+          not one worth paying.
+        * the DSpark stages take the bucketed span too — their own three-stage
+          stack was keying a second copy of itself otherwise — but their
+          *anchor* stays on the last real token, which is what `forward`'s
+          `live_lengths` carries into `_draft`. Their window write is one entry
+          per row and the padded rows' entries go to the null block with
+          everything else.
+
+        A no-op at one rank, where the graph keys the passing verifier run used
+        must not move, and a no-op unless there is exactly one span starting at
+        row 0 — which is what `require_multi_rank_budget`'s `max_num_seqs = 1`
+        guarantees above one rank. A multi-sequence batch would need the spans
+        after the first to move, and their `begin` offsets are the runner's.
+
+        **The block table has to be de-sentinelled, and that is not cosmetic.**
+        `NeuronModelRunner._save_block_table_to_device` runs every 0 in the
+        block table — which is both vLLM's null block *and* every column past
+        what the sequence has allocated — through
+        `_remap_null_block_to_sentinel`, i.e. to **-1**, "so the Neuron
+        attention kernel can DMA-skip inactive slots via oob_mode.skip"
+        (`neuron_model_runner.py:100`). This port does not use that kernel: it
+        turns a block id into a slot arithmetically (`PagedSpan.slots`), so -1
+        becomes slot `-1 * 32 + offset`, a *negative* index, and the first
+        indirect gather off it is
+
+            scatter/gather (indirect memory copy via vector DGE)
+            out-of-bound access ... engine=GPSIMD
+            RuntimeError: nrta status=1006
+
+        A padded row sits past the sequence's last allocated block (position
+        2016 of a 2008-token prompt is block 63 of 63), and so does the
+        compressed read's clamp bound and the padded row's own sliding window,
+        so all three hit it — this is what the first four-rank run of this
+        change died on. Mapping the sentinel back to the null block is exact for
+        everything live: a position a live row can reach is, by construction,
+        inside the blocks the scheduler allocated for it, so no live entry is -1
+        and no live read moves. On the host, because the fallback outside a
+        graph cannot be relied on for `torch.where`, and it is `[1, 66]` int32.
+
+        The padded mapping is built from a host list and copied over in one go,
+        the same shape of host boundary as `_paged_spans`' `starts`: a
+        `torch.cat` of two device tensors out here would be served by the
+        backend's eager fallback.
+        """
+        if self.world_size <= 1 or len(spans) != 1 or total_rows <= 0:
+            return spans, meta
+        begin, length, start_pos = spans[0]
+        if begin != 0 or length >= total_rows:
+            return spans, meta
+        flat = meta["slot_mapping"].reshape(-1)
+        slots = flat[:length].tolist()
+        slots.extend([0] * (total_rows - length))
+        bucket = dict(meta)
+        bucket["slot_mapping"] = torch.tensor(slots, dtype=flat.dtype).to(flat.device)
+        for key in ("full_block_table_tensor", "block_table_tensor"):
+            table = meta.get(key)
+            if table is None:
+                continue
+            host = table.cpu().clamp_min(0)
+            bucket[key] = host.to(table.device)
+        return [(0, total_rows, start_pos)], bucket
+
+    @torch._dynamo.disable
     def _sequence_spans(
         self, positions: torch.Tensor, slot_mapping: torch.Tensor
     ) -> list[tuple[int, int, int]]:
@@ -5477,7 +5652,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         slices: list[tuple[int, int]],
         paged: list[PagedSpan],
         shared: list[SharedAttentionState],
-        live_rows: int | None = None,
+        row_count: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One layer over a flat `[T, hc, dim]` stream covering several
         sequences.
@@ -5492,6 +5667,13 @@ class DeepseekV41ForCausalLM(nn.Module):
         staged expert weights used once per layer rather than once per
         sequence — the timeshare schedule. Looping sequences outermost would
         re-stream 276 GiB per sequence.
+
+        **`row_count`, not the live token count.** This frame is traced, one
+        compiled variant per layer, and dynamo specializes on Python ints — so
+        what arrives here has to be the row count the *graphs* see, which
+        `_bucket_rows` makes bucket-invariant. The MoE's real token count takes
+        `_MOE_LIVE_ROWS` instead; that module comment has the measurement, and
+        the two numbers are equal at one rank and for any full chunk.
         """
         tp_group = self.tp_group if self.world_size > 1 else None
         # The shared per-shape buffers, resolved before anything traced runs so
@@ -5500,7 +5682,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         normed, residual, ffn_pre, ffn_post, ffn_comb = _block_entry(
             block, "attn_half"
         )(stream, pre_mix, slices, paged, shared, tp_group, io_residual, io_normed)
-        ffn_out = block.ffn(normed, None, self.weight_store, tp_group, live_rows)
+        ffn_out = block.ffn(normed, None, self.weight_store, tp_group, row_count)
         # `HyperConnections.post` directly, not `_block_entry(block,
         # "ffn_half")`. They compute the same thing — `ffn_half`'s whole body is
         # this call — but `post` reaches the `hc_attn_out` kernel through
@@ -5531,6 +5713,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         shared: list[SharedAttentionState],
         main_hidden: torch.Tensor | None,
         gathered: bool,
+        live_lengths: list[int] | None = None,
     ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """One DSpark draft per scheduled sequence, seeded from this step's own
         committed token.
@@ -5567,9 +5750,14 @@ class DeepseekV41ForCausalLM(nn.Module):
         as `_paged_spans`' `starts`.
         """
         device = sampled.device
-        lengths = torch.tensor(
-            [length for _, length, _ in spans], dtype=torch.int64, device=device
-        )
+        # `live_lengths`, not the spans' own, and the two differ above one rank:
+        # `_bucket_rows` rounds a span up to the token bucket so the stages
+        # reuse a full chunk's graphs, and the anchor must still land on the
+        # last *real* token. The padded rows write their window entries to the
+        # null block and are never anchored to.
+        if live_lengths is None:
+            live_lengths = [length for _, length, _ in spans]
+        lengths = torch.tensor(live_lengths, dtype=torch.int64, device=device)
         ones = torch.ones(len(spans), dtype=torch.int64, device=device)
         if accepted is not None:
             seeds, valid = _compiled(_accepted_tail)(accepted)
@@ -5585,7 +5773,10 @@ class DeepseekV41ForCausalLM(nn.Module):
                 picks = torch.arange(len(spans), dtype=torch.int64, device=device)
             else:
                 picks = torch.tensor(
-                    [begin + length - 1 for begin, length, _ in spans],
+                    [
+                        begin + live - 1
+                        for (begin, _, _), live in zip(spans, live_lengths)
+                    ],
                     dtype=torch.int64,
                     device=device,
                 )
