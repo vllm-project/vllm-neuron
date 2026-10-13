@@ -174,19 +174,82 @@ class ShardRule:
             the axis is only correct in combination with another one's (heads
             with `attn_sink`, groups with `wo_a`), and a wrong-but-plausible
             axis produces a model that runs and is subtly wrong.
+        align: when set, each rank's slice is rounded *up* to a multiple of this
+            and the checkpoint tensor is zero-padded to match. See
+            `vocab_shard_width` for why the unembedding needs it; nothing else
+            does, and `align=None` leaves the arithmetic exactly as it was.
     """
 
-    __slots__ = ("dim", "reason")
+    __slots__ = ("dim", "reason", "align")
 
-    def __init__(self, dim: int | None, reason: str) -> None:
+    def __init__(
+        self, dim: int | None, reason: str, align: int | None = None
+    ) -> None:
         self.dim = dim
         self.reason = reason
+        self.align = align
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return f"ShardRule(dim={self.dim}, reason={self.reason!r})"
+        return (
+            f"ShardRule(dim={self.dim}, reason={self.reason!r}, "
+            f"align={self.align})"
+        )
 
 
 REPLICATE = ShardRule(None, "no free axis; every rank needs the whole tensor")
+
+#: Alignment the unembedding's vocab shard is padded to, and the number is the
+#: tensor engine's partition width because that is what the GEMM tiles on.
+#:
+#: `blockquant._ntile` picks the widest divisor of the output width that fits a
+#: psum bank, and below 128 the compiler takes a path that is catastrophically
+#: worse rather than slightly worse. Measured on the real head graph, same HLO
+#: shape, **the compiler flags the runner passes** (`-O1 --verbose=35
+#: --modular-flow-mac-threshold=10 ...`):
+#:
+#:     width 129280  (TP=1, nt=256)   NEFF    3-4 MB    compile seconds
+#:     width  64640  (TP=2, nt=128)   NEFF    4.3 MB    compile seconds
+#:     width  32320  (TP=4, nt= 64)   NEFF **133 MB**   compile **10.5 min**
+#:     width  32384  (pad, nt=128)    NEFF    1.0 MB    compile **3 s**
+#:
+#: and the 133 MB NEFF is what made four ranks impossible, because the runtime
+#: builds a per-NEFF debug-info graph from the NEFF's own sections
+#: (`NDBG:ndebug_info_graph_build`) and 133 MB of NEFF came to ~13 GiB of host
+#: memory a rank. Four ranks doing that within 200 ms of each other took
+#: `Committed_AS` to 112.9 GiB of a 114.8 GiB `CommitLimit` and every 4-rank run
+#: died with `std::bad_alloc` immediately after layer 39 — which is exactly
+#: where the head and the MTP stages' graphs load. Eleven device runs in
+#: iteration 9 attributed that to the collectives' host buffer scaling with the
+#: peer count; it was one GEMM's tile width, and the reason TP=2 was fine
+#: untuned is that 129280/2 happens to be 128-divisible where 129280/4 is not.
+#:
+#: 64 was tried first and is not enough: `_ntile` returns 64 for 32320 and the
+#: NEFF stayed at 133 MB. The cliff is at 128.
+VOCAB_SHARD_ALIGN = 128
+
+
+def vocab_shard_width(vocab_size: int, world_size: int) -> int:
+    """Rows of the vocab-parallel embedding and head that one rank holds.
+
+    `ceil` to a multiple of `VOCAB_SHARD_ALIGN`, so the shard is a width the
+    GEMM can tile. The padded rows are zeros, they live at the very end of the
+    *last* rank's slice, and the logits they produce are masked to `-inf`
+    (`DeepseekV41Model.logits_shard`) so they can never be sampled. Because the
+    split stays contiguous and in order, a local index still maps to a global
+    token id as `rank * width + local`, which is the arithmetic
+    `vllm_neuron.functional.argmax` applies.
+
+    A no-op wherever the division already lands on a multiple of 128, which
+    includes **both configurations that work today**:
+
+        129280, 1 rank  -> 129280   (129280 = 1010 x 128)
+        129280, 2 ranks ->  64640   ( 64640 =  505 x 128)
+        129280, 4 ranks ->  32384   ( 32320 =  252.5 x 128, so round up)
+
+    so TP=1 and TP=2 trace byte-identical graphs and keep every cache entry.
+    """
+    exact = -(-vocab_size // world_size)
+    return -(-exact // VOCAB_SHARD_ALIGN) * VOCAB_SHARD_ALIGN
 
 
 # =============================================================================
@@ -2308,6 +2371,55 @@ def _compile_fn(fn):
     )
 
 
+@torch._dynamo.disable
+def _graph_break() -> None:
+    """A dynamo graph boundary and nothing else — no tensors, no side effects.
+
+    Dynamo cannot trace into a `disable`d callee, so a call to this splits the
+    frame around it into separate graphs. Used by `forward_spec` to give each
+    `mtp.*` stage its own graph instead of tracing the whole DSpark draft path
+    into one, and the reason is a **`neuronx-cc` internal compiler error**.
+
+    The one-graph form of the draft path is 460 FX lines with 17 NKI kernel
+    calls, and at four ranks the backend dies compiling it:
+
+        ERROR [job.WalrusDriver.0]: Backend exited with code -11 and stderr:
+        [F139] neuronx-cc terminated abnormally
+
+    a SIGSEGV inside `non_ssa_legalization`. It reproduces on the saved HLO with
+    no engine, no device and no memory pressure (`Committed_AS` 53.6 GiB of
+    114.8 at the time), and it is unmoved by every compiler flag tried: `-O2`,
+    `--no-fork-subcommand`, `--tensorizer-parallel-compile=False`,
+    `--enable-bir-vnsplitter=False`, and dropping each of `--verbose=35`,
+    `--modular-flow-mac-threshold=10`, `--enable-nested-dynamic-loop` and
+    `--enable-verifier=false`. It is also not the padded vocab shard: rank 1's
+    graph has no pad column and none of the masking, and crashes identically.
+    Smaller graphs are the lever that worked.
+
+    Why a bare break rather than `_block_entry(stage, "forward")`, which was
+    tried first: `_block_entry` compiles with `fullgraph=True`, and a stage's
+    `forward` reaches `MoE.forward`, which is `@torch._dynamo.disable`d for its
+    host I/O — so `fullgraph=True` turns that intended break into
+
+        RuntimeError: Skip inlining `torch.compiler.disable()`d function
+        ... <function MoE.forward> ... Hint: Remove the `torch.compiler.disable`
+        call
+
+    A break admits the host boundary the MoE needs *and* splits the graph, which
+    is what was wanted from `_block_entry` in the first place.
+
+    Applied only above one rank, and that is caution rather than principle: the
+    arithmetic is identical either way — same modules, same weights, same order,
+    the breaks only change where one graph ends and the next begins — but
+    splitting re-keys the draft graphs, and the single-rank graphs cached today
+    are the ones the gate's verifier passes with. A later iteration should try
+    the split at one rank too and measure what it buys; the per-NEFF debug-info
+    graph the runtime builds at load makes several small NEFFs cheaper in host
+    memory than one large one, so it is likely to be a win there as well.
+    """
+    return None
+
+
 @functools.lru_cache(maxsize=None)
 def _compiled(fn):
     """`fn` as a device graph, cached per function rather than per shape.
@@ -3829,7 +3941,12 @@ class DSparkMarkovHead(nn.Module):
         super().__init__()
         rank = config.dspark_markov_rank
         self.vocab_size = config.vocab_size
-        self.part_vocab_size = config.vocab_size // tp_size
+        # 128-aligned like the unembedding it mirrors, and for the same reason:
+        # `head_weight` goes through `blockquant.bf16_linear`, whose free-axis
+        # tile collapses below 128 (see `vocab_shard_width`). Both tables are
+        # sharded by `_build_shard_plan`'s aligned rule, so the buffer shape has
+        # to agree with it.
+        self.part_vocab_size = vocab_shard_width(config.vocab_size, tp_size)
         self.register_buffer(
             "embed_weight",
             torch.empty(self.part_vocab_size, rank, dtype=torch.bfloat16),
@@ -3866,6 +3983,13 @@ class DSparkMarkovHead(nn.Module):
         logits = nki_linear(embed, self.head_weight, None, "bf16").float()
         if self.world_size > 1 and self._tp_group is not None:
             logits = tp_all_gather_last(logits, self._tp_group)
+            # Drop the 128-alignment pad (`vocab_shard_width`) so the bias has
+            # the width of the logits it is added to. No `-inf` mask is needed
+            # here, unlike `logits_shard`: this tensor is a *bias* and only its
+            # gathered-and-trimmed form is ever read, so the pad columns —
+            # zeros out of a zero weight row — never reach a comparison.
+            if logits.shape[-1] != self.vocab_size:
+                logits = logits[..., : self.vocab_size]
         return logits, embed
 
     #: Set by the model, which owns the process group.
@@ -3909,7 +4033,19 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.rank = tp_group.rank_in_group
 
         self.hc_mult = config.hc_mult
-        self.part_vocab_size = config.vocab_size // self.world_size
+        self.part_vocab_size = vocab_shard_width(config.vocab_size, self.world_size)
+        #: Columns of `logits_shard` this rank owns that are *not* real tokens.
+        #: Non-zero only on the last rank, and only when the vocabulary does not
+        #: divide evenly into 128-aligned shards — see `vocab_shard_width`. Kept
+        #: as a count rather than a flag because `logits_shard` needs the
+        #: boundary to build the mask.
+        self.vocab_pad = max(
+            0, (self.rank + 1) * self.part_vocab_size - config.vocab_size
+        )
+        #: `(width, dtype, device) -> bias`, filled by `_vocab_pad_bias`. Same
+        #: idea as `_layer_io_slots`: one buffer per shape, so the mask is not
+        #: rebuilt per forward and the graph's retained inputs do not grow.
+        self._vocab_pad_slots: dict[tuple, torch.Tensor] = {}
 
         self.register_buffer(
             "embed_weight",
@@ -4062,8 +4198,12 @@ class DeepseekV41ForCausalLM(nn.Module):
         """
         config = self.config
         plan: dict[str, ShardRule] = {
-            "embed.weight": ShardRule(0, "vocab-parallel embedding"),
-            "head.weight": ShardRule(0, "vocab-parallel LM head"),
+            "embed.weight": ShardRule(
+                0, "vocab-parallel embedding", align=VOCAB_SHARD_ALIGN
+            ),
+            "head.weight": ShardRule(
+                0, "vocab-parallel LM head", align=VOCAB_SHARD_ALIGN
+            ),
             "norm.weight": REPLICATE,
         }
 
@@ -4158,10 +4298,14 @@ class DeepseekV41ForCausalLM(nn.Module):
         last = config.num_nextn_predict_layers - 1
         plan[f"mtp.{last}.norm.weight"] = REPLICATE
         plan[f"mtp.{last}.markov_head.embed.weight"] = ShardRule(
-            0, "vocab-parallel, like the embedding it mirrors"
+            0,
+            "vocab-parallel, like the embedding it mirrors",
+            align=VOCAB_SHARD_ALIGN,
         )
         plan[f"mtp.{last}.markov_head.head.weight"] = ShardRule(
-            0, "vocab-parallel, like the LM head it mirrors"
+            0,
+            "vocab-parallel, like the LM head it mirrors",
+            align=VOCAB_SHARD_ALIGN,
         )
         plan[f"mtp.{last}.confidence_head.proj.weight"] = REPLICATE
         return plan
@@ -4187,6 +4331,26 @@ class DeepseekV41ForCausalLM(nn.Module):
             return tensor.to(device)
 
         extent = tensor.shape[rule.dim]
+        if rule.align is not None:
+            # An aligned rule splits a *padded* extent, so divisibility is
+            # arranged rather than required. The pad rows are zeros and sit at
+            # the end of the last rank's slice; `logits_shard` masks what they
+            # produce. `narrow` past the real extent would raise, so clamp the
+            # slice and pad only the shortfall — which is zero for every rank
+            # but the last, and zero for every world size whose exact division
+            # is already aligned.
+            width = vocab_shard_width(extent, self.world_size)
+            start = min(self.rank * width, extent)
+            have = max(0, min(width, extent - start))
+            shard = tensor.narrow(rule.dim, start, have)
+            if have < width:
+                pad_shape = list(shard.shape)
+                pad_shape[rule.dim] = width - have
+                shard = torch.cat(
+                    [shard, shard.new_zeros(pad_shape)], dim=rule.dim
+                )
+            return shard.to(device)
+
         if extent % self.world_size:
             raise ValueError(
                 f"{key}: dim {rule.dim} has extent {extent}, which is not "
@@ -4217,7 +4381,9 @@ class DeepseekV41ForCausalLM(nn.Module):
                 problems.append(f"{name}: no sharding rule")
                 continue
             shape = list(index.ref(key).shape)
-            if rule.dim is not None:
+            if rule.dim is not None and rule.align is not None:
+                shape[rule.dim] = vocab_shard_width(shape[rule.dim], self.world_size)
+            elif rule.dim is not None:
                 if shape[rule.dim] % self.world_size:
                     problems.append(
                         f"{key}: dim {rule.dim} extent {shape[rule.dim]} is not "
@@ -4522,14 +4688,52 @@ class DeepseekV41ForCausalLM(nn.Module):
         unchanged, so the two spellings are the same tensor and the traced graph
         is identical — which is what makes this safe to land without a
         multi-rank run to check it against.
+
+        When the shard is 128-padded (`vocab_shard_width`, TP=4 only) the pad
+        columns come out of a zero weight row, so they are exactly 0.0 — which
+        beats a genuinely negative logit and would be sampled as a token id past
+        the end of the vocabulary. They are masked to `-inf` here. The mask is
+        added only when there *are* pad columns, so at TP=1 and TP=2 no operator
+        is introduced and the traced graph does not change.
         """
-        return nki_linear(hidden_states, self.head_weight, None, "bf16").float()
+        logits = nki_linear(hidden_states, self.head_weight, None, "bf16").float()
+        if self.vocab_pad:
+            logits = logits + self._vocab_pad_bias(logits)
+        return logits
+
+    def _vocab_pad_bias(self, like: torch.Tensor) -> torch.Tensor:
+        """`[part_vocab_size]`, zero on real columns and `-inf` on the pad.
+
+        A buffer rather than a `masked_fill` with a slice assignment: the latter
+        is an in-place write on a graph-owned tensor, which this backend traces
+        as a scatter. An additive bias is one elementwise op, and `-inf + x` is
+        `-inf` for every finite `x`, so the pad columns lose every comparison in
+        the sampler and in `argmax`.
+        """
+        key = (like.shape[-1], like.dtype, like.device)
+        bias = self._vocab_pad_slots.get(key)
+        if bias is None:
+            bias = torch.zeros(key[0], dtype=like.dtype, device=like.device)
+            bias[key[0] - self.vocab_pad :] = float("-inf")
+            self._vocab_pad_slots[key] = bias
+        return bias
 
     def gather_logits(self, logits_shard: torch.Tensor) -> torch.Tensor:
-        """Every rank's columns, concatenated: `[T, vocab_size]`."""
+        """Every rank's columns, concatenated and trimmed to the real vocabulary.
+
+        `[T, world_size * part_vocab_size]` out of the all-gather, which is
+        `vocab_size` exactly unless the shard was padded (`vocab_shard_width`),
+        and `vocab_size` after the slice either way. The slice is a view, so it
+        costs nothing and adds no aten op to the graph; vLLM's logprobs and the
+        detokenizer both assume full-vocab width, and a wider row would index
+        past the tokenizer.
+        """
         if self.world_size == 1:
             return logits_shard
-        return tp_all_gather_last(logits_shard, self.tp_group)
+        gathered = tp_all_gather_last(logits_shard, self.tp_group)
+        if gathered.shape[-1] != self.config.vocab_size:
+            gathered = gathered[..., : self.config.vocab_size]
+        return gathered
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Vocab-parallel unembedding, gathered to full width.
@@ -4775,6 +4979,24 @@ class DeepseekV41ForCausalLM(nn.Module):
         # of a `[1, 129280]` logits row and a dtype cast the backend's fallback
         # cannot do. The goal permits sampling on the host; this is simply
         # cheaper and keeps the whole step on the device.
+        # `Sampler.forward` shards a full-vocab `logit_mask` itself, by
+        # `arange(shard_size) + rank * shard_size`, and it first insists that
+        # the full width divide the shard width. With a 128-padded shard
+        # (`vocab_shard_width`, TP=4) neither holds: 129280 % 32384 != 0, and
+        # rank 3's indices would run past the mask. Widening the mask to the
+        # padded vocabulary restores both — the added columns are `False`, which
+        # `masked_fill(~mask, -inf)` turns into the same `-inf` the pad columns
+        # already carry from `logits_shard`. `logit_mask` is only ever non-None
+        # for structured output, and this is a no-op at any world size whose
+        # shard is already aligned.
+        if logit_mask is not None and self.vocab_pad:
+            full = self.world_size * self.part_vocab_size
+            if logit_mask.shape[-1] < full:
+                pad_shape = list(logit_mask.shape)
+                pad_shape[-1] = full - logit_mask.shape[-1]
+                logit_mask = torch.cat(
+                    [logit_mask, logit_mask.new_zeros(pad_shape)], dim=-1
+                )
         sampled = _block_entry(self.sampler, "forward")(
             logits_shard, sampling_params, logit_mask, rank
         )
@@ -5262,16 +5484,23 @@ class DeepseekV41ForCausalLM(nn.Module):
         # committed token at `paged.pos + tap`. See `PagedSpan` for why neither
         # may be a Python int, and `DSparkAttention` for why they differ.
         draft_pos = paged.pos + tap
+        split = self.world_size > 1
         for stage in self.mtp:
-            stream, pre_mix = stage(
+            args = (
                 stream, paged.pos, draft_pos, pre_mix, main_x, shared, paged,
                 self.weight_store, tp_group,
             )
+            if split:
+                _graph_break()
+            stream, pre_mix = stage(*args)
 
         last = self.mtp[-1]
         last.head_fn = self.compute_logits
         last.markov_head._tp_group = tp_group
+        if split:
+            _graph_break()
         return last.forward_head(stream, pre_mix, seed_ids)
+
 
     # ── Weights ───────────────────────────────────────────────────────────
 

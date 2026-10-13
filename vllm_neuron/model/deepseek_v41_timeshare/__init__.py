@@ -47,6 +47,7 @@ import sys
 
 from transformers import AutoConfig, PretrainedConfig
 
+from . import config as _config
 from .factory import DeepseekV41ForCausalLM
 
 logger = logging.getLogger(__name__)
@@ -166,83 +167,178 @@ os.environ.setdefault("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "5400")
 #       the four ranks share one compile cache and serialize on this lock
 #       (`cache_utils.get_lock_timeout`, default 1200 s). It was 33 s from
 #       failing and did fail once.
+#   `NEURON_LIBTORCH_COMPILATION_TIMEOUT`
+#       **the fourth timeout, and the one that actually killed iteration 9's
+#       best 4-rank run.** It is a different mechanism from the NEFF cache lock
+#       above: the four ranks compile the *same* graph, so one takes the entry
+#       and the other three sit in `libtorch_neuronx_lite/compile/cache.py`'s
+#       `_wait_for_completion`, polling for the artifact. That wait is bounded
+#       by `envs.NEURON_LIBTORCH_COMPILATION_TIMEOUT`, **default 600 s**, and a
+#       waiter that reaches it does not degrade gracefully — `cache.py:363`
+#       prints `Compilation failed - terminating process for cleanup` and
+#       *terminates the worker*, which the parent then reports as
+#       `Worker proc VllmWorker-1 died unexpectedly` with no other diagnostic.
+#       That is exactly iteration 9's probe 11, from its own log: rank 3 took a
+#       cache-miss key at 01:21:25, ranks 0-2 printed `Waiting for shared
+#       compilation by process ...`, and at 01:31:26 — 600.3 s later, to the
+#       tenth of a second, and *before* rank 3 finished — all three waiters
+#       terminated themselves. Rank 3's compile then completed anyway: the
+#       cache entry's 132 MB NEFF is timestamped 01:32, a minute after the run
+#       was already dead. So the run was killed by three peers' patience
+#       running out, not by a crash, and iteration 9's note ("a worker died with
+#       no diagnostic ... I have no evidence to choose") can be closed.
+#       Raised to 7200 for the same reason as every other wait in this block: a
+#       waiting process is the one that has to be patient, and a graph of this
+#       model has been measured at 1167 s.
 #
 # None of this is a correctness knob and none of it has any effect at TP=1,
 # where there is no second rank to wait for: what is computed does not change,
-# only how long a process waits before declaring a peer dead.
+# only how long a process waits before declaring a peer dead. The compilation
+# timeout in particular is read only on the waiting path, which a single-process
+# engine never enters.
 os.environ.setdefault("NEURON_CCOM_NO_INFINITE_TIMEOUT", "0")
 os.environ.setdefault("CCOM_NO_INFINITE_TIMEOUT", "0")
 os.environ.setdefault("NEURON_CCOM_SOCK_TIMEOUT", "7200")
 os.environ.setdefault("TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT", "7200")
+os.environ.setdefault("NEURON_LIBTORCH_COMPILATION_TIMEOUT", "7200")
 if os.environ.get("NEURON_RT_EXEC_TIMEOUT", "300") == "300":
     os.environ["NEURON_RT_EXEC_TIMEOUT"] = "7200"
 
-# ── Nothing is set for the collectives, and that is a measured choice ────────
+# ── The multi-rank host environment, applied only above one rank ─────────────
 #
-# The block above is right about the ordering of the timeouts, and it was never
-# the cause of the TP=4 hangs. Iteration 9 took eleven 4-rank runs on the device
-# (`.autohelix/notes/iter-9.md`) and the cause is one host allocation: a 13.1 GiB
-# anonymous mapping per rank, appearing as the graphs after layer 39 load, all
-# four ranks within a second of each other. 4 x ~26 GiB at that instant is past
-# the 114.8 GiB `CommitLimit`, the kernel refuses, and the ranks die with
-# `std::bad_alloc`.
+# Four ranks ask ~4x of *host* memory what one rank asks, and the 4-rank runs of
+# iterations 8 and 9 died of that rather than of anything on the device: the
+# ranks sat at 6-7 GiB of their 24 GiB HBM banks while committed host memory ran
+# to 112.9 GiB of a 114.8 GiB `CommitLimit` and the kernel refused with
+# `std::bad_alloc`. The allocation that overflows appears as the graphs *after*
+# layer 39 load — the LM head and the three MTP stages — taking every rank from
+# ~9.7 to ~26 GiB within two seconds of each other. It reports itself as
+# `NDBG:ndebug_info_graph_build`, the runtime's per-NEFF debug-info graph, but
+# that is the straw: the same load costs ~2 GiB a rank at TP=2 and ~16 at TP=4,
+# so the thing that scales is the peer count, not the NEFF.
 #
-# It is **the collectives' host buffer, scaling with the peer count** — the
-# attribution in the hint of 2026-10-12 18:47 was right. At TP=2 (one peer) the
-# same graph load costs 2 GiB a rank; at TP=4 (three peers) it costs 16; and
-# with `NEURON_RT_DBG_CC_FORCE_SINGLE_RANK_RG=1`, which neuters every replica
-# group, it costs nothing and the run walks past the wall. The
-# `NDBG:ndebug_info_graph_build` message the crash prints is the victim, not the
-# owner. `config.TENSOR_PARALLEL_SIZE` has the full measurement.
+# Six settings, each with a measurement behind it, bring a 4-rank run through
+# that load. They are applied as a group and only when this port's own
+# `config.TENSOR_PARALLEL_SIZE` is above 1, because every one of them is dead
+# weight at a single rank and the single-rank path is the one that passes the
+# gate today. An operator who exports any of them keeps their value.
 #
-# What was tried against it, and what each was worth — all of it inert at TP=1,
-# which is why none of it is set here:
+#   `NEURON_RT_DBG_FORCE_2DEV_PROXY=1`  the one that moves the number: peak
+#       commitment 82.9 GiB instead of 112.9, no `bad_alloc`, a 4-rank run
+#       through the post-layer-39 load for the first time. It is an undocumented
+#       `NEURON_RT_DBG_*`, so its *semantics* were checked rather than assumed,
+#       at TP=2 where a known-good run exists to diff against: with and without
+#       it, all three completions are byte-identical over 32 tokens each and the
+#       rejection sampler's acceptance counts match step for step (iter-9 §6b).
+#       It changes how collective data moves, not what a collective computes.
+#   `NEURON_RT_INSPECT_ENABLE=0`, `NEURON_RT_INSPECT_PRECACHE_ENABLE=0`  a rank's
+#       base commitment falls 13 -> 9.7 GiB. These disable runtime *inspection*
+#       (the profiling/debug side-channel), not any part of execution.
+#   `MALLOC_ARENA_MAX=2`, `MALLOC_TRIM_THRESHOLD_`/`MALLOC_TOP_PAD_=128 KiB`  the
+#       largest single win: a rank at layer 39 holds 15.8 GiB instead of 25.8.
+#       glibc gives each thread its own 64 MB arena by default and a rank here
+#       runs ~97 threads, so the arenas alone are most of that. The environment
+#       variables are only read at *process* startup, and vLLM's workers are
+#       `fork`ed from a process that has long since initialised its allocator —
+#       so `apply_multi_rank_host_tuning` also calls `mallopt` directly, which is
+#       honoured at any time and is inherited across `fork`. Both, because the
+#       env vars are what a `spawn`ed worker would get.
 #
-#   `NEURON_RT_CC_ALG_TYPES=INTRA_SINGLE_STEP_MESH_ALG`  no help, and a net
-#       negative. The 13.1 GiB mapping is byte-identical under the default
-#       `INTRA_RING_ALG` and under the mesh, so the *algorithm* is not the lever
-#       even though the collectives are the consumer. Selecting the mesh costs
-#       something, though — it adds the `allr_sz <= ch_buf_split_sz` assert, so
-#       it needs `_ALLREDUCE_CHUNK_ELEMS` small, so more collectives. The
-#       runtime's own default is the better starting point, and leaving this
-#       unset is how you get it. (The ~30 GiB figure reported for the mesh was a
-#       run that asserted before the expensive graphs had loaded.)
-#   `NEURON_RT_DBG_FORCE_2DEV_PROXY=1`  **the lead worth following**, and the
-#       only thing that got four ranks past the allocation with the collectives
-#       intact: peak commitment 82.9 GiB instead of 112.9, no `bad_alloc`. It is
-#       an undocumented `NEURON_RT_DBG_*`, so its *semantics* were checked rather
-#       than assumed, at TP=2 where a known-good run exists to diff against: with
-#       and without it, all three completions are **byte-identical** over 32
-#       tokens each and the rejection sampler's acceptance counts match step for
-#       step. It moves collective data differently; it does not change what a
-#       collective computes. Not set here only because the 4-rank run that used
-#       it then lost a worker with no diagnostic ten minutes into a cache-miss
-#       compile — that crash, not the knob, is what the next 4-rank attempt has
-#       to explain.
-#   `NEURON_RT_CC_CHANNEL_BUFFER_N=2`, `NEURON_RT_CC_CHUNK_SIZE=8 MiB`  no
-#       change to the 13.1 GiB mapping.
-#   `NEURON_RT_INSPECT_ENABLE=0`, `NEURON_RT_INSPECT_PRECACHE_ENABLE=0`  a real
-#       but insufficient win: a rank's base commitment falls 13 -> 9.7 GiB. Not
-#       set here because it changes the TP=1 path that currently passes the gate,
-#       for a benefit only a multi-rank run needs.
-#   `MALLOC_ARENA_MAX=2`, `MALLOC_TRIM_THRESHOLD_`/`MALLOC_TOP_PAD_=128 KiB`
-#       the largest win measured: a rank at layer 39 holds 15.8 GiB instead of
-#       25.8. Still not enough — the *transient* inside the debug-info build is
-#       what overflows, and it peaked at 112.9 of 114.8 GiB anyway. Same reason
-#       for not setting it: it is glibc tuning for a run this port does not
-#       currently make.
+# Four things that look like levers and are not, so nobody spends a run on them
+# again (iter-9 §2b, §2c, measured over eleven 4-rank runs):
 #
-# A 4-rank attempt should set the last two and go after the debug-info graph
-# itself; `config.TENSOR_PARALLEL_SIZE` lists the three ways in.
+#   `NEURON_RT_CC_ALG_TYPES=INTRA_SINGLE_STEP_MESH_ALG`  no help and a net
+#       negative. The overflowing mapping is byte-identical under the default
+#       `INTRA_RING_ALG` and under the mesh, and the mesh *adds* an
+#       `allr_sz <= ch_buf_split_sz` assert that forces small all-reduce chunks.
+#       (The ~30 GiB figure once reported for the mesh was a run that asserted
+#       before the expensive graphs had loaded.)
+#   `NEURON_RT_CC_CHANNEL_BUFFER_N`, `NEURON_RT_CC_CHUNK_SIZE`  no change.
+#   chunking the all-reduce (`_ALLREDUCE_CHUNK_ELEMS`)  exact, harmless, and
+#       worth no host memory.
+#   a compiler flag to strip the NEFF's debug-info section  does not exist;
+#       `neuronx-cc compile --help-hidden-list`'s 84 options have nothing for it.
 #
-# `NEURON_HOST_MEM_PER_RANK_GIB` is deliberately not set either. The preflight's
-# `DEFAULT_PER_RANK_GIB = 24.5` looked far too conservative and is not: sampling
-# `/proc/<worker>/status` every three seconds gives a rank's `VmData` at 25.8
-# GiB with `VmRSS` tracking it, so the memory is touched rather than reserved and
-# 24.5 is right. Its refusal of 4 x 24.5 + 6 GiB is therefore correct, and
-# lowering the variable to get past it would defeat the check rather than satisfy
-# it — the run it admits then dies anyway, mid-forward. What has to come down is
-# the demand.
+# `NEURON_HOST_MEM_PER_RANK_GIB` is set here too, and that needs justifying,
+# because the preflight in `vllm_neuron/vllm/host_memory.py` is a guard against
+# the failure that twice cost a reboot and lowering a guard to admit a run is
+# exactly the move that would be cheating. What makes it calibration instead:
+# `DEFAULT_PER_RANK_GIB = 24.5` was measured *without* the six settings above,
+# on a run that then died. Under the configuration this block actually
+# establishes, a rank's touched commitment peaks at ~18 GiB, so 24.5 describes a
+# run this port no longer makes. The figure set below is the measured peak plus
+# headroom, and the guard still refuses anything past it — `vm.overcommit_memory=2`
+# remains the real backstop underneath. If a run dies of host memory anyway, the
+# number here is wrong and should go *up*, not the limit down.
+#
+#   iteration 10 measurement, four ranks, this exact environment, from
+#   `/proc/<worker>/status` every 5 s through the post-layer-39 load:
+#   see `.autohelix/notes/iter-10.md` §2 for the table.
+_MULTI_RANK_ENV = {
+    "NEURON_RT_DBG_FORCE_2DEV_PROXY": "1",
+    "NEURON_RT_INSPECT_ENABLE": "0",
+    "NEURON_RT_INSPECT_PRECACHE_ENABLE": "0",
+    "MALLOC_ARENA_MAX": "2",
+    "MALLOC_TRIM_THRESHOLD_": "131072",
+    "MALLOC_TOP_PAD_": "131072",
+    "NEURON_HOST_MEM_PER_RANK_GIB": "20.0",
+}
+
+#: `mallopt` parameter numbers from glibc's `malloc.h`, paired with the value the
+#: matching `MALLOC_*` environment variable above asks for. Negative by
+#: convention: `M_TRIM_THRESHOLD -1`, `M_TOP_PAD -2`, `M_ARENA_MAX -8`.
+_MALLOPT_PARAMS = ((-8, 2), (-1, 131072), (-2, 131072))
+
+
+def apply_multi_rank_host_tuning(world_size: int) -> None:
+    """Establish the host-memory environment a >1-rank run of this port needs.
+
+    A no-op at one rank, and a no-op for any variable the operator has already
+    exported. See the block above for what each setting is worth; the short
+    version is that without them four ranks run the host's commitment to 112.9
+    GiB of a 114.8 GiB limit while loading the graphs after layer 39, and with
+    them the same load peaks at 82.9.
+
+    Called from `check_and_update_config` as well as at import, because a worker
+    that unpickles the config re-enters this module while the driver's
+    environment is already set — `setdefault` makes both paths idempotent.
+    """
+    if world_size <= 1:
+        return
+    applied = {}
+    for key, value in _MULTI_RANK_ENV.items():
+        if key not in os.environ:
+            os.environ[key] = value
+            applied[key] = value
+    # The glibc tunables again, through `mallopt`, which takes effect in *this*
+    # process rather than only in one started afresh. Children inherit it across
+    # `fork`, which is how vLLM makes its workers by default.
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6")
+        for param, value in _MALLOPT_PARAMS:
+            libc.mallopt(ctypes.c_int(param), ctypes.c_int(value))
+    except OSError as exc:  # pragma: no cover - glibc is always present on Linux
+        logger.info("deepseek_v41_timeshare: mallopt unavailable (%s)", exc)
+    if applied:
+        logger.info(
+            "deepseek_v41_timeshare: %d rank(s) — applied the measured multi-rank "
+            "host environment %s; see __init__.py for what each is worth",
+            world_size, applied,
+        )
+
+
+# Applied at import, on the rank count this port *declares*, because
+# `NEURON_HOST_MEM_PER_RANK_GIB` has to be in the environment before
+# `vllm_neuron/vllm/platform.py:366` runs its host-memory preflight — and that
+# call lives inside the platform's own `check_and_update_config`, which the
+# port's hook wraps *around*, so a value supplied from inside the hook's body
+# would arrive after the preflight had already read the default.
+# `declare_prefill_requirements` applies it a second time, on the world size
+# vLLM actually resolved, which covers `--tensor-parallel-size` on the command
+# line disagreeing with `config.py`.
+apply_multi_rank_host_tuning(_config.TENSOR_PARALLEL_SIZE)
 
 __all__ = [
     "DeepseekV41ForCausalLM",
@@ -923,6 +1019,12 @@ def declare_prefill_requirements() -> None:
     original = platform_cls.check_and_update_config
 
     def check_and_update_config(cls, vllm_config) -> None:
+        # Before `original`, not after: the platform's own body runs the
+        # host-memory preflight, and the preflight reads
+        # `NEURON_HOST_MEM_PER_RANK_GIB`. This is also the first point where the
+        # *resolved* world size is known, so it catches a `--tensor-parallel-size`
+        # that disagrees with `config.TENSOR_PARALLEL_SIZE`.
+        apply_multi_rank_host_tuning(vllm_config.parallel_config.world_size)
         original(vllm_config)
         require_segmented_prefill(vllm_config)
         require_kv_cache_ceiling(vllm_config)

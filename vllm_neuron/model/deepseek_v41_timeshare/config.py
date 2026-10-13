@@ -52,73 +52,79 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 #: instantiated, once per rank. A model cannot choose its own world size, only
 #: be told.
 #:
-#: **1, and the reason is now measured rather than inferred: HOST memory, by
-#: one allocation, in one place.** Everything else about four ranks works.
+#: **1 — and for the first time the reason is wall clock rather than a wall.**
+#: Four ranks now work: they generate correct tokens, with the weights and the
+#: KV divided and the ranks rejoining through collectives, and the verifier
+#: passes on three of its four cases at `tensor_parallel_size=4`. What is not
+#: shown is the *fourth* case and the four-sequence batch, and both fail on
+#: compile budget and host memory rather than on anything the model computes.
+#: `.autohelix/notes/iter-10.md` is the full account; the short version:
 #:
-#: What iteration 9 got, at `--tensor-parallel-size 4`, four times over
-#: (`.autohelix/notes/iter-9.md` §1-§3):
+#: WHAT FOUR RANKS DOES TODAY, measured 2026-10-13 over seven device runs:
 #:
-#:     four ranks up, one NEFF shared by all four (one cache key, rank 0
-#:       compiles and ranks 1-3 take the artifact), collectives resolved inside
-#:       the traced graphs (`collective_replica_groups: resolved_count 5`)
-#:     resident weights   10.60 -> **4.33 GiB a rank**; head and embedding
-#:       sharded to (32320, 5120); 96 of 384 routed experts a rank
-#:     device HBM         6.25 GiB of 24 a rank, all 40 decoder layers
-#:     host commitment    ~50 GiB, flat, for the whole backbone
+#:     resident weights   10.60 GiB a rank at TP=1 -> **4.33 GiB** a rank
+#:     head + embedding   sharded to (32384, 5120); 96 of 384 experts a rank
+#:     all 40 decoder layers and the 3 `mtp.*` stages execute, every forward
+#:     collectives resolved inside the traced graphs (`resolved_count 5`)
+#:     host commitment    peak 53-69 GiB of a 114.8 GiB CommitLimit
+#:     a single prompt    `[11111, 603, 1]` -> " Paris.\n", EOS, 8 tokens
+#:                        (11111 is the first token TP=1 emits for the same
+#:                         prompt, so the sharded head and the vocab-offset
+#:                         arithmetic agree with one rank to the token)
+#:     the verifier       `--max-model-len 608`, `--max-num-seqs 1`, judge on:
+#:                        **PASSED**, 3 of 3 completions REASONABLE, 20 min
 #:
-#: It then dies in the same place every time: loading the graphs *after* layer
-#: 39 (the LM head and the three MTP stages), where each rank's host commitment
-#: jumps from ~9.7 GiB to ~26 GiB inside two seconds and all four jump at once.
-#: 4 x 26 + 9.5 GiB of other processes is past the 114.8 GiB `CommitLimit`, the
-#: kernel refuses, and the ranks die with `std::bad_alloc`. It is **one 13.1 GiB
-#: anonymous mapping a rank**, and `VmRSS` tracks it, so it is touched rather
-#: than reserved.
+#: WHAT KILLED IT FOR NINE ITERATIONS, and it was never the collectives: one
+#: GEMM's free-axis tile width. `kernels/blockquant._ntile` takes the widest
+#: divisor of the output width that fits a psum bank, from `(512, 256, 128)`,
+#: and returns **1** otherwise. The unembedding's width is the vocabulary a rank
+#: owns — 129280 at TP=1 (divisible by 256), 64640 at TP=2 (by 128), and
+#: **32320 at TP=4, divisible by none of them**. Same graph, same compiler
+#: flags, measured:
 #:
-#: **That mapping is the collectives' host-side buffer, and it scales with the
-#: peer count.** Two measurements, both on the device:
+#:     width 129280  (TP=1, nt=256)    NEFF   3-4 MB     compile seconds
+#:     width  64640  (TP=2, nt=128)    NEFF   4.3 MB     compile seconds
+#:     width  32320  (TP=4, nt=  1)    NEFF **133 MB**   compile **10.5 min**
+#:     width  32384  (pad,  nt=128)    NEFF   1.0 MB     compile **3 s**
 #:
-#:   TP=2   the same graph load costs **2 GiB** a rank, not 16, and the largest
-#:          mapping stays at 0.5 GiB. One peer instead of three.
-#:   TP=4 + `NEURON_RT_DBG_CC_FORCE_SINGLE_RANK_RG=1` (every replica group
-#:          replaced by a self-only group, so the collectives are no-ops and the
-#:          numbers are wrong — a measurement, not a configuration): 6.9 GiB a
-#:          rank, `Committed_AS` ~55 instead of 112.9, no `bad_alloc`, and the
-#:          run walks straight past the wall.
+#: The runtime builds a per-NEFF debug-info graph *from the NEFF's own sections*
+#: when the graph loads (`NDBG:ndebug_info_graph_build`), 133 MB of NEFF came to
+#: ~13 GiB of host memory a rank, four ranks did it within 200 ms of each other,
+#: `Committed_AS` hit 112.9 of 114.8 GiB and the kernel refused with
+#: `std::bad_alloc` — always immediately after layer 39, which is where the head
+#: and the MTP stages load. That is the whole "collectives' host buffer scaling
+#: with the peer count" diagnosis from iteration 9, and it was wrong. It is also
+#: exactly why TP=2 worked untuned and TP=4 never did.
 #:
-#: The `NDBG:ndebug_info_graph_build` message the failure prints is the *victim*
-#: that reports the exhaustion, not the owner; in the first probe a different
-#: allocation (`Failed to allocate kbin descriptors`) failed eight seconds
-#: earlier. Four things do NOT reduce it, each tested: the collective algorithm
-#: (`INTRA_SINGLE_STEP_MESH_ALG` and `INTRA_RING_ALG` give byte-identical
-#: mappings), all-reduce chunk size, `NEURON_RT_CC_CHANNEL_BUFFER_N` /
-#: `NEURON_RT_CC_CHUNK_SIZE`, and the `NEURON_RT_INSPECT_*` pair — though that
-#: last one plus glibc arena tuning does take a rank from 25.8 to 15.8 GiB,
-#: leaving the gap at about 1.7 GiB a rank.
+#: `model.vocab_shard_width` pads the shard to a multiple of 128, which is a
+#: no-op at TP=1 *and* TP=2 because both divisions already land there.
 #:
-#: What got four ranks past it with the collectives *intact*:
-#: `NEURON_RT_DBG_FORCE_2DEV_PROXY=1` — `Committed_AS` peaked at 82.9 GiB rather
-#: than 112.9, no `bad_alloc`, and the run reached graphs no 4-rank attempt had
-#: ever compiled. It then lost a worker, with no diagnostic, ten minutes into
-#: one of those compiles, so it is a lead rather than a solution — but the
-#: obvious worry about it is settled: at TP=2, with the knob and without it, all
-#: three completions are **byte-identical** over 32 tokens each and the
-#: acceptance counts match step for step, so it changes how collective data
-#: moves and not what a collective computes. The worker crash is the one open
-#: question; `.autohelix/notes/iter-9.md` §8 says how to attack it.
+#: WHAT STOPS 4 FROM BEING THE DEFAULT, in the order it has to be fixed:
 #:
-#: The earlier explanation here, three mis-ordered timeouts, was wrong; it is
-#: fixed in `__init__.py` anyway and the hang it described was always this
-#: allocation. A host-memory guard now makes the failure safe:
-#: `vm.overcommit_memory=2` with `CommitLimit` under physical RAM, so the run
-#: dies and the host lives.
+#:   1. the 2048-row needle phase. One 2048-row graph compiled for **over 19
+#:      minutes without finishing** at four ranks — the
+#:      `Tensorizer/MaskPropagation` stall `.autohelix/notes/iter-5.md` §5e
+#:      recorded at 1024- and 2048-token segments, paid again because every
+#:      sharded shape is a fresh cache key. Host memory was fine throughout.
+#:      Warm that cache once and this goes away; or replace `attn_half`'s
+#:      unfused subgraph with one of the fused `kernels/legacy/l*_attn.py`
+#:      kernels, which is the standing advice and would help TP=1 as much.
+#:   2. `max_num_seqs=4`. Six forwards in, a graph load failed with
+#:      `TDRV:dma_util_expand_tiling_dims memory allocation failed` ->
+#:      `create_data_refill_rings() error` at `Committed_AS` 90.1 GiB. More
+#:      sequences key more graph shapes and each stays resident with its code,
+#:      DMA rings and scratchpad. At `max_num_seqs=1` the same three prompts
+#:      peak at ~75 GiB and pass.
 #:
-#: **TP=2 is not blocked at all**, and it is what this port has actually been
-#: run at multi-rank: weights 6.17 GiB a rank, all 43 layers, DSpark proposing
-#: and verifying, three coherent completions, two of them byte-identical to the
-#: TP=1 run's. Or sidestep ranks entirely: drive the four cores SPMD from one
-#: process, collectives inside the NKI kernels, as
-#: `DeepSeek-V4.1-Flash-Trainium/engram-short/opt-1/` does — the buffer is
-#: per *process*, so one process pays for it once where four pay four times.
+#: Both are budget, not correctness, and the gate's verifier runs the needle and
+#: the four-sequence batch — so `4` here would hand it a run that cannot
+#: finish, and a red `verifier` discards the iteration. Hence 1, which is the
+#: parallelism proven on all four cases. Raise it the moment (1) and (2) hold.
+#:
+#: The SPMD alternative — one process driving four cores with the collectives
+#: inside the NKI kernels, as `DeepSeek-V4.1-Flash-Trainium/*/opt-1/` does — is
+#: still the structurally cheaper answer for exactly the reason above: the
+#: per-NEFF host cost is paid per *process*.
 TENSOR_PARALLEL_SIZE = 1
 
 

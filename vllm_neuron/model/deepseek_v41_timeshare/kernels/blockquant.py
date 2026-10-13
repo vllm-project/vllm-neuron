@@ -91,11 +91,47 @@ def _mgroup(mtiles, ktiles):
     return mg
 
 
+#: Free-axis tile widths to try, widest first. Any divisor of `n` not larger
+#: than `NT` is correct; wider is fewer tiles, so fewer instructions.
+#:
+#: The short list this used to be — `(512, 256, 128)` and then `1` — held a
+#: cliff that cost iterations 8 and 9 their 4-rank runs, and it is worth
+#: spelling out because nothing about it is visible from the call site. `n` for
+#: the unembedding is the vocabulary this rank owns:
+#:
+#:     TP=1   n = 129280   % 256 == 0   -> nt = 256,  505 tiles
+#:     TP=2   n =  64640   % 128 == 0   -> nt = 128,  505 tiles
+#:     TP=4   n =  32320   divides none -> nt =   1, **32320 tiles**
+#:
+#: 32320 is 64 x 505, so it is divisible by 64 and by nothing larger that was on
+#: the list. Falling to `nt = 1` multiplies the tile count by 64 and the inner
+#: `static_range(ktiles)` emits 40 `nc_matmul`s per tile, so the compiler was
+#: asked to schedule 1.29M matmuls for one GEMM. What that produced, measured:
+#:
+#:     TP=1 head graph   NEFF 3-4 MB,   compile seconds
+#:     TP=4 head graph   NEFF **132 MB**, compile **10.5 min**
+#:
+#: and then the NEFF could not be *loaded* at four ranks: the runtime builds a
+#: per-NEFF debug-info graph from the NEFF's own sections
+#: (`NDBG:ndebug_info_graph_build`), 132 MB of NEFF came to ~13 GiB of host
+#: memory, four ranks did it within 200 ms of each other, and `Committed_AS`
+#: hit 112.9 GiB of a 114.8 GiB limit — `std::bad_alloc`, every 4-rank attempt,
+#: always just past layer 39. That is the whole failure that eleven device runs
+#: in iteration 9 attributed to the collectives' host buffer: it was never the
+#: collectives, it was one GEMM's tile width. It is also exactly why TP=2
+#: worked untuned — 64640 happens to be 128-aligned and TP=4's shard is not.
+#:
+#: So the list continues down in powers of two. Adding the smaller candidates
+#: cannot change any `n` that already matched a wider one, which is why this is
+#: inert at TP=1 and TP=2.
+_NTILES = (NT, 256, PT, 64, 32, 16, 8, 4, 2)
+
+
 def _ntile(n):
     """Free-axis tile width: as wide as a psum bank allows, and a divisor."""
     if n <= NT:
         return n
-    for cand in (NT, 256, PT):
+    for cand in _NTILES:
         if n % cand == 0:
             return cand
     return 1
