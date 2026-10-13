@@ -87,3 +87,89 @@ per-case verdicts and any execution traceback.
 `--skip-judge` generates and prints without grading, for inspecting raw output.
 Such a run reports `passed=0` by construction, since condition 2 was never
 tested.
+
+## On-device time — what it measures, and what it is not
+
+Each phase also reports **on-device** TTFT and time-per-output-token, as
+`##autohelix[...]` metrics and in `verifier_report.json` under `device_time`:
+
+| metric | measured? | what it is |
+|---|---|---|
+| `device_ttft_ms_<phase>` | measured | one prefill forward, cold prefix cache |
+| `device_step_ms_<phase>` | measured | one decode forward |
+| `device_tpot_ms_<phase>` | derived | the step divided by the tokens a step emits |
+| `device_total_ms_<phase>` | derived | what this phase's 32-token generate would cost on device at those rates |
+
+`<phase>` is `long` (the needle) or `short` (the other three cases).
+
+**Device time, not wall clock.** The target is a 16-device `trn2.48xlarge` that
+keeps the weights resident and builds its graphs once; a wall-clock figure from
+this 1-device host would mostly describe the host. The numbers come from the
+`ExecutionInfo` table of an NRT device profile — one row per NEFF execution,
+summed — so the host gaps *between* executions are excluded. On this port that
+is most of the clock: a prefill window measured 62 s on device inside a 372 s
+span.
+
+Two honest caveats. An execution's span still contains whatever happens *inside*
+it, and on this port that includes waiting for weights streamed from the host —
+which is exactly what the 16-device target would not do, so these figures are an
+upper bound for it. And the capture itself is not free; it is on for two forwards
+of each window and costs wall-clock time, not output.
+
+**The correctness run is untouched.** All 4 cases, 32 tokens, greedy, same
+engine. The measurement adds a profile session *around* that generate — the
+runtime records two forwards and stops itself — plus two short extra generates
+*after* the judged completions have been collected. Nothing it does changes what
+is scheduled or sampled, and nothing it does can fail the run: every step of it
+is wrapped, and a failure lands in `notes` with the metrics left out.
+
+**How a forward of one kind gets measured.** A window records the 2nd and 3rd
+forwards of whatever it wraps (`delay_iterations=2`, `max_iterations=2`), which
+is what keeps prefill and decode from landing in the same trace:
+
+| window | wraps | records |
+|---|---|---|
+| `<phase>-generate` | the real 32-token generate | its forwards 2-3 — decode steps, since forward 1 is the first prompt's prefill |
+| `<phase>-cold-prefill` | `"Hello."`, then the phase's longest prompt twice, cache reset before each | two cold prefills of that prompt |
+| `<phase>-cold-decode` | the cache reset, then the same prompt for 3 tokens | two decode steps — that prompt's prefill is the skipped forward |
+
+Mind the offset: `NeuronWorker.execute_model` calls the profiler's `step()`
+*before* the forward, so `delay_iterations=D` records forwards D..D+M-1 rather
+than the obvious reading. `D=1` records forward **1**.
+
+Every window prefills cold, resetting the prefix cache first, because that is
+what the run's own generate does. An earlier version let the decode window
+reuse the warm cache the previous window left behind — cheaper, and a path the
+gate never takes: on the 2008-token needle it killed the engine with
+`RuntimeError: nrta status=1006`, an out-of-bounds execution. Reaching a
+full-prefix-cache hit at that length looks like a live bug in the port, worth a
+look on its own; it is not one the measurement needs to walk into.
+
+The two built windows hold a known kind by construction. The third — around the
+real generate — does not: this port forces `max_num_seqs` to 1 above one rank,
+so a phase's prompts run one after another and "the first N forwards are the
+prefills" is false for it. It is identified instead by fingerprint: the graph a
+window spends most of its device time in, matched against the two known
+windows', since a prefill and a decode forward run different graphs for the same
+layer. A window matching neither is reported and not pooled.
+
+Forwards are then pooled by kind, so TTFT is the mean of two cold prefills and
+the step figure the mean of four decode forwards, two of them from the 32-token
+run itself. Means rather than single samples because one forward is a noisy
+sample here: two windows of identical prefill work measured 23.8 s and 29.5 s,
+an execution's span moving with whatever else is streaming weights at the time.
+
+Tokens-per-step is measured on the 32-token generate (`vllm:iteration_tokens_total`
+counts forwards, `vllm:generation_tokens` counts tokens), because with
+speculation a step emits `1 + accepted` tokens and one step's device time is not
+one token's.
+
+`--no-device-time` skips all of it. `--profile-dir` chooses where the profiles
+go (default: a per-pid directory under the system temp dir, *not* the
+repository — an NTFF is ~1 GB a forward). The raw NTFFs are deleted once read;
+the parquet they were read from stays under `<profile-dir>/windows/<window>/ingest/`,
+including a per-NEFF device-time breakdown that is the obvious place to start an
+optimization pass. Reading it needs `pyarrow`; without it the metrics are
+skipped rather than guessed, because the one figure available without it —
+`Summary.total_time` — is the window's span, not its device time (491 s against
+62 s on the window above).
