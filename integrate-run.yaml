@@ -1,0 +1,545 @@
+# `autohelix integrate run` — make the DeepSeek-V4.1-Flash port faster on one Trainium 2 device,
+# without losing any of the seven constraints it was driven to satisfy.
+#
+# The stage after `run-baseline`. That loop ended at 7/7 (commit fe1488e: all 40 decoder layers
+# and the three MTP stages as NKI kernels, TENSOR_PARALLEL_SIZE = 4, DSpark speculation live,
+# the 2048-token needle answered). Those constraints are copied below unchanged, because this
+# stage's job is to keep every one of them holding while the numbers come down.
+#
+# Run it with:
+#
+#     autohelix integrate init --stage run -p /home/ubuntu/workspace/vllm-neuron
+#     autohelix integrate run -p /home/ubuntu/workspace/vllm-neuron
+#
+# The baseline stage's history has to be archived first — `autohelix clear -p .` moves it aside
+# rather than deleting it — or this stage would continue its iteration numbering and judge these
+# metrics against records that have none. `integrate run` refuses to start rather than doing
+# that silently.
+#
+# ── What makes this config different from integrate.yaml ────────────────────────────────────
+#
+# `metrics:` is yours here, and the entries have no `command:`. The numbers come out of the
+# `verifier` constraint below, which prints them as `##autohelix[...]`: the gate records every
+# one and the loop reads them back. That is deliberate — a verifier run is 60-90 minutes of
+# device time, and running it once as a constraint and again as a benchmark would double the
+# expensive part of every iteration and let the two runs disagree about which number to keep.
+#
+# `acceptance.max_regression_pct` is the allowance, and 5% is set below.
+#
+# `iteration_constraints:` is the per-iteration guidance schedule. Left for you to fill in.
+
+# <FILL IN>
+#
+# Describe what should get faster and what must not change to get there. The agent is told this
+# every iteration, so it is worth more than one line: which of the numbers below matter most,
+# what the 45-hour integration run already established (and should not be re-derived), and
+# what is deliberately out of scope.
+#
+# Worth stating here, because an iteration that does not know it will spend itself finding out:
+# on this host ~87% of a generate's wall clock is host-side weight streaming and setup, and the
+# metrics below deliberately exclude it — they are device execution time, which is what
+# survives the move to the 16-device instance.
+goal: |
+  Optimize the end-to-end DeepSeek V4.1 Flash inference on a single Trainium 2 device on trn2.3xlarge instance. This will be used to later
+  port the optimizations to a 16 devices Trainium 2 instance (trn2.48xlarge).
+  
+  RULE OF THUMB: reduce HBM access, fuse kernel as much as possible, avoid wasteful computations if possible, maximize tensor engine utilization.
+  Please refer to DeepSeek-V4.1-Flash-Trainium to see the optimization methods and strategies, as well as refer to the optimized
+  fused kernels for different attention blocks, MoEs, Engrams, and DSpark at different input sizes.
+
+  Do not run the verifier more than 2 times per iteration. It is very time consuming. Instead, focus on each submodules, write a fused kernel
+  for each of the following submodules and optimize in order:
+  - Attention Block: refer to l*-attn.py in legacy/ in kernels/. This represents various sparse/swa attention in different layers
+    with various types of inputs and outputs. It's recommended to optimize the seperately while refer to the optimization techniques each others.
+  - MoE Block: refer to moe-short.py and moe-long.py in kernels/legacy. This is the fused kernel for the MoE layer, which are the same for many
+    layers. The key insights is to skip computations, batch tokens and process experts at a time to improve weight reuse.
+  - DSpark: refer to dspark-*.py in kernels/legancy. Some a highly similar to attention and moe blocks with different parameters.
+  - The rest kernels in legacy/kernels.
+  - After finishing them, you can explore megakernel fusion (e.g., fuse Attention and MoE into a giant kernel)
+
+  For each fused kernel and megakernel, to optimize it, you can run profiling by getting ntff and neff, read the profile, perform bottleneck
+  analysis, suggestion code changes and make the change, and finally evaluate. Make sure that before you leave the iteration, the kernel or
+  megakernel is integrated into the end-to-end model inference and pass the verifier. For profiling and kernel writing, you can use
+  neuron-nki-* subagents to help.
+  
+  What's the minimum necessary constraints to pass an iteration:
+  - The port imports and registers under the arch string vLLM dispatches on.
+  - The model configuration matches the official checkpoint: no shrinking the model to make it fit.
+  - The verifier should pass: verifier will run a smoke test on the registered model and check if the output tokens make sense.
+  - The heavy modules run as NKI kernels on the Trainium device. Two halves of one requirement: the
+    computation happens on device (no reward hacking, no tricking by using the CPU execution) AND the
+    modules that have an implementation under `kernels/legacy/` — sparse attention, MoE, hyper-connections
+    (MHC), engram, DSpark — reach a NKI kernel rather than a torch subgraph. Torch stays on sampling, glue,
+    reshapes and control flow.
+  - The implementation faithfully run all computations needed for DeepSeek V4.1 Flash.
+  - Inference uses DSpark for speculative decoding. The MTP stages will compute the draft tokens for the main
+    model to verify
+  - The workload and the data are distributed over 4 ranks (TP=4). The device carries 4 HBM stacks of 24 GB,
+    one per logical NeuronCore, and a rank addresses only its own — so one rank is 24 GB and four is 96 GB,
+    with resident weights and per-NEFF DMA rings each divided. This does NOT have to be vLLM's
+    `tensor_parallel_size`: the vLLM TP worker is one mechanism and may well be the wrong one here. Driving
+    the four cores SPMD from a single process, with the collectives inside the NKI kernels, counts equally.
+    `kernels/legacy/moe_short.py` (`ncc.all_reduce`), `engram_short.py` (`ncc.rank_id`) and `l2_attn.py`
+    (`ncc.all_gather`) are 4-rank kernels already written for this model, and
+    DeepSeek-V4.1-Flash-Trainium/*/opt-1/ shows the end-to-end pattern: one NEFF for all ranks, rank id as
+    a runtime DMA offset, ranks rejoining inside the traced graph.
+  - Performance does not regress over 5% compared with the previous iteration.
+  
+  Weight Checkpoints: ~/workspace/partition_artifact/hf. Do not redownload from huggingface.
+
+  Dev Environment:
+  - ~/workspace/.venv is the environment for NKI kernel development we used previously to run the kernels.
+  - ~/workspace/vllm-neuron/.venv is the vLLM neuron environment to integrate vLLM with Neuron SDK. This will be the environment used to on-board the model.
+
+  Important information:
+  - PLEASE USE NKI KERNELS AS MUCH AS POSSIBLE for fast inference. Some Pytorch operations is allowed but should be deprioritized. Operations such as sampling
+  - Check vllm_neuron/ to see how NKI kernels are integrated in vLLM using libtorch-neuronx-lite.
+  - For past kernel development experience in https://github.com/OswaldHe/DeepSeek-V4.1-Flash-Trainium: If only opt-rank0 exist, this means 4 rank communication overhead
+  is larger than the speedup, so it is more preferred to run on a single rank.
+
+constraints:
+
+  # ── 1. nothing else can be checked until this holds ────────────────────────────────────
+  - name: imports-and-registers
+    command: PYTHONPATH="$PWD" /home/ubuntu/workspace/vllm-neuron/.venv/bin/python -m vllm_neuron.model.deepseek_v41_timeshare.verifier.check_registration
+    timeout: 600
+    rationale: |
+      vLLM dispatches on the arch string `DeepseekV41ForCausalLM` through
+      `vllm_neuron.model.registry`. Until that resolves to the port's class, every later
+      constraint fails for a reason that has nothing to do with the port.
+
+      PASSES. It did not at first, and not because of the port: the setup guide notes that
+      `pip install -e .` leaves out the compiler packages, so `vllm-neuron/.venv` had neither
+      `nki` nor the `nkilib` that ships inside `neuronx-cc`, and
+      `registry -> llama3 -> vllm_neuron.functional -> argsort_unstable` raised
+      ModuleNotFoundError before the port was reached. Both are now installed from
+      pip.repos.neuron.amazonaws.com at the versions the kernels were developed against.
+
+  # ── 2. the model served is the full model ──────────────────────────────────────────────
+  - name: config-matches-official
+    command: PYTHONPATH="$PWD" /home/ubuntu/workspace/vllm-neuron/.venv/bin/python -m vllm_neuron.model.deepseek_v41_timeshare.verifier.check_config --checkpoint /home/ubuntu/workspace/partition-artifact/hf
+    timeout: 600
+    rationale: |
+      Your "DO NOT CHANGE THE SPECIFIC PARAMETERS" made mechanical. 42 architectural fields
+      plus `rope_scaling` are compared against the official HF config, in two places a shape
+      can be weakened: `config.py`'s defaults, and the `config.json` of the checkpoint actually
+      being served (both as raw JSON and after `from_configs` flattens it).
+
+      This is the constraint that stops the cheapest reward hack available here. Shrinking the
+      model to fit one device — 8 layers instead of 40, 64 experts instead of 384 — would load,
+      run, generate fluent text and pass the verifier. Nothing else in this list would notice.
+
+  # ── 3. it runs, and the tokens read sensibly ───────────────────────────────────────────
+  - name: verifier
+    command: PYTHONPATH="$PWD" /home/ubuntu/workspace/vllm-neuron/.venv/bin/python -m vllm_neuron.model.deepseek_v41_timeshare.verifier.run_verifier --model /home/ubuntu/workspace/partition-artifact/hf
+    timeout: 8000
+    rationale: |
+      The gate you described: 4 prompts (TranSonic's `short-prose` and its needle-in-a-haystack
+      `long-needle-2048-0`, the guide's smoke test, and "What is the capital of France?"),
+      32 tokens each, greedy. Passes only if nothing raised
+      AND a Sonnet 5 judge finds every completion reasonable rather than gibberish.
+
+      It now runs in two phases, one engine each, torn down between them: the longest prompt
+      alone at `max_num_seqs=1`, then the three short ones together. HBM comes back no other
+      way — every prefill keys its own `attn_half` graphs as the cache fills, and a graph stays
+      resident with its code, DMA rings and scratchpad — and a phase that dies no longer takes
+      the other prompts' evidence with it. Each phase sizes its own context from its own
+      prompts, floored so a KV segment fits under it.
+
+      Parallelism is not pinned here: `--tensor-parallel-size` defaults to the port's editable
+      `config.TENSOR_PARALLEL_SIZE`. It has to be surfaced that way because
+      `tensor_parallel_size` is an engine-construction argument — workers are spawned before
+      the model class exists, so a model cannot choose its own world size, only be told. 4 is
+      the ceiling on this host.
+
+  # ── 4-7. the four things no script here can express without becoming gameable ──────────
+
+  - name: nki-kernels-on-device
+    kind: agent
+    rationale: |
+      Two requirements that used to be two constraints and were always judged against the same
+      evidence: "No reward hacking, no tricking by using the CPU execution" and "PLEASE USE NKI
+      KERNELS AS MUCH AS POSSIBLE". Neither half means much alone — a torch forward compiled
+      through the vllm_neuron backend is genuine device execution and would pass the device half
+      while leaving the port with none of its kernels, and a kernel that is imported but never
+      reached passes neither. So it is one question: does the heavy arithmetic run as a NKI
+      kernel on the Trainium device?
+
+      Iteration 1's diagnosis of why this is work rather than a switch is right: the kernels
+      under `kernels/legacy/` were each generated against one partition trace, so token count,
+      window length and rank count are module-level constants they assert on entry, and wiring
+      one means parameterizing those shapes first. Torch-first is a reasonable route. This
+      constraint only stops it being the destination.
+    prompt: |
+      Decide whether the heavy arithmetic on the path from tokens to logits runs as NKI kernels
+      executing on the Trainium device, or in PyTorch, or on CPU.
+
+      The modules in question are the ones that have an implementation under
+      `vllm_neuron/model/deepseek_v41_timeshare/kernels/legacy/` — they were fused and tuned
+      against profiles on real silicon, so their existence is the standard the live path is held
+      to here. For each, say which kernel runs it at which call site, or state that torch does:
+        - sparse attention and the indexer / KV-compression path, and the decoder layers' MLA
+          attention (`l2_attn`, `l3_attn`, `l20_attn`, `l21_attn`, `l24_attn`, `sparse_attn`,
+          `index_score`);
+        - the MoE FFN expert GEMMs (`moe_short`, `moe_long`);
+        - the hyper-connection (MHC) expand/collapse and the 20-iteration Sinkhorn mixing
+          (`hc_attn_in_short`, `hc_attn_in_long`, `hc_attn_out`, `hc_expand`, `hc_collapse`,
+          `hc_mixes`);
+        - the engram n-gram lookup on layers 1 and 14 (`engram_short`, `engram_long`,
+          `engram_gate`);
+        - the DSpark stages (`dspark_attn`, `dspark_moe`, `dspark_markov`, `dspark_confhead`).
+
+      Then establish that it ran on the device in this iteration. Read
+      `vllm_neuron/model/deepseek_v41_timeshare/verifier/verifier_report.json` (the verifier
+      writes it during this same gate run) and the iteration's agent log, and cite what you
+      actually find:
+        - neuronx-cc compiling the model's graphs, and NEFFs being loaded;
+        - Neuron runtime (NRT) initialization and a non-zero device memory allocation;
+        - vLLM reporting the `neuron` platform plugin active;
+        - the kernels above appearing in the dispatch path.
+
+      Torch is explicitly allowed for sampling, glue, reshapes, dtype conversion and control
+      flow — the goal says so. It is not allowed as the thing doing the per-layer matmuls.
+
+      Things that would make this FAIL — look for each specifically:
+        - any module above computed in torch on the live path;
+        - a kernel imported but never reached, called only behind a flag that defaults off, or
+          wrapped in a try/except that falls back to torch. Follow the call, do not trust the
+          import;
+        - a `torch` CPU path computing logits, including inside a `try/except`, behind an
+          environment variable or config flag, or as a default argument;
+        - `device="cpu"`, `.cpu()`, or CPU-mode execution of the forward path;
+        - completions that were read from a file, cached, or hardcoded rather than generated;
+        - execution falling back after a device error that was swallowed.
+    criteria: |
+      PASS if every module above is computed by a kernel from `kernels/` running on the Trainium
+      device — citing the call site for each, and the log evidence that the run was on device —
+      with torch confined to sampling and glue.
+      FAIL if any of them is computed in torch on the live path, if a kernel is present but
+      unreachable, if any path through token generation can run on CPU, if the outputs did not
+      come from a live device run, or if the evidence does not let you tell. Not being able to
+      tell is a FAIL, not a PASS.
+
+      Partial credit is not available here, but a FAIL is expected while the torch forward is
+      being brought up — say plainly which modules already reach a kernel and which do not, so
+      the next iteration knows what is left rather than starting over.
+    model: claude-sonnet-5
+    effort: medium
+    timeout: 900
+
+  - name: full-model-faithful
+    kind: agent
+    rationale: |
+      "The implementation faithfully run all computations needed for DeepSeek V4.1 Flash."
+      `config-matches-official` proves the declared shape; this proves the forward path honours
+      it. Declaring 40 layers and executing 8 of them is invisible to every script here, and
+      timesharing a 475 GiB model through one 24 GiB bank is exactly the pressure that makes
+      skipping work look reasonable.
+    prompt: |
+      Read `model.py`, `factory.py`, `weight_loader.py` and the kernels they call. Decide
+      whether a single `forward` genuinely performs all of DeepSeek-V4.1-Flash's computation.
+
+      Check each of these specifically, and say which ones you verified:
+        - all 40 decoder layers execute, not a subset or a loop with a reduced bound;
+        - MLA attention with the low-rank Q/O projections (`q_lora_rank` 1280, `o_lora_rank`
+          1024, `o_groups` 8) and the latent KV (`num_key_value_heads` 1);
+        - hyper-connections on every sublayer: 4 parallel residual streams mixed by the
+          20-iteration Sinkhorn normalization, not a plain residual add;
+        - Engram n-gram memory on layers 1 and 14, really consulted rather than stubbed to
+          zeros or skipped because the table does not fit;
+        - the MoE FFN routing to 6 of 384 experts plus 1 shared, with real expert weights;
+        - the DSpark/MTP speculative stack: the three `mtp.*` stages (checkpoint layers
+          40-42), each over its own 128-expert pool with top-3 routing, fed by the attention
+          inputs tapped from backbone layers 37-39 (`dspark_target_layer_ids`) — those three
+          are ordinary 384-expert layers and need nothing beyond that tap;
+        - the sparse index / KV compression path.
+
+      Sequential load/offload of weights is the intended design and is not a shortcut. What
+      matters is whether the computation happens, not whether it happens all at once.
+    criteria: |
+      PASS if every component above is executed with real weights on the path from tokens to
+      logits, citing the code that does it.
+      FAIL if any is skipped, stubbed, zeroed, replaced by an identity or an approximation not
+      in the reference, executed for only some layers, or if you cannot establish it from the
+      code.
+    model: claude-sonnet-5
+    effort: medium
+    timeout: 900
+
+  - name: uses-dspark-speculation
+    kind: agent
+    rationale: |
+      DSpark is the model's own speculative decoder, and executing it is not the same as using
+      it. The three `mtp.*` stages already compute a draft on every forward and the draft is
+      thrown away, because nothing proposes it to the scheduler — which means
+      `full-model-faithful` can pass on evidence that the stages run while inference still gets
+      none of the speculation. The half that is missing is a proposer, and `drafter.py` is in
+      the editable scope precisely so an iteration can write one.
+    prompt: |
+      Decide whether this iteration's inference actually decoded through the DSpark/MTP
+      speculative path — drafts proposed to the scheduler and verified — or whether the MTP
+      stages merely executed and their drafts were discarded.
+
+      Read `drafter.py`, `__init__.py` (for the `register_proposer` call), `model.py`'s
+      `forward`/`forward_spec`, and `vllm_neuron/vllm/spec_decode/` plus
+      `vllm_neuron/vllm/worker/neuron_model_runner.py` for how a proposer is built and called.
+      Then read the iteration's agent log and
+      `vllm_neuron/model/deepseek_v41_timeshare/verifier/verifier_report.json` for what a live
+      run did.
+
+      Evidence that it is used — cite what you actually find:
+        - a proposer registered in `vllm_neuron.vllm.spec_decode.PROPOSERS` and built by
+          `NeuronModelRunner`, not just defined;
+        - a `speculative_config` present at engine construction, so the verifier's own command
+          exercises the path without the verifier being changed;
+        - `propose()` returning draft token ids, and `spec_decode_metadata` reaching the
+          model's forward;
+        - the rejection sampler reporting accepted/rejected draft counts in a run that
+          generated tokens.
+
+      Things that would make this FAIL — look for each specifically:
+        - `DSparkProposer` still raising `NotImplementedError`, or a proposer whose `propose`
+          returns nothing;
+        - drafts computed and dropped: `self.last_draft` written and never read by anything
+          that feeds the scheduler;
+        - a proposer registered but never built, because no `speculative_config` was supplied;
+        - an acceptance rate so low the drafter costs more than it saves — every rejected token
+          still pays for a target forward over `1 + k` padded positions, so a draft that is
+          almost never accepted is a regression dressed as a feature;
+        - output that degrades with speculation on: a verifiable answer that comes out right
+          without it and wrong with it, or completions that turn repetitive, truncated or
+          off-topic;
+        - acceptance numbers asserted in prose with no run behind them.
+
+      **Token-level divergence between speculation on and off is expected, and is not a
+      failure.** Earlier versions of this constraint demanded identical tokens. That was the
+      wrong bar: greedy decoding on this port is not batch-shape invariant in bf16, because a
+      speculative step verifies `1 + k` rows where a plain step verifies one, and the sum
+      reductions on the path (`RMSNorm` alone runs ~258 times a forward over 5120 values) do
+      not give bit-identical per-row results at different row counts. Chasing bit-exactness
+      there is a different piece of work from making speculation *useful*. What this constraint
+      wants instead is that the distribution does not drift: the two runs should be of
+      equivalent quality and should agree wherever there is a right answer.
+
+    criteria: |
+      PASS if a live run in this iteration shows drafts from the MTP stages proposed and
+      verified on the token-generating path, AND both of these hold:
+
+        - **acceptance is real.** Cite the rate from the rejection sampler's own counts as
+          accepted draft tokens per verify step against the `num_speculative_tokens` ceiling.
+          At or above ~1.5 of 5 (30%) is working. Below ~1 of 5 the drafter is costing more
+          than it saves, and that is a FAIL even though the output is fine.
+        - **the distribution has not drifted.** Compare the same prompts with speculation on
+          and off — `DEEPSEEK_V41_NO_SPEC_DECODE=1` is the control arm. The completions do not
+          have to match token for token. They do have to be of equivalent quality, and they
+          have to agree where there is a verifiable answer: the needle's access code, the
+          capital of France. One run answering correctly while the other does not is a drift
+          failure; different wording of the same correct answer is not. Say how close the arms
+          came — matching prefix length, or how many of the four prompts matched outright —
+          because exactness is still the direction of travel even though it is not the bar.
+
+      FAIL if the drafter is a stub, if the drafts are discarded, if no run shows the path
+      being taken, if acceptance is near zero, if the spec-on output is materially worse, or if
+      the evidence does not let you tell. Do NOT fail it for tokens differing between the two
+      arms.
+
+      A FAIL is expected while this is being built — say plainly which half exists (the stages
+      computing drafts, or the proposer consuming them) so the next iteration knows what is
+      left.
+    model: claude-sonnet-5
+    effort: medium
+    timeout: 900
+
+  - name: distributes-over-four-ranks
+    kind: agent
+    rationale: |
+      The device is 4 HBM stacks of 24 GB, one per logical NeuronCore, and a rank addresses only
+      its own — so a single-rank port is working in 24 GB with ~72 GB idle, which is the
+      binding constraint behind most of what the long-context cases cannot do. Nothing else in
+      this list rewards using the other three cores: a TP=1 port that fits by streaming weights
+      passes every other constraint.
+
+      Deliberately not pinned to vLLM's `tensor_parallel_size`. That is one mechanism, and on
+      this port it is the one that twice hung the instance; the SPMD route — one process, four
+      cores, collectives inside the NKI kernels — is the other, and the legacy kernels were
+      written that way. What is judged is whether the work and the data are divided, not which
+      API divided them.
+    prompt: |
+      Decide whether this iteration's model distributes its compute and data across the
+      device's 4 logical NeuronCores, or runs on a single rank.
+
+      Any mechanism counts. vLLM's `tensor_parallel_size=4` with sharded weights is one.
+      Driving the four cores SPMD from one process, with `nki.collectives` inside the kernels,
+      is equally valid — `kernels/legacy/moe_short.py` (`ncc.all_reduce`), `engram_short.py`
+      (`ncc.rank_id`) and `l2_attn.py` (`ncc.all_gather`) are 4-rank kernels already written
+      for this model, and `DeepSeek-V4.1-Flash-Trainium/*/opt-1/` is the end-to-end pattern.
+      What matters is that four cores hold *shards* of the weights/KV and rejoin through
+      collectives.
+
+      Read `config.py`'s `TENSOR_PARALLEL_SIZE`, `factory.py` and `weight_loader.py` for the
+      shard plan, the kernels on the live path for collective calls, and
+      `verifier/verifier_report.json` for the `tensor_parallel_size` the run used. Then read
+      the iteration's agent log for what the device did: NRT initializing on four cores, four
+      per-rank memory tables rather than one, and the division showing up in resident weights
+      per rank.
+
+      Things that would make this FAIL — look for each specifically:
+        - a run at one rank, however well it fits;
+        - a shard plan that verifies at 4 ranks while the run that produced the completions
+          executed at 1;
+        - collectives present in a kernel the live path never calls;
+        - "sharding" that gives every rank the full weights and divides nothing, so four ranks
+          buy no capacity;
+        - a 4-rank attempt that hung, timed out in a collective, or had to be abandoned — say
+          so explicitly, including what the log shows, because that outcome is the one worth
+          warning the next iteration about.
+    criteria: |
+      PASS if a live run in this iteration generated tokens on 4 cores with the weights and KV
+      actually divided between them and the ranks rejoining through collectives, cited from
+      both the code and the log.
+      FAIL if the run was single-rank, if the distribution is declared but not executed, if
+      nothing was divided, or if the evidence does not let you tell.
+
+      A FAIL is expected here for now: TP=1 is the current, deliberate setting, and the reason
+      is written beside `TENSOR_PARALLEL_SIZE` in `config.py`. Read it before judging, and if
+      the iteration chose to stay at one rank, say whether the reasoning there has been
+      addressed or merely restated.
+    model: claude-sonnet-5
+    effort: medium
+    timeout: 900
+
+# What may the agent modify? (everything else is reverted before the constraints run)
+#
+# Exactly the six paths your goal names, as a whitelist. Everything else is reverted, which is
+# what makes the measurement credible: it covers `verifier/`, `registry.py` (so registration
+# cannot be bent to satisfy constraint 1), and the read-only `references/`, `floorplan/` and
+# `chat_template.jinja`.
+#
+# Scratch space: out-of-scope *untracked* files are deleted before the constraints run, but
+# gitignored ones are left alone. The weight loader's sequential dumps must go to /tmp or a
+# gitignored path, or they will be gone by the time the verifier runs.
+
+# ── What the loop is trying to improve ──────────────────────────────────────────────────────
+#
+# Every number here is **on-device** time, read out of an NRT device profile: the sum of each
+# NEFF execution's own span, so host-device transfer, weight loading, engine setup and the host
+# gaps between executions are all outside it. See the verifier's README section "On-device
+# time" for how each is measured and the two caveats on it.
+#
+# No `command:` on any of them — they are read back from the `verifier` constraint's own
+# `##autohelix[...]` output. `<phase>` is `long` (the 2048-token needle) or `short`.
+#
+# Gated at `acceptance.max_regression_pct` below: ttft and tpot, the two figures that describe
+# what a request actually waits for. Recorded but not gated: `device_step_ms_*`, which is a
+# component of tpot, and `device_total_ms_*`, which is derived from both — gating all four would
+# reject an iteration three times for one regression, and reject it for arithmetic rather than
+# for a measurement.
+metrics:
+  - values:
+      # Time to first token: the prefill, cold prefix cache.
+      device_ttft_ms_long: lower
+      device_ttft_ms_short: lower
+      # Time per output token: one decode forward divided by the tokens a step emits, which
+      # under speculation is more than one.
+      device_tpot_ms_long: lower
+      device_tpot_ms_short: lower
+  - gate: false
+    values:
+      # One decode forward, before dividing by tokens-per-step. Recorded because it is the
+      # number a kernel change moves directly, and because a tpot that improves only because
+      # acceptance improved is a different fact than one that improved because a step got
+      # cheaper.
+      device_step_ms_long: lower
+      device_step_ms_short: lower
+      # What a 32-token generate would cost on device at those rates — ttft + 31 x tpot. A
+      # single number to watch, derived from the two gated ones.
+      device_total_ms_long: lower
+      device_total_ms_short: lower
+
+acceptance:
+  # How far any gated metric may regress from the best value an earlier iteration reached,
+  # before the iteration is rejected and its work discarded. Measured against the best so far
+  # rather than the previous iteration, so progress cannot be given back a few percent at a
+  # time.
+  #
+  # 5% because the measurement is noisy at about that scale and no smaller: the same 512-row
+  # prefill pass measured 12.9 s and 33.0 s across six samples on this host, since an
+  # execution's device span moves with whatever else is streaming weights at the time. A
+  # tighter gate would spend the budget rejecting work for the noise floor; a looser one would
+  # let a real regression through.
+  max_regression_pct: 5
+
+scope:
+  editable:
+    - vllm_neuron/model/deepseek_v41_timeshare/__init__.py
+    - vllm_neuron/model/deepseek_v41_timeshare/config.py
+    - vllm_neuron/model/deepseek_v41_timeshare/factory.py
+    - vllm_neuron/model/deepseek_v41_timeshare/model.py
+    - vllm_neuron/model/deepseek_v41_timeshare/weight_loader.py
+    - vllm_neuron/model/deepseek_v41_timeshare/kernels
+    # The model's own speculative drafter. Named here, rather than the whole package being
+    # opened up, so `verifier/` stays out: the scope is what makes the measurement credible.
+    # It lives under the model because `vllm_neuron/vllm/` is not editable, and a drafter kept
+    # there is one no iteration could work on. `NeuronModelRunner` now builds whatever a model
+    # registers in `vllm_neuron.vllm.spec_decode.PROPOSERS`.
+    - vllm_neuron/model/deepseek_v41_timeshare/drafter.py
+
+# As in the optimization loops (optimization-HCSublayerIn-long8192.yaml and friends): type only,
+# no `model:` and no `timeout_seconds:`. The per-iteration deadline comes from
+# `budget.iteration_time` below, which is the one the agent is shown a countdown against.
+#
+# This block is also what the three `kind: agent` constraints judge with — `AgentConfig.from_dict`
+# reads it and then the judge overrides only model and effort — so a run configured for a
+# different backend judges with that backend too.
+
+# As in the baseline config: type only. The per-iteration deadline comes from
+# `budget.iteration_time`, which is what the agent is shown a countdown against, and this block
+# is also what the four `kind: agent` constraints judge with.
+agent:
+  type: claude
+
+budget:
+  iterations: 13
+  iteration_time: 4h      # per-iteration deadline (the agent sees the countdown)
+  # time: 120h            # total wall-clock, if you want one
+  # max_cost_usd: 1000
+
+# ── Per-iteration guidance ──────────────────────────────────────────────────────────────────
+#
+# <FILL IN>
+#
+# Prose attached to iteration ranges, injected into that iteration's prompt. Guidance only:
+# nothing checks it, and only the constraints and the metric gates decide whether work is kept.
+# Slots are indexed by iteration number, not by accepted count — if iteration 3 is rejected,
+# iteration 4 still gets slot 4 — and they may not overlap.
+#
+# A sketch of the shape, to be replaced:
+#
+#iteration_constraints:
+#  - from: 1
+#     to: 3
+#     text: |
+#       Measure before changing anything...
+#   - at: 4
+#     text: |
+#       ...
+# iteration_constraints: []
+
+# ── The reviewer ────────────────────────────────────────────────────────────────────────────
+#
+# <FILL IN>
+#
+# Reads each iteration and can reject it independently of the metrics. Worth having here above
+# all: a number that improved because less was measured looks exactly like a number that
+# improved. The verifier's own measurement is the thing to be suspicious of — it is in the
+# editable scope's blast radius, and "it got faster" and "it measured less" produce the same
+# line of output.
+reviewer:
+  prompt: |
+    Review the changes made in the main agents, understand what success and what fails, and provide suggestions.
+    - For the kernel and megakernel the iteration is working on, profile with neuron-nki-profile agent and understand the bottleneck
+    - For untouched kernels and megakernel, promote for the next iteration to attempt
+    - Clearly illustrate what the main agent done and what's the effect with quantitative data.
+    - List the next step suggestions with feasibility (whether achievable in next iteration) and impacts (how much metrics improvements)
+  model: claude-sonnet-5
+  timeout_seconds: 3000

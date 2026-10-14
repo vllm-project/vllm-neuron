@@ -294,230 +294,282 @@ def _session(llm, out: dict, profile_dir: Path, label: str, kind: str | None,
         print(f"  note: {note}")
 
 
+def _segment_rows() -> int:
+    """The token width of one prefill pass: the smallest KV segment this build has.
+
+    The port prefills in segments, and the segment — not `max_num_batched_tokens`
+    — is what one pass through the layers covers. Measured on the device: a
+    2008-token prompt with `max_num_batched_tokens=2048` still runs as 512-row
+    passes, which the NEFF declares as `hidden_states [1 512 5120]`.
+    """
+    from vllm_neuron.utils.bucket_utils import SUPPORTED_KV_SEGMENT_SIZES
+
+    return min(SUPPORTED_KV_SEGMENT_SIZES)
+
+
+def _decode_delay(prompt_tokens: int) -> int:
+    """`delay_iterations` for a window that must start on a *decode* pass.
+
+    A prompt of `prompt_tokens` prefills as `ceil(prompt / segment)` forwards, so
+    a window recording from forward `segments + 1` is the first one that cannot
+    contain a prefill segment. Getting this wrong is not a rounding error: at
+    `delay=2` on the 2008-token needle the "decode" window recorded prefill
+    segments 2 and 3, and every long-phase decode figure the previous cut
+    reported was a prefill segment.
+    """
+    return max(1, -(-prompt_tokens // _segment_rows())) + 1
+
+
 def _measure_phase(llm, phase: dict, out: dict, profile_dir: Path) -> dict:
-    """Capture the two extra windows the phase's figures need.
+    """Capture the prefill window, on the engine that just ran the phase.
 
-    The phase's own 32-token generate is already one recorded window — see
-    `_run_phase`, which wraps it — and this adds the two whose *kind* is known
-    by construction, both in the same engine with the same configuration:
+    `delay_iterations=1, max_iterations=3` records the first three forwards of
+    whatever this window wraps, so:
 
-      `cold-prefill`  a throwaway prompt (one forward, the one the window
-                      skips), the prefix cache reset, then the phase's longest
-                      prompt for one token. What gets recorded is that cold
-                      prefill, alone.
-      `cold-decode`   the cache reset again, then the same prompt for
-                      `MEASURE_TOKENS`. Its first forward is that prompt's
-                      prefill, which is the one skipped, so what gets recorded
-                      is decode steps, alone.
+      `cold-prefill`  the prefix cache reset, then the phase's longest prompt for
+                      one token, three times. What gets recorded is three cold
+                      prefill *segments* — the first three of however many the
+                      prompt needs — which is what TTFT is built from. Three
+                      because the first is a warm-up `_resolve_measurement`
+                      drops (measured 1097.9 ms against 291.2 ms for the same
+                      512 rows, and the gap is engine time, not DMA), leaving
+                      two steady samples rather than one.
 
-    The decode window resets the cache rather than reusing what the window
-    before it left warm, even though a warm re-prefill would be cheaper. A warm
-    one is also a path the gate never takes — the run's own prefills are all
-    cold — and taking it on the 2008-token needle killed the engine with
-    `RuntimeError: nrta status=1006`, an out-of-bounds execution inside the
-    model's forward. Measuring must not go anywhere the thing being measured
-    does not.
+    The decode pass cannot come from this engine: it would have to be recorded
+    from forward `segments + 1`, and `delay_iterations` is fixed when the engine
+    is built. `_measure_decode` builds a second engine for it. The alternative —
+    reaching a decode forward early by leaving the prefix cache warm — is the
+    path that killed the engine with `RuntimeError: nrta status=1006` on the
+    2008-token needle, and it is a path the run itself never takes.
 
-    These two also serve as the fingerprints that say what the 32-token
-    generate's own window caught, which is not something to assume: this port
-    forces `max_num_seqs` to 1 above one rank, so a phase's prompts run one
-    after another rather than together, and "the first N forwards are the
-    prefills" is false for it.
-
-    The ingest is *not* done here — it peaks around 17 GiB of host memory, which
-    is not something to ask for while four ranks hold an engine. This collects
-    the captures; `_resolve_measurement` reads them after the teardown.
+    The ingest is *not* done here: it needs ~20 GiB and the instruction trace,
+    and it OOM'd at 22 GiB while four ranks held 85 GiB of the 115 GiB limit.
+    This collects the captures; `_resolve_measurement` reads them after teardown.
     """
     from vllm import SamplingParams
+
+    from . import device_time
 
     cases = phase["cases"]
     pick = max(range(len(cases)), key=lambda i: cases[i][1][1])
     case, (text, n_prompt) = cases[pick]
     out["measured_case"] = case.id
     out["measured_prompt_tokens"] = n_prompt
-    print(f"verifier: measuring on {case.id} ({n_prompt} prompt tokens)")
+    out["segment_rows"] = _segment_rows()
+    out["decode_delay"] = _decode_delay(n_prompt)
+    print(f"verifier: measuring on {case.id} ({n_prompt} prompt tokens, "
+          f"{max(1, -(-n_prompt // _segment_rows()))} prefill segment(s))")
 
     one_token = SamplingParams(max_tokens=1, temperature=TEMPERATURE)
 
     def cold_prefill():
-        # Forward 1 is the throwaway the window's delay is there to skip —
-        # short, so it costs little and is one forward. Then the prompt twice,
-        # with the cache reset before each so both are as cold as the 32-token
-        # run's prefill was: two forwards recorded, because one prefill of this
-        # port is a noisy sample (two windows of identical work measured 23.8 s
-        # and 29.5 s).
-        llm.generate([WARMUP_PROMPT], one_token)
-        llm.reset_prefix_cache()
-        first = llm.generate([text], one_token)
-        llm.reset_prefix_cache()
-        return first + llm.generate([text], one_token)
+        # Three cold generates for a three-forward window. A long prompt fills
+        # it from the first generate alone (2008 tokens prefill as four 512-row
+        # forwards, and the window closes after three); a short one needs all
+        # three, since its prefill is a single forward. Either way the first
+        # recorded pass is the warm-up `_resolve_measurement` drops.
+        out_passes = []
+        for _ in range(device_time.MAX_ITERATIONS):
+            llm.reset_prefix_cache()
+            out_passes += llm.generate([text], one_token)
+        return out_passes
 
     try:
         _session(llm, out, profile_dir, f"{phase['metric']}-cold-prefill",
                  "prefill", cold_prefill)
     except Exception:  # noqa: BLE001 - a measurement is not a pass condition
-        return out
-
-    def cold_decode():
-        llm.reset_prefix_cache()
-        return llm.generate(
-            [text],
-            SamplingParams(max_tokens=MEASURE_TOKENS, temperature=TEMPERATURE),
-        )
-
-    try:
-        _session(llm, out, profile_dir, f"{phase['metric']}-cold-decode",
-                 "decode", cold_decode)
-    except Exception:  # noqa: BLE001
-        return out
+        pass
     return out
 
 
-def _dominant_neff(window) -> str | None:
-    """The graph a window spent most of its device time in.
+def _measure_decode(phase: dict, out: dict, args, tensor_parallel_size: int,
+                    profile_dir: Path) -> dict:
+    """Capture a decode pass, on an engine built to record past the prefill.
 
-    A prefill forward and a decode forward run different graphs for the same
-    layer — different token-dimension buckets — and on this port one graph per
-    layer dominates either way, so this is a usable fingerprint of which kind
-    of forward a trace holds.
+    A second engine for one window, because the window has to start at forward
+    `segments + 1` and that offset is `delay_iterations`, fixed at engine
+    construction. It costs one more engine build and one more prefill per phase,
+    which is the price of the long phase having a decode figure at all.
     """
-    if not getattr(window, "per_neff", None):
-        return None
-    return max(window.per_neff.items(), key=lambda kv: kv[1]["busy_s"])[0]
+    import gc
+
+    from vllm import LLM, SamplingParams
+
+    from . import device_time
+
+    cases = phase["cases"]
+    pick = max(range(len(cases)), key=lambda i: cases[i][1][1])
+    _case, (text, n_prompt) = cases[pick]
+    delay = _decode_delay(n_prompt)
+
+    kwargs = device_time.profiler_engine_kwargs(
+        profile_dir, delay_iterations=delay, max_iterations=2,
+    )
+    print(f"\nverifier: decode engine for phase {phase['name']} "
+          f"(records from forward {delay})")
+    llm = LLM(
+        model=args.model,
+        max_num_seqs=phase["max_num_seqs"],
+        max_model_len=phase["max_model_len"],
+        max_num_batched_tokens=phase["max_num_batched_tokens"],
+        tensor_parallel_size=tensor_parallel_size,
+        enable_prefix_caching=phase["enable_prefix_caching"],
+        **kwargs,
+    )
+    try:
+        _session(
+            llm, out, profile_dir, f"{phase['metric']}-cold-decode", "decode",
+            lambda: llm.generate(
+                [text],
+                SamplingParams(max_tokens=MEASURE_TOKENS, temperature=TEMPERATURE),
+            ),
+        )
+    except Exception:  # noqa: BLE001 - a measurement is not a pass condition
+        out["notes"].append(f"decode window raised:\n{traceback.format_exc()}")
+    finally:
+        del llm
+        gc.collect()
+        print(f"verifier: decode engine for {phase['name']} torn down")
+    return out
 
 
-def _resolve_measurement(raw: dict, correctness: dict) -> dict:
+def _resolve_measurement(raw: dict, correctness: dict, model: str | None = None) -> dict:
     """Read the captured windows and turn them into TTFT, step time and TPOT.
 
-    Runs after the engine is gone, because the ingest is memory-hungry.
+    Runs after the engine is gone, because the ingest needs ~20 GiB and the
+    instruction trace it now keeps is what makes the measurement mean anything.
 
-    Every recorded forward is pooled by kind — each window knows whether it
-    caught prefills or decode steps, from the engine's forward count and the
-    phase's prefill-chunk count — so TTFT is the mean device time of a prefill
-    forward and the step figure is the mean of a decode forward. A window that
-    caught one of each is reported but not pooled: this port's execution spans
-    include waiting for host-streamed weights, so a mixed window's total cannot
-    be split by subtracting a figure measured somewhere else.
+    Every window is split into *passes* — one sweep of the model's layers — and
+    each pass is priced as **engine-busy time plus what its collectives actually
+    transferred**. Both exclusions matter and both were measured on this port:
 
-    `correctness` carries the counters differenced around the phase's real
-    32-token generate, which is where tokens-per-step comes from: with
-    speculation a step emits `1 + accepted` tokens, so one step's device time is
-    not one token's. Measuring that ratio on the generate that actually ran,
-    rather than on a 3-token window whose last step the sampler truncates,
-    keeps it honest.
+      * a per-layer all-reduce's execution span is ~20 s of which 30 ms is
+        transfer, the rest being the engine armed and idle while three peer
+        ranks catch up;
+      * an execution's span also contains the DMA wait for that layer's weights,
+        which arrive from NVMe at ~155 MB/s a rank rather than from HBM at
+        ~725 GB/s.
+
+    Neither is device work and neither exists on the 16-device target, where the
+    weights are resident. Priced this way a 512-row prefill pass is 215-840 ms
+    where its span was 12-17 s.
+
+    The pass's *kind* is read off the NEFF — the `hidden_states` width it
+    declares, 512 for a KV segment and `1 + k` for a verify step — so "this is
+    prefill" is a fact from the compiled graph rather than an inference from
+    where the forward sat in the run. That inference is what the previous cut
+    got wrong: a 2008-token prompt prefills as four 512-row passes, so its
+    second and third forwards are still prefill, and every long-phase figure it
+    reported as decode was a prefill segment.
     """
     from . import device_time
 
+    # How many per-layer executions make one pass, from the checkpoint's own
+    # `config.json` rather than from a constant: a depth baked in here would be
+    # one more thing that breaks on a model this verifier has not seen.
+    num_layers = device_time.layer_count(model)
     out = {k: v for k, v in raw.items() if k != "captures"}
     out.update(ttft_ms=None, decode_step_ms=None, tpot_ms=None, total_ms=None,
-               tokens_per_step=None, correctness=correctness)
-    pooled: dict[str, dict[str, float]] = {
-        "prefill": {"busy_s": 0.0, "forwards": 0},
-        "decode": {"busy_s": 0.0, "forwards": 0},
-    }
+               tokens_per_step=None, correctness=correctness, passes={})
+    pooled: dict[str, list[float]] = {"prefill": [], "decode": []}
+    widths: dict[str, int] = {}
+    #: The first prefill pass of each window, which is not a steady-state sample
+    #: and is excluded from the pool. See the loop below.
+    warmup: list[float] = []
 
-    windows: dict[str, object] = {}
     for label, capture in raw.get("captures", {}).items():
-        window = device_time.summarize(capture)
-        windows[label] = window
+        window = device_time.summarize(capture, num_layers=num_layers)
         session = raw["sessions"].get(label, {})
         entry = window.as_dict()
-        entry.update(
-            forwards=session.get("forwards"),
-            recorded=session.get("recorded"),
-            tokens=session.get("tokens"),
-            kind=session.get("kind"),
-            dominant_neff=_dominant_neff(window),
-        )
+        entry.update(forwards=session.get("forwards"), tokens=session.get("tokens"),
+                     expected=session.get("kind"))
+        passes = window.passes
+        entry["passes"] = [p.as_dict() for p in passes]
+        by_kind: dict[str, list[float]] = {}
         out["windows"][label] = entry
-        busy = entry["device_busy_ms"]
-        print(f"verifier: [{raw['metric']}] {label}: "
-              + ("not measured" if busy is None else f"{busy:.1f} ms on device")
-              + f" over {entry['executions']} execution(s) in "
-                f"{entry['recorded']} forward(s) of "
-                f"{session.get('kind') or 'unknown kind'}"
-              + (" (DROPPED)" if entry["dropped"] else ""))
+        print(f"verifier: [{raw['metric']}] {label}: {len(passes)} pass(es)")
+        for p in passes:
+            print(f"    {p.kind:<8} rows={p.rows} {p.device_ns / 1e6:9.1f} ms device "
+                  f"(engine {p.engine_ns / 1e6:.1f} + dma {p.dma_ns / 1e6:.1f} + cc "
+                  f"{p.collective_ns / 1e6:.1f}, union)  util {p.utilisation * 100:.0f}%"
+                  f"  [span-sum {p.busy_ns / 1e6:.0f} ms]")
+            if p.kind in pooled:
+                by_kind.setdefault(p.kind, []).append(p.device_ns / 1e6)
+                if p.rows:
+                    widths[p.kind] = p.rows
+        # The first prefill pass of a window is not a sample of steady-state
+        # work: it is the first forward of a fresh process, and it carries
+        # first-touch costs the 16-device target pays at startup rather than per
+        # request. Measured in one window: 1097.9 ms then 291.2 ms for the same
+        # 512 rows — 3.8x, and *engine* time (809.6 vs 189.6 ms), not DMA, so
+        # averaging the two reports a TTFT 2.4x the steady one. Decode passes
+        # get no such treatment: measured first-then-second they were 407/414
+        # and 483/392 ms, i.e. noise with no warm-up direction, and dropping one
+        # of two samples there would leave a gated metric on a single pass.
+        for kind, values in by_kind.items():
+            if kind == "prefill" and len(values) > 1:
+                warmup.append(values[0])
+                values = values[1:]
+            pooled[kind].extend(values)
         for note in entry["notes"]:
             print(f"  note: {note}")
-
-    # The two purpose-built windows hold a known kind of forward, so the graph
-    # each one spent most of its device time in is a fingerprint of that kind —
-    # a prefill and a decode forward run different graphs for the same layer,
-    # being different token-dimension buckets. That is what identifies the
-    # third window, the one around the 32-token generate, whose schedule is not
-    # ours to assume. A window matching neither fingerprint is reported and not
-    # pooled rather than guessed at.
-    reference = {
-        session["kind"]: out["windows"][label]["dominant_neff"]
-        for label, session in raw.get("sessions", {}).items()
-        if session.get("kind") and out["windows"].get(label, {}).get("dominant_neff")
-    }
-
-    for label in raw.get("captures", {}):
-        window = windows[label]
-        entry = out["windows"][label]
-        session = raw["sessions"].get(label) or {}
-        recorded = session.get("recorded") or 0
-        entry["pooled"] = False
-        if not window.ok or not recorded:
-            continue
-        if window.dropped:
-            out["notes"].append(
-                f"{label} lost notifications, so its device time is a lower "
-                "bound and it is reported but not used"
-            )
-            continue
-
-        kind = session.get("kind")
-        if kind is None:
-            dominant = entry["dominant_neff"]
-            matches = [k for k, ref in reference.items() if ref == dominant]
-            if len(matches) != 1:
+        if session.get("kind") and passes:
+            seen = {p.kind for p in passes}
+            if seen != {session["kind"]}:
                 out["notes"].append(
-                    f"{label}'s most expensive graph ({dominant}) matches "
-                    f"{matches or 'neither'} of the reference windows, so what "
-                    "it recorded cannot be told apart; reported, not used"
+                    f"{label} was built to hold {session['kind']} passes but the NEFFs say "
+                    f"{sorted(seen)}; the passes are pooled by what the NEFFs say"
                 )
-                continue
-            kind = matches[0]
-            entry["kind"] = kind
-            entry["kind_from"] = "trace fingerprint"
 
-        entry["pooled"] = True
-        bucket = pooled[kind]
-        bucket["busy_s"] += window.device_busy_s
-        bucket["forwards"] += recorded
+    out["passes"] = {k: {"count": len(v), "device_ms": v} for k, v in pooled.items()}
+    out["prefill_warmup_ms"] = warmup
+    if warmup:
+        out["notes"].append(
+            "the first prefill pass of each window is a warm-up and is excluded: "
+            f"{', '.join(f'{v:.1f}' for v in warmup)} ms against "
+            f"{', '.join(f'{v:.1f}' for v in pooled['prefill']) or 'nothing'} ms kept"
+        )
 
-    out["pooled"] = {
-        kind: {"device_busy_ms": v["busy_s"] * 1e3, "forwards": v["forwards"]}
-        for kind, v in pooled.items()
-    }
-    if pooled["prefill"]["forwards"]:
-        out["ttft_ms"] = (
-            pooled["prefill"]["busy_s"] * 1e3 / pooled["prefill"]["forwards"]
-        )
-    if pooled["decode"]["forwards"]:
-        out["decode_steps"] = pooled["decode"]["forwards"]
-        out["decode_step_ms"] = (
-            pooled["decode"]["busy_s"] * 1e3 / pooled["decode"]["forwards"]
-        )
+    # TTFT: one prefill pass covers `rows` tokens, so the prompt needs
+    # ceil(prompt / rows) of them. Measured per pass and multiplied, because a
+    # window cannot hold every segment of a long prompt without the runtime
+    # dropping notifications partway through.
+    prefill = pooled["prefill"] or warmup[:1]
+    if prefill:
+        per_pass = sum(prefill) / len(prefill)
+        rows = widths.get("prefill")
+        prompt = raw.get("measured_prompt_tokens") or 0
+        segments = max(1, -(-prompt // rows)) if rows else 1
+        out.update(prefill_pass_ms=per_pass, prefill_pass_rows=rows,
+                   prefill_segments=segments, ttft_ms=per_pass * segments)
+
+    decode = pooled["decode"]
+    if decode:
+        out["decode_steps"] = len(decode)
+        out["decode_step_ms"] = sum(decode) / len(decode)
+        out["decode_rows"] = widths.get("decode")
 
     tps = correctness.get("tokens_per_step")
     if tps and out["decode_step_ms"] is not None:
         out["tokens_per_step"] = tps
         out["tpot_ms"] = out["decode_step_ms"] / tps
     elif out["decode_step_ms"] is not None:
-        # No ratio to divide by: one token a step is the floor, so this becomes
-        # an upper bound on TPOT rather than a measurement. Said out loud.
         out["tokens_per_step"] = 1.0
         out["tpot_ms"] = out["decode_step_ms"]
         out["notes"].append(
-            "tokens per step could not be measured, so TPOT is reported at one "
-            "token per step — an upper bound, since speculation emits more"
+            "tokens per step could not be measured, so TPOT is reported at one token a "
+            "step — an upper bound, since speculation emits more"
         )
-
     if out["ttft_ms"] is not None and out["tpot_ms"] is not None:
         out["total_ms"] = out["ttft_ms"] + (MAX_TOKENS - 1) * out["tpot_ms"]
+    if out["ttft_ms"] is None:
+        out["notes"].append("no prefill pass was captured, so there is no TTFT")
+    if out["decode_step_ms"] is None:
+        out["notes"].append(
+            "no decode pass was captured, so there is no step time and no TPOT. The "
+            "decode window has to start after every prefill segment — see "
+            "`_decode_delay`."
+        )
     return out
 
 
@@ -729,73 +781,57 @@ def _device_time_report(phases: list[dict]) -> dict | None:
 def _print_device_time(measured: dict | None) -> None:
     """Print the measurement, and the `##autohelix[...]` metrics for a loop.
 
-    Four metrics per phase. The first two are measured, the last two derived
-    from them, and all four are *device* time — no host transfer, no host
-    runtime, no setup:
+    Per phase, measured first and derived after:
 
-      `device_ttft_ms_<phase>`        the prefill forward: time to first token.
-      `device_step_ms_<phase>`        one decode forward.
-      `device_tpot_ms_<phase>`        per output token, i.e. the step divided by
-                                      the tokens a step emits (speculation
-                                      makes that more than one).
-      `device_total_ms_<phase>`       what the verifier's own 32-token generate
-                                      would cost on device at those rates.
+      `device_ttft_ms_<phase>`   one prefill pass x the segments the prompt needs.
+      `device_step_ms_<phase>`   one decode pass.
+      `device_tpot_ms_<phase>`   the step divided by the tokens a step emits,
+                                 which speculation makes more than one.
+      `device_total_ms_<phase>`  what a 32-token generate would cost at those
+                                 rates.
 
-    Deliberately not wall clock. The target is a 16-device instance that keeps
-    the weights resident and builds its graphs once; what survives that move is
-    the device's own execution time, so that is what is recorded as the
-    reference point. On this host the difference is not a detail — a prefill
-    window measured 62 s on device inside a 372 s wall-clock span.
+    **Device time means engine-busy plus what the collectives transferred.** Not
+    the execution span: on this port a span is mostly host waiting — a per-layer
+    all-reduce sitting armed for its peers (20 s of span, 30 ms of transfer) and
+    the DMA wait for weights arriving from NVMe at ~155 MB/s a rank instead of
+    HBM at ~725 GB/s. Neither is device work and neither exists on the 16-device
+    target. `span_sum_ms` is printed beside each window so the gap stays visible;
+    it ran 15-60x the device time on every window measured here.
     """
     if not measured:
         return
     print("\n" + "=" * 72)
-    print("ON-DEVICE TIME — NRT device profile, rank 0, host transfer/runtime "
+    print("ON-DEVICE TIME — engine-busy + real collective transfer; host waits "
           "excluded")
     for suffix, m in measured.items():
         print(f"\n  [{suffix}] phase {m['phase']}, measured on "
-              f"{m.get('measured_case')} "
-              f"({m.get('measured_prompt_tokens')} prompt tokens)")
-        pooled = m.get("pooled") or {}
+              f"{m.get('measured_case')} ({m.get('measured_prompt_tokens')} prompt tokens)")
         if m.get("ttft_ms") is not None:
-            n = (pooled.get("prefill") or {}).get("forwards")
             print(f"    TTFT        {m['ttft_ms']:10.1f} ms  "
-                  f"mean of {n} prefill forward(s)")
+                  f"{m.get('prefill_segments')} x {m.get('prefill_pass_ms', 0):.1f} ms "
+                  f"prefill pass of {m.get('prefill_pass_rows')} rows")
         if m.get("decode_step_ms") is not None:
             print(f"    decode step {m['decode_step_ms']:10.1f} ms  "
-                  f"mean of {m.get('decode_steps')} decode forward(s)")
+                  f"mean of {m.get('decode_steps')} pass(es) of "
+                  f"{m.get('decode_rows')} rows")
         if m.get("tokens_per_step"):
             print(f"    tokens/step {m['tokens_per_step']:10.2f}     "
                   "measured on the 32-token generate")
         if m.get("tpot_ms") is not None:
-            print(f"    TPOT        {m['tpot_ms']:10.1f} ms  per output token")
+            print(f"    TPOT        {m['tpot_ms']:10.1f} ms  per output token "
+                  f"({1000 / m['tpot_ms']:.0f} tok/s)")
         if m.get("total_ms") is not None:
-            print(f"    {MAX_TOKENS} tokens  {m['total_ms'] / 1000:10.1f} s   "
+            print(f"    {MAX_TOKENS} tokens  {m['total_ms'] / 1000:10.2f} s   "
                   "of device time at those rates")
 
         for label, w in (m.get("windows") or {}).items():
-            busy = w.get("device_busy_ms")
-            print(f"      {label:<22} "
-                  + ("not measured" if busy is None else f"{busy:9.1f} ms")
-                  + f"  {w.get('recorded')} of {w.get('forwards')} forward(s), "
-                    f"{w.get('kind') or 'unknown'}, "
-                    f"{w.get('executions')} execution(s)"
-                  + ("" if w.get("pooled", False) else "  [not pooled]")
+            print(f"      {label:<22} {w.get('device_ms', 0):9.1f} ms device   "
+                  f"[span-sum {w.get('span_sum_ms') or 0:9.0f} ms]  "
+                  f"{len(w.get('passes') or [])} pass(es)"
                   + (" DROPPED" if w.get("dropped") else ""))
-        prefill_window = next(
-            (w for label, w in (m.get("windows") or {}).items()
-             if w.get("kind") == "prefill" and w.get("per_neff")),
-            None,
-        )
-        top = list((prefill_window or {}).get("per_neff", {}).items())[:5]
-        if top:
-            print("      the prefill forward's most expensive graphs:")
-            for name, v in top:
-                print(f"        {v['device_busy_ms']:9.1f} ms  x{v['count']:<5} {name}")
         c = m.get("correctness") or {}
         if c.get("steps"):
-            print(f"      the 32-token generate: {c['steps']} forward(s), "
-                  f"{c.get('prefill_forwards')} prefill chunk(s), "
+            print(f"      the {MAX_TOKENS}-token generate: {c['steps']} forward(s), "
                   f"{c.get('decode_steps')} decode step(s), "
                   f"{c.get('generation_tokens')} token(s) over "
                   f"{c.get('sequences')} sequence(s)")
@@ -989,9 +1025,20 @@ def main(argv: list[str] | None = None) -> int:
         # build an engine.
         raw = phase.pop("_measurement", None)
         if raw is not None:
+            # The decode window needs its own engine, built now that the phase's
+            # is gone: it has to record from past the last prefill segment, and
+            # that offset is `delay_iterations`, fixed when an engine is built.
+            try:
+                _measure_decode(phase, raw, args, tensor_parallel_size, profile_dir)
+            except Exception:  # noqa: BLE001 - not a pass condition
+                raw.setdefault("notes", []).append(
+                    f"the decode engine raised:\n{traceback.format_exc()}"
+                )
+                print("verifier: the decode measurement failed; the run is "
+                      "unaffected", file=sys.stderr)
             try:
                 phase["device_time"] = _resolve_measurement(
-                    raw, raw.pop("correctness", {}) or {}
+                    raw, raw.pop("correctness", {}) or {}, model=args.model
                 )
             except Exception:  # noqa: BLE001 - not a pass condition
                 phase["device_time"] = {

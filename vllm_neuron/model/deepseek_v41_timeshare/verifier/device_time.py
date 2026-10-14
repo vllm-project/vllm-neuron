@@ -106,25 +106,54 @@ ACTIVITIES = ("device_profile",)
 #: M=2 records two forwards, which is also about the most this port can afford:
 #: a forward is ~1400 NEFF executions and the runtime's notification buffer
 #: starts dropping past ~6700.
-DELAY_ITERATIONS = 2
-MAX_ITERATIONS = 2
+#: The default pair: record forwards 1-2 of whatever a window wraps. A window
+#: that must start later — a decode window, which has to clear every prefill
+#: segment first — passes its own `delay_iterations`; see
+#: `run_verifier._decode_delay`.
+DELAY_ITERATIONS = 1
+#: Three, not two: `_resolve_measurement` drops the first prefill pass of a
+#: window as a warm-up (first-touch costs the resident-weight target pays once
+#: at startup, measured at 3.8x the steady pass), so a two-forward window would
+#: leave TTFT resting on a single sample. The decode window stays at two, where
+#: no warm-up is dropped — see `_measure_decode`.
+MAX_ITERATIONS = 3
 
 #: The forwards a window records, as 1-based offsets into the `generate` it
-#: wraps. With the settings above: the second and third.
+#: wraps: `delay .. delay + max - 1`. With the defaults above, forwards 1-2.
 RECORDED_FORWARDS = tuple(
     range(DELAY_ITERATIONS, DELAY_ITERATIONS + MAX_ITERATIONS)
 )
 
-#: `neuron-explorer view` reads the whole trace by default -- every
-#: instruction, DMA packet and semaphore update -- which on a window this size
-#: is minutes of processing and GiBs of parquet. `ExecutionInfo` and `Summary`
-#: come from the execution timeline and the runtime's TPB notifications, which
-#: survive all of these: on a reference profile this ingest returns
-#: `total_time` and the execution rows identical to a full ingest, in 0.3 s
-#: instead of 90 s.
-_LIGHT_INGEST = (
-    "--ignore-dma-trace",
-    "--ignore-instruction-trace",
+
+def recorded_forwards(delay: int = DELAY_ITERATIONS, count: int = MAX_ITERATIONS) -> tuple[int, ...]:
+    """Which forwards a window with this `delay_iterations` records."""
+    return tuple(range(delay, delay + count))
+
+#: What `neuron-explorer view` is told to skip.
+#:
+#: The **instruction and DMA traces are both kept**, and together they are the
+#: measurement. Without them the only timing available is the execution *span*,
+#: and on this port a span is almost entirely host-caused waiting: measured on
+#: one window, 29.19 s of spans holding 1.46 s of device activity, because the
+#: weights arrive from NVMe at ~155 MB/s a rank inside each execution, and
+#: because a per-layer all-reduce sits armed waiting for its three peers — 20 s
+#: of span for 30 ms of transfer.
+#:
+#: The DMA trace is kept because `DmaPacket` is, in the schema's own words, a
+#: transfer "within a Neuron Device": it is the HBM->SBUF staging that every
+#: kernel needs and that the 16-device target still pays. Measured on that same
+#: window it is 1.03 s of the 1.46 s — two thirds of the device's real work — so
+#: an earlier cut of this file that dropped it under-counted by a third. What is
+#: *not* in this trace, and so needs no excluding, is the host->device copy: the
+#: weight staging is an `nrt` memcpy outside the NEFF, which is why its wait
+#: shows up as idle rather than as work.
+#:
+#: Costs ~6 min and ~2.8 GB of parquet a window, against 0.3 s and 1 MB for the
+#: span-only ingest. Paid once per window after the engine is gone, which is the
+#: only time there is memory for it: a lighter version of this ingest OOM'd at
+#: 22 GiB RSS while four ranks held 85 GiB of the 115 GiB `CommitLimit`. The
+#: heavy tables are deleted once read; see `_prune`.
+_INGEST_FLAGS = (
     "--ignore-event-trace",
     "--ignore-nc-buf-usage",
     "--ignore-instruction-hierarchy",
@@ -176,15 +205,30 @@ class Window:
     per_neff: dict[str, dict[str, float]] = field(default_factory=dict)
     ntffs: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    #: The window split into passes, each priced as compute + real collective
+    #: time. This is what the metrics are built from; everything above it is
+    #: context, including `device_busy_s`, which is the span sum the metrics
+    #: used to be built from and which is mostly host waiting.
+    passes: list["Pass"] = field(default_factory=list)
+
+    @property
+    def device_ms(self) -> float:
+        """Device time for the whole window: the passes' sum."""
+        return sum(p.device_ns for p in self.passes) / 1e6
 
     @property
     def ok(self) -> bool:
-        return self.device_busy_s is not None
+        return bool(self.passes)
 
     def as_dict(self, per_neff_top: int = 12) -> dict[str, Any]:
         ranked = sorted(self.per_neff.items(), key=lambda kv: -kv[1]["busy_s"])
         return {
             "label": self.label,
+            # The measurement. `span_sum_ms` below is the same window counted the
+            # old way, kept so the gap between them stays visible.
+            "device_ms": self.device_ms,
+            "passes": [p.as_dict() for p in self.passes],
+            "span_sum_ms": _ms(self.device_busy_s),
             "device_busy_ms": _ms(self.device_busy_s),
             "span_ms": _ms(self.span_s),
             "summary_total_time_ms": _ms(self.summary_total_time_s),
@@ -350,8 +394,13 @@ def measure(
     return result, capture
 
 
-def summarize(capture: Capture) -> Window:
-    """Ingest a staged window and sum its per-execution device time."""
+def summarize(capture: Capture, num_layers: int | None = None) -> Window:
+    """Ingest a staged window and sum its per-execution device time.
+
+    `num_layers` is how many per-layer executions make one pass; pass
+    `layer_count(model)` so it comes from the checkpoint rather than from a
+    constant in this file.
+    """
     window = Window(label=capture.label, notes=list(capture.notes),
                     ntffs=[str(p) for p in capture.ntffs])
     if capture.window_dir is None:
@@ -388,6 +437,14 @@ def summarize(capture: Capture) -> Window:
     window.span_s = (
         max(r["end"] for r in rows) - min(r["start"] for r in rows)
     ) / 1e9
+    # The measurement proper: passes, each priced as engine-busy plus real
+    # collective time. `device_busy_s` above is kept for contrast — it is the
+    # span sum, which on this port is 15-60x larger because the host waits are
+    # inside the executions.
+    window.passes, pass_notes = passes_from_ingest(
+        dest, num_layers if num_layers else _LAYERS_FALLBACK
+    )
+    window.notes.extend(pass_notes)
     _prune(capture, window)
     return window
 
@@ -496,7 +553,7 @@ def _ingest(
         # Without this the tool leaves a UI/API server running and never
         # returns; with it, it ingests and exits.
         "--ingest-only",
-        *_LIGHT_INGEST,
+        *_INGEST_FLAGS,
         "-d",
         str(window_dir),
     ]
@@ -519,6 +576,324 @@ def _ingest(
         tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
         note = f"ingest failed: {' / '.join(t[:200] for t in tail)}"
     return rows, total, drops, note
+
+
+#: Fallback layer count, used only if the checkpoint's own config cannot be
+#: read. The per-layer graph runs once per layer, so this is how many of its
+#: executions make one pass — and it must not be a constant in practice:
+#: hardcoding this model's 40 would silently misgroup passes for any checkpoint
+#: with a different depth, which is exactly the kind of input-specific
+#: assumption this file should not contain. `layer_count()` reads it from the
+#: checkpoint.
+_LAYERS_FALLBACK = 40
+
+
+def layer_count(model: str | os.PathLike[str] | None) -> int:
+    """`num_hidden_layers` from the checkpoint's own config.
+
+    Read rather than assumed, so a checkpoint of a different depth splits into
+    passes correctly instead of quietly mis-splitting.
+    """
+    if model is None:
+        return _LAYERS_FALLBACK
+    try:
+        import json
+
+        config = json.loads((Path(model) / "config.json").read_text())
+    except Exception:  # noqa: BLE001 - the fallback is the point
+        return _LAYERS_FALLBACK
+    for key in ("num_hidden_layers", "n_layers", "num_layers"):
+        for where in (config, config.get("text_config") or {}):
+            value = where.get(key)
+            if isinstance(value, int) and value > 0:
+                return value
+    return _LAYERS_FALLBACK
+
+
+def _merge(starts, ends):
+    """Disjoint intervals covering the same time as `starts`/`ends`.
+
+    numpy rather than Python: `DmaPacket` is 68 million rows on one window, and
+    building that many Python ints costs more memory than the engine the
+    measurement is about.
+    """
+    import numpy as np
+
+    if len(starts) == 0:
+        return np.empty(0, dtype="int64"), np.empty(0, dtype="int64")
+    order = np.argsort(starts, kind="stable")
+    s, e = starts[order], ends[order]
+    reach = np.maximum.accumulate(e)
+    head = np.empty(len(s), dtype=bool)
+    head[0] = True
+    head[1:] = s[1:] > reach[:-1]
+    idx = np.flatnonzero(head)
+    return s[idx], np.maximum.reduceat(e, idx)
+
+
+def _covered(starts, ends, lo: int, hi: int) -> int:
+    """How much of `[lo, hi)` the disjoint intervals cover."""
+    import numpy as np
+
+    if len(starts) == 0 or hi <= lo:
+        return 0
+    first = int(np.searchsorted(ends, lo, side="right"))
+    last = int(np.searchsorted(starts, hi, side="left"))
+    if last <= first:
+        return 0
+    a = np.maximum(starts[first:last], lo)
+    b = np.minimum(ends[first:last], hi)
+    return int(np.clip(b - a, 0, None).sum())
+
+
+@dataclass
+class Activity:
+    """Every interval in which the device was doing something, by source.
+
+    Three sources, and all three are device work:
+
+    * **engines** — `ActiveTime`, the compute.
+    * **dma** — `DmaPacket`, transfers *within* the device. Mostly HBM->SBUF
+      weight staging, which a resident-weight machine still pays, so it counts.
+      On one window it was 1.03 s of 1.46 s of total activity.
+    * **collectives** — `CcOp`, what an all-reduce actually transferred, as
+      opposed to how long its execution sat armed waiting for peers (30 ms
+      against 20 s).
+
+    The union is what "the device was busy" means, because the engines and the
+    DMA queues run in parallel; summing them double-counts (per-source sum
+    2.5 s against a 1.46 s union on the same window).
+    """
+
+    engine: tuple
+    dma: tuple
+    collective: tuple
+    union: tuple
+
+    @classmethod
+    def read(cls, dest: Path) -> "Activity":
+        import numpy as np
+
+        def intervals(table: str) -> tuple:
+            try:
+                import pyarrow.parquet as pq
+
+                t = pq.read_table(dest / f"{table}.parquet",
+                                  columns=["start_ts", "end_ts"])
+            except Exception:  # noqa: BLE001 - a missing table is no activity
+                return (np.empty(0, dtype="int64"), np.empty(0, dtype="int64"))
+            s = t.column("start_ts").to_numpy(zero_copy_only=False).astype("int64")
+            e = t.column("end_ts").to_numpy(zero_copy_only=False).astype("int64")
+            keep = e > s
+            return _merge(s[keep], e[keep])
+
+        engine = intervals("ActiveTime")
+        dma = intervals("DmaPacket")
+        collective = intervals("CcOp")
+        both = (
+            np.concatenate([engine[0], dma[0], collective[0]]),
+            np.concatenate([engine[1], dma[1], collective[1]]),
+        )
+        return cls(engine=engine, dma=dma, collective=collective,
+                   union=_merge(*both))
+
+
+@dataclass
+class Pass:
+    """One pass through the model's layers, and what the device really spent on it.
+
+    `device_ns` is the **union of engine, device-DMA and collective activity**
+    clipped to this pass: every microsecond in which the device was doing
+    something, counted once. Deliberately not the execution span, which here is
+    15-30x larger and almost all host waiting — weights arriving from NVMe, and
+    an all-reduce sitting armed for its peers. Neither happens on the 16-device
+    target, where the weights are resident.
+
+    It is a **lower bound** on what that target would spend, one-sided in a known
+    way: idle *inside* a kernel is excluded along with the host waits, because
+    the host->device copy the device waits for is absent from the device profile,
+    so a bubble and a weight wait are the same observation. `utilisation` keeps a
+    bubbly kernel visible — engine time over device time, which reads low when a
+    kernel mostly waits on its own DMA.
+    """
+
+    index: int
+    kind: str                 # "prefill" | "decode" | "unknown"
+    rows: int | None          # the pass's token width, off the NEFF
+    executions: int
+    span_ns: int              # first execution's start to last one's end
+    device_ns: int            # union of all device activity: the measurement
+    engine_ns: int            # engines only
+    dma_ns: int               # within-device transfer only
+    collective_ns: int        # what the collectives actually transferred
+    busy_ns: int              # sum of execution spans — the old, contaminated number
+
+    @property
+    def utilisation(self) -> float:
+        """Engine time over device time: low means the device waited on itself."""
+        return self.engine_ns / self.device_ns if self.device_ns else 0.0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "kind": self.kind,
+            "rows": self.rows,
+            "executions": self.executions,
+            "device_ms": self.device_ns / 1e6,
+            "engine_ms": self.engine_ns / 1e6,
+            "dma_ms": self.dma_ns / 1e6,
+            "collective_ms": self.collective_ns / 1e6,
+            "utilisation": self.utilisation,
+            "span_sum_ms": self.busy_ns / 1e6,
+            "span_ms": self.span_ns / 1e6,
+        }
+
+
+def passes_from_ingest(dest: Path, num_layers: int = _LAYERS_FALLBACK) -> tuple[list[Pass], list[str]]:
+    """Split an ingested window into passes and price each one.
+
+    Five tables, each answering one question:
+
+    * `ExecutionInfo` — when each NEFF execution ran, which is how the window is
+      split into passes: at every `num_layers`-th execution of the per-layer
+      graph (the NEFF running a multiple of `num_layers` times that costs most).
+    * `ActiveTime`, `DmaPacket`, `CcOp` — when the device was busy, and at what.
+      Their union inside a pass is the pass's device time; see `Activity`.
+    * `TensorInfo` — the `hidden_states` width the NEFF declares, which says
+      prefill (a KV segment, e.g. 512) from decode (`1 + k`, e.g. 6). Read off
+      the compiled graph rather than inferred from scheduling order: a
+      2008-token prompt prefills as four 512-row passes, so "the second forward"
+      is still prefill, which is what an earlier cut of this got wrong.
+    """
+    notes: list[str] = []
+    execs = _table(dest, "ExecutionInfo")
+    if not execs:
+        return [], [f"no ExecutionInfo in {dest}"]
+
+    rows = sorted(
+        (s, e, n)
+        for s, e, n in zip(
+            execs.get("execution_start_ts", []),
+            execs.get("execution_end_ts", []),
+            execs.get("neff_name", []),
+        )
+        if s is not None and e is not None
+    )
+    if not rows:
+        return [], [f"no executions with timestamps in {dest}"]
+
+    marker, marker_note = _pass_marker(rows, num_layers)
+    if marker_note:
+        notes.append(marker_note)
+    # Every `num_layers`-th marker execution, not every one: the marker runs once
+    # per *layer*, so splitting at each would price the window per layer and
+    # report 80 "passes" for a window holding two.
+    hits = [s for s, _, n in rows if n == marker] if marker else []
+    bounds = hits[::num_layers] if hits else [rows[0][0]]
+
+    try:
+        activity = Activity.read(dest)
+    except Exception as exc:  # noqa: BLE001 - reported, not raised
+        return [], [f"could not read the activity tables: {exc!r}"]
+
+    width, width_note = _declared_width(dest)
+    if width_note:
+        notes.append(width_note)
+
+    out: list[Pass] = []
+    for i, start in enumerate(bounds):
+        stop = bounds[i + 1] if i + 1 < len(bounds) else rows[-1][1] + 1
+        segment = [r for r in rows if start <= r[0] < stop]
+        if not segment:
+            continue
+        end = max(r[1] for r in segment)
+        out.append(
+            Pass(
+                index=i,
+                kind=_kind_for(width),
+                rows=width,
+                executions=len(segment),
+                span_ns=end - start,
+                device_ns=_covered(*activity.union, start, end),
+                engine_ns=_covered(*activity.engine, start, end),
+                dma_ns=_covered(*activity.dma, start, end),
+                collective_ns=_covered(*activity.collective, start, end),
+                busy_ns=sum(b - a for a, b, _ in segment),
+            )
+        )
+    return out, notes
+
+
+def _pass_marker(rows: list[tuple[int, int, str]], num_layers: int) -> tuple[str | None, str | None]:
+    """The NEFF that runs once per layer, which is what delimits a pass."""
+    import collections
+
+    count: dict[str, int] = collections.Counter(n for _, _, n in rows)
+    cost: dict[str, int] = collections.Counter()
+    for a, b, n in rows:
+        cost[n] += b - a
+    candidates = [n for n, c in count.items() if c and c % num_layers == 0 and c >= num_layers]
+    if not candidates:
+        return None, (
+            f"no NEFF runs a multiple of {num_layers} times, so the window could not be "
+            "split into passes; it is priced as one pass"
+        )
+    return max(candidates, key=lambda n: cost[n]), None
+
+
+def _intervals(table: dict[str, list[Any]] | None, start: str, end: str) -> list[tuple[int, int]]:
+    if not table:
+        return []
+    return [
+        (a, b)
+        for a, b in zip(table.get(start, []), table.get(end, []))
+        if a is not None and b is not None and b > a
+    ]
+
+
+def _declared_width(dest: Path) -> tuple[int | None, str | None]:
+    """The token width this window's passes computed, off the NEFF's own tensors.
+
+    `hidden_states` is the activation the per-layer graph takes, so its middle
+    dimension is the number of rows the pass computed: a KV segment size for a
+    prefill, `1 + num_speculative_tokens` for a decode step. Reading it from the
+    NEFF is what makes "this is a prefill pass" a fact rather than an inference
+    from scheduling order.
+    """
+    table = _table(dest, "TensorInfo")
+    if not table:
+        return None, "no TensorInfo, so the pass width could not be read off the NEFF"
+    widths: set[int] = set()
+    for name, kind, shape in zip(
+        table.get("kernel_param_name", []),
+        table.get("type", []),
+        table.get("shape", []),
+    ):
+        if name != "hidden_states" or kind != "IN" or not shape:
+            continue
+        parts = str(shape).strip("[]").split()
+        if len(parts) >= 2 and parts[-2].isdigit():
+            widths.add(int(parts[-2]))
+    if not widths:
+        return None, "no `hidden_states` input found, so the pass width is unknown"
+    if len(widths) > 1:
+        return max(widths), (
+            f"the window holds passes of more than one width {sorted(widths)}; they are "
+            "priced together under the largest, which mixes prefill and decode"
+        )
+    return widths.pop(), None
+
+
+def _kind_for(width: int | None) -> str:
+    """prefill or decode, from the pass width.
+
+    A decode step is narrow — one token plus the drafter's `k` — and a prefill
+    segment is a KV segment size. The boundary is set well above any plausible
+    `1 + k` and well below the smallest segment this build supports (512).
+    """
+    if width is None:
+        return "unknown"
+    return "decode" if width <= 64 else "prefill"
 
 
 def _table(dest: Path, name: str) -> dict[str, list[Any]] | None:
@@ -576,7 +951,7 @@ def read_summary_json(window_dir: Path) -> float | None:
         "view",
         "--output-format",
         "summary-json",
-        *_LIGHT_INGEST,
+        *_INGEST_FLAGS,
         "-d",
         str(window_dir),
     ]

@@ -90,86 +90,136 @@ tested.
 
 ## On-device time — what it measures, and what it is not
 
-Each phase also reports **on-device** TTFT and time-per-output-token, as
-`##autohelix[...]` metrics and in `verifier_report.json` under `device_time`:
+Each phase reports on-device TTFT and time-per-output-token, as `##autohelix[...]`
+metrics and under `device_time` in the report:
 
 | metric | measured? | what it is |
 |---|---|---|
-| `device_ttft_ms_<phase>` | measured | one prefill forward, cold prefix cache |
-| `device_step_ms_<phase>` | measured | one decode forward |
+| `device_ttft_ms_<phase>` | measured × segments | the mean steady prefill pass, times the segments the prompt needs |
+| `device_step_ms_<phase>` | measured | the mean decode pass |
 | `device_tpot_ms_<phase>` | derived | the step divided by the tokens a step emits |
-| `device_total_ms_<phase>` | derived | what this phase's 32-token generate would cost on device at those rates |
+| `device_total_ms_<phase>` | derived | a 32-token generate at those rates |
 
 `<phase>` is `long` (the needle) or `short` (the other three cases).
 
-**Device time, not wall clock.** The target is a 16-device `trn2.48xlarge` that
-keeps the weights resident and builds its graphs once; a wall-clock figure from
-this 1-device host would mostly describe the host. The numbers come from the
-`ExecutionInfo` table of an NRT device profile — one row per NEFF execution,
-summed — so the host gaps *between* executions are excluded. On this port that
-is most of the clock: a prefill window measured 62 s on device inside a 372 s
-span.
+### Device time is device-busy, not execution span
 
-Two honest caveats. An execution's span still contains whatever happens *inside*
-it, and on this port that includes waiting for weights streamed from the host —
-which is exactly what the 16-device target would not do, so these figures are an
-upper bound for it. And the capture itself is not free; it is on for two forwards
-of each window and costs wall-clock time, not output.
+A NEFF's *execution span* is almost all host waiting on this port, and the two
+reasons were both measured here:
 
-**The correctness run is untouched.** All 4 cases, 32 tokens, greedy, same
-engine. The measurement adds a profile session *around* that generate — the
-runtime records two forwards and stops itself — plus two short extra generates
-*after* the judged completions have been collected. Nothing it does changes what
-is scheduled or sampled, and nothing it does can fail the run: every step of it
-is wrapped, and a failure lands in `notes` with the metrics left out.
+- **A per-layer all-reduce sits armed waiting for its three peer ranks.** Its
+  span is ~20 s; `CcOp` says the transfer is **30 ms**. The ranks arrive apart
+  because each is reading expert weights off NVMe at ~155 MB/s.
+- **The weights arrive *inside* the execution.** This port streams them per
+  layer per forward, so a span contains the host→device copy that stages them —
+  an `nrt` memcpy outside the NEFF, which is why the device profile shows it as
+  idle rather than as work.
 
-**How a forward of one kind gets measured.** A window records the 2nd and 3rd
-forwards of whatever it wraps (`delay_iterations=2`, `max_iterations=2`), which
-is what keeps prefill and decode from landing in the same trace:
+Neither is device work, and neither exists on the 16-device target where the
+weights are resident. So the metric is the union of the three traces that *are*
+device work:
 
-| window | wraps | records |
+```
+device time = union( engine ActiveTime , device DmaPacket , CcOp transfer )
+```
+
+The union, not the sum: the engines and the DMA queues run in parallel, and on
+one window the per-source sum was 2.5 s where the union was 1.46 s. **DMA is
+included** — `DmaPacket` is, in the schema's own words, a transfer *within a
+Neuron Device*, i.e. the HBM→SBUF staging every kernel needs and the target
+still pays. It is 1.03 s of that 1.46 s, so an earlier cut of this file which
+dropped it under-counted by a third. Measured on one real window: **1 460 ms of
+device time inside 29 190 ms of execution spans**, a factor of 20. The window's
+`span_sum_ms` is printed and recorded beside every figure so that gap never
+hides again.
+
+The exclusion is one-sided in a known way: idle *inside* a pass with no engine,
+no DMA and no collective active is dropped along with the host waits, because
+the copy the device is waiting for is absent from the device profile — a kernel
+bubble and a weight wait are the same observation here. So a badly written kernel
+is forgiven its gaps. `utilisation` (engine ÷ device) is printed next to every
+pass to keep that visible: 76-85% on decode, 64-74% on prefill as measured.
+
+An earlier cut of this file gated on the spans, which meant it gated on NVMe
+bandwidth: a loop optimising it won 30-55% by removing disk reads while
+expert-GEMM time stayed identical to the microsecond, and that win does not
+exist on the target machine.
+
+### The first prefill pass of a window is a warm-up
+
+It is excluded from the pool, and reported separately as `prefill_warmup_ms`.
+Measured in one window, same 512 rows, same work: **1 097.9 ms then 291.2 ms**.
+The 3.8x is *engine* time (809.6 against 189.6 ms), not DMA, so it is the first
+forward of a fresh process rather than a weight wait — a cost the target pays at
+startup, not per request. Averaging the two reported a TTFT 2.4x the steady one.
+
+Decode passes get no such treatment. First-then-second they measured 407/414 ms
+and 483/392 ms: noise with no warm-up direction, and dropping one of two samples
+would leave a gated metric resting on a single pass.
+
+### Passes, and which is prefill
+
+Everything is priced per **pass** — one sweep of the model's layers. A window is
+split at every `num_layers`-th execution of the per-layer graph (the NEFF that
+runs a multiple of 40 times and costs the most).
+
+A pass's kind comes **off the NEFF**: the `hidden_states` width it declares is
+512 for a KV segment and `1 + k` for a verify step. That is a fact from the
+compiled graph, not an inference from where the forward sat in the run — and the
+inference is what the previous cut got wrong. A 2008-token prompt prefills as
+**four** 512-row passes, so its second and third forwards are still prefill, and
+every long-phase "decode" figure it reported was a prefill segment.
+
+`num_layers` is `text_config.num_hidden_layers` read from the checkpoint, not a
+constant — 40 here, and **the trunk only**: the three DSpark/MTP stages
+(`num_nextn_predict_layers`, tapping layers 37/38/39) are not counted. That is
+correct for the split twice over: a graph running 3 times a forward can never be
+the marker, which must run a multiple of `num_layers` times, and the MTP
+executions land *inside* the pass, so the draft's cost is counted in the step
+that uses it.
+
+One fragility to know about: if kernel fusion ever leaves no NEFF running a
+multiple of `num_layers` times, the marker search fails and the whole window is
+priced as one pass — a note, but a silently mis-scaled metric. The fix is to
+stride on the window's known forward count instead; see `_pass_marker`.
+
+### The windows
+
+A window records forwards `delay .. delay + max - 1` of whatever it wraps. Mind
+the offset: `NeuronWorker.execute_model` calls the profiler's `step()` *before*
+the forward, so `delay=1` records forward **1**.
+
+| window | engine | records |
 |---|---|---|
-| `<phase>-generate` | the real 32-token generate | its forwards 2-3 — decode steps, since forward 1 is the first prompt's prefill |
-| `<phase>-cold-prefill` | `"Hello."`, then the phase's longest prompt twice, cache reset before each | two cold prefills of that prompt |
-| `<phase>-cold-decode` | the cache reset, then the same prompt for 3 tokens | two decode steps — that prompt's prefill is the skipped forward |
+| `<phase>-cold-prefill` | the phase's own | `delay=1, max=3` — the prompt three times with the cache reset before each, so three cold prefill segments: one warm-up and two samples. A long prompt fills the window from its first generate alone, since 2008 tokens prefill as four forwards |
+| `<phase>-cold-decode` | a second, built after the phase's is gone | `delay = segments + 1, max=2` — the first forward that cannot be a prefill segment, so two decode passes, both kept |
 
-Mind the offset: `NeuronWorker.execute_model` calls the profiler's `step()`
-*before* the forward, so `delay_iterations=D` records forwards D..D+M-1 rather
-than the obvious reading. `D=1` records forward **1**.
+The decode window needs its own engine because `delay_iterations` is fixed when
+an engine is built. The cheaper alternative — reaching a decode forward early by
+leaving the prefix cache warm — is the path that killed the engine with
+`RuntimeError: nrta status=1006` on the needle, and one the run itself never
+takes.
 
-Every window prefills cold, resetting the prefix cache first, because that is
-what the run's own generate does. An earlier version let the decode window
-reuse the warm cache the previous window left behind — cheaper, and a path the
-gate never takes: on the 2008-token needle it killed the engine with
-`RuntimeError: nrta status=1006`, an out-of-bounds execution. Reaching a
-full-prefix-cache hit at that length looks like a live bug in the port, worth a
-look on its own; it is not one the measurement needs to walk into.
+TTFT is one prefill pass × `ceil(prompt / rows)` rather than a captured whole
+prefill, because four passes of a long prompt exceed the ~6 700 executions at
+which the runtime starts dropping notifications.
 
-The two built windows hold a known kind by construction. The third — around the
-real generate — does not: this port forces `max_num_seqs` to 1 above one rank,
-so a phase's prompts run one after another and "the first N forwards are the
-prefills" is false for it. It is identified instead by fingerprint: the graph a
-window spends most of its device time in, matched against the two known
-windows', since a prefill and a decode forward run different graphs for the same
-layer. A window matching neither is reported and not pooled.
+Tokens-per-step comes from the 32-token generate's own counters
+(`vllm:iteration_tokens_total` for forwards, completion lengths for tokens),
+because with speculation a step emits `1 + accepted` and one step's device time
+is not one token's.
 
-Forwards are then pooled by kind, so TTFT is the mean of two cold prefills and
-the step figure the mean of four decode forwards, two of them from the 32-token
-run itself. Means rather than single samples because one forward is a noisy
-sample here: two windows of identical prefill work measured 23.8 s and 29.5 s,
-an execution's span moving with whatever else is streaming weights at the time.
+### The correctness run is untouched
 
-Tokens-per-step is measured on the 32-token generate (`vllm:iteration_tokens_total`
-counts forwards, `vllm:generation_tokens` counts tokens), because with
-speculation a step emits `1 + accepted` tokens and one step's device time is not
-one token's.
+All 4 cases, 32 tokens, greedy, same engine arguments. The measurement adds a
+profile session around that generate plus short extra generates *after* the
+judged completions are collected, and nothing it does can fail the run: every
+step is wrapped and a failure lands in `notes` with the metrics left out.
 
-`--no-device-time` skips all of it. `--profile-dir` chooses where the profiles
-go (default: a per-pid directory under the system temp dir, *not* the
-repository — an NTFF is ~1 GB a forward). The raw NTFFs are deleted once read;
-the parquet they were read from stays under `<profile-dir>/windows/<window>/ingest/`,
-including a per-NEFF device-time breakdown that is the obvious place to start an
-optimization pass. Reading it needs `pyarrow`; without it the metrics are
-skipped rather than guessed, because the one figure available without it —
-`Summary.total_time` — is the window's span, not its device time (491 s against
-62 s on the window above).
+`--no-device-time` skips all of it. `--profile-dir` chooses where profiles go
+(default: a per-pid directory under the system temp dir — an NTFF is ~1 GB a
+forward, and the instruction trace this now keeps makes it ~2 GB). The ingest
+costs ~92 s and ~434 MB of parquet a window, and needs ~20 GiB of host memory —
+which is why it runs only after an engine is torn down: the same ingest OOM'd at
+22 GiB while four ranks held 85 GiB of the 115 GiB `CommitLimit`. Reading it
+needs `pyarrow`; without it the metrics are skipped rather than guessed.
