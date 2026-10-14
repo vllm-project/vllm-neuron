@@ -30,28 +30,24 @@ JUDGE_EFFORT = "medium"
 JUDGE_TIMEOUT_S = 600
 
 _RUBRIC = """\
-You are grading the output of a newly ported large language model. For each case \
-below you get the prompt (long ones are elided in the middle) and the model's \
-completion, capped at 32 tokens.
+Grade a newly ported LLM's output. Per case you get the prompt (long ones elided \
+in the middle) and the completion, capped at 32 tokens. Verdict per case: \
+REASONABLE or GIBBERISH.
 
-Decide, per case, whether the completion is REASONABLE or GIBBERISH.
+REASONABLE: text that is about the prompt. Cut off mid-sentence is fine, so is \
+incomplete or restating the question. This is a reasoning model in thinking \
+mode, so a completion is often its chain of thought — terse and note-like, \
+quoting the prompt back, sometimes closed by a literal </think> — and that is \
+REASONABLE whether or not an answer follows. Empty is not.
 
-REASONABLE means: fluent, well-formed text that plausibly continues or answers \
-the prompt. A 32-token cap means completions are often cut off mid-sentence, and \
-that is fine. A completion that is on-topic but incomplete, or that restates the \
-question before answering, is REASONABLE. An empty completion is NOT reasonable.
+GIBBERISH: looping tokens or phrases; random unrelated words; mojibake or \
+control characters; unexpected script; punctuation only; or no relation to the \
+prompt.
 
-GIBBERISH means any of: repeated tokens or phrases looping; random unrelated \
-words; mojibake or stray control characters; text in an unexpected script; \
-punctuation or whitespace only; or output with no discernible relationship to \
-the prompt.
-
-Where a case lists expected_substring, treat containing it as strong evidence of \
-REASONABLE, but do NOT require it — 32 tokens may legitimately stop before \
-restating a needle. Never mark a case GIBBERISH solely for omitting it.
-
-Judge only fluency and relevance. Factual errors, refusals and style are NOT \
-gibberish.
+Judge fluency and relevance only — factual errors, refusals and style are not \
+gibberish. Where a case lists expected_substring, containing it is strong \
+evidence of REASONABLE but is never required; never mark GIBBERISH for omitting \
+it.
 
 Reply with ONLY a JSON object, no prose and no code fence:
 
