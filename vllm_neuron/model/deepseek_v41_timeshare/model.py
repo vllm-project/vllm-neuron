@@ -121,6 +121,7 @@ import functools
 import gc
 import logging
 import os
+import time
 
 import torch
 import torch.nn.functional as F
@@ -1240,6 +1241,72 @@ _MOE_LIVE_ROWS: list[int | None] = [None]
 #: milliseconds and would be paid 43 times per generated token.
 _GC_MIN_ROWS = 64
 
+#: Collect every Nth layer rather than every layer.
+#:
+#: The collection is what keeps the per-layer device garbage from accumulating
+#: (see `_collect_layer_garbage`), and it is *not* free: a full `gc.collect()`
+#: walks this process's whole heap, which by the time 40 layers of graphs are
+#: compiled is millions of objects. Skipping three layers out of four leaves at
+#: most four layers' worth of garbage alive at once — ~55 MiB a layer at a
+#: 512-row bucket, so ~220 MiB of a 24 GiB bank — and pays a quarter of the
+#: walks.
+#:
+#: Why this is worth doing at all, measured: a layer of a 512-row prefill takes
+#: 6.84 s of wall time (`/tmp/iter13/v13full.log`, 40 layers in 266.7 s), the
+#: four ranks arrive at the MoE all-reduce 0.587 s apart on average, and **that
+#: arrival spread is 85-90% of the device time the gate measures** — the
+#: collective itself moves 0.23 ms of data inside a 508 ms execution. So
+#: anything that shortens or de-jitters a layer's *host* work shows up directly
+#: in `device_ttft_ms_*`. `_GC_STRIDE` is one knob on that; the expert cache
+#: below is the other, much larger one.
+#:
+#: Set `DEEPSEEK_V41_GC_LAYER_STRIDE=1` to restore the per-layer collection.
+_GC_STRIDE = max(1, int(os.environ.get("DEEPSEEK_V41_GC_LAYER_STRIDE", 4)))
+
+#: `[collections, seconds]` since the last forward boundary, for `_hbm_mark`'s
+#: per-forward line. Instrumentation only.
+_GC_STATE = [0, 0.0]
+
+#: HBM, per rank, to spend holding routed experts between steps — the expert
+#: cache `MoE` keeps. 0 disables it and restores the single-staging-slot
+#: behaviour exactly.
+#:
+#: **Why this is the biggest lever on this port.** The routed experts are
+#: streamed from the checkpoint on every forward (`MoE.forward`), and the
+#: checkpoint lives on this host's root EBS volume, which delivers 140 MB/s to
+#: `dd` and ~540 MB/s aggregate to the four ranks during a run (measured
+#: 2026-10-14). One expert is 17.9 MiB of fp4 plus 1.1 MiB of scales, a 512-row
+#: prefill layer routes ~49 of them *per rank*, and 4 x 49 x 18.8 MiB / 540 MB/s
+#: is 6.8 s — which is exactly the 6.84 s a layer takes. The arithmetic in that
+#: layer is ~0.1 s of it. So the model is weight-fetch bound end to end, and
+#: every expert served out of HBM instead of the file is a layer-time
+#: reduction, a wall-clock reduction, and - through the all-reduce arrival
+#: spread above - a device-time reduction.
+#:
+#: Sized to leave the bank comfortable rather than to fill it: device HBM runs
+#: at 5.1-7.1 GiB of 24 a rank at four ranks (`config.TENSOR_PARALLEL_SIZE`'s
+#: note), so 8 GiB of cache lands around 15 GiB and keeps ~9 GiB spare for the
+#: DMA rings and scratchpads of graphs that compile mid-run. Raise it if a run
+#: shows the bank idle; the stats line in `_hbm_mark` reports the hit rate it
+#: buys.
+_EXPERT_CACHE_BYTES = int(
+    os.environ.get("DEEPSEEK_V41_EXPERT_CACHE_BYTES", 8 << 30)
+)
+
+#: `[hits, misses, admissions]` since the last forward boundary, summed over
+#: every `MoE`. Instrumentation only.
+_EXPERT_CACHE_STATS = [0, 0, 0]
+
+#: Bytes one expert occupies in its stored form, filled in from the buffers
+#: themselves by `allocate_staging_buffers` so the fetched-bytes figure in the
+#: per-forward log is measured rather than remembered. 18,800,640 for this
+#: checkpoint: 3 x (2304 x 2560) packed fp4 plus 3 x (2304 x 160) e8m0 scales.
+_EXPERT_BYTES = [0]
+
+#: Use counts are halved once the hottest expert in a layer reaches this, so an
+#: expert that was popular early cannot hold a slot forever.
+_EXPERT_USE_CEILING = 64
+
 #: Layers at which `_census_device_tensors` reports. Early, middle and late, so
 #: the difference between them is what the layer loop accumulates.
 _CENSUS_LAYERS = frozenset({4, 20, 39})
@@ -1280,9 +1347,16 @@ def _collect_layer_garbage() -> None:
     It is not free — a full collection over this process's heap is tens of
     milliseconds — so it is skipped for the small shapes where there is nothing
     worth collecting. A decode step moves ~90 KiB per layer; a prefill segment
-    moves hundreds of MiB.
+    moves hundreds of MiB. It is also skipped on all but every `_GC_STRIDE`th
+    layer, which bounds what accumulates to that many layers' worth.
+
+    Timed, because the cost is the reason for the stride and nobody had
+    measured it: `_hbm_mark` logs the per-forward total.
     """
+    start = time.perf_counter()
     gc.collect()
+    _GC_STATE[0] += 1
+    _GC_STATE[1] += time.perf_counter() - start
 
 
 def _census_device_tensors(layer_id: int) -> None:
@@ -1327,8 +1401,27 @@ def _hbm_mark(layer_id: int, rows: int) -> None:
     A layer id that does not advance means a new forward started, which is how
     the step count is kept without a call in `forward` itself — see
     `MoE._route_plan` for why there must not be one.
+
+    That same boundary is where the forward's expert-cache and collection
+    counters are logged and reset. One line per forward, for every forward
+    rather than only the first few: the hit rate is the number that says
+    whether the cache is sized right, and a run that never prints it is a run
+    that has to be repeated.
     """
     if layer_id <= _HBM_STATE[2]:
+        hits, misses, admitted = _EXPERT_CACHE_STATS
+        if hits or misses:
+            logger.info(
+                "deepseek_v41_timeshare: forward %d experts %d/%d from HBM "
+                "(%.0f%%), %d admitted, ~%.2f GiB fetched; gc %d collections "
+                "in %.2f s",
+                _HBM_STATE[0], hits, hits + misses,
+                100.0 * hits / max(1, hits + misses), admitted,
+                misses * _EXPERT_BYTES[0] / 1024**3,
+                _GC_STATE[0], _GC_STATE[1],
+            )
+        _EXPERT_CACHE_STATS[:] = [0, 0, 0]
+        _GC_STATE[:] = [0, 0.0]
         _HBM_STATE[0] += 1
         _HBM_STATE[1] = None
     _HBM_STATE[2] = layer_id
@@ -2970,6 +3063,14 @@ class MoE(nn.Module):
     `expert_slots` is sized for the worst case a step can route to, not for 384:
     `max_num_seqs` sequences x `num_experts_per_tok` experts, capped at the pool
     size. A decode step with 4 sequences can touch at most 24 of 384.
+
+    On top of that one staging slot sits the **expert cache**: a handful of
+    extra slots per layer that keep a fetched expert on the device, so a step
+    that routes to it again reads nothing. The fetch is what this model's
+    latency is made of — the checkpoint is on a ~140 MB/s volume and a layer
+    spends 6.8 s streaming experts against 0.1 s computing with them — so the
+    hit rate is the single number that moves `device_ttft_ms_*` and
+    `device_tpot_ms_*`. See `_EXPERT_CACHE_BYTES` and `_expert`.
     """
 
     def __init__(
@@ -2997,9 +3098,100 @@ class MoE(nn.Module):
         # buffers, and refilled in place by `_stage` rather than reallocated.
         self.expert_slot = Expert(config, storage="fp4", persistent=False)
 
+        # The expert cache. Empty until `allocate_cache_slots` divides
+        # `_EXPERT_CACHE_BYTES` across the model's MoEs; with no slots every
+        # fetch goes through `expert_slot` and this class behaves exactly as it
+        # did before. See `_EXPERT_CACHE_BYTES` for why it is worth the HBM.
+        self.cache_slots = nn.ModuleList()
+        #: `expert_id -> slot index` for the experts currently resident.
+        self._resident: dict[int, int] = {}
+        #: Slot indices with nothing in them yet.
+        self._free: list[int] = []
+        #: `expert_id -> times this rank has fetched it`, the admission and
+        #: eviction key. Halved at `_EXPERT_USE_CEILING` so early popularity
+        #: does not pin a slot for the rest of the run.
+        self._uses: dict[int, int] = {}
+
+    def allocate_cache_slots(self, config, device, count: int) -> int:
+        """Give this layer `count` HBM slots to hold routed experts.
+
+        Returns how many were actually allocated, which is capped at the number
+        of experts this rank owns: a slot per owned expert is a fully resident
+        layer and anything beyond that can never be filled.
+
+        Called from `DeepseekV41ForCausalLM.allocate_staging_buffers`, for the
+        same reason `expert_slot` is: these buffers carry no checkpoint key, so
+        nothing assigns them during loading, and they are allocated on the
+        device directly rather than moved there from meta.
+        """
+        count = max(0, min(count, self.n_local_experts))
+        slots = []
+        for _ in range(count):
+            slot = Expert(config, storage="fp4", persistent=False)
+            slot.allocate(device)
+            slots.append(slot)
+        self.cache_slots = nn.ModuleList(slots)
+        self._resident = {}
+        self._free = list(range(count))
+        return count
+
     @torch._dynamo.disable
-    def _stage(self, blob: dict[str, torch.Tensor]) -> Expert:
-        """Copy one expert's stored weights into the staging slot.
+    def _expert(self, weight_store, expert_id: int) -> Expert:
+        """The device buffers holding `expert_id`, fetching it if they must.
+
+        A hit returns the cache slot the expert already sits in and reads
+        nothing: no file, no PCIe, no copy. A miss reads the expert out of the
+        checkpoint and stages it, into a cache slot if this expert has earned
+        one and into the shared `expert_slot` otherwise.
+
+        The admission rule is a frequency comparison, not an LRU: with ~10
+        slots against the 96 experts a rank owns, LRU on a decode step's cyclic
+        40-layer walk evicts exactly what it is about to need. An expert gets a
+        slot only when it has been fetched more often than the least-used
+        resident one, so the cache converges on the layer's popular set and a
+        one-off expert passes through `expert_slot` without disturbing it.
+
+        Returning different buffers to `_routed_expert_step` costs no extra
+        graph: the 43 MoEs already hand that one compiled function 43 different
+        weight buffers and it keys a single NEFF (`graph_e8622b49...`, one hash
+        for every layer in the profile).
+        """
+        uses = self._uses.get(expert_id, 0) + 1
+        if uses >= _EXPERT_USE_CEILING:
+            # Halve every count, so what the cache holds tracks the recent
+            # routing rather than whatever was popular in the first prefill.
+            self._uses = {e: n // 2 for e, n in self._uses.items()}
+            uses = self._uses.get(expert_id, 0) + 1
+        self._uses[expert_id] = uses
+        slot = self._resident.get(expert_id)
+        if slot is not None:
+            _EXPERT_CACHE_STATS[0] += 1
+            return self.cache_slots[slot]
+
+        _EXPERT_CACHE_STATS[1] += 1
+        blob = weight_store.expert(self.layer_id, expert_id)
+        return self._stage(blob, self._target(expert_id, uses))
+
+    def _target(self, expert_id: int, uses: int) -> Expert:
+        """Where to stage a missing expert: a cache slot, or the shared one."""
+        if not len(self.cache_slots):
+            return self.expert_slot
+        if self._free:
+            slot = self._free.pop()
+        else:
+            victim = min(self._resident, key=self._uses.__getitem__)
+            if self._uses[victim] >= uses:
+                return self.expert_slot
+            slot = self._resident.pop(victim)
+        self._resident[expert_id] = slot
+        _EXPERT_CACHE_STATS[2] += 1
+        return self.cache_slots[slot]
+
+    @torch._dynamo.disable
+    def _stage(
+        self, blob: dict[str, torch.Tensor], slot: Expert | None = None
+    ) -> Expert:
+        """Copy one expert's stored weights into `slot`, or the staging slot.
 
         `copy_()` into the existing device buffers, not assignment: the buffers
         are what `.to(device)` placed in HBM and what a compiled graph is bound
@@ -3016,11 +3208,12 @@ class MoE(nn.Module):
         this is an instance of: **anything that touches the host is its own
         decorated method, not a line in the middle of a traced one.**
         """
+        slot = self.expert_slot if slot is None else slot
         for name in ("w1", "w2", "w3"):
-            linear = getattr(self.expert_slot, name)
+            linear = getattr(slot, name)
             linear.weight.copy_(blob[f"{name}.weight"].to(linear.weight.device))
             linear.scale.copy_(blob[f"{name}.scale"].to(linear.scale.device))
-        return self.expert_slot
+        return slot
 
     @torch._dynamo.disable
     def _route_plan(
@@ -3065,7 +3258,7 @@ class MoE(nn.Module):
         is_subset()`). Instrumentation must go where a break already is.
         """
         rows = int(indices.shape[0])
-        if rows >= _GC_MIN_ROWS:
+        if rows >= _GC_MIN_ROWS and self.layer_id % _GC_STRIDE == 0:
             _collect_layer_garbage()
         _hbm_mark(self.layer_id, rows)
         if _HBM_STATE[0] == 0 and self.layer_id in _CENSUS_LAYERS:
@@ -3126,11 +3319,12 @@ class MoE(nn.Module):
         """Route to `num_experts_per_tok` of the pool, plus the shared expert.
 
         The loop runs only over the experts *this rank owns that this step
-        actually routed to*, and fetches each one's weights as it reaches it.
-        For a 4-sequence decode step that is at most 24 of 384 experts across
-        all ranks — 6 of them here — so the layer's expert traffic is 6% of its
-        expert bytes rather than all of them. That streaming is the whole of
-        what "timesharing the HBM" means for this model.
+        actually routed to*, and `_expert` either finds each one already on the
+        device or fetches it. For a 4-sequence decode step that is at most 24 of
+        384 experts across all ranks — 6 of them here — so the layer's expert
+        traffic is 6% of its expert bytes rather than all of them, less whatever
+        the cache already holds. That streaming is the whole of what
+        "timesharing the HBM" means for this model.
 
         Expert selection is identical on every rank (the gate is replicated and
         scores the whole pool), which is what makes the per-rank id partition
@@ -3155,7 +3349,7 @@ class MoE(nn.Module):
         y = _compiled(_moe_carry)(flat)
         limit = self.expert_slot.swiglu_limit
         for expert_id, rows, route_weights in plan:
-            slot = self._stage(weight_store.expert(self.layer_id, expert_id))
+            slot = self._expert(weight_store, expert_id)
             y = _compiled(_routed_expert_step)(
                 y, flat, rows, route_weights,
                 slot.w1.weight, slot.w1.scale,
@@ -4775,9 +4969,34 @@ class DeepseekV41ForCausalLM(nn.Module):
         One expert's worth of HBM per layer (17.9 MiB of fp4 weights plus 1.1
         MiB of scales), refilled per forward by `MoE._stage`. 43 layers of that
         is ~0.8 GiB, against the 276 GiB the 384-per-layer pool would need.
+
+        Then `_EXPERT_CACHE_BYTES` more, divided evenly over the same layers, as
+        the expert cache: slots that keep a fetched expert on the device so the
+        next step that routes to it reads nothing. That constant's note has the
+        measurement that makes this the most valuable HBM on the bank — the
+        model is weight-fetch bound on a 140 MB/s root volume, not
+        compute bound.
         """
-        for block in list(self.layers) + list(self.mtp):
+        blocks = list(self.layers) + list(self.mtp)
+        for block in blocks:
             block.ffn.expert_slot.allocate(device)
+
+        per_expert = sum(
+            buffer.numel() * buffer.element_size()
+            for buffer in blocks[0].ffn.expert_slot.buffers()
+        )
+        _EXPERT_BYTES[0] = per_expert
+        want = _EXPERT_CACHE_BYTES // (per_expert * max(1, len(blocks)))
+        allocated = sum(
+            block.ffn.allocate_cache_slots(self.config, device, want)
+            for block in blocks
+        )
+        logger.info(
+            "deepseek_v41_timeshare: expert cache %d slots over %d layers "
+            "(%d each of %.1f MiB, %.2f GiB of HBM) for rank %d",
+            allocated, len(blocks), want, per_expert / 1024**2,
+            allocated * per_expert / 1024**3, self.rank,
+        )
 
     def _build_ngram_hash(self, device) -> NgramHashState:
         """Build the n-gram hash state, which needs the *tokenizer*.

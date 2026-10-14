@@ -76,6 +76,7 @@ import logging
 import mmap
 import os
 import struct
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Iterator
@@ -92,6 +93,51 @@ logger = logging.getLogger(__name__)
 TIMESHARE_CACHE_ROOT = Path(
     os.environ.get("DEEPSEEK_V41_TIMESHARE_CACHE", "/mnt/nvme/hf")
 )
+
+#: Threads `SafetensorsIndex.rows` issues its `pread`s from.
+#:
+#: The engram gather is 12,288 scattered rows per layer per 512-row forward
+#: (`(engram_max_ngram_size - 1) * engram_n_heads = 24` columns a token), twice
+#: — once for the fp8 values and once for their scales. Issued one at a time
+#: they are 24,576 serialized device round trips, and the engram tables are the
+#: two shards that do *not* fit on the instance store, so they come off the
+#: root EBS volume. Measured on the verifier's own needle prefill: the two
+#: engram layers cost 11-15 s each of a 140-227 s forward, ~10-18% of it.
+#:
+#: `os.pread` releases the GIL, so threads here really do raise the queue
+#: depth; faulting the `mmap` from threads would not, because the faulting
+#: thread holds the GIL while the page comes in.
+_ROW_READ_THREADS = max(1, int(os.environ.get("DEEPSEEK_V41_ROW_THREADS", 16)))
+
+#: Below this many rows the pool costs more than it saves and the gather runs
+#: inline. One decode token asks for 24 rows.
+_ROW_READ_MIN = 64
+
+#: Lazily created, shared by every `rows()` call in the process.
+_ROW_POOL: ThreadPoolExecutor | None = None
+
+
+def _row_pool() -> ThreadPoolExecutor:
+    global _ROW_POOL
+    if _ROW_POOL is None:
+        _ROW_POOL = ThreadPoolExecutor(
+            max_workers=_ROW_READ_THREADS, thread_name_prefix="ds41-rows"
+        )
+    return _ROW_POOL
+
+
+def _forget_row_pool() -> None:
+    """Drop the pool in a forked child, where its threads do not exist.
+
+    vLLM may start its workers with either `spawn` or `fork`, and a pool
+    inherited across `fork()` has a work queue and no workers — every `map`
+    would block forever. Rebuilding it lazily costs one thread creation.
+    """
+    global _ROW_POOL
+    _ROW_POOL = None
+
+
+os.register_at_fork(after_in_child=_forget_row_pool)
 
 #: Where `spill`/`unspill` put intermediate activations. Falls back to the
 #: cache volume's parent, then to /tmp.
@@ -296,12 +342,31 @@ class SafetensorsIndex:
         The engram path. `indices` may repeat and need not be sorted; the result
         is in `indices` order and is a fresh tensor (not a view), since the rows
         it came from are scattered.
+
+        Read with `pread` from a thread pool rather than by faulting the `mmap`,
+        and de-duplicated first. Both are about the same measurement: this
+        gather is 12,288 scattered rows a layer on a table that lives on the
+        slow volume, so its cost is round trips, not bytes.
+
+          * **de-duplication.** A row is read once however many of the 24
+            columns land on it. The result is still assembled in `indices`
+            order, so a repeat is a dict lookup instead of a second read.
+          * **`pread` instead of a page fault.** A fault on a shared
+            file-backed mapping pulls in the kernel's fault-around window — 16
+            pages on this kernel — so a 256-byte row costs 64 KiB off the
+            volume. `pread` of exactly the row asks for one page. Same bytes
+            out, an eighth of the traffic in.
+          * **threads.** `pread` releases the GIL, so sixteen of them are
+            sixteen requests in flight on a volume whose single-request
+            latency, not its bandwidth, is the limit here.
+
+        `_read_rows` falls back to the inline loop for small gathers, which is
+        what a decode token's 24 rows takes.
         """
         ref = self.ref(key)
         if len(ref.shape) != 2:
             raise ValueError(f"rows() needs a 2-D tensor, {key} is {ref.shape}")
         n_rows, row_width = ref.shape
-        mapping = self._map(ref.shard)
         itemsize = torch.empty((), dtype=ref.dtype).element_size()
         row_bytes = row_width * itemsize
 
@@ -314,16 +379,41 @@ class SafetensorsIndex:
                 f"(min={int(flat_indices.min())}, max={int(flat_indices.max())})"
             )
 
-        out = torch.empty(
-            (flat_indices.numel(), row_width), dtype=ref.dtype, device="cpu"
-        )
-        view = memoryview(mapping)
-        for position, row in enumerate(flat_indices.tolist()):
-            begin = ref.begin + row * row_bytes
-            out[position] = torch.frombuffer(
-                view[begin : begin + row_bytes], dtype=ref.dtype
-            )
+        wanted = flat_indices.tolist()
+        blobs = self._read_rows(ref, sorted(set(wanted)), row_bytes)
+        out = torch.empty((len(wanted), row_width), dtype=ref.dtype, device="cpu")
+        for position, row in enumerate(wanted):
+            out[position] = torch.frombuffer(blobs[row], dtype=ref.dtype)
         return out.view(*indices.shape, row_width)
+
+    def _read_rows(
+        self, ref: TensorRef, rows: list[int], row_bytes: int
+    ) -> dict[int, bytes]:
+        """`{row: bytes}` for the distinct rows of one gather. See `rows`."""
+        # The mapping is still what `release_pages` madvises, and opening it
+        # here is what keeps `self._files` populated for the descriptor below.
+        self._map(ref.shard)
+        handle = self._files[ref.shard]
+        fileno = handle.fileno()  # type: ignore[attr-defined]
+
+        def read(part: list[int]) -> list[tuple[int, bytes]]:
+            return [
+                (row, os.pread(fileno, row_bytes, ref.begin + row * row_bytes))
+                for row in part
+            ]
+
+        if len(rows) < _ROW_READ_MIN or _ROW_READ_THREADS == 1:
+            return dict(read(rows))
+
+        workers = min(_ROW_READ_THREADS, len(rows))
+        # Strided rather than contiguous slices: every worker then walks the
+        # whole range, so the volume sees requests spread over the table
+        # instead of sixteen hot spots.
+        parts = [rows[i::workers] for i in range(workers)]
+        out: dict[int, bytes] = {}
+        for got in _row_pool().map(read, parts):
+            out.update(got)
+        return out
 
     def release_pages(self, key: str) -> None:
         """Drop one tensor's pages out of the page cache.
