@@ -449,24 +449,48 @@ def summarize(capture: Capture, num_layers: int | None = None) -> Window:
     return window
 
 
-def _prune(capture: Capture, window: Window) -> None:
-    """Drop the raw NTFFs once they have been read.
+#: Ingested tables above this stay only until the window is priced. `DmaPacket`
+#: is 47 million rows and ~3 GB of the ~3.2 GB a prefill window ingests to; the
+#: small tables (`Summary`, `ExecutionInfo`, `TensorInfo`, `NeffHeader`, and the
+#: merged-interval sources once read) are worth keeping for a post-mortem.
+_INGEST_KEEP_BYTES = 50 * 1024 * 1024
 
-    A window's trace is ~1 GB a forward and a run captures six of them, so
-    keeping them would leave tens of GB per run in the temp directory. The
-    parquet the numbers came from stays, under the window's `ingest/`.
+
+def _prune(capture: Capture, window: Window) -> None:
+    """Drop the raw NTFFs and the bulky parquet once they have been read.
+
+    A window's trace is ~1 GB a forward and a run captures six windows, and the
+    parquet it ingests to is another ~16 GB a run. Neither is needed once the
+    passes are priced, and a loop calling this every iteration fills the disk:
+    measured at 16 GB for one run against 245 GB free, i.e. the run would have
+    died of `ENOSPC` around iteration 10 of 13. The small tables stay.
     """
     for path in capture.ntffs:
         try:
             Path(path).unlink(missing_ok=True)
         except OSError as exc:  # noqa: PERF203 - one note per failure is fine
             window.notes.append(f"could not remove {path}: {exc!r}")
-    if capture.window_dir is not None:
-        for link in capture.window_dir.glob("session-*/*.ntff"):
-            try:
-                link.unlink(missing_ok=True)
-            except OSError:
-                pass
+    if capture.window_dir is None:
+        return
+    for link in capture.window_dir.glob("session-*/*.ntff"):
+        try:
+            link.unlink(missing_ok=True)
+        except OSError:
+            pass
+    reclaimed = 0
+    for table in capture.window_dir.glob("ingest/*.parquet"):
+        try:
+            size = table.stat().st_size
+            if size > _INGEST_KEEP_BYTES:
+                table.unlink()
+                reclaimed += size
+        except OSError:
+            pass
+    if reclaimed:
+        window.notes.append(
+            f"pruned {reclaimed / 2**30:.1f} GiB of ingested parquet; the tables "
+            "under 50 MiB stay for a post-mortem"
+        )
 
 
 # ── profile artifacts ────────────────────────────────────────────────────────
