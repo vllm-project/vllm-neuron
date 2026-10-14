@@ -1307,6 +1307,24 @@ _EXPERT_BYTES = [0]
 #: expert that was popular early cannot hold a slot forever.
 _EXPERT_USE_CEILING = 64
 
+#: Split the per-expert cost into "get the weights onto the device" and "launch
+#: the GEMM", and report both in `_hbm_mark`'s per-forward line.
+#:
+#: **This is the measurement the next piece of work on this port needs.** The
+#: profile says 68.9-71.8 ms of device idle sits between consecutive
+#: `_routed_expert_step` executions, and a clean four-process benchmark says the
+#: 18.8 MiB read off `/mnt/nvme` is only 24-40 ms of it (notes iter-2 §11). The
+#: rest is host — `_expert`'s staging, or the compiled call's own dispatch — and
+#: which of the two it is decides whether the fix is fewer, bigger expert
+#: launches (`kernels/legacy/moe_short.py`'s batching) or something else
+#: entirely. Off by default: `DEEPSEEK_V41_TIME_EXPERTS=1` turns it on, and the
+#: cost when off is one boolean test per expert.
+_EXPERT_TIMING = os.environ.get("DEEPSEEK_V41_TIME_EXPERTS", "0") != "0"
+
+#: `[fetch+stage, launch, read, host->device]` seconds since the last forward
+#: boundary. The first is the sum of the last two plus the cache lookup.
+_EXPERT_TIME = [0.0, 0.0, 0.0, 0.0]
+
 #: Layers at which `_census_device_tensors` reports. Early, middle and late, so
 #: the difference between them is what the layer loop accumulates.
 _CENSUS_LAYERS = frozenset({4, 20, 39})
@@ -1409,18 +1427,31 @@ def _hbm_mark(layer_id: int, rows: int) -> None:
     that has to be repeated.
     """
     if layer_id <= _HBM_STATE[2]:
+        # Imported here, like every other reference to this module from
+        # `model.py`: the two import each other's names and only the function
+        # scope keeps that acyclic.
+        from .weight_loader import EXPERT_STREAM_STATS
+
         hits, misses, admitted = _EXPERT_CACHE_STATS
+        served, stalled, inline = EXPERT_STREAM_STATS
         if hits or misses:
             logger.info(
                 "deepseek_v41_timeshare: forward %d experts %d/%d from HBM "
-                "(%.0f%%), %d admitted, ~%.2f GiB fetched; gc %d collections "
-                "in %.2f s",
+                "(%.0f%%), %d admitted, ~%.2f GiB fetched; prefetch %d served "
+                "(%d stalled, %d inline); gc %d collections in %.2f s"
+                "; experts %.1f s staging (%.1f read + %.1f h2d) "
+                "+ %.1f s launching",
                 _HBM_STATE[0], hits, hits + misses,
                 100.0 * hits / max(1, hits + misses), admitted,
                 misses * _EXPERT_BYTES[0] / 1024**3,
+                served, stalled, inline,
                 _GC_STATE[0], _GC_STATE[1],
+                _EXPERT_TIME[0], _EXPERT_TIME[2], _EXPERT_TIME[3],
+                _EXPERT_TIME[1],
             )
+        EXPERT_STREAM_STATS[:] = [0, 0, 0]
         _EXPERT_CACHE_STATS[:] = [0, 0, 0]
+        _EXPERT_TIME[:] = [0.0, 0.0, 0.0, 0.0]
         _GC_STATE[:] = [0, 0.0]
         _HBM_STATE[0] += 1
         _HBM_STATE[1] = None
@@ -3169,6 +3200,14 @@ class MoE(nn.Module):
             return self.cache_slots[slot]
 
         _EXPERT_CACHE_STATS[1] += 1
+        if _EXPERT_TIMING:
+            mark = time.perf_counter()
+            blob = weight_store.expert(self.layer_id, expert_id)
+            read = time.perf_counter()
+            slot = self._stage(blob, self._target(expert_id, uses))
+            _EXPERT_TIME[2] += read - mark
+            _EXPERT_TIME[3] += time.perf_counter() - read
+            return slot
         blob = weight_store.expert(self.layer_id, expert_id)
         return self._stage(blob, self._target(expert_id, uses))
 
@@ -3207,6 +3246,25 @@ class MoE(nn.Module):
         (5898240 = 2304 x 2560, one expert's packed fp4 `w1`.) The general rule
         this is an instance of: **anything that touches the host is its own
         decorated method, not a line in the middle of a traced one.**
+
+        **The two steps are not redundant and must not be collapsed into
+        `linear.weight.copy_(host_tensor)`.** Iteration 2 tried exactly that,
+        on the arithmetic that a direct host->device copy skips a 17.9 MiB
+        device allocation and a device-to-device DMA per tensor — measured 1.5
+        ms against 2.3 ms for one expert's six tensors, so 0.8 ms x 2,031
+        experts a prefill forward. It was the wrong 1.6 s: the verifier's needle
+        came back as a single space where it had answered
+        `5591-C67`, and two of the three short completions diverged from a tree
+        whose arithmetic had not changed. The explanation that fits is
+        ordering. `.to(device)` makes a *new* device tensor and the `copy_()`
+        that follows is a device-side op, enqueued behind the
+        `_routed_expert_step` executions already queued for the experts before
+        it. A direct host->device `copy_` is a synchronous DMA (iteration 2
+        measured that too: overwriting the host buffer right after it returns
+        does not corrupt the destination), and a synchronous DMA into
+        `expert_slot` does not wait for the queued graph that is still reading
+        `expert_slot` — so expert `k`'s GEMM can run against expert `k+1`'s
+        weights. It is cheap, it is intermittent, and it changes tokens.
         """
         slot = self.expert_slot if slot is None else slot
         for name in ("w1", "w2", "w3"):
@@ -3221,6 +3279,7 @@ class MoE(nn.Module):
         indices: torch.Tensor,
         weights: torch.Tensor,
         live_rows: int | None,
+        weight_store=None,
     ) -> list[tuple[int, torch.Tensor, torch.Tensor]]:
         """Which of this rank's experts to run, over which rows, with what
         weight.
@@ -3285,10 +3344,25 @@ class MoE(nn.Module):
         wts_host = wts.cpu().float()
         device = indices.device
 
+        candidates = [
+            expert_id
+            for expert_id in sorted(set(ids_host.flatten().tolist()))
+            if self.experts_start_idx <= expert_id < self.experts_end_idx
+        ]
+        # Hand the reader thread the fetch list here rather than at the top of
+        # the expert loop. This is the first moment the set is knowable at all
+        # — it is an output of the router — and the ~100 small host->device row
+        # copies below are a head start nothing else can use. The experts
+        # already resident are left out: `_expert` will not read them, and a
+        # read nobody claims holds a ring buffer the next one needs. See
+        # `weight_loader._ExpertStream`.
+        if weight_store is not None:
+            weight_store.prefetch_experts(
+                self.layer_id, candidates, self._resident
+            )
+
         plan = []
-        for expert_id in sorted(set(ids_host.flatten().tolist())):
-            if not self.experts_start_idx <= expert_id < self.experts_end_idx:
-                continue
+        for expert_id in candidates:
             rows, slot = torch.where(ids_host == expert_id)
             count = rows.numel()
             if count == 0:
@@ -3344,12 +3418,14 @@ class MoE(nn.Module):
         shape = x.shape
         flat = x.reshape(-1, self.hidden_size)
         weights, indices = self.gate(flat, image_mask)
-        plan = self._route_plan(indices, weights, live_rows)
+        plan = self._route_plan(indices, weights, live_rows, weight_store)
 
         y = _compiled(_moe_carry)(flat)
         limit = self.expert_slot.swiglu_limit
         for expert_id, rows, route_weights in plan:
+            mark = time.perf_counter() if _EXPERT_TIMING else 0.0
             slot = self._expert(weight_store, expert_id)
+            staged = time.perf_counter() if _EXPERT_TIMING else 0.0
             y = _compiled(_routed_expert_step)(
                 y, flat, rows, route_weights,
                 slot.w1.weight, slot.w1.scale,
@@ -3357,6 +3433,12 @@ class MoE(nn.Module):
                 slot.w3.weight, slot.w3.scale,
                 limit,
             )
+            if _EXPERT_TIMING:
+                _EXPERT_TIME[0] += staged - mark
+                _EXPERT_TIME[1] += time.perf_counter() - staged
+        # Hands back the ring buffer the last expert came in, so the reader
+        # thread is not left holding one across the all-reduce below.
+        weight_store.end_expert_loop()
 
         if tp_group is not None and self.n_local_experts != self.n_routed_experts:
             # Each rank holds the partial sum over its own experts. The
