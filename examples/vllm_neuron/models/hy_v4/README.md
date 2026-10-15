@@ -8,7 +8,7 @@
 | layers | 78: layer 0 dense FFN (18432), 77 MoE |
 | MoE | 256 routed experts of 2048, top-8, sigmoid + correction-bias routing, x2.827, SwiGLU clamp 10, 1 shared expert |
 | attention | gated MLA, 64 heads, q_lora 2048, kv_lora 512, qk 192+64, v 256, learnable sink per head |
-| sparse attention | DSA, top-2048 keys, indexer shared across groups of 4 layers |
+| sparse attention | DSA, top-2048 keys; 20 "full" layers run the indexer, 58 "shared" ones reuse it |
 | residual | iHC, 4 streams |
 | vocab / hidden | 120832 / 6144 |
 
@@ -20,7 +20,24 @@ python examples/vllm_neuron/models/hy_v4/convert_mxfp8_to_neuron_fp8.py \
     --src <dir>/Hy4-preview-FP8 --dst <dir>/Hy4-preview-neuron-fp8 --workers 24
 
 python examples/vllm_neuron/models/hy_v4/run.py --model <dir>/Hy4-preview-neuron-fp8
+
+# long context (max_model_len 32768, prefill in 2048-token chunks): a pass key
+# hidden at the start of ~30K tokens of filler
+python examples/vllm_neuron/models/hy_v4/run.py --model <dir>/Hy4-preview-neuron-fp8 \
+    --needle 30000
 ```
+
+Cold start compiles two graphs; at 32K context the prefill one takes **~50-85 min**
+at `-O1`. `run.py` raises vLLM's `distributed_timeout_seconds` (and the CPU
+group's) to 4 h because the other 63 ranks wait for rank 0's compile in a gloo
+barrier whose default timeout is 3600 s -- at the default, every cold 32K start
+dies with `RuntimeError: Operation timed out!` on all ranks at the hour mark.
+Set `NEURON_RT_EXEC_TIMEOUT=1200` too: a 32K prefill chunk takes ~150 s (see
+*Known limitations*), over the runtime's default execution timeout, which
+otherwise surfaces as `TOPSP missing collectives status` / `NRT_TIMEOUT`. While
+a chunk runs, `neuron-monitor` shows ~0% core utilisation and every worker sits
+idle in vLLM's message queue -- it looks hung and is not; count completed
+executions over a few minutes before concluding otherwise.
 
 ## Environment
 
@@ -45,13 +62,19 @@ otherwise the previous trace is compiled again.
 
 ## Measured
 
-trn2.48xlarge, world 64, `max_model_len` 2048, 4 sequences, greedy, default
-(interleaved) RoPE:
+**32K context** (current code): trn2.48xlarge, world 64, `max_model_len` 32768,
+2048-token prefill chunks, 4 sequences, greedy, `--needle`, 32 output tokens:
 
-* weights load in ~55 s per rank; KV cache 53,824 tokens at
-  `--gpu-memory-utilization 0.8`;
-* engine init 335 s, of which 329 s is compiling the two graphs (cold cache);
-* `run.py`'s demo prompts, 32 tokens:
+| prompt | prefill chunks | output | wall time |
+|---|---|---|---|
+| 1,732 tokens | 1 | `' 71432. I have memorized it.\n\nThe pass key is **71432**.\n\nI have memorized it.\n\nThe pass key is **'` | 187 s |
+| 28,804 tokens | 15 | `' 71432. Remember it. 71432 is the pass key.\nThe grass is green. The sky is blue. The sun is yellow. Here'` | 2306 s |
+
+KV cache 40,384 tokens at `--gpu-memory-utilization 0.8` (704 values x 78 layers
+per token, replicated on every rank); weights 15.08 GiB of each core's 24.
+
+**2K context**, the first, dense-attention build (before DSA and chunked
+prefill; `run.py`'s demo prompts):
 
 ```
 'The capital of France is'  -> ' __________.\nA. Sydney\nB. New York\nC. Paris\nD. Ottawa 【解析】句意：法国的首都是巴黎。Sydney'
@@ -60,7 +83,7 @@ trn2.48xlarge, world 64, `max_model_len` 2048, 4 sequences, greedy, default
 'Once upon a time, there was a' -> ' king who was very rich. He had a lot of gold and silver, but he was not happy. He wanted to be the happiest man in the world'
 ```
 
-No latency or throughput numbers yet; this is functional validation.
+Weights load in ~55 s per rank. No latency/throughput benchmark yet.
 
 ## Why the fp8 checkpoint, and why converted
 
@@ -95,18 +118,51 @@ Trn2's MoE kernels accept fp8 weights (`NF.moe_tkg` rejects `float8` today).
 The kernel path (`moe_cte` shard_on_block FP8 / `moe_tkg`) needs
 `2048 / tp_degree` to be a multiple of 128, so `ep_degree >= 4`; not done yet.
 
-**MLA in latent space.** The cache stores the normed 512-wide latent plus the
-64-wide rope key per token, as the K and V halves of a 288-wide single head
-(576 = 2 x 288, so a page is exactly what the planner reserved): 1152 B per token
-per layer, replicated on every rank. `kv_b_proj` is absorbed into the query and
-the output.
+**MLA in latent space, with the DSA key alongside.** Per token the cache holds
+the normed 512-wide latent, the 64-wide rope key and the 128-wide indexer key --
+704 values, stored as the K and V halves of one 352-wide head so a page is
+exactly what the planner reserved; layers with a shared indexer leave the last
+128 zero. `kv_b_proj` is absorbed into the query and the output. Every rank holds
+a full copy, which at one head per rank is ~10% *more* than an expanded per-head
+cache would be; sharding the latent's tokens across ranks is what would make
+MLA's compression pay here.
+
+**DSA.** A full layer scores every visible key with
+`sum_h w_h * relu(q_h . k)` (32 heads of 128, LayerNorm'd key, rope on the last 64
+dims) and keeps the top 2048 per query; the next shared layers reuse that mask.
+The top-k is a per-row threshold found by bisection -- elementwise passes only,
+no k=2048 sort and no scatter -- and is exact up to ties with the 2048th score.
+In prefill the scoring and selection are **split by query** across the 64 ranks
+and the mask all-gathered: done replicated, they were ~90% of the 32K prefill
+graph and pushed it to 15.7M instructions, over neuronx-cc's 10M limit. The
+attention itself is dense attention masked to the selection: exact, but its cost
+still grows with the context.
+
+**Chunked prefill** is the plugin's segmented prefill: one chunk of one request
+per step, attending to the `cached_seq_len` tokens already in the cache plus
+causally to itself. `max_num_batched_tokens` (`--prefill-chunk`, default 2048)
+must be one of 512/1024/2048/4096/8192.
 
 ## Known limitations
 
-* **Context <= 2048 tokens.** Past `index_topk` = 2048, Hy4 attends to the keys
-  the DSA indexer picks. Up to it the selection is every key, so dense attention
-  is exact; the model raises on a longer `max_model_len` rather than silently
-  diverging. The indexer (and its cache) is the next piece.
+* **Prefill is slow: ~150 s per 2048-token chunk at 32K** (2306 s for the 28.8K
+  needle). Every chunk attends to (and every full layer's indexer scores) the
+  whole 32K cache span, because the graph is static: `[2048, 34816]` scores per
+  layer, 78 times. It was ~55 s per chunk before the miscompile workaround below:
+  dropping the context mask doubled the prefill graph (284K -> 596K
+  instructions per subgraph) and nearly tripled its run time. The same graph is
+  why cold compiles take 50-85 min. Bucketing the prefix length, and a real
+  sparse gather instead of a masked dense attention, are next.
+* **Context is 32K, not 1M.** The latent cache is replicated on every rank, so
+  KV capacity (40K tokens at gmu 0.8) is per rank, not per instance.
+* **A neuronx-cc miscompile is worked around, not fixed.** In decode, masking
+  the gathered `[rows, 32K, 704]` context with `in_prefix` (by `where` or by a
+  multiply) made the device compute `in_prefix` *itself* wrongly -- extra keys in
+  128-key blocks past the prefix, even on a dead row at position 0 -- so every
+  decode at 32K attended to the wrong keys while the first token (from prefill)
+  was right. The same ops compiled alone, and the CPU, are correct. The model no
+  longer masks the context (it masks the scores, which is sufficient: every byte
+  in this model's single KV group is a finite entry it wrote).
 * **RoPE pairing: interleaved, and transformers disagrees.** vLLM's and SGLang's
   Hy4 ports rotate interleaved pairs; transformers' `hy_v4` rotates halves.
   Measured on device with the same weights, `HY4_ROPE_STYLE=neox` degrades
@@ -114,13 +170,14 @@ the output.
   ...'`, `def fibonacci(n):` comes out broken -- while interleaved (the default)
   gives the outputs above. So the checkpoint wants interleaved. The CPU check
   below still runs `neox`, because it compares against transformers.
-* No MTP (the `mtp_layers.0` tensors are ignored), no prefix caching, no
-  chunked/mixed prefill (one sequence per prefill, as for Qwen3.5).
-  `run.py` sets `max_num_batched_tokens = max_model_len`, which is what turns
-  chunked prefill off: the prefill attends only within the tokens it is given.
+* No MTP (the `mtp_layers.0` tensors are ignored), no prefix caching, no mixed
+  prefill/decode batches (the plugin runs one prefill request per step).
 * vLLM 0.24 has no class for `HYV4ForCausalLM`, so the plugin registers it from
   a `vllm.general_plugins` entry point (`vllm_neuron:register_models`); reinstall
   with `pip install -e .` so that entry point exists.
+* `HY4_DEBUG_CAPTURE=1` (with `HY4_DEBUG_LAYERS=0,1,...` and `run.py
+  --capture-dir`) traces `capture_tensor` calls for those layers' attention and
+  MLP into the graphs, for device-vs-CPU comparison. Off, nothing is traced.
 
 ## Correctness check (CPU, one layer vs transformers)
 
@@ -129,10 +186,19 @@ HY4_ROPE_STYLE=neox VLLM_NEURON_CPU_MODE=1 python examples/vllm_neuron/models/hy
     --model <dir>/Hy4-preview-neuron-fp8 --layer 1
 ```
 
-Loads one layer through this port's weight loaders, runs a 40-token prefill and
-one paged decode step, and compares the layer's update against
-`transformers.models.hy_v4.HYV4DecoderLayer` in fp32 on the same (dequantised)
-weights:
+Loads one layer through this port's weight loaders, runs a 2600-token prefill in
+2048-token chunks (the second reads its prefix back from the paged cache, and
+its rows past 2048 attend to a DSA selection) and one paged decode step, and
+compares the layer's update against `transformers.models.hy_v4.HYV4DecoderLayer`
+in fp32 on all 2601 tokens at once, on the same (dequantised) weights. It also
+checks that the query-split selection, emulated over 4 ranks with the
+all-gather returning blocks in a shuffled order, equals the unsplit one, and how
+many of the decode row's 2048 selected keys match transformers' indexer.
+
+Layers 0 and 1, current code: chunk 1 / later chunks / decode per-token median
+0.39-0.47% / 0.43-0.47% / 0.45-0.61%; 2044-2045 of 2048 selected keys agree
+with transformers (the rest are ties at the boundary). The table below is the
+dense build's, 40 tokens:
 
 | layer | kind | prefill, per-token median | decode |
 |---|---|---|---|

@@ -10,16 +10,19 @@ then::
 
     python examples/vllm_neuron/models/hy_v4/run.py --model <dir>/Hy4-preview-neuron-fp8
 
+    # long context: a pass key hidden at the start of ~30K tokens of filler
+    python examples/vllm_neuron/models/hy_v4/run.py \\
+        --model <dir>/Hy4-preview-neuron-fp8 --needle 30000
+
 All 64 logical cores, pure TP: one attention head per rank, every expert
-sharded 64 ways on its intermediate dim. See README.md for why, and for the
-2048-token context limit.
+sharded 64 ways on its intermediate dim. See README.md.
 """
 
 import argparse
 import os
+import time
 
 os.environ.setdefault("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "3600")
-os.environ.setdefault("VLLM_NEURON_COMPILATION_TIMEOUT", "14400")
 
 from vllm import LLM, SamplingParams
 
@@ -30,15 +33,37 @@ PROMPTS = [
     "Once upon a time, there was a",
 ]
 
+PASS_KEY = "71432"
+FILLER = (
+    "The grass is green. The sky is blue. The sun is yellow. Here we go. "
+    "There and back again. "
+)
+
+
+def needle_prompt(tokenizer, approx_tokens: int) -> str:
+    """The pass-key retrieval prompt: the key first, then filler, then the question."""
+    head = (
+        "There is an important piece of information hidden inside a lot of "
+        "irrelevant text. Find it and memorize it.\n"
+        f"The pass key is {PASS_KEY}. Remember it. {PASS_KEY} is the pass key.\n"
+    )
+    tail = "\nWhat is the pass key? The pass key is"
+    per_filler = len(tokenizer.encode(FILLER, add_special_tokens=False))
+    budget = approx_tokens - len(
+        tokenizer.encode(head + tail, add_special_tokens=False)
+    )
+    return head + FILLER * max(0, budget // per_filler) + tail
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
     parser.add_argument("--tensor-parallel-size", type=int, default=64)
-    # Past index_topk = 2048 tokens Hy4's attention is sparse (DSA), which is
-    # not implemented yet; up to it, dense attention is exact. The model
-    # refuses a longer max_model_len.
-    parser.add_argument("--max-model-len", type=int, default=2048)
+    parser.add_argument("--max-model-len", type=int, default=32768)
+    # The prefill step size. Below max_model_len this is the plugin's segmented
+    # prefill: one chunk of one request per step, each reading the prefix the
+    # earlier chunks cached. Must be one of 512/1024/2048/4096/8192.
+    parser.add_argument("--prefill-chunk", type=int, default=2048)
     parser.add_argument("--max-num-seqs", type=int, default=4)
     parser.add_argument("--max-tokens", type=int, default=32)
     # Weights are ~15 GiB of each logical core's 24; the KV planner spends
@@ -50,6 +75,32 @@ def main() -> None:
         action="store_true",
         help="wrap each prompt in the checkpoint's chat template",
     )
+    parser.add_argument(
+        "--needle",
+        type=int,
+        default=None,
+        metavar="TOKENS",
+        help=f"instead of the demo prompts, ask for a pass key ({PASS_KEY}) hidden "
+        "at the start of about this many tokens of filler",
+    )
+    parser.add_argument(
+        "--no-async-scheduling",
+        action="store_true",
+        help="run the engine with async_scheduling=False",
+    )
+    parser.add_argument(
+        "--capture-dir",
+        default=None,
+        help="capture embed_tokens and layer 0 (plus, with HY4_DEBUG_CAPTURE=1, "
+        "layer 0's DSA intermediates) to this directory, for comparison against "
+        "the CPU port",
+    )
+    parser.add_argument(
+        "--capture-modules",
+        nargs="*",
+        default=["model.embed_tokens", "model.layers.0"],
+        help="module paths for --capture-dir",
+    )
     args = parser.parse_args()
 
     extra = {}
@@ -58,43 +109,66 @@ def main() -> None:
 
         extra["optimization_level"] = OptimizationLevel(args.optlevel)
 
+    if args.no_async_scheduling:
+        extra["async_scheduling"] = False
+
+    chunk = min(args.prefill_chunk, args.max_model_len)
     llm = LLM(
         model=args.model,
         **extra,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=args.max_model_len,
-        # Equal to max_model_len, which is what turns chunked prefill off on
-        # this plugin: prefill attends within the tokens it is given and does
-        # not read a cached prefix, so a prompt split into chunks would lose
-        # attention to its own earlier chunks.
-        max_num_batched_tokens=args.max_model_len,
+        max_num_batched_tokens=chunk,
         max_num_seqs=args.max_num_seqs,
         tensor_parallel_size=args.tensor_parallel_size,
-        # Prefill attends within the prompt only (no cached prefix is read).
+        # Rank 0 compiles while the other ranks wait in a gloo barrier whose
+        # timeout is this (vLLM's default is 3600 s). The 32K prefill graph
+        # takes ~50-70 min at -O1, so the default kills every cold start.
+        distributed_timeout_seconds=4 * 3600,
+        cpu_distributed_timeout_seconds=4 * 3600,
         enable_prefix_caching=False,
         additional_config={
             "neuron_config": {
                 "quantization": "bf16",
-                "num_batched_tokens_buckets": [args.max_model_len],
+                "num_batched_tokens_buckets": [chunk],
                 "num_seqs_buckets": [args.max_num_seqs],
                 "on_device_sampling_config": {"all_greedy": True},
                 # No NKI kernel is called by this model yet, which is the case
                 # Qwen3.5's dense checkpoints need the mac threshold suppressed
                 # for (see that example's mac_threshold_override).
                 "hlo2tensorizer_options": "",
+                **(
+                    {
+                        "tensor_capture": {
+                            "modules": args.capture_modules,
+                            "capture_dir": args.capture_dir,
+                        }
+                    }
+                    if args.capture_dir
+                    else {}
+                ),
             },
         },
     )
 
     sampling_params = SamplingParams(max_tokens=args.max_tokens, temperature=0.0)
+    prompts = PROMPTS
+    if args.needle is not None:
+        prompts = [needle_prompt(llm.get_tokenizer(), args.needle)]
+    start = time.time()
     if args.chat:
-        conversations = [[{"role": "user", "content": p}] for p in PROMPTS]
+        conversations = [[{"role": "user", "content": p}] for p in prompts]
         outputs = llm.chat(conversations, sampling_params)
     else:
-        outputs = llm.generate(PROMPTS, sampling_params)
-    for prompt, output in zip(PROMPTS, outputs):
-        print(f"Prompt:    {prompt!r}")
+        outputs = llm.generate(prompts, sampling_params)
+    elapsed = time.time() - start
+    for prompt, output in zip(prompts, outputs):
+        shown = prompt if len(prompt) < 200 else f"{prompt[:80]!r} ... {prompt[-60:]!r}"
+        print(f"Prompt:    {shown!r} ({len(output.prompt_token_ids)} tokens)")
         print(f"Generated: {output.outputs[0].text!r}\n")
+    if args.needle is not None:
+        found = PASS_KEY in outputs[0].outputs[0].text
+        print(f"NEEDLE {'FOUND' if found else 'MISSED'} in {elapsed:.1f} s")
 
 
 if __name__ == "__main__":

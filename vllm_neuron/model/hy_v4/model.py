@@ -12,22 +12,32 @@ answers without failing:
   ``x + f(x)`` anywhere. The gate projections, their RMS factor and the
   combination are fp32, as in every reference implementation.
 * **MLA is computed in latent space.** The cache holds, per token, the normed
-  512-dim KV latent and the shared 64-dim rope key -- 576 values, stored as the
-  K and V halves of a 288-wide "head" so that one page is exactly the bytes the
-  planner reserved. ``kv_b_proj`` is absorbed: the no-rope query is multiplied
-  into latent space, attention runs against the latent directly, and the value
-  up-projection is applied to the attention output. Identical in exact
-  arithmetic to expanding K/V per head, and 13x less cache.
+  512-dim KV latent, the shared 64-dim rope key and the 128-dim DSA indexer key
+  -- 704 values, stored as the K and V halves of a 352-wide "head" so that one
+  page is exactly the bytes the planner reserved. ``kv_b_proj`` is absorbed:
+  the no-rope query is multiplied into latent space, attention runs against
+  the latent directly, and the value up-projection is applied to the attention
+  output. Identical in exact arithmetic to expanding K/V per head. Note what
+  it does and does not save: the latent is 704 values against 64 x 512 for
+  all heads expanded, but every rank holds a full copy, and at one head per
+  rank an expanded cache would be 512 + 128 -- so at world 64 the latent
+  cache is ~10% *larger* per rank. Sharding the latent's tokens across ranks
+  (context parallelism) is what would turn it into a saving.
 * **Every head has a learned sink logit**, a column with no value that only
   takes probability mass, and the attention output is gated elementwise by
   ``sigmoid(gate_proj(x))`` before ``o_proj``.
-* **The rope pairing is a choice** -- see ``ROPE_STYLE`` in ``config.py``.
+* **The rope pairing is interleaved** -- see ``ROPE_STYLE`` in ``config.py``.
 
-**DSA is not implemented yet.** Hy4 attends to the top ``index_topk`` = 2048
-keys its lightning indexer picks (shared across groups of four layers). Up to
-2048 tokens of context that selection is *every* key, so dense attention is
-exact there; ``HYV4ForCausalLM`` refuses a longer ``max_model_len`` rather
-than silently diverging past it. The indexer weights are not loaded.
+**DSA.** Each query attends to the top ``index_topk`` = 2048 keys a lightning
+indexer picks (``HYV4Indexer``); the 20 ``"full"`` layers run one, the other 58
+reuse the selection of the last full layer before them. Below 2048 visible keys
+the selection is every key. The sparse attention is computed as dense attention
+masked to the selection: exact, but its cost still grows with the context.
+
+**Prefill is chunked** (the plugin's segmented prefill): each step is one chunk
+of one request, attending to the ``cached_seq_len`` tokens already in the cache
+plus causally to itself, so a prompt longer than the prefill bucket is handled
+across steps and per-step cost does not grow with the bucket.
 
 Parallelism is plain TP over the 64 query heads (one per rank at world 64) and
 over every MLP's intermediate dim. The MLA down-projections (``q_a_proj``,
@@ -37,8 +47,11 @@ the full width.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from vllm.distributed.parallel_state import get_tp_group
 
 import vllm_neuron.nn as neuron_nn
@@ -53,6 +66,21 @@ from vllm_neuron.utils.weight_loader import (
 )
 
 from .config import ROPE_STYLE, HYV4Config
+
+# HY4_DEBUG_CAPTURE=1 traces ``capture_tensor`` calls for the layers listed in
+# HY4_DEBUG_LAYERS (default "0") into the graph (used with
+# neuron_config.tensor_capture). Off, nothing is traced.
+DEBUG_CAPTURE = os.environ.get("HY4_DEBUG_CAPTURE") == "1"
+DEBUG_LAYERS = {int(x) for x in os.environ.get("HY4_DEBUG_LAYERS", "0").split(",")}
+
+
+def _capture(layer_idx: int, name: str, tensor: torch.Tensor) -> None:
+    if DEBUG_CAPTURE and layer_idx in DEBUG_LAYERS:
+        from vllm_neuron.accuracy import capture_tensor
+
+        capture_tensor(f"hy4.l{layer_idx}.{name}", tensor)
+
+
 from .moe import HYV4MLP, HYV4MoE
 
 HF_PREFIX = "model"
@@ -199,9 +227,118 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 
 # ── Attention ────────────────────────────────────────────────────────────
 
+# Bisection steps for the top-k threshold; see ``select_topk``. 24 halvings of
+# the per-row score range leave ties within ~6e-8 of it unresolved, which only
+# ever widens the selection by keys tied with the k-th.
+TOPK_BISECTION_STEPS = 24
+# Stand-in for -inf/+inf in the selection, where real infinities would turn the
+# bisection midpoint into NaN.
+_BIG = 3.0e38
+
+
+def select_topk(scores: torch.Tensor, visible: torch.Tensor, k: int) -> torch.Tensor:
+    """Boolean mask of each row's top-``k`` visible keys (all of them if fewer).
+
+    ``scores``/``visible`` are ``[rows, keys]``; every row must have at least one
+    visible key (each query always sees itself).
+
+    By bisection on a per-row threshold rather than ``torch.topk``: it is a few
+    elementwise passes over ``[rows, keys]``, with no k=2048 sort and no scatter
+    to turn indices back into a mask. The invariant is ``count(s >= lo) >= k``
+    (or ``lo`` is the row minimum, which selects everything visible), so the
+    result is exactly the top-k up to keys tied with the k-th score.
+    """
+    s = scores.float()
+    hi = s.masked_fill(~visible, -_BIG).amax(dim=-1, keepdim=True)
+    lo = s.masked_fill(~visible, _BIG).amin(dim=-1, keepdim=True)
+    for _ in range(TOPK_BISECTION_STEPS):
+        mid = (lo + hi) * 0.5
+        count = ((s >= mid) & visible).float().sum(dim=-1, keepdim=True)
+        up = count >= k
+        lo = torch.where(up, mid, lo)
+        hi = torch.where(up, hi, mid)
+    return visible & (s >= lo)
+
+
+class HYV4Indexer(nn.Module):
+    """DSA lightning indexer: scores every visible key, the top ``index_topk`` attend.
+
+    ``score[t, s] = sum_h w[t, h] * relu(q[t, h] . k[s])`` with 32 query heads of
+    128 against one 128-wide key per token (LayerNorm'd, with the rope applied to
+    its *last* 64 dims, as is the query's). Replicated on every rank: it is small
+    (~9.4M parameters) and its output, a selection over keys, is needed by each
+    rank's attention head in full. The reference's Hadamard rotation and fp8
+    scoring are precision/speed devices that leave the selection's definition
+    unchanged, and are skipped, as transformers does.
+    """
+
+    def __init__(self, config: HYV4Config):
+        super().__init__()
+        self.dtype = config.torch_dtype
+        self.n_heads = config.index_n_heads
+        self.head_dim = config.index_head_dim
+        self.rope_dim = config.qk_rope_head_dim
+        hidden = config.hidden_size
+        self.wq_b_weight = nn.Parameter(
+            torch.empty(
+                config.q_lora_rank, self.n_heads * self.head_dim, dtype=self.dtype
+            )
+        )
+        self.wk_weight = nn.Parameter(
+            torch.empty(hidden, self.head_dim, dtype=self.dtype)
+        )
+        self.k_norm_weight = nn.Parameter(
+            torch.ones(self.head_dim, dtype=torch.float32)
+        )
+        self.k_norm_bias = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32))
+        self.weights_proj_weight = nn.Parameter(
+            torch.empty(hidden, self.n_heads, dtype=torch.float32)
+        )
+        # vLLM's HYV4 indexer uses 1e-6 here, not rms_norm_eps.
+        self.k_norm_eps = 1e-6
+        self.weight_scale = self.head_dim**-0.5 * self.n_heads**-0.5
+        for param in (self.wq_b_weight, self.wk_weight, self.weights_proj_weight):
+            set_weight_loader(param, _replicated_transposed())
+
+    def _rope_tail(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+        keep = self.head_dim - self.rope_dim
+        return torch.cat((x[..., :keep], apply_rope(x[..., keep:], cos, sin)), dim=-1)
+
+    def keys(
+        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
+        """``x [T, H]`` -> ``[T, 128]``, what the cache stores for this layer."""
+        k = F.layer_norm(
+            (x @ self.wk_weight).float(),
+            (self.head_dim,),
+            self.k_norm_weight,
+            self.k_norm_bias,
+            self.k_norm_eps,
+        )
+        return self._rope_tail(k, cos, sin).to(self.dtype)
+
+    def queries(
+        self,
+        q_resid: torch.Tensor,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """-> (``[T, heads, 128]`` queries, ``[T, heads]`` fp32 head weights)."""
+        q = (q_resid @ self.wq_b_weight).view(-1, self.n_heads, self.head_dim)
+        weights = (x.float() @ self.weights_proj_weight) * self.weight_scale
+        return self._rope_tail(q, cos, sin), weights
+
 
 class HYV4Attention(nn.Module):
-    """Gated MLA with learnable sinks, attending to all keys (see module docstring)."""
+    """Gated MLA with learnable sinks over the keys DSA selects.
+
+    The cache entry per token is 704 wide: the 576-wide MLA latent (normed
+    kv latent + rope key) followed by the 128-wide indexer key, stored as the K
+    and V halves of one 352-wide head. Layers whose indexer is ``"shared"``
+    leave the indexer slot zero and reuse the selection of the last ``"full"``
+    layer before them, which the decoder threads through.
+    """
 
     def __init__(self, config: HYV4Config, layer_idx: int):
         super().__init__()
@@ -224,13 +361,20 @@ class HYV4Attention(nn.Module):
         self.v_dim = config.v_head_dim
         self.kv_lora_rank = config.kv_lora_rank
         self.latent_dim = config.kv_latent_dim
-        if self.latent_dim % 2:
-            raise ValueError(f"kv latent width {self.latent_dim} must be even")
+        self.index_dim = config.index_head_dim
+        self.index_topk = config.index_topk
+        self.entry_dim = self.latent_dim + self.index_dim
+        if self.entry_dim % 2:
+            raise ValueError(f"cache entry width {self.entry_dim} must be even")
         # The K and V halves of the cache page, each this wide.
-        self.cache_head_dim = self.latent_dim // 2
+        self.cache_head_dim = self.entry_dim // 2
         self.scaling = self.qk_dim**-0.5
         hidden = config.hidden_size
         nh = self.num_heads
+
+        self.indexer = (
+            HYV4Indexer(config) if config.indexer_types[layer_idx] == "full" else None
+        )
 
         self.q_a_proj_weight = nn.Parameter(
             torch.empty(hidden, config.q_lora_rank, dtype=self.dtype)
@@ -322,12 +466,13 @@ class HYV4Attention(nn.Module):
 
     def _project(
         self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``x [T, H]`` -> (query ``[T, nh, 576]``, latent ``[T, 576]``, gate).
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``x [T, H]`` -> (query ``[T, nh, 576]``, entry ``[T, 704]``, gate, q_resid).
 
         The query's no-rope part is absorbed through ``w_uk`` so that it scores
         directly against the cached latent; its rope part scores against the
         cached rope key. Concatenating both gives one 576-wide dot product.
+        ``entry`` is what this token writes to the cache.
         """
         tokens = x.shape[0]
         q_resid = self.q_a_layernorm(x @ self.q_a_proj_weight)
@@ -340,10 +485,16 @@ class HYV4Attention(nn.Module):
         kv = x @ self.kv_a_proj_weight
         c = self.kv_a_layernorm(kv[:, : self.kv_lora_rank])
         k_rope = apply_rope(kv[:, self.kv_lora_rank :], cos, sin)
-        latent = torch.cat((c, k_rope), dim=-1)
+        if self.indexer is not None:
+            index_key = self.indexer.keys(x, cos, sin)
+        else:
+            index_key = torch.zeros(
+                tokens, self.index_dim, dtype=self.dtype, device=x.device
+            )
+        entry = torch.cat((c, k_rope.to(c.dtype), index_key.to(c.dtype)), dim=-1)
 
         gate = x @ self.gate_proj_weight
-        return query, latent, gate
+        return query, entry, gate, q_resid
 
     def _finish(self, o_lat: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """``o_lat [T, nh, 512]`` -> value up-projection, gate, ``o_proj`` partial."""
@@ -356,14 +507,14 @@ class HYV4Attention(nn.Module):
             out = self.tp_group.all_reduce(out)
         return out
 
-    def _write_kv(self, latent: torch.Tensor, metadata: dict) -> None:
-        """Scatter ``[T, 576]`` into the paged cache as two 288-wide halves.
+    def _write_kv(self, entry: torch.Tensor, metadata: dict) -> None:
+        """Scatter ``[T, 704]`` into the paged cache as two 352-wide halves.
 
         Same slot handling as ``Qwen3_5Attention._write_kv``: padded tokens
         (slot 0) go to the private scratch page, never to vLLM's null block.
 
-        Written as one 2-index scatter into the ``[pages * 2, block, 288]`` view
-        rather than a 4-index one into ``[pages, 2, 1, block, 288]``: with one
+        Written as one 2-index scatter into the ``[pages * 2, block, 352]`` view
+        rather than a 4-index one into ``[pages, 2, 1, block, 352]``: with one
         KV head the head index is all zeros, and neuronx-cc folds such an index
         to a rank-0 constant and then fails the decode graph with
         ``NCC_IRRW901 RewriteWeights assertion error: expected tensor.rank=0 to
@@ -381,9 +532,34 @@ class HYV4Attention(nn.Module):
         )
         offsets = slot_mapping % block_size
         rows = torch.cat((blocks * 2, blocks * 2 + 1))  # K half, then V half
-        values = torch.cat((latent[:, :half], latent[:, half:])).to(self.kv_pages.dtype)
+        values = torch.cat((entry[:, :half], entry[:, half:])).to(self.kv_pages.dtype)
         flat = self.kv_pages.view(num_pages * 2, self.kv_pages.shape[3], half)
         flat.index_put_((rows, torch.cat((offsets, offsets))), values)
+
+    def _gather(
+        self, block_table: torch.Tensor, live_rows: torch.Tensor
+    ) -> torch.Tensor:
+        """``[R, W]`` block ids -> ``[R, W * block_size, 704]`` cache entries.
+
+        Pages flattened to rank 3 and indexed per row, as in
+        ``Qwen3_5Attention.forward_decode``. Dead rows, table padding (-1) and
+        vLLM's null block are redirected to the private zero page.
+        """
+        num_rows = block_table.shape[0]
+        zero_page = self.kv_pages.shape[0] - 2
+        bt = block_table.to(torch.long)
+        blocks = torch.where(
+            live_rows & (bt > 0) & (bt < zero_page), bt, torch.full_like(bt, zero_page)
+        )
+        num_pages, block_size = self.kv_pages.shape[0], self.kv_pages.shape[3]
+        ctx_len = blocks.shape[1] * block_size
+        half = self.cache_head_dim
+        # [pages, 2, 1, block, 352] -> [pages * 2, block, 352]: K half of page p
+        # is row 2p, V half is row 2p + 1.
+        flat = self.kv_pages.reshape(num_pages * 2, block_size, half)
+        k_half = flat[(blocks * 2).reshape(-1)].reshape(num_rows, ctx_len, half)
+        v_half = flat[(blocks * 2 + 1).reshape(-1)].reshape(num_rows, ctx_len, half)
+        return torch.cat((k_half, v_half), dim=-1)
 
     def _with_sinks(self, scores: torch.Tensor) -> torch.Tensor:
         """Softmax over ``[..., keys]`` plus one sink column per head, sink dropped.
@@ -402,28 +578,142 @@ class HYV4Attention(nn.Module):
         positions: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attn_metadata: dict,
-    ) -> torch.Tensor:
+        selected: torch.Tensor | None = None,
+        rank: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """-> (output, this layer's key selection, for the next shared layers)."""
         metadata = attn_metadata[self.layer_name]
+        if self.indexer is None and selected is None:
+            raise ValueError(
+                f"{self.layer_name} shares its DSA selection but no full-indexer "
+                f"layer ran before it"
+            )
         if metadata["max_query_len"] <= metadata["decode_token_threshold"]:
-            return self.forward_decode(x, positions, position_embeddings, metadata)
-        return self.forward_prefill(x, position_embeddings, metadata)
+            return self.forward_decode(
+                x, positions, position_embeddings, metadata, selected
+            )
+        return self.forward_prefill(x, position_embeddings, metadata, selected, rank)
+
+    def _select_prefill(
+        self,
+        iq: torch.Tensor,
+        iw: torch.Tensor,
+        ik: torch.Tensor,
+        visible: torch.Tensor,
+        rank: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """DSA selection ``[C, K]`` for a prefill chunk, split by query across ranks.
+
+        Every rank needs the whole selection (its head attends to every query's
+        keys), but each query's selection depends only on that query. So rank
+        ``r`` scores and selects for its ``C / world`` queries against all keys,
+        and one all-gather assembles the mask. Done replicated instead, the
+        indexer and the top-k bisection were ~90% of the prefill graph at 32K
+        context -- 15.7M instructions at -O3, over neuronx-cc's 10M limit.
+
+        ``rank`` is the runner's tensor, not ``rank_in_group``: a Python rank
+        would bake into the trace and make 64 different graphs.
+        """
+        chunk, world = iq.shape[0], self.world_size
+        if world == 1 or chunk % world:
+            rows = slice(None)
+            local_q, local_w, local_vis = iq, iw, visible
+        else:
+            per_rank = chunk // world
+            if rank is None:
+                rank = torch.tensor(self.tp_group.rank_in_group, device=iq.device)
+            rows = rank.reshape(1).to(torch.long) * per_rank + torch.arange(
+                per_rank, device=iq.device
+            )
+            local_q = torch.index_select(iq, 0, rows)
+            local_w = torch.index_select(iw, 0, rows)
+            local_vis = torch.index_select(visible, 0, rows)
+        s = torch.relu(torch.einsum("qhd,kd->qhk", local_q, ik).float())
+        scores = (s * local_w.unsqueeze(-1)).sum(dim=1)  # [C / world, K]
+        local = select_topk(scores, local_vis, self.index_topk)
+        _capture(self.layer_idx, "index_scores_local", scores)
+        _capture(self.layer_idx, "selected_local", local.to(torch.bfloat16))
+        if isinstance(rows, slice):
+            return local
+        # The all-gather's block order is the collective's, which on Trn2 is
+        # *not* tp-rank order (the rank -> device mapping is a mesh; see
+        # ``_TRN2_MESH``). Assuming it was gave every query some other query's
+        # selection -- coherent-looking garbage from the first token. So the
+        # ranks are gathered too, and a 0/1 permutation matmul puts block ``j``
+        # (from rank ``j``) at rows ``[j * per_rank, (j + 1) * per_rank)``.
+        # Exact in bf16: every output element is one 0/1 product.
+        #
+        # bf16 for the collective, which bool may not be on every backend; back
+        # by a cast, not ``> 0.5``: a bf16-vs-Python-float compare lowers to an
+        # f64 constant, which neuronx-cc rejects (NCC_ESPP004).
+        gathered = self.tp_group.all_gather(local.to(torch.bfloat16), dim=0)
+        sources = self.tp_group.all_gather(rank.reshape(1).to(torch.float32), dim=0)
+        targets = torch.arange(world, dtype=torch.float32, device=iq.device)
+        perm = (targets.view(world, 1) == sources.view(1, world)).to(torch.bfloat16)
+        ordered = perm @ gathered.reshape(world, -1)
+        _capture(self.layer_idx, "gather_sources", sources)
+        return ordered.reshape(chunk, -1).to(torch.bool)
 
     def forward_prefill(
-        self, x: torch.Tensor, position_embeddings: tuple, metadata: dict
-    ) -> torch.Tensor:
-        """One sequence, causal over itself (the assumption Qwen3.5's prefill makes)."""
-        cos, sin = position_embeddings
-        tokens = x.shape[0]
-        query, latent, gate = self._project(x.to(self.dtype), cos, sin)
-        self._write_kv(latent, metadata)
+        self,
+        x: torch.Tensor,
+        position_embeddings: tuple,
+        metadata: dict,
+        selected: torch.Tensor | None,
+        rank: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One chunk of one sequence: the cached prefix, then causal over the chunk.
 
-        q = query.transpose(0, 1).float()  # [nh, T, 576]
-        scores = (q @ latent.float().t().unsqueeze(0)) * self.scaling  # [nh, T, T]
-        causal = torch.ones(tokens, tokens, dtype=torch.bool, device=x.device).triu(1)
-        scores = scores.masked_fill(causal, float("-inf"))
+        The scheduler runs one request per prefill step, and ``cached_seq_len``
+        tokens of it are already in the cache -- an earlier chunk, or a prefix
+        hit. The prefix is read from the cache; the chunk's own keys come from
+        this step's projections, because the ``index_put_`` writing them is not
+        visible to a gather in the same graph. Keys are laid out
+        ``[cache span (W * block_size) | chunk (C)]``; a cache key is visible iff
+        its position is below ``cached_seq_len``.
+        """
+        cos, sin = position_embeddings
+        chunk = x.shape[0]
+        x = x.to(self.dtype)
+        query, entry, gate, q_resid = self._project(x, cos, sin)
+        self._write_kv(entry, metadata)
+
+        prior = metadata["cached_seq_len"].reshape(1, 1).to(torch.long)
+        block_table = metadata["block_table_tensor"][:1]
+        live = torch.ones(1, 1, dtype=torch.bool, device=x.device)
+        ctx = self._gather(block_table, live)[0]  # [ctx_len, 704]
+        ctx_len = ctx.shape[0]
+        in_prefix = torch.arange(ctx_len, device=x.device).view(1, ctx_len) < prior
+        # No masking of ``ctx`` itself: keys outside the prefix are excluded by
+        # ``visible`` (from the DSA selection and the softmax alike), and every
+        # byte this model's single KV group holds is a finite entry it wrote
+        # (or the zero page), so a probability of exactly 0 times one is 0.
+        # Masking it was also *wrong on device*: a ``where``/multiply of the
+        # [rows, 32K, 704] context by ``in_prefix`` makes neuronx-cc compute
+        # ``in_prefix`` itself wrongly (128-key blocks set past the prefix),
+        # which at 32K context turned every decode into garbage while the
+        # same ops compiled separately, and the CPU, were right.
+
+        keys = torch.cat((ctx, entry.to(ctx.dtype)), dim=0)  # [K, 704]
+        causal = torch.ones(chunk, chunk, dtype=torch.bool, device=x.device).tril()
+        visible = torch.cat((in_prefix.expand(chunk, ctx_len), causal), dim=1)
+
+        if self.indexer is not None:
+            iq, iw = self.indexer.queries(q_resid, x, cos, sin)
+            selected = self._select_prefill(
+                iq, iw, keys[:, self.latent_dim :], visible, rank
+            )
+
+        lat = keys[:, : self.latent_dim]
+        q = query.transpose(0, 1).float()  # [nh, C, 576]
+        scores = (q @ lat.float().t().unsqueeze(0)) * self.scaling  # [nh, C, K]
+        scores = scores.masked_fill(~selected.unsqueeze(0), float("-inf"))
         probs = self._with_sinks(scores)
-        o_lat = probs.to(self.dtype) @ latent[:, : self.kv_lora_rank].unsqueeze(0)
-        return self._finish(o_lat.transpose(0, 1), gate)
+        o_lat = probs.to(self.dtype) @ lat[:, : self.kv_lora_rank].unsqueeze(0)
+        out = self._finish(o_lat.transpose(0, 1), gate)
+        _capture(self.layer_idx, "selected", selected.to(torch.bfloat16))
+        _capture(self.layer_idx, "attn_out", out)
+        return out, selected
 
     def forward_decode(
         self,
@@ -431,63 +721,62 @@ class HYV4Attention(nn.Module):
         positions: torch.Tensor,
         position_embeddings: tuple,
         metadata: dict,
-    ) -> torch.Tensor:
-        """One new token per request against its paged latent history.
+        selected: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One new token per request against its paged history.
 
-        The gather follows ``Qwen3_5Attention.forward_decode``: pages flattened to
-        rank 3 and indexed per request, dead rows and table padding redirected to
-        the private zero page, the current token's own latent appended as an
-        extra key column (the ``index_put_`` above is not visible to the gather).
+        Keys are ``[cache span | the token itself]``: the current token's entry is
+        appended, since the ``index_put_`` above is not visible to the gather.
         """
         cos, sin = position_embeddings
         block_table = metadata["block_table_tensor"]
         num_reqs = block_table.shape[0]
-        query, latent, gate = self._project(x.to(self.dtype), cos, sin)
-        self._write_kv(latent, metadata)
+        x = x.to(self.dtype)
+        query, entry, gate, q_resid = self._project(x, cos, sin)
+        self._write_kv(entry, metadata)
 
-        zero_page = self.kv_pages.shape[0] - 2
-        bt = block_table.to(torch.long)
         live_rows = (metadata["slot_mapping"].view(num_reqs, -1)[:, 0] > 0).view(-1, 1)
-        blocks = torch.where(
-            live_rows & (bt > 0) & (bt < zero_page), bt, torch.full_like(bt, zero_page)
-        )
-        num_pages, block_size = self.kv_pages.shape[0], self.kv_pages.shape[3]
-        ctx_len = blocks.shape[1] * block_size
-        half = self.cache_head_dim
-
-        # [pages, 2, 1, block, 288] -> [pages * 2, block, 288]: K half of page p
-        # is row 2p, V half is row 2p + 1.
-        flat = self.kv_pages.reshape(num_pages * 2, block_size, half)
-        k_half = flat[(blocks * 2).reshape(-1)].reshape(num_reqs, ctx_len, half)
-        v_half = flat[(blocks * 2 + 1).reshape(-1)].reshape(num_reqs, ctx_len, half)
-        ctx = torch.cat((k_half, v_half), dim=-1)  # [reqs, ctx, 576]
-
+        ctx = self._gather(block_table, live_rows)  # [reqs, ctx_len, 704]
+        ctx_len = ctx.shape[1]
         key_positions = torch.arange(ctx_len, device=x.device).view(1, ctx_len)
-        visible = key_positions < positions.view(num_reqs, 1)  # [reqs, ctx]
-        # A select, not a multiply: recycled pages can hold non-finite bytes.
-        ctx = torch.where(visible.unsqueeze(-1), ctx, torch.zeros_like(ctx))
+        in_prefix = key_positions < positions.view(num_reqs, 1)  # [reqs, ctx_len]
+        # No masking of ``ctx`` itself: keys outside the prefix are excluded by
+        # ``visible`` (from the DSA selection and the softmax alike), and every
+        # byte this model's single KV group holds is a finite entry it wrote
+        # (or the zero page), so a probability of exactly 0 times one is 0.
+        # Masking it was also *wrong on device*: a ``where``/multiply of the
+        # [rows, 32K, 704] context by ``in_prefix`` makes neuronx-cc compute
+        # ``in_prefix`` itself wrongly (128-key blocks set past the prefix),
+        # which at 32K context turned every decode into garbage while the
+        # same ops compiled separately, and the CPU, were right.
 
-        q = query.float()  # [reqs, nh, 576]
-        scores = (q @ ctx.float().transpose(1, 2)) * self.scaling  # [reqs, nh, ctx]
-        scores = scores.masked_fill(~visible.unsqueeze(1), float("-inf"))
-        scores_cur = (q * latent.float().unsqueeze(1)).sum(
-            -1, keepdim=True
-        ) * self.scaling
-
-        # Heads first for the sink broadcast, then back.
-        logits = torch.cat((scores, scores_cur), dim=-1).transpose(
-            0, 1
-        )  # [nh, reqs, ctx+1]
-        probs = self._with_sinks(logits).transpose(0, 1)  # [reqs, nh, ctx+1]
-        c_all = torch.cat(
-            (
-                ctx[..., : self.kv_lora_rank],
-                latent[:, None, : self.kv_lora_rank].to(ctx.dtype),
-            ),
+        keys = torch.cat(
+            (ctx, entry.to(ctx.dtype).unsqueeze(1)), dim=1
+        )  # [reqs, K, 704]
+        visible = torch.cat(
+            (in_prefix, torch.ones(num_reqs, 1, dtype=torch.bool, device=x.device)),
             dim=1,
         )
-        o_lat = probs.to(self.dtype) @ c_all.to(self.dtype)  # [reqs, nh, 512]
-        return self._finish(o_lat, gate)
+
+        if self.indexer is not None:
+            iq, iw = self.indexer.queries(q_resid, x, cos, sin)  # [reqs, 32, 128]
+            ik = keys[..., self.latent_dim :]  # [reqs, K, 128]
+            s = torch.relu((iq @ ik.transpose(1, 2)).float())  # [reqs, 32, K]
+            index_scores = (s * iw.unsqueeze(-1)).sum(dim=1)
+            selected = select_topk(index_scores, visible, self.index_topk)
+
+        lat = keys[..., : self.latent_dim]  # [reqs, K, 576]
+        q = query.float()  # [reqs, nh, 576]
+        scores = (q @ lat.float().transpose(1, 2)) * self.scaling  # [reqs, nh, K]
+        scores = scores.masked_fill(~selected.unsqueeze(1), float("-inf"))
+        # Heads first for the sink broadcast, then back.
+        probs = self._with_sinks(scores.transpose(0, 1)).transpose(0, 1)
+        o_lat = probs.to(self.dtype) @ lat[..., : self.kv_lora_rank]  # [reqs, nh, 512]
+        out = self._finish(o_lat, gate)
+        _capture(self.layer_idx, "attn_in", x)
+        _capture(self.layer_idx, "selected", selected.to(torch.bfloat16))
+        _capture(self.layer_idx, "attn_out", out)
+        return out, selected
 
 
 # ── Decoder ──────────────────────────────────────────────────────────────
@@ -525,20 +814,31 @@ class HYV4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attn_metadata: dict,
-    ) -> torch.Tensor:
+        selected: torch.Tensor | None = None,
+        rank: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """-> (streams, DSA key selection for the layers that share it)."""
         residual = streams
         x, post = self.attn_hc(streams)
-        x = self.self_attn(
-            self.input_layernorm(x), positions, position_embeddings, attn_metadata
+        x, selected = self.self_attn(
+            self.input_layernorm(x),
+            positions,
+            position_embeddings,
+            attn_metadata,
+            selected,
+            rank,
         )
         streams = hc_post(x, residual, post)
 
         residual = streams
         x, post = self.ffn_hc(streams)
-        x = self.mlp(self.post_attention_layernorm(x))
+        x = self.post_attention_layernorm(x)
+        _capture(self.layer_idx, "mlp_in", x)
+        x = self.mlp(x)
         if self.world_size > 1:
             x = self.tp_group.all_reduce(x)
-        return hc_post(x, residual, post)
+        _capture(self.layer_idx, "mlp_out", x)
+        return hc_post(x, residual, post), selected
 
 
 class HYV4TextModel(nn.Module):
@@ -579,8 +879,11 @@ class HYV4TextModel(nn.Module):
         x = self.embed_tokens(input_ids, scatter_tokens=False, rank=rank)
         streams = x.unsqueeze(1).expand(-1, self.config.hc_mult, -1).contiguous()
         position_embeddings = self.rotary_emb(positions)
+        selected = None
         for layer in self.layers:
-            streams = layer(streams, positions, position_embeddings, attn_metadata)
+            streams, selected = layer(
+                streams, positions, position_embeddings, attn_metadata, selected, rank
+            )
         return self.norm(self.hc_head(streams))
 
 
@@ -608,6 +911,13 @@ def checkpoint_mappings(config: HYV4Config) -> dict[str, str]:
         m[f"{a}.gate_proj_weight"] = f"{ha}.linear_gate.weight"
         m[f"{a}.o_proj_weight"] = f"{ha}.o_proj.weight"
         m[f"{a}.sinks"] = f"{ha}.learnable_sink_param"
+        if config.indexer_types[i] == "full":
+            ia, hi = f"{a}.indexer", f"{ha}.indexer"
+            m[f"{ia}.wq_b_weight"] = f"{hi}.wq_b.weight"
+            m[f"{ia}.wk_weight"] = f"{hi}.wk.weight"
+            m[f"{ia}.k_norm_weight"] = f"{hi}.k_norm.weight"
+            m[f"{ia}.k_norm_bias"] = f"{hi}.k_norm.bias"
+            m[f"{ia}.weights_proj_weight"] = f"{hi}.weights_proj.weight"
 
         mlp, hm = f"{ours}.mlp", f"{hf}.mlp"
         if config.is_moe_layer(i):
@@ -638,7 +948,7 @@ def checkpoint_mappings(config: HYV4Config) -> dict[str, str]:
 class HYV4ForCausalLM(nn.Module):
     """Hy4-preview text model, on the ``convert_mxfp8_to_neuron_fp8.py`` checkpoint.
 
-    The MTP layer (``model.mtp_layers.0``) and the DSA indexers are not loaded.
+    The MTP layer (``model.mtp_layers.0``) is not loaded.
     """
 
     # Two private pages per buffer (zero page + write sink), as Qwen3.5 uses.
@@ -660,19 +970,6 @@ class HYV4ForCausalLM(nn.Module):
         self.rank = self.tp_group.rank_in_group
 
         nc = config.neuron_config
-        from vllm.config import get_current_vllm_config
-
-        try:
-            max_len = get_current_vllm_config().model_config.max_model_len
-        except (AssertionError, AttributeError, RuntimeError):
-            max_len = None  # no engine context: CPU checks
-        if max_len is not None and max_len > config.index_topk:
-            raise NotImplementedError(
-                f"max_model_len={max_len} > index_topk={config.index_topk}: past "
-                f"{config.index_topk} tokens Hy4 attends only to the keys its DSA "
-                f"indexer selects, which is not implemented yet, and dense "
-                f"attention would silently diverge from the model."
-            )
 
         self.model = HYV4TextModel(config)
 
