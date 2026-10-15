@@ -231,6 +231,9 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 # the per-row score range leave ties within ~6e-8 of it unresolved, which only
 # ever widens the selection by keys tied with the k-th.
 TOPK_BISECTION_STEPS = 24
+# Keys per block of the prefill attention's online softmax (see
+# ``HYV4Attention._attend_blocked``).
+ATTN_KEY_BLOCK = 2048
 # Stand-in for -inf/+inf in the selection, where real infinities would turn the
 # bisection midpoint into NaN.
 _BIG = 3.0e38
@@ -599,6 +602,52 @@ class HYV4Attention(nn.Module):
         probs = torch.softmax(torch.cat((scores, sink.float()), dim=-1), dim=-1)
         return probs[..., :-1]
 
+    def _attend_blocked(
+        self, query: torch.Tensor, keys: torch.Tensor, selected: torch.Tensor
+    ) -> torch.Tensor:
+        """Prefill attention with sinks, ``[nh, C, 512]``, in key blocks.
+
+        ``query`` ``[nh, C, 576]``, ``keys`` ``[K, 704]``, ``selected`` ``[C, K]``.
+
+        At 32K the ``[C, K]`` score matrix is ~285 MB of fp32 per head per
+        layer against ~24 MB of SBUF per core, and a softmax over its full rows
+        made neuronx-cc spill it: profiled on one layer, 2.6 GB spilled out and
+        7.3 GB reloaded per step, as tens of millions of ~150-byte DMA packets,
+        with the Tensor engine 6% busy. So keys are processed ``ATTN_KEY_BLOCK``
+        at a time with an online softmax (running max ``m``, running sum ``l``,
+        and the output rescaled by ``exp(m_old - m_new)``), and the sink -- a
+        logit with no value -- joins at the end, in the max and the sum.
+        """
+        nh, chunk, _ = query.shape
+        q = query.float() * self.scaling
+        # A finite floor, not -inf: with -inf a row that has nothing selected
+        # in the blocks so far computes exp(-inf - -inf) = NaN. With the floor,
+        # its masked keys briefly count with weight 1, and the first selected
+        # key (every row has one) rescales them by exp(floor - m) = 0.
+        floor = -1.0e30
+        m = torch.full((nh, chunk, 1), floor, device=q.device)
+        l = torch.zeros((nh, chunk, 1), device=q.device)
+        acc = torch.zeros((nh, chunk, self.kv_lora_rank), device=q.device)
+        total = keys.shape[0]
+        for start in range(0, total, ATTN_KEY_BLOCK):
+            stop = min(start + ATTN_KEY_BLOCK, total)
+            lat = keys[start:stop, : self.latent_dim]
+            s = q @ lat.float().t().unsqueeze(0)  # [nh, C, B]
+            s = s.masked_fill(~selected[:, start:stop].unsqueeze(0), floor)
+            m_new = torch.maximum(m, s.amax(dim=-1, keepdim=True))
+            corr = torch.exp(m - m_new)
+            e = torch.exp(s - m_new)
+            l = l * corr + e.sum(dim=-1, keepdim=True)
+            acc = (
+                acc * corr
+                + (e.to(self.dtype) @ lat[:, : self.kv_lora_rank].unsqueeze(0)).float()
+            )
+            m = m_new
+        sink = self.sinks.view(-1, 1, 1).float()
+        m_f = torch.maximum(m, sink)
+        scale = torch.exp(m - m_f)
+        return acc * scale / (l * scale + torch.exp(sink - m_f))
+
     # ── phases ───────────────────────────────────────────────────────────
 
     def forward(
@@ -725,12 +774,7 @@ class HYV4Attention(nn.Module):
                 iq, iw, keys[:, self.latent_dim :], visible, rank
             )
 
-        lat = keys[:, : self.latent_dim]
-        q = query.transpose(0, 1).float()  # [nh, C, 576]
-        scores = (q @ lat.float().t().unsqueeze(0)) * self.scaling  # [nh, C, K]
-        scores = scores.masked_fill(~selected.unsqueeze(0), float("-inf"))
-        probs = self._with_sinks(scores)
-        o_lat = probs.to(self.dtype) @ lat[:, : self.kv_lora_rank].unsqueeze(0)
+        o_lat = self._attend_blocked(query.transpose(0, 1), keys, selected)
         out = self._finish(o_lat.transpose(0, 1), gate)
         _capture(self.layer_idx, "selected", selected.to(torch.bfloat16))
         _capture(self.layer_idx, "attn_out", out)
