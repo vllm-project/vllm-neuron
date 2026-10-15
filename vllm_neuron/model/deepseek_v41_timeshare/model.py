@@ -678,6 +678,32 @@ def nki_linear(
         name = "fp8_linear" if quantize_activation else "fp8_linear_raw"
         out = _nki_entry("blockquant", name)(flat, weight, scale)
     elif storage == "fp4":
+        # `fp4_linear_fused` is the faster kernel and this line is the whole of
+        # wiring it: same stored bytes, same signature, the weight transposed as
+        # *packed* bytes straight into SBUF and decoded there, so no dequantized
+        # bf16 weight ever reaches HBM. Iteration 2 wired it, ran the gate's own
+        # verifier at four ranks, and measured it **32% cheaper per routed-expert
+        # execution** (917.2 -> 623.7 µs of engine, every other graph in the
+        # window reproducing to 0.3%) for **-10.05% on `device_step_ms_long` and
+        # -12.87% on `device_step_ms_short`** — and then took it back out,
+        # because two *gated* numbers moved the wrong way for reasons that are
+        # not speed:
+        #
+        #   `device_tpot_ms_long`  +14.90%  = step / tokens_per_step, and the
+        #       divisor fell 3.6 -> 2.818 because the needle case emitted 32
+        #       tokens where the record-holding run emitted 19. Greedy decoding
+        #       is re-rolled by any last-bit change, and this kernel's
+        #       accumulation order is not bit-exact.
+        #   `device_ttft_ms_short` +6.61%  = half a fully-traced prefill pass,
+        #       and halving a kernel's instruction count frees NRT trace budget,
+        #       so *untouched* graphs get priced more completely (`69d801c7`'s
+        #       worst-traced execution went 5 044 -> 40 533 activity rows at an
+        #       unchanged 15 executions).
+        #
+        # Both are measured, both are in `.autohelix/notes/iter-2.md` §3-§4
+        # with the arithmetic. To land this, the decode step has to reach
+        # **324 ms** (= 115.1 x 2.818) rather than 355, which is what the fp8
+        # kernel in the same shape is worth — wire them together.
         out = _nki_entry("blockquant", "fp4_linear")(flat, weight, scale)
     else:
         raise ValueError(f"unknown storage {storage!r}")

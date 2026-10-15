@@ -848,6 +848,716 @@ def fp4_linear(x, w, scale):
     return out
 
 
+# =============================================================================
+# fp4, fused — the routed experts' GEMM with no dequantized weight in HBM
+# =============================================================================
+#
+# `fp4_linear` above writes the whole bf16 weight to a `private_hbm` scratch and
+# `_gemm` reads it back through a `dma_transpose`. Measured in the baseline
+# gate's own decode profile, per routed-expert execution (three GEMMs,
+# 35.4M weight values): **engine 917 µs, device DMA 904 µs, union 1117 µs**, and
+# the DMA is three transposing reads of the dequantized bf16 weight, 22.5 MiB
+# each at 104-115 GB/s = 655 µs. Each weight value costs 4.5 bytes of traffic
+# (0.5 stored + 2 written + 2 read back) where 0.5 is what it is worth.
+#
+# The kernels below move the transpose to the *packed* bytes, viewed as uint16
+# and transposed by DMA straight into SBUF (16.9 MiB instead of 67.5), decode
+# there and hand `nc_matmul` the result. No scratch, no staging, no bf16 weight
+# in HBM. What that buys, from the same profile's per-opcode table:
+#
+#   | per execution                        | `fp4_linear` | fused |
+#   |--------------------------------------|---|---|
+#   | transposing weight DMA               | 67.5 MiB | 16.9 MiB |
+#   | dequantized-weight writes            | 67.5 MiB | none |
+#   | nibble extract (Vector)              | 180 µs, strided dst, 2x | 4 ops, 32-bit, de-interleaved |
+#   | uint8 -> uint16 widen (Scalar)       | 129 µs | gone: the extract is already uint16 |
+#   | 32-fold scale broadcast COPY (Vector)| 156 µs | gone: the scale lands per 8 partitions |
+#
+# The price is the accumulation order: a `[128, nt]` moving tile now carries k
+# values `4r + c` for one `c`, so the contraction is four interleaved matmul
+# chains instead of one over 128 consecutive k. Same products, different fp32
+# order, so this is **not bit-exact** against `fp4_linear` — it is the one
+# deliberate numerical change. `_dequant_fp4`'s own arithmetic is reproduced
+# value for value (same nibble, same `FP4_NIB_MUL`, same `FP4_FIELD`, same
+# `2**(code-65)`), and that is checked rather than argued: under `nki.simulate`
+# against the shipped `fp4_linear`, **1 of 32,768 output elements differs at
+# `m=128 k=512 n=256`, 4 of 32,768 at `k=1152` (which exercises the partial last
+# k-tile) and 0 of 2,304 at the decode width `m=6`** — one bf16 step each, from
+# the accumulation order and nothing else. On device at the six live expert
+# shapes (`k=5120 n=2304` and `k=2304 n=5120`, `m` 128/130/256/512) the result
+# agrees with a float64 emulation to **2.1-3.3e-3 relative**, which is the bf16
+# output quantum (2**-8 = 3.9e-3), i.e. as close as the dtype allows.
+
+#: The low nibble of each uint16 lane of a uint32, i.e. two nibbles a lane-op.
+#: Byte 0 of a packed pair holds k = 4r (low nibble) and 4r+1 (high), byte 1
+#: holds 4r+2 and 4r+3, so nibble `c` of the pair is k = 4r + c at bits 4c..4c+3
+#: — and a right shift inside the uint32 brings lane 1's nibble to bits 16..19
+#: while this mask drops what crossed the lane boundary.
+FP4_NIB_MASK2 = 0x000F000F
+#: `FP4_FIELD` doubled and signed: NKI takes a 32-bit bitwise operand as int32,
+#: the same way `E4M3_SGN2` is written.
+FP4_FIELD2 = 0x81C081C0 - (1 << 32)
+
+#: PSUM holds 8 banks of 2 KiB a partition. An accumulation chain has to stay
+#: in one place for the whole k loop, so the chunking below is sized to keep
+#: `mtiles * (nc // nt)` live accumulators inside both of these.
+_PSUM_TILES = 6
+_PSUM_FP32 = 6 * 2048 // 4
+
+
+def _fp4_plan(n, mtiles):
+    """`(nt, nc)`: the PSUM tile width and the n-chunk the k loop runs over.
+
+    `nt` is the widest divisor of `n` a PSUM bank holds (512 fp32), which is
+    not `_ntile`'s power-of-two list: the MoE intermediate 2304 divides by 384
+    and not by 512, and taking 384 over 256 is what turns a decode step's `w1`
+    from three chunks into one.
+    `nc` is how much of `n` one pass over k covers, and it is as wide as PSUM
+    allows: widening it does not change any volume — every per-chunk cost here
+    is proportional to bytes — but it does spread the ~150 ns fixed cost of a
+    NKI instruction over a wider decode. At the live shapes: `nc = n` for `w1`
+    and `w3` on a decode step (one chunk, six 384-wide accumulators), `n/2` for
+    `w2`, and `nc = nt` at a 512-row prefill segment, where four m-tiles leave
+    room for one accumulator each.
+    """
+    nt = 1
+    for cand in range(1, NT + 1):
+        if n % cand == 0:
+            nt = cand
+    room = min(max(1, _PSUM_TILES // mtiles), max(1, _PSUM_FP32 // (mtiles * nt)))
+    best = 1
+    for cand in range(1, room + 1):
+        if n % (nt * cand) == 0:
+            best = cand
+    return nt, nt * best
+
+
+def _stage_rows_fp4(x, m, k, dst_hbm):
+    """`_stage_rows(..., quantize=True)` with the k axis de-interleaved.
+
+    Writes `dst[j, c, r] = xq[j, 4r + c]`, so the activation tile that pairs
+    with nibble `c` of a transposed weight pair is a *contiguous* `[128, 128]`
+    block of HBM and `dma_transpose` can take it as it stands. The split has to
+    happen after `_qdq_fp8`, because the quantization block is 32 consecutive
+    k of the original order; doing it in SBUF against a stride-4 view costs four
+    `tensor_copy`s over `k/4` values each, ~3 µs at the live shapes.
+    """
+    kq = k // 4
+    full = m // PT
+    tail = m - full * PT
+    for mb in nl.affine_range(full):
+        tile = _qdq_fp8(nl.load(x[mb * PT : (mb + 1) * PT, 0:k], dtype=nl.bfloat16), PT, k)
+        blocked = tile.reshape((PT, kq, 4))
+        half = nl.ndarray((PT, kq), dtype=nl.bfloat16, buffer=nl.sbuf)
+        for c in range(4):
+            nisa.tensor_copy(dst=half, src=blocked[0:PT, 0:kq, c])
+            nl.store(dst_hbm[mb * PT : (mb + 1) * PT, c, 0:kq], value=half)
+    if tail:
+        padded = nl.ndarray((PT, k), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.memset(padded, 0.0)
+        nisa.tensor_copy(
+            dst=padded[0:tail, 0:k],
+            src=nl.load(x[full * PT : full * PT + tail, 0:k], dtype=nl.bfloat16),
+        )
+        tile = _qdq_fp8(padded, PT, k)
+        blocked = tile.reshape((PT, kq, 4))
+        half = nl.ndarray((PT, kq), dtype=nl.bfloat16, buffer=nl.sbuf)
+        for c in range(4):
+            nisa.tensor_copy(dst=half, src=blocked[0:PT, 0:kq, c])
+            nl.store(dst_hbm[full * PT : (full + 1) * PT, c, 0:kq], value=half)
+
+
+def _fp4_decode_tile(wb, scb, dst, nc, c):
+    """Nibble `c` of every packed pair in `wb[*, nc]`, dequantized into `dst`.
+
+    `wb` is a transposed tile of the stored bytes viewed as uint16, so a
+    partition is one pair — four k values — and `dst` comes out as the moving
+    operand `nc_matmul` wants for the k values `4r + c`.
+
+    Four instructions, against `_dequant_fp4`'s seven for the same values:
+    the extract is 32-bit and its destination contiguous (where `_dequant_fp4`
+    writes `nib[:, :, c::2]` and pays 2x instead of 4x), the multiply by
+    `FP4_NIB_MUL` widens nothing because the extract already landed in uint16
+    (`_dequant_fp4` pays a separate 129 µs Scalar pass to widen uint8 first),
+    and the scale multiply reads `scb` element for element, where
+    `_dequant_fp4` has to materialize a 32-fold broadcast first — a 156 µs
+    Vector COPY an execution.
+    """
+    nib = nl.ndarray((PT, nc), dtype=nl.uint16, buffer=nl.sbuf)
+    if c == 0:
+        nisa.tensor_scalar(
+            dst=nib.view(nl.uint32),
+            data=wb.view(nl.uint32),
+            op0=nl.bitwise_and,
+            operand0=FP4_NIB_MASK2,
+            engine=nisa.engine.vector,
+        )
+    else:
+        nisa.tensor_scalar(
+            dst=nib.view(nl.uint32),
+            data=wb.view(nl.uint32),
+            op0=nl.right_shift,
+            operand0=4 * c,
+            op1=nl.bitwise_and,
+            operand1=FP4_NIB_MASK2,
+            engine=nisa.engine.vector,
+        )
+    pre = nl.ndarray((PT, nc), dtype=nl.uint16, buffer=nl.sbuf)
+    nisa.tensor_scalar(
+        dst=pre, data=nib, op0=nl.multiply, operand0=FP4_NIB_MUL,
+        engine=nisa.engine.scalar,
+    )
+    # A separate destination for the field mask, not `dst` in place: a
+    # `tensor_tensor` whose `dst` and `data1` are two different dtype views of
+    # one tile reads as zeros (checked under `nki.simulate`), and iteration 4 of
+    # the previous run measured an in-place uint32 mask at 26.8 -> 390.5 µs.
+    bits = nl.ndarray((PT, nc), dtype=nl.uint16, buffer=nl.sbuf)
+    nisa.tensor_scalar(
+        dst=bits.view(nl.uint32),
+        data=pre.view(nl.uint32),
+        op0=nl.bitwise_and,
+        operand0=FP4_FIELD2,
+        engine=nisa.engine.vector,
+    )
+    nisa.tensor_tensor(
+        dst=dst,
+        data1=bits.view(nl.bfloat16),
+        data2=scb.view(nl.bfloat16),
+        op=nl.multiply,
+    )
+
+
+def _fp4_scale_rows(s16, srep, n, k):
+    """`srep[r, j] = s[j, r // 8]` — the e8m0 code of the 32-value block that
+    k-pair `r` belongs to, k-major, one byte a pair.
+
+    This exists because of a hardware rule rather than a preference. A
+    transposed `[128 pairs, nc]` weight tile has one scale block spanning eight
+    partitions, so the natural thing is to broadcast each code over its eight
+    partitions in SBUF — and a compute instruction's partition base has to be
+    0, 32, 64 or 96, so writing eight partitions at base 8 fails BIR
+    verification outright:
+
+        Invalid access of 8 partitions starting at partition 8
+
+    A DMA has no such rule, so the replication is done once per GEMM through
+    HBM: `(k/4) * n` bytes written and read back, 2.95 MB and ~15 µs at the
+    live expert shapes, against the 22.5 MiB of transposing weight reads this
+    whole kernel exists to delete. Per `(k-tile, n-chunk)` the k loop then
+    spends one contiguous load and one `tensor_scalar` where the SBUF route
+    would have spent nineteen instructions.
+
+    `srep` is `[k//64, 2, 8, n]`: scale pair, which of its two bytes, and the
+    eight pairs that share the code. Flattened that is exactly the `[k//4, n]`
+    the k loop indexes, because pair `r` carries block `r // 8`.
+    """
+    npair = k // 64
+    tw = _ntile(n)
+    for tb in range(-(-npair // 64)):
+        p0 = tb * 64
+        pn = min(64, npair - p0)
+        sp = nl.ndarray((64, n), dtype=nl.uint16, buffer=nl.sbuf)
+        for q in range(n // tw):
+            nisa.dma_transpose(
+                dst=sp[0:pn, q * tw : (q + 1) * tw],
+                src=s16[q * tw : (q + 1) * tw, p0 : p0 + pn],
+            )
+        spu = sp.view(nl.uint8)
+        for h in range(2):
+            half = nl.ndarray((64, n), dtype=nl.uint8, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=half[0:pn, 0:n], src=spu[0:pn, h : 2 * n : 2])
+            for i in range(8):
+                nl.store(srep[p0 : p0 + pn, h, i, 0:n], value=half[0:pn, 0:n])
+
+
+def _gemm_fp4_fused(x4_hbm, w16, srep, dst_hbm, m, k, n):
+    """`dst[m, n] = x[m, k] @ w[n, k].T` with the fp4 weight decoded in SBUF.
+
+    `w16` is the stored `[n, k//2]` bytes viewed as uint16 and `s16` the
+    `[n, k//32]` e8m0 bytes viewed the same way; both are read by
+    `dma_transpose`, which is why they have to be two bytes wide (its only hard
+    dtype constraint). A transposed weight tile is `[128 pairs, nc]`, so a
+    partition carries four k values and one 32-value scale block spans eight
+    partitions — which is where the scale broadcast disappears to.
+
+    The k loop is outer and PSUM holds every accumulator across it, so each
+    weight tile is read, decoded and consumed once. `k // 4` need not be a
+    multiple of 128: the last tile takes the remainder (`k = 2304`, the MoE
+    intermediate, leaves 64 of 576), and `k % 64 == 0` is all this needs.
+    """
+    kq = k // 4
+    rfull = kq // PT
+    rrem = kq - rfull * PT
+    rtiles = rfull
+    if rrem:
+        rtiles = rfull + 1
+    mtiles = m // PT
+    nt, nc = _fp4_plan(n, mtiles)
+    ntiles = nc // nt
+
+    at = nl.ndarray((PT, 4, rtiles, m), dtype=nl.bfloat16, buffer=nl.sbuf)
+    for mi in range(mtiles):
+        for c in range(4):
+            for rb in range(rtiles):
+                part = PT
+                if rb >= rfull:
+                    part = rrem
+                nisa.dma_transpose(
+                    dst=at[0:part, c, rb, mi * PT : (mi + 1) * PT],
+                    src=x4_hbm[
+                        mi * PT : (mi + 1) * PT, c, rb * PT : rb * PT + part
+                    ],
+                )
+
+    for cb in nl.affine_range(n // nc):
+        accs = []
+        for mi in range(mtiles):
+            row = []
+            for nb in range(ntiles):
+                row.append(nl.ndarray((PT, nt), dtype=nl.float32, buffer=nl.psum))
+            accs.append(row)
+        for rb in range(rtiles):
+            part = PT
+            if rb >= rfull:
+                part = rrem
+            wb = nl.ndarray((PT, nc), dtype=nl.uint16, buffer=nl.sbuf)
+            for q in range(ntiles):
+                lo = cb * nc + q * nt
+                nisa.dma_transpose(
+                    dst=wb[0:part, q * nt : (q + 1) * nt],
+                    src=w16[lo : lo + nt, rb * PT : rb * PT + part],
+                )
+            # `srep` already carries one e8m0 code per k-pair, so the scale
+            # arrives as a plain contiguous load and the whole 32-fold broadcast
+            # `_dequant_fp4` pays for (a 156 µs Vector COPY an execution) is
+            # gone. See `_fp4_scale_rows` for why it has to come from HBM.
+            cod = nl.load(
+                srep[rb * PT : rb * PT + part, cb * nc : (cb + 1) * nc],
+                dtype=nl.uint8,
+            )
+            scb = nl.ndarray((PT, nc), dtype=nl.uint16, buffer=nl.sbuf)
+            nisa.tensor_scalar(
+                dst=scb[0:part, 0:nc],
+                data=cod,
+                op0=nl.multiply,
+                operand0=128.0,
+                op1=nl.add,
+                operand1=float(FP4_EXP_BIAS * 128),
+                engine=nisa.engine.scalar,
+            )
+            for c in range(4):
+                dqf = nl.ndarray((PT, nc), dtype=nl.bfloat16, buffer=nl.sbuf)
+                _fp4_decode_tile(wb, scb, dqf, nc, c)
+                for nb in range(ntiles):
+                    for mi in range(mtiles):
+                        nisa.nc_matmul(
+                            dst=accs[mi][nb],
+                            stationary=at[0:part, c, rb, mi * PT : (mi + 1) * PT],
+                            moving=dqf[0:part, nb * nt : (nb + 1) * nt],
+                            accumulate=(rb > 0 or c > 0),
+                        )
+        for mi in range(mtiles):
+            for nb in range(ntiles):
+                row = nl.ndarray((PT, nt), dtype=nl.bfloat16, buffer=nl.sbuf)
+                nisa.tensor_scalar(
+                    dst=row, data=accs[mi][nb], op0=nl.multiply, operand0=FP4_POST
+                )
+                nl.store(
+                    dst_hbm[
+                        mi * PT : (mi + 1) * PT,
+                        cb * nc + nb * nt : cb * nc + (nb + 1) * nt,
+                    ],
+                    value=row,
+                )
+
+
+@nki.jit
+def fp4_linear_fused(x, w, scale):
+    """`fp4_linear` with the weight transposed as bytes and decoded in SBUF.
+
+    Same stored form, same call signature: `w` is `[n, k//2]` uint8 and `scale`
+    `[n, k//32]` uint8, exactly as the checkpoint has them and exactly as
+    `fp4_linear` takes them, so nothing in the loader or the shard plan moves.
+    The only difference a caller can see is the last bit or two of the result —
+    see the comment above `FP4_NIB_MASK2` for why that is unavoidable here.
+
+    **Faster, measured, and unreachable — and the three facts are not in
+    tension.** Iteration 2 wired this into `nki_linear`, ran the gate's own
+    verifier at four ranks, and got:
+
+    | | `fp4_linear` | this |
+    |---|---|---|
+    | routed-expert engine, **per execution** | 917.2 µs | **623.7** |
+    | — Vector / Scalar / Tensor / GpSimd | 619 / 456 / 293 / 234 | **420 / 412 / 212 / 95** |
+    | `device_step_ms_long` | 394.653 | **354.984** (−10.05%) |
+    | `device_step_ms_short` | 437.103 | **380.864** (−12.87%) |
+    | `device_tpot_ms_short` | 149.129 | **125.461** (−15.87%) |
+    | `device_ttft_ms_long` | 1183 | 1192.560 (+0.81%) |
+    | `device_tpot_ms_long` | 109.626 | 125.962 (**+14.90%**) |
+    | `device_ttft_ms_short` | 779.179 | 830.653 (**+6.61%**) |
+
+    The verifier *passed* with it in (4/4 `REASONABLE`, the needle's access code
+    correct). The two numbers that moved the wrong way did so for reasons that
+    are not speed, both diagnosed in `.autohelix/notes/iter-2.md` §4:
+
+      * `tpot = step / tokens_per_step`, and the divisor fell 3.6 → 2.818
+        because the needle case emitted 32 tokens where the record-holding run
+        emitted 19. The first five decode steps accepted 12 of 25 drafts — the
+        baseline's own rate — so this is EOS placement, not a worse drafter.
+        **To land this kernel the decode pass has to reach 324 ms**
+        (= 115.108 × 2.818), from 355.
+      * `ttft_short` is half a *fully traced* prefill pass, and this kernel
+        emits ~1 261 activity rows an execution where `fp4_linear` emits 2 230.
+        Freeing that much NRT trace budget makes **untouched** graphs get priced
+        more completely: in the same window `69d801c7`'s worst-traced execution
+        went 5 044 → 40 533 rows at an unchanged 15 executions and its measured
+        engine time rose 28%, while `544192c5`, whose coverage did not move,
+        did not move in time either (0.08%).
+
+    So wire it together with the fp8 kernel in the same shape (notes §5.2,
+    worth ~39 ms of scale plumbing a decode step), not on its own.
+    """
+    m, k = x.shape
+    n = w.shape[0]
+    assert w.shape[1] * 2 == k, f"fp4 weight {w.shape} does not pack k={k}"
+    assert k % 64 == 0, f"k={k} must be a multiple of 64 for the uint16 view"
+    _check(k, n)
+    mpad = -(-m // PT) * PT
+
+    out = nl.ndarray((mpad, n), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    x4 = nl.ndarray((mpad, 4, k // 4), dtype=nl.bfloat16, buffer=nl.private_hbm)
+    srep = nl.ndarray((k // 64, 2, 8, n), dtype=nl.uint8, buffer=nl.private_hbm)
+
+    _stage_rows_fp4(x, m, k, x4)
+    _fp4_scale_rows(scale.view(nl.uint16), srep, n, k)
+    _gemm_fp4_fused(
+        x4, w.view(nl.uint16), srep.reshape((k // 4, n)), out, mpad, k, n
+    )
+    return out
+
+
+# =============================================================================
+# fp8, fused — the same trick one size up, and for a different reason
+# =============================================================================
+#
+# `fp8_linear`'s problem is not its DMA. Measured on the baseline decode window
+# (`an3.py`, shared-expert graph `9539a540`, 40 executions, engine 1059.8 µs
+# against a 1124 µs union — so only 64 µs of DMA is even exposed), **601 µs of
+# that engine budget is scale plumbing**, for 11,520 distinct scale values:
+#
+#   | per execution                                           | engine | µs |
+#   |---|---|---|
+#   | `MATMUL` + `LDWEIGHTS` (the floor)                      | Tensor | 326 + 97 |
+#   | the `32 x 32` grid -> a `[128, k]` replica: `left_shift/add` (304 instr), the `view`/`CAST`, and the 32-partition `broadcast_to` that lowers to `STREAM_SHUFFLE` | Sc+Ve+Gp | **445** |
+#   | the 32-fold free-axis `broadcast_to` materializing as a `COPY` | Vector | **156** |
+#   | the scale multiply itself                               | Vector | 156 |
+#   | `_decode_e4m3`: the uint8->uint16 widen, the magnitude shift, the sign `or` | Sc+Ve | 245 + 86 + 156 |
+#
+# `Vector` at 818 µs is what binds. The kernels below delete the 601 µs: the
+# scale arrives as one contiguous byte a partition out of an HBM replica
+# (`_fp8_scale_rows`), and the e4m3 byte is selected by one uint32-wide mask
+# instead of a Scalar multiply by 256 — which lands it exactly where
+# `E4M3_MAG2`/`E4M3_SGN2` already expect it, so `_decode_e4m3`'s other two
+# instructions are reused verbatim.
+#
+# Two k values a partition, so the contraction splits in two (against fp4's
+# four), and as in the fp4 case that makes the result **not bit-exact** against
+# `fp8_linear` — same products, different fp32 order.
+#
+# **Unreachable.** `nki_linear` still dispatches `"fp8"` to `fp8_linear`, for
+# the same reason the fp4 one is unreachable: see `fp4_linear_fused`'s docstring
+# and `.autohelix/notes/iter-2.md` §4. Wire the two together.
+
+#: Select byte 1 of each uint16 lane, in place (signed, as `E4M3_SGN2` is).
+FP8_HI_MASK2 = 0xFF00FF00 - (1 << 32)
+#: Select byte 0 of each uint16 lane; a following `<< 8` moves it to byte 1,
+#: which is where `_decode_e4m3`'s masks expect the e4m3 byte to sit.
+FP8_LO_MASK2 = 0x00FF00FF
+
+
+def _fp8_scale_rows(s16, srep, n, k, ns):
+    """`srep[r, j] = scale[j // 32, r // 16]`, the e8m0 code of the `32 x 32`
+    block that k-pair `r` and output `j` belong to, k-major, one byte a pair.
+
+    The fp8 grid is blocked on *both* axes, which is the only thing harder here
+    than in `_fp4_scale_rows`: a code has to be replicated 16x along k (one
+    scale block is 32 k = 16 pairs) and 32x along n. The k replication goes
+    through HBM because a compute instruction's SBUF partition base must be 0,
+    32, 64 or 96 and 16-partition groups at base 16 are illegal; the n
+    replication is a free stride-0 `broadcast_to` on the free axis.
+
+    `s16` is `scale.view(nl.uint16)`, i.e. `[ns, kb/2]` with two k-blocks a
+    uint16, and `srep` is `[kb/2, 2, 16, n]` — scale pair, which of its two
+    bytes, and the 16 k-pairs that share the code — which flattens to exactly
+    the `[k/2, n]` the k loop indexes.
+
+    **Validated on device**, bit-exact against
+    `scale[j // 32, r // 16]` at `(n, k)` = (2304, 5120), (5120, 2304) and
+    (8192, 1280): 0 of 5.9M / 5.9M / 5.2M bytes differ (`/tmp/it2/fp8scale.py`).
+    """
+    npair = (k // 32) // 2
+    tw = _ntile(ns)
+    for tb in range(-(-npair // 64)):
+        p0 = tb * 64
+        pn = min(64, npair - p0)
+        sp = nl.ndarray((64, ns), dtype=nl.uint16, buffer=nl.sbuf)
+        for q in range(ns // tw):
+            nisa.dma_transpose(
+                dst=sp[0:pn, q * tw : (q + 1) * tw],
+                src=s16[q * tw : (q + 1) * tw, p0 : p0 + pn],
+            )
+        spu = sp.view(nl.uint8)
+        dei = nl.ndarray((PT, ns), dtype=nl.uint8, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=dei[0:pn, 0:ns], src=spu[0:pn, 0 : 2 * ns : 2])
+        nisa.tensor_copy(dst=dei[64 : 64 + pn, 0:ns], src=spu[0:pn, 1 : 2 * ns : 2])
+        for h in range(2):
+            rep = nl.ndarray((PT, ns, 32), dtype=nl.uint8, buffer=nl.sbuf)
+            nisa.tensor_copy(
+                dst=rep[0:pn, 0:ns, 0:32],
+                src=nl.broadcast_to(
+                    dei[h * 64 : h * 64 + pn, 0:ns].reshape((pn, ns, 1)),
+                    (pn, ns, 32),
+                ),
+            )
+            flat = rep.reshape((PT, ns * 32))
+            for i in range(16):
+                nl.store(srep[p0 : p0 + pn, h, i, 0:n], value=flat[0:pn, 0:n])
+
+
+def _stage_rows_fp8k(x, m, k, dst_hbm, quantize):
+    """`_stage_rows` with the k axis split by `k % 2`.
+
+    Writes `dst[j, c, r] = xq[j, 2r + c]`, so the activation tile that pairs
+    with byte `c` of a transposed uint16 weight pair is a contiguous
+    `[128, 128]` block of HBM.
+    """
+    kh = k // 2
+    full = m // PT
+    tail = m - full * PT
+    for mb in nl.affine_range(full):
+        tile = nl.load(x[mb * PT : (mb + 1) * PT, 0:k], dtype=nl.bfloat16)
+        if quantize:
+            tile = _qdq_fp8(tile, PT, k)
+        blocked = tile.reshape((PT, kh, 2))
+        half = nl.ndarray((PT, kh), dtype=nl.bfloat16, buffer=nl.sbuf)
+        for c in range(2):
+            nisa.tensor_copy(dst=half, src=blocked[0:PT, 0:kh, c])
+            nl.store(dst_hbm[mb * PT : (mb + 1) * PT, c, 0:kh], value=half)
+    if tail:
+        padded = nl.ndarray((PT, k), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.memset(padded, 0.0)
+        nisa.tensor_copy(
+            dst=padded[0:tail, 0:k],
+            src=nl.load(x[full * PT : full * PT + tail, 0:k], dtype=nl.bfloat16),
+        )
+        tile = _qdq_fp8(padded, PT, k) if quantize else padded
+        blocked = tile.reshape((PT, kh, 2))
+        half = nl.ndarray((PT, kh), dtype=nl.bfloat16, buffer=nl.sbuf)
+        for c in range(2):
+            nisa.tensor_copy(dst=half, src=blocked[0:PT, 0:kh, c])
+            nl.store(dst_hbm[full * PT : (full + 1) * PT, c, 0:kh], value=half)
+
+
+def _fp8_decode_tile(wb, scb, dst, nc, c):
+    """Byte `c` of every packed pair in `wb[*, nc]`, dequantized into `dst`.
+
+    Four instructions, and the middle two are `_decode_e4m3`'s own: the mask
+    that selects the byte also leaves it in bits 8..15 of its uint16 lane,
+    which is precisely the position `_decode_e4m3` gets by multiplying a uint8
+    by 256 on the Scalar engine — 245 µs an execution that this replaces with a
+    32-bit Vector op.
+    """
+    t = nl.ndarray((PT, nc), dtype=nl.uint16, buffer=nl.sbuf)
+    if c:
+        nisa.tensor_scalar(
+            dst=t.view(nl.uint32), data=wb.view(nl.uint32),
+            op0=nl.bitwise_and, operand0=FP8_HI_MASK2, engine=nisa.engine.vector,
+        )
+    else:
+        nisa.tensor_scalar(
+            dst=t.view(nl.uint32), data=wb.view(nl.uint32),
+            op0=nl.bitwise_and, operand0=FP8_LO_MASK2,
+            op1=nl.left_shift, operand1=8, engine=nisa.engine.vector,
+        )
+    hi = nl.ndarray((PT, nc), dtype=nl.uint16, buffer=nl.sbuf)
+    nisa.tensor_scalar(
+        dst=hi.view(nl.uint32), data=t.view(nl.uint32),
+        op0=nl.bitwise_and, operand0=E4M3_MAG2,
+        op1=nl.right_shift, operand1=4, engine=nisa.engine.vector,
+    )
+    bits = nl.ndarray((PT, nc), dtype=nl.uint16, buffer=nl.sbuf)
+    nisa.scalar_tensor_tensor(
+        dst=bits.view(nl.uint32), data=t.view(nl.uint32),
+        op0=nl.bitwise_and, operand0=E4M3_SGN2,
+        op1=nl.bitwise_or, operand1=hi.view(nl.uint32),
+    )
+    nisa.tensor_tensor(
+        dst=dst, data1=bits.view(nl.bfloat16), data2=scb.view(nl.bfloat16),
+        op=nl.multiply,
+    )
+
+
+#: SBUF a partition may spend on the resident activation tiles of the fused fp8
+#: GEMM (`2 * rtiles * m * 2` bytes). The MTP input projection, `k = 15360`, is
+#: 60 k-pair tiles and so needs 30 KiB at `m = 128` and 120 KiB at `m = 512` —
+#: the second does not fit beside the decode tiles, and the fix is an outer
+#: m-group loop that re-reads the weight per group, which is not written. Until
+#: it is, `fp8_linear_fused` asserts and the caller dispatches by shape.
+_FP8_AT_BYTES = 64 * 1024
+
+
+def _gemm_fp8_tfused(x2_hbm, w16, srep, dst_hbm, m, k, n):
+    """`dst[m, n] = x[m, k] @ w[n, k].T` with the fp8 weight decoded in SBUF.
+
+    `_gemm_fp4_fused` with two lanes instead of four: `w16` is the stored
+    `[n, k]` e4m3 bytes viewed as uint16, so a transposed `[128, nc]` tile puts
+    one *pair* of k values on each partition and the contraction is two
+    interleaved chains. `srep` is `_fp8_scale_rows`' `[k/2, n]` replica.
+    """
+    kh = k // 2
+    rfull = kh // PT
+    rrem = kh - rfull * PT
+    rtiles = rfull
+    if rrem:
+        rtiles = rfull + 1
+    mtiles = m // PT
+    nt, nc = _fp4_plan(n, mtiles)
+    ntiles = nc // nt
+    assert 2 * rtiles * m * 2 <= _FP8_AT_BYTES, (
+        f"activation tiles are {2 * rtiles * m * 2} bytes a partition for "
+        f"k={k} m={m}; see _FP8_AT_BYTES"
+    )
+
+    at = nl.ndarray((PT, 2, rtiles, m), dtype=nl.bfloat16, buffer=nl.sbuf)
+    for mi in range(mtiles):
+        for c in range(2):
+            for rb in range(rtiles):
+                part = PT
+                if rb >= rfull:
+                    part = rrem
+                nisa.dma_transpose(
+                    dst=at[0:part, c, rb, mi * PT : (mi + 1) * PT],
+                    src=x2_hbm[mi * PT : (mi + 1) * PT, c, rb * PT : rb * PT + part],
+                )
+
+    for cb in nl.affine_range(n // nc):
+        accs = []
+        for mi in range(mtiles):
+            row = []
+            for nb in range(ntiles):
+                row.append(nl.ndarray((PT, nt), dtype=nl.float32, buffer=nl.psum))
+            accs.append(row)
+        for rb in range(rtiles):
+            part = PT
+            if rb >= rfull:
+                part = rrem
+            wb = nl.ndarray((PT, nc), dtype=nl.uint16, buffer=nl.sbuf)
+            for q in range(ntiles):
+                lo = cb * nc + q * nt
+                nisa.dma_transpose(
+                    dst=wb[0:part, q * nt : (q + 1) * nt],
+                    src=w16[lo : lo + nt, rb * PT : rb * PT + part],
+                )
+            cod = nl.load(
+                srep[rb * PT : rb * PT + part, cb * nc : (cb + 1) * nc],
+                dtype=nl.uint8,
+            )
+            scb = nl.ndarray((PT, nc), dtype=nl.uint16, buffer=nl.sbuf)
+            nisa.tensor_scalar(
+                dst=scb[0:part, 0:nc], data=cod,
+                op0=nl.multiply, operand0=128.0,
+                op1=nl.add, operand1=float(SC_EXP_ADD * 128),
+                engine=nisa.engine.scalar,
+            )
+            for c in range(2):
+                dqf = nl.ndarray((PT, nc), dtype=nl.bfloat16, buffer=nl.sbuf)
+                _fp8_decode_tile(wb, scb, dqf, nc, c)
+                for nb in range(ntiles):
+                    for mi in range(mtiles):
+                        nisa.nc_matmul(
+                            dst=accs[mi][nb],
+                            stationary=at[0:part, c, rb, mi * PT : (mi + 1) * PT],
+                            moving=dqf[0:part, nb * nt : (nb + 1) * nt],
+                            accumulate=(rb > 0 or c > 0),
+                        )
+        for mi in range(mtiles):
+            for nb in range(ntiles):
+                nl.store(
+                    dst_hbm[
+                        mi * PT : (mi + 1) * PT,
+                        cb * nc + nb * nt : cb * nc + (nb + 1) * nt,
+                    ],
+                    value=nl.copy(accs[mi][nb], dtype=nl.bfloat16),
+                )
+
+
+@nki.jit
+def fp8_linear_tfused(x, w, scale, quantize=True):
+    """`fp8_linear` with the weight transposed as bytes and decoded in SBUF.
+
+    Same stored form and same signature as `fp8_linear` / `fp8_linear_raw`:
+    `w` is `[n, k]` uint8 e4m3 and `scale` the `[ceil(n/32), ceil(k/32)]` e8m0
+    grid, so nothing in the loader or the shard plan moves. `quantize=False` is
+    `fp8_linear_raw`'s behaviour, for the block-diagonal `wo_a`.
+
+    **Unreachable, and validated for correctness but never timed end to end.**
+    The model has **355 fp8 linears in 10 distinct `(k, n)`**
+    (`/tmp/it2/fp8shapes.py` enumerates them off-device from a `meta` build),
+    and on device against a float64 emulation of `_qdq_fp8` + the e4m3 decode
+    (`/tmp/it2/dev8*.py`) **all ten agree to 1.9-3.4e-3 relative**:
+
+    | k | n | count | what | max relative |
+    |---|---|---|---|---|
+    | 5120 | 2304 | 86 | shared expert `w1`/`w3` | 1.9e-3 |
+    | 1280 | 8192 | 43 | `wq_b` | 2.7e-3 |
+    | 2048 | 5120 | 43 | `wo_b` | 2.1e-3 (at m=512) |
+    | 2304 | 5120 | 43 | shared expert `w2` | 2.3e-3 |
+    | 4096 | 2048 | 43 | | 2.0e-3 |
+    | 5120 | 512 | 43 | | 3.4e-3 |
+    | 5120 | 1280 | 43 | (`nt = 320`) | 2.0e-3 |
+    | 1280 | 1024 | 8 | | 3.1e-3 |
+    | 6144 | 25600 | 2 | the engram `wkv`, widest `n` | 3.0e-3 |
+    | 15360 | 5120 | 1 | the MTP input projection | 2.2e-3 (m=128); **asserts at m=512** |
+
+    plus `m = 130` (a row-pad tail), `m = 256` (two m-tiles) and
+    `quantize=False` (the `wo_a` path, 3.3e-3).
+
+    3.4e-3 is the bf16 output quantum (2**-8 = 3.9e-3), so this is as close to
+    `fp8_linear` as the dtype allows. The *exact* comparison cannot be made
+    either way, and it is worth knowing why: `nki.simulate` cannot run
+    `_decode_e4m3` at all (`OverflowError: Python integer -2147450880 out of
+    bounds for uint32` on the signed `E4M3_SGN2` operand inside
+    `scalar_tensor_tensor_bitvec`), and the standalone device entry point
+    rejects `_gemm`'s closures, so neither instrument can host the reference.
+
+    What is **not** established: any speed number. And `k = 15360` at a 512-row
+    prefill width asserts (122 880 bytes of activation tiles a partition), which
+    is **one** linear of 355 — dispatch that call site to `fp8_linear` rather
+    than writing the outer m-group loop, because a loop there would re-read and
+    re-decode the weight once per m-group and 4x the decode is worse than the
+    scratch it would be avoiding.
+    """
+    m, k = x.shape
+    n = w.shape[0]
+    assert w.shape[1] == k, f"fp8 weight {w.shape} is not [n, k] for k={k}"
+    assert k % 64 == 0, f"k={k} must be a multiple of 64"
+    assert n % BLK == 0, f"n={n} must be a multiple of {BLK}"
+    _check(k, n)
+    mpad = -(-m // PT) * PT
+    ns = -(-n // BLK)
+
+    out = nl.ndarray((mpad, n), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    x2 = nl.ndarray((mpad, 2, k // 2), dtype=nl.bfloat16, buffer=nl.private_hbm)
+    srep = nl.ndarray((k // 64, 2, 16, n), dtype=nl.uint8, buffer=nl.private_hbm)
+
+    _stage_rows_fp8k(x, m, k, x2, quantize)
+    _fp8_scale_rows(scale.view(nl.uint16), srep, n, k, ns)
+    _gemm_fp8_tfused(
+        x2, w.view(nl.uint16), srep.reshape((k // 2, n)), out, mpad, k, n
+    )
+    return out
+
+
 @nki.jit
 def fp32w_linear(x, w):
     """`x[m, k] @ w[n, k].T` where `w` is stored **fp32**, narrowed in-kernel.
