@@ -22,7 +22,7 @@ aggregate:
 
     legacy kernel        what it is                  where its arithmetic runs now
     --------------------------------------------------------------------------------
-    l2_attn.py           `layers.2.attention`,       sparse_attn.gathered_attn
+    l2_attn.py           `layers.2.attention`,       sparse_attn.gathered_attn_idx
     l3_attn.py           `layers.3.attention`,       (the attention proper),
     l20_attn.py          `layers.20.attention`,      blockquant.{fp8,bf16}_linear
     l21_attn.py          `layers.21.attention`,      (every projection, lifted

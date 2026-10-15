@@ -1122,6 +1122,12 @@ _ATTN_QUERY_TILE = 512
 #: slots, which costs arithmetic but nothing in accuracy.
 _ATTN_SLOT_TILE = 128
 
+#: Mirrors `kernels/sparse_attn.BIAS_PAD`: how many fp32 columns of the bias row
+#: come before the bias proper, carrying `softmax_scale`. Kept here as a literal
+#: rather than imported because `sparse_attn` runs inside a dynamo trace and the
+#: import machinery is not traceable (see `_nki_entry`).
+_ATTN_BIAS_PAD = 16
+
 #: Bucket for the compressed-KV and index-key reads. `compress_len` grows with
 #: the decode position and is a tensor *shape*, so reading exactly that many
 #: groups makes every layer recompile once per token. Rounding the read up to a
@@ -1677,20 +1683,32 @@ def sparse_attn(
     `sparse_attn`, transcribed from the torch equivalent the partition artifact
     ships as `compat/sparse_attn_sm89.py`.
 
-    **The query axis is tiled, and it has to be.** The gather is per query, so
-    one `kv[batch, topk_idxs]` over a whole prefill materializes
-    `[1, 8192, 640, 512]` bf16 = 5.4 GiB of activations for a single layer —
-    which no device here has room for, and which earlier component checks never
-    hit because they only ever ran 128-token prompts. Tiling bounds it at 84 MiB
-    and changes nothing numerically: every tile is an independent set of rows
-    with its own softmax.
+    **The gather is inside the kernel.** `kernels/sparse_attn.gathered_attn_idx`
+    takes `kv` and the slot ids and reads `kv[idx]` itself, by indirect DMA
+    straight into SBUF. Until iteration 4 this function materialized
+    `gathered = kv[batch, idxs]` — `[1, 512, 640, 512]` bf16, **320 MiB per
+    layer per forward** out of a 1.7 MiB table — wrote it to HBM, masked it
+    (two more passes), and the kernel then read it back twice, once transposed
+    for the score product and once in natural layout for the value product.
+    Iteration 3's profile measured that expression at 73% of the instruction
+    time of the largest per-layer prefill graph. Gathering in the kernel leaves
+    one read of those bytes instead of six, and it is **bit-exact**: the only
+    difference is that an empty slot's row is read rather than zeroed, and a
+    -1e30 bias makes that row's contribution exactly zero either way (the
+    kernel's docstring carries the fp32 argument).
 
-    **The arithmetic is `kernels/sparse_attn.gathered_attn`** — the QK score,
-    the masked softmax with the per-head sink, and the probability-weighted sum.
-    What is left here is the gather itself (`kv[batch, idxs]`, data movement),
-    the comparison that builds the mask, and the padding of the slot list to the
-    kernel's 128-slot granularity. Padding with *empty* slots is free, because
-    an empty slot's bias removes it from the softmax.
+    **The query axis is still tiled**, now for the compiler rather than for
+    HBM: the loop is a Python `range` that dynamo unrolls, and 512 keeps the
+    per-layer graph at 16 copies of (mask, kernel call) rather than 64. It
+    changes nothing numerically — every tile is an independent set of rows with
+    its own softmax.
+
+    **The arithmetic is `kernels/sparse_attn.gathered_attn_idx`** — the gather,
+    the QK score, the masked softmax with the per-head sink, and the
+    probability-weighted sum. What is left here is the comparison that builds
+    the mask, the clamp of the empty sentinel, and the padding of the slot list
+    to the kernel's 128-slot granularity. Padding with *empty* slots is free,
+    because an empty slot's bias removes it from the softmax.
 
     Where the precision is deliberate — see the kernel's module docstring for
     which instruction does which:
@@ -1727,16 +1745,17 @@ def sparse_attn(
 
     kpad = -(-topk // _ATTN_SLOT_TILE) * _ATTN_SLOT_TILE
     sink = attn_sink.float().reshape(h, 1)
-    scale = q.new_full((1, 1), softmax_scale, dtype=torch.float32)
-    batch = torch.arange(b, device=kv.device).view(b, 1, 1)
+    assert b == 1, (
+        f"sparse_attn gathers from kv[{b}, n, d]; the kernel takes one table, "
+        "and every producer in this model (`Attention._window_kv`, "
+        "`DSparkAttention.forward`) reshapes to a leading 1"
+    )
     for lo in range(0, s, _ATTN_QUERY_TILE):
         hi = min(lo + _ATTN_QUERY_TILE, s)
         t = hi - lo
-        idxs = topk_idxs[:, lo:hi].long()
+        idxs = topk_idxs[:, lo:hi]
         empty = idxs == EMPTY_SLOT
 
-        gathered = kv[batch, idxs.clamp_min(0)]
-        gathered = gathered.masked_fill(empty.unsqueeze(-1), 0)
         # `empty.float() * _NEG_BOUND`, not `torch.where(empty, _NEG_BOUND,
         # 0.0)`. A `where` whose both branches are Python scalars has no tensor
         # operand to take a dtype from, so it comes out **f64** — which traces
@@ -1749,24 +1768,36 @@ def sparse_attn(
         # already in the graph. The multiply anchors the dtype on a tensor and
         # is exact: a live slot gives `0.0 * -1e30`, an empty one `-1e30`.
         bias = empty.float() * _NEG_BOUND
+        # An empty slot's index is `-1`; the gather inside the kernel is an
+        # indirect DMA whose default out-of-bounds mode *raises*, so the
+        # sentinel is clamped here. Which row an empty slot reads cannot matter:
+        # its bias is -1e30, so its probability is exactly 0 and the row leaves
+        # the softmax — see `kernels/sparse_attn.gathered_attn_idx` for the
+        # bit-exactness argument.
+        gidx = idxs.clamp_min(0).int()
         if kpad != topk:
             # Both widths the model actually produces are multiples of 128 —
             # `sliding_window` and `sliding_window + index_topk` — so this
-            # branch is for a config that changes one of them.
-            gathered = torch.cat(
-                [gathered, gathered.new_zeros(b, t, kpad - topk, d)], dim=2
-            )
+            # branch is for a config that changes one of them. The pad slots
+            # read row 0 and are masked out of the softmax.
+            gidx = torch.cat([gidx, gidx.new_zeros(b, t, kpad - topk)], dim=2)
             bias = torch.cat(
                 [bias, bias.new_full((b, t, kpad - topk), _NEG_BOUND)], dim=2
             )
+        # The softmax scale rides in column 0 of the bias row rather than as its
+        # own operand, so that the kernel's two SBUF operands are slices of one
+        # tile; `kernels/sparse_attn.BIAS_PAD` is why that matters.
+        bias = torch.cat(
+            [bias.new_full((b, t, _ATTN_BIAS_PAD), softmax_scale), bias], dim=2
+        )
 
         tiles.append(
-            _nki_entry("sparse_attn", "gathered_attn")(
+            _nki_entry("sparse_attn", "gathered_attn_idx")(
                 q[:, lo:hi].reshape(-1, d),
-                gathered.reshape(-1, d),
-                bias.reshape(-1, kpad),
+                kv.reshape(n, d),
+                gidx.reshape(-1, kpad),
+                bias.reshape(-1, _ATTN_BIAS_PAD + kpad),
                 sink,
-                scale,
             ).reshape(b, t, h, d)
         )
     return tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=1)

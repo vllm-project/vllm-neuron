@@ -37,8 +37,9 @@ directly). Line numbers are from the revision that added this table.
     MLA attention: Q/O low-rank
       and latent KV projections  blockquant.fp8_linear        BlockQuantLinear.forward
                                                               -> nki_linear:673-680
-    attention score + softmax
-      + weighted sum             sparse_attn.gathered_attn    sparse_attn:1614
+    sparse attention: the slot
+      gather, score, softmax
+      + weighted sum             sparse_attn.gathered_attn_idx sparse_attn:1795
     indexer score                index_score.weighted_scores  Indexer.forward:2112
     KV compression pooling       compress_pool.softmax_pool   Compressor.forward:1962
     every RMSNorm                rmsnorm.rms_norm             RMSNorm.forward:306
