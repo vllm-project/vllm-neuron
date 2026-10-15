@@ -27,12 +27,13 @@ python examples/vllm_neuron/models/hy_v4/run.py --model <dir>/Hy4-preview-neuron
     --needle 30000
 ```
 
-Cold start compiles two graphs; at 32K context the prefill one takes **~50-85 min**
-at `-O1`. `run.py` raises vLLM's `distributed_timeout_seconds` (and the CPU
+Cold start compiles two graphs; at 32K context the prefill one takes **~35 min**
+at `-O1` (decode ~2 min). `run.py` raises vLLM's `distributed_timeout_seconds` (and the CPU
 group's) to 4 h because the other 63 ranks wait for rank 0's compile in a gloo
-barrier whose default timeout is 3600 s -- at the default, every cold 32K start
-dies with `RuntimeError: Operation timed out!` on all ranks at the hour mark.
-Set `NEURON_RT_EXEC_TIMEOUT=1200` too: a 32K prefill chunk takes ~150 s (see
+barrier whose default timeout is 3600 s -- an intermediate build's prefill graph
+took 85 min, and every rank died with `RuntimeError: Operation timed out!` at
+the hour mark.
+Set `NEURON_RT_EXEC_TIMEOUT=1200` too: a 32K prefill chunk takes ~55 s (see
 *Known limitations*), over the runtime's default execution timeout, which
 otherwise surfaces as `TOPSP missing collectives status` / `NRT_TIMEOUT`. While
 a chunk runs, `neuron-monitor` shows ~0% core utilisation and every worker sits
@@ -67,8 +68,8 @@ otherwise the previous trace is compiled again.
 
 | prompt | prefill chunks | output | wall time |
 |---|---|---|---|
-| 1,732 tokens | 1 | `' 71432. I have memorized it.\n\nThe pass key is **71432**.\n\nI have memorized it.\n\nThe pass key is **'` | 187 s |
-| 28,804 tokens | 15 | `' 71432. Remember it. 71432 is the pass key.\nThe grass is green. The sky is blue. The sun is yellow. Here'` | 2306 s |
+| 1,732 tokens | 1 | `' 71432. I have memorized it.\n\nThe pass key is **71432**.\n\nI have memorized it.\n\nThe pass key is **'` | 136 s |
+| 28,804 tokens | 15 | `' 71432. I have memorized it.\n\nThe pass key is **71432**. I have memorized it.\n\nThe pass key is **714'` | 825 s |
 
 KV cache 40,384 tokens at `--gpu-memory-utilization 0.8` (704 values x 78 layers
 per token, replicated on every rank); weights 15.08 GiB of each core's 24.
@@ -145,24 +146,27 @@ must be one of 512/1024/2048/4096/8192.
 
 ## Known limitations
 
-* **Prefill is slow: ~150 s per 2048-token chunk at 32K** (2306 s for the 28.8K
+* **Prefill is slow: ~55 s per 2048-token chunk at 32K** (825 s for the 28.8K
   needle). Every chunk attends to (and every full layer's indexer scores) the
   whole 32K cache span, because the graph is static: `[2048, 34816]` scores per
-  layer, 78 times. It was ~55 s per chunk before the miscompile workaround below:
-  dropping the context mask doubled the prefill graph (284K -> 596K
-  instructions per subgraph) and nearly tripled its run time. The same graph is
-  why cold compiles take 50-85 min. Bucketing the prefix length, and a real
-  sparse gather instead of a masked dense attention, are next.
+  layer, 78 times. Bucketing the prefix length, and a real sparse gather
+  instead of a masked dense attention, are next.
+* **Zeroing the gathered context is a 2.8x speed matter, not a correctness
+  one.** Keys beyond the prefix are masked out of the scores either way, but a
+  build that left the context unmasked ran ~150 s per chunk (2306 s for the
+  same needle) with a prefill graph twice the size (596K vs 284K instructions
+  per subgraph) and an 85 min compile. Why is not understood.
 * **Context is 32K, not 1M.** The latent cache is replicated on every rank, so
   KV capacity (40K tokens at gmu 0.8) is per rank, not per instance.
 * **A neuronx-cc miscompile is worked around, not fixed.** In decode, masking
   the gathered `[rows, 32K, 704]` context with `in_prefix` (by `where` or by a
-  multiply) made the device compute `in_prefix` *itself* wrongly -- extra keys in
-  128-key blocks past the prefix, even on a dead row at position 0 -- so every
-  decode at 32K attended to the wrong keys while the first token (from prefill)
-  was right. The same ops compiled alone, and the CPU, are correct. The model no
-  longer masks the context (it masks the scores, which is sufficient: every byte
-  in this model's single KV group is a finite entry it wrote).
+  multiply) made the device compute `in_prefix` *itself* wrongly wherever it was
+  reused -- extra keys in 128-key blocks past the prefix, even on a dead row at
+  position 0 -- so every decode at 32K attended to the wrong keys while the first
+  token (from prefill) was right. The same ops compiled alone, and the CPU, are
+  correct. `_zero_beyond` masks the context with a *separately computed*
+  predicate (a float subtraction), which compiles correctly; checked on device
+  in a standalone graph of the decode attention chain before it went in.
 * **RoPE pairing: interleaved, and transformers disagrees.** vLLM's and SGLang's
   Hy4 ports rotate interleaved pairs; transformers' `hy_v4` rotates halves.
   Measured on device with the same weights, `HY4_ROPE_STYLE=neox` degrades

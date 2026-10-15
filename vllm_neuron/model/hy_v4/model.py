@@ -260,6 +260,35 @@ def select_topk(scores: torch.Tensor, visible: torch.Tensor, k: int) -> torch.Te
     return visible & (s >= lo)
 
 
+def _zero_beyond(ctx: torch.Tensor, limit: torch.Tensor) -> torch.Tensor:
+    """Zero the gathered cache entries at positions ``>= limit`` (per row).
+
+    Not needed for correctness -- those keys are masked out of the scores, and
+    this model's single KV group only ever holds finite entries -- but in the
+    one build without it the 32K prefill was ~2.7x slower (150 s vs 55 s per
+    chunk) and its graph twice the size (596K vs 284K instructions per
+    subgraph). Why is not understood; the masked build is the measured one.
+
+    The predicate here is computed *separately* from ``in_prefix`` (float
+    subtraction, not the integer compare) on purpose. Applying ``in_prefix``
+    itself to the ``[rows, 32K, 704]`` context made neuronx-cc 2.27 compute
+    ``in_prefix`` wrongly wherever it was reused -- 128-key blocks set past the
+    prefix, even on a dead row at position 0 -- so every 32K decode attended
+    to the wrong keys while the CPU, and the same ops compiled separately,
+    were right. A second, independent predicate compiles correctly (checked
+    on device in a standalone graph of the decode attention chain).
+    """
+    rows = ctx.shape[0] if ctx.dim() == 3 else 1
+    ctx_len = ctx.shape[-2]
+    positions = torch.arange(ctx_len, device=ctx.device, dtype=torch.float32)
+    # A tensor threshold: comparing against a Python float lowers to an f64
+    # constant, which neuronx-cc rejects (NCC_ESPP004).
+    half = torch.full((1, 1), 0.5, dtype=torch.float32, device=ctx.device)
+    keep = (limit.float().view(rows, 1) - positions.view(1, ctx_len)) > half
+    keep = keep.to(ctx.dtype)
+    return ctx * (keep.unsqueeze(-1) if ctx.dim() == 3 else keep.view(ctx_len, 1))
+
+
 class HYV4Indexer(nn.Module):
     """DSA lightning indexer: scores every visible key, the top ``index_topk`` attend.
 
@@ -684,15 +713,7 @@ class HYV4Attention(nn.Module):
         ctx = self._gather(block_table, live)[0]  # [ctx_len, 704]
         ctx_len = ctx.shape[0]
         in_prefix = torch.arange(ctx_len, device=x.device).view(1, ctx_len) < prior
-        # No masking of ``ctx`` itself: keys outside the prefix are excluded by
-        # ``visible`` (from the DSA selection and the softmax alike), and every
-        # byte this model's single KV group holds is a finite entry it wrote
-        # (or the zero page), so a probability of exactly 0 times one is 0.
-        # Masking it was also *wrong on device*: a ``where``/multiply of the
-        # [rows, 32K, 704] context by ``in_prefix`` makes neuronx-cc compute
-        # ``in_prefix`` itself wrongly (128-key blocks set past the prefix),
-        # which at 32K context turned every decode into garbage while the
-        # same ops compiled separately, and the CPU, were right.
+        ctx = _zero_beyond(ctx, prior.reshape(1, 1))
 
         keys = torch.cat((ctx, entry.to(ctx.dtype)), dim=0)  # [K, 704]
         causal = torch.ones(chunk, chunk, dtype=torch.bool, device=x.device).tril()
@@ -740,15 +761,7 @@ class HYV4Attention(nn.Module):
         ctx_len = ctx.shape[1]
         key_positions = torch.arange(ctx_len, device=x.device).view(1, ctx_len)
         in_prefix = key_positions < positions.view(num_reqs, 1)  # [reqs, ctx_len]
-        # No masking of ``ctx`` itself: keys outside the prefix are excluded by
-        # ``visible`` (from the DSA selection and the softmax alike), and every
-        # byte this model's single KV group holds is a finite entry it wrote
-        # (or the zero page), so a probability of exactly 0 times one is 0.
-        # Masking it was also *wrong on device*: a ``where``/multiply of the
-        # [rows, 32K, 704] context by ``in_prefix`` makes neuronx-cc compute
-        # ``in_prefix`` itself wrongly (128-key blocks set past the prefix),
-        # which at 32K context turned every decode into garbage while the
-        # same ops compiled separately, and the CPU, were right.
+        ctx = _zero_beyond(ctx, positions.view(num_reqs, 1))
 
         keys = torch.cat(
             (ctx, entry.to(ctx.dtype).unsqueeze(1)), dim=1
