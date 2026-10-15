@@ -655,6 +655,53 @@ def _merge(starts, ends):
     return s[idx], np.maximum.reduceat(e, idx)
 
 
+def _traced_fraction(dest: Path, lo: int, hi: int, executions: int) -> float | None:
+    """What share of a pass's executions the instruction trace actually covered.
+
+    **Reported, never charged.** The NRT instruction trace is bounded: measured
+    on one real prefill window, the first 554 executions of the per-layer graph
+    carry ~5 100 instructions each and every one after carries a 362-424
+    instruction skeleton, while their wall spans stay identical (1.23 ms median
+    in all three passes). `ActiveTime` is built by merging instruction intervals,
+    so it thins out with the trace — 1 023 activity rows an execution before the
+    cutoff, 359-368 after — and a pass priced from what was traced therefore
+    reads low once the window outruns the budget: 1 171 ms for the first pass of
+    a window against 300 ms for the second, for the same 512 rows of work.
+
+    The metric deliberately stays the *measured* union of compute, DMA and
+    collective time, so this number is here to make that effect visible rather
+    than to correct it. Two things it is good for: a pass at a few percent is
+    mostly untraced and its absolute value means little (the relative one is
+    still reproducible to ~1%), and a change in coverage *between* iterations is
+    a warning that two numbers are not comparable — fusing kernels cuts the
+    execution count, which moves coverage, which moves the figure for a reason
+    that is not speed.
+
+    `None` means there is no instruction table to judge coverage from.
+    """
+    import numpy as np
+
+    try:
+        import pyarrow.parquet as pq
+
+        t = pq.read_table(dest / "Instruction.parquet", columns=["start_ts"])
+    except Exception:  # noqa: BLE001 - no table, no coverage signal
+        return None
+    if not executions:
+        return None
+    i_s = t.column("start_ts").to_numpy(zero_copy_only=False).astype("int64")
+    inpass = int(((i_s >= lo) & (i_s < hi)).sum())
+    # A fully traced execution of the heavy graph runs ~5 100 instructions; the
+    # skeleton is ~363. Coverage is where this pass's average sits between them.
+    return min(1.0, (inpass / executions) / _FULL_TRACE_INSTRUCTIONS)
+
+
+#: Instructions in a fully traced execution of the per-layer graph, measured.
+#: Only the scale matters here: it turns instructions-per-execution into a
+#: fraction that reads 1.0 when everything was traced.
+_FULL_TRACE_INSTRUCTIONS = 5100.0
+
+
 def _covered(starts, ends, lo: int, hi: int) -> int:
     """How much of `[lo, hi)` the disjoint intervals cover."""
     import numpy as np
@@ -751,6 +798,9 @@ class Pass:
     dma_ns: int               # within-device transfer only
     collective_ns: int        # what the collectives actually transferred
     busy_ns: int              # sum of execution spans — the old, contaminated number
+    #: Share of this pass's executions the instruction trace covered. Reported,
+    #: never charged — see `_traced_fraction` for what it is good for.
+    traced_fraction: float | None = None
 
     @property
     def utilisation(self) -> float:
@@ -768,6 +818,7 @@ class Pass:
             "dma_ms": self.dma_ns / 1e6,
             "collective_ms": self.collective_ns / 1e6,
             "utilisation": self.utilisation,
+            "traced_fraction": self.traced_fraction,
             "span_sum_ms": self.busy_ns / 1e6,
             "span_ms": self.span_ns / 1e6,
         }
@@ -843,6 +894,7 @@ def passes_from_ingest(dest: Path, num_layers: int = _LAYERS_FALLBACK) -> tuple[
                 dma_ns=_covered(*activity.dma, start, end),
                 collective_ns=_covered(*activity.collective, start, end),
                 busy_ns=sum(b - a for a, b, _ in segment),
+                traced_fraction=_traced_fraction(dest, start, end, len(segment)),
             )
         )
     return out, notes

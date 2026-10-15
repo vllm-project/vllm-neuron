@@ -362,14 +362,18 @@ def _measure_phase(llm, phase: dict, out: dict, profile_dir: Path) -> dict:
 
     one_token = SamplingParams(max_tokens=1, temperature=TEMPERATURE)
 
+    # One generate per *window-full* of forwards, not one per forward. A
+    # 2008-token prompt prefills as four 512-row forwards, so its first generate
+    # already closes a three-forward window and every later one is a full cold
+    # prefill that no session records — measured at ~4.7 min of device time each
+    # on the long phase, for nothing. A short prompt is one forward, so it still
+    # needs one generate per recorded pass.
+    segments = max(1, -(-n_prompt // _segment_rows()))
+    repeats = max(1, -(-device_time.MAX_ITERATIONS // segments))
+
     def cold_prefill():
-        # Three cold generates for a three-forward window. A long prompt fills
-        # it from the first generate alone (2008 tokens prefill as four 512-row
-        # forwards, and the window closes after three); a short one needs all
-        # three, since its prefill is a single forward. Either way the first
-        # recorded pass is the warm-up `_resolve_measurement` drops.
         out_passes = []
-        for _ in range(device_time.MAX_ITERATIONS):
+        for _ in range(repeats):
             llm.reset_prefix_cache()
             out_passes += llm.generate([text], one_token)
         return out_passes
@@ -492,6 +496,8 @@ def _resolve_measurement(raw: dict, correctness: dict, model: str | None = None)
             print(f"    {p.kind:<8} rows={p.rows} {p.device_ns / 1e6:9.1f} ms device "
                   f"(engine {p.engine_ns / 1e6:.1f} + dma {p.dma_ns / 1e6:.1f} + cc "
                   f"{p.collective_ns / 1e6:.1f}, union)  util {p.utilisation * 100:.0f}%"
+                  f"  traced "
+                  f"{'n/a' if p.traced_fraction is None else f'{p.traced_fraction * 100:.0f}%'}"
                   f"  [span-sum {p.busy_ns / 1e6:.0f} ms]")
             if p.kind in pooled:
                 by_kind.setdefault(p.kind, []).append(p.device_ns / 1e6)
