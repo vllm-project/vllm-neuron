@@ -12,6 +12,26 @@ that take their shapes from the tensors:
     fp4  `[out, in//2]` two e2m1 per byte + `[out, in/32]` e8m0  routed experts
     bf16 `[out, in]`, no scale                                   compressor, indexer wk, router
 
+Every weight here is **n-major**, as the checkpoint has it, and `_gemm` turns
+each tile with a `dma_transpose` on the way into SBUF because `nc_matmul` wants
+the contracted axis on partitions. That transpose is the largest single DMA
+term in both measured paths (104-115 GB/s against ~464 for the same bytes read
+contiguously), and iteration 1 of the optimizing run tried the obvious fix —
+store the fp8 pair k-major, decode straight into the matmul's orientation — and
+measured it **slower end to end**. `_dequant_fp8_k` and `fp8_linear_kmajor`
+keep that arm, unreachable, with the numbers; `legacy/moe_short.py:623` shows
+the form that does win, which decodes in SBUF and never stages a dequantized
+weight through HBM at all. Read both before trying again.
+
+The fp4 experts can be made k-major as cheaply — `legacy/moe_short.py` stores
+them `[k/2, n]`, a plain transpose of the *byte* matrix (4.4 ms a matrix on the
+host, ~170 µs on device), keeping the checkpoint's two-k-per-byte packing. What
+that costs is that a byte's two nibbles land on one partition, so the
+contraction splits into even-k and odd-k halves — two `nc_matmul`s per weight
+tile against an activation pre-split to match (`moe_short.py:499-510`) — the
+same products in a different fp32 order, so not bit-exact. See
+`.autohelix/notes/iter-1.md` §5.
+
 The bit-level decoders, the activation round trip and the GEMM pipeline are
 lifted from `l3_attn.py` (`_decode_e4m3`, `_pow2_ceil_log2`, `_qdq_fp8`,
 `_dequant_weight`, `_gemm`), which the previous project profiled and validated
@@ -244,6 +264,117 @@ def _dequant_fp8(w_u8, s_u8, dst_hbm, n, k):
         nl.store(dst_hbm[nb * rows : (nb + 1) * rows, 0:k], value=prod)
 
 
+#: Widest n-slab one `_dequant_fp8_k` iteration decodes at once, in elements.
+#: The slab is the instruction width of the whole decode, and wide is what
+#: matters: every NKI instruction carries a few hundred ns of fixed overhead, so
+#: decoding a `[128, 256]` tile per matmul tile instead of a `[128, n]` slab
+#: costs the same arithmetic 1.4-2.0x more (measured in the optimization project
+#: that preceded this port). The cap is SBUF: `_decode_e4m3` holds three uint16
+#: tiles of the slab plus the product, so a slab of 8192 is ~80 KiB of the
+#: 192 KiB a partition has, and the engram `wkv`'s n = 25600 would be 250 KiB.
+_DQ_SLAB = 8192
+
+
+def _nslab(n):
+    """Widest divisor of `n` at most `_DQ_SLAB` and a multiple of `BLK`.
+
+    A divisor so the loop has no tail, a `BLK` multiple so each slab holds whole
+    scale blocks along n.
+    """
+    if n <= _DQ_SLAB:
+        return n
+    best = BLK
+    for cand in range(BLK, _DQ_SLAB + 1, BLK):
+        if n % cand == 0:
+            best = cand
+    return best
+
+
+def _dequant_fp8_k(w_u8, s_u8, dst_hbm, k, n):
+    """fp8 `[k, n]` **k-major** with a `32 x 32`-tile e8m0 scale, into bf16 HBM.
+
+    **Unreachable: measured end to end and slower.** Kept with its numbers
+    because the idea is right and the next attempt should start from what went
+    wrong rather than from the idea.
+
+    The same arithmetic as `_dequant_fp8` with the axes swapped: the partition
+    axis is the contracted one, so a decoded tile already has the orientation
+    `nc_matmul` wants for the moving operand, and `_gemm(..., w_kmajor=True)`
+    reads this scratch with a plain `dma_copy` instead of a `dma_transpose`.
+    Bit-identical to `_dequant_fp8` + `_gemm` — same bytes, same scale per
+    `(n, k-block)`, same `k -> partition` map, so the same products in the same
+    order; checked on device at five shapes, 0 of 4,784,128 elements differ.
+
+    **What a four-rank verifier run measured** (long phase, against the
+    baseline's own profile, both at 40 layers and 512-row prefill segments):
+
+    | | baseline | k-major |
+    |---|---|---|
+    | prefill pass, fully traced | 1200.4 / 1171.5 ms | **1141.2 / 1111.5 ms** |
+    | prefill pass, the TTFT metric's | 300.4 ms mean | **297.0 ms mean** |
+    | decode pass | 394.7 ms | **414.2 ms** |
+    | transposed-read volume, decode window | 18.90 GiB | **12.95 GiB** |
+    | `sync DMA_DIRECT2D` | 17,462 instr, 7.8 ms | **93,832 instr, 53.1 ms** |
+
+    So the transposing read really does disappear — a third of the window's
+    transposed volume is the fp8 weights — and the strided `dma_copy` that
+    replaces it costs more in descriptor generation than the transpose cost in
+    bandwidth. The arithmetic was not the problem (the dequant opcodes moved
+    +1-3% despite 13-17% more instructions from the narrower slabs).
+
+    **What would fix it**, and why it is not a variant of this function: the
+    staging DMA exists only because the dequantized weight goes through HBM at
+    all. `legacy/moe_short.py:623` (`_gemm_fp8`) decodes a k-major tile **in
+    SBUF** and hands it straight to `nc_matmul`, so there is no scratch, no
+    staging copy and no transpose anywhere. That needs `_gemm`'s loop nest
+    turned inside out (k outer, PSUM banks per n-tile), which is the next piece
+    of work; this layout is the half of it that is already proven.
+
+    One scale row covers 32 weight rows on *both* axes, so `nsb = 4` scale rows
+    serve one 128-partition k tile, and each of them is replicated across 32
+    partitions exactly as `_dequant_fp8` replicates along its own partitions.
+    """
+    assert n % BLK == 0, f"n={n} must be a multiple of {BLK} for a k-major scale"
+    slab = _nslab(n)
+    nb = slab // BLK
+    nsb = PT // BLK
+    for kt in nl.affine_range(k // PT):
+        for ns in nl.affine_range(n // slab):
+            wq = _decode_e4m3(
+                nl.load(
+                    w_u8[kt * PT : (kt + 1) * PT, ns * slab : (ns + 1) * slab],
+                    dtype=nl.uint8,
+                ),
+                PT,
+                slab,
+            )
+            sf = nl.ndarray((PT, nb), dtype=nl.bfloat16, buffer=nl.sbuf)
+            for i in nl.static_range(nsb):
+                sb = nl.load(
+                    s_u8[
+                        kt * nsb + i : kt * nsb + i + 1,
+                        ns * nb : (ns + 1) * nb,
+                    ],
+                    dtype=nl.int32,
+                )
+                one = nl.copy(nl.left_shift(nl.add(sb, SC_EXP_ADD), 23)).view(
+                    nl.float32
+                )
+                nisa.tensor_copy(
+                    dst=sf[i * BLK : (i + 1) * BLK, 0:nb],
+                    src=nl.broadcast_to(one, (BLK, nb)),
+                )
+            rep = nl.broadcast_to(sf.reshape((PT, nb, 1)), (PT, nb, BLK))
+            prod = nl.ndarray((PT, slab), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_tensor(
+                dst=prod, data1=wq, data2=rep.reshape((PT, slab)), op=nl.multiply
+            )
+            nl.store(
+                dst_hbm[kt * PT : (kt + 1) * PT, ns * slab : (ns + 1) * slab],
+                value=prod,
+            )
+
+
 def _dequant_fp4(w_u8, s_u8, dst_hbm, n, k):
     """fp4 `[n, k//2]` with a per-row, per-32-column e8m0 scale, into bf16 HBM.
 
@@ -313,13 +444,19 @@ def _dequant_fp4(w_u8, s_u8, dst_hbm, n, k):
         )
 
 
-def _gemm(x_hbm, w_hbm, dst_hbm, m, k, n, out_scale=1.0, qdq=False):
+def _gemm(x_hbm, w_hbm, dst_hbm, m, k, n, out_scale=1.0, qdq=False, w_kmajor=False):
     """`dst[m, n] = x[m, k] @ w[n, k].T`, both operands bf16 in HBM.
 
     `nc_matmul` wants the contracted axis on partitions for both operands, so
     both sides arrive by `dma_transpose`. The staging is double-buffered along
     k (`WLOOK`) and m (`XLOOK`) exactly as `l3_attn._gemm` does; `out_scale`
     folds the fp4 decoder's split exponent back in on the way out.
+
+    `w_kmajor` says the weight is already `[k, n]` — what `_dequant_fp8_k`
+    writes — so its tiles need no transpose and arrive by `dma_copy`. Same
+    tiles, same `k -> partition` map, same accumulation order: only the DMA
+    pattern differs, and a contiguous read of these bytes measured ~4x the
+    throughput of the transposing one.
     """
     ktiles = k // PT
     nt = _ntile(n)
@@ -354,10 +491,16 @@ def _gemm(x_hbm, w_hbm, dst_hbm, m, k, n, out_scale=1.0, qdq=False):
             wt = nl.ndarray((PT, ktiles, ntp), dtype=nl.bfloat16, buffer=nl.sbuf)
 
             def stage_w(kb):
-                nisa.dma_transpose(
-                    dst=wt[0:PT, kb, 0:nt],
-                    src=w_hbm[nb * nt : (nb + 1) * nt, kb * PT : (kb + 1) * PT],
-                )
+                if w_kmajor:
+                    nisa.dma_copy(
+                        dst=wt[0:PT, kb, 0:nt],
+                        src=w_hbm[kb * PT : (kb + 1) * PT, nb * nt : (nb + 1) * nt],
+                    )
+                else:
+                    nisa.dma_transpose(
+                        dst=wt[0:PT, kb, 0:nt],
+                        src=w_hbm[nb * nt : (nb + 1) * nt, kb * PT : (kb + 1) * PT],
+                    )
 
             for kb in nl.static_range(min(WLOOK, ktiles)):
                 stage_w(kb)
@@ -450,6 +593,17 @@ def fp8_linear(x, w, scale):
     bytes; the activation is rounded through fp8 first, which is what
     `vendor/model.py`'s `linear()` does. The returned rows are
     `ceil(m/128)*128`; the caller keeps the first `m`.
+
+    **This is the n-major form, and it is here because the k-major one was
+    tried end to end and measured slower.** See `_dequant_fp8_k` for the
+    numbers; the short version is that storing the weight `[k, n]` really does
+    delete the transposing read (the decode window's transposed-read volume
+    fell 18.90 -> 12.95 GiB), and the strided `dma_copy` that replaces it costs
+    more in descriptor generation than the transpose cost in bandwidth
+    (`sync DMA_DIRECT2D` 17,462 -> 93,832 instructions, 7.8 -> 53.1 ms). The
+    layout is only worth having together with the in-SBUF fusion that removes
+    the staging DMA altogether — `legacy/moe_short.py:623` — which is the next
+    piece of work, not a variant of this one.
     """
     m, k = x.shape
     n = w.shape[0]
@@ -486,6 +640,188 @@ def fp8_linear_raw(x, w, scale):
     _stage_rows(x, m, k, xs, False)
     _dequant_fp8(w, scale, wd, n, k)
     _gemm(xs, wd, out, mpad, k, n)
+    return out
+
+
+#: SBUF bytes a partition may spend on the staged weight in the fused GEMM.
+#: 96 KiB of the 192 KiB a partition has, which leaves the activation tiles
+#: (`mg * ktiles * 128 * 2`, up to 40 KiB at the 512-row prefill width) and the
+#: decoder's three uint16 temporaries room beside it. Measured footprints at the
+#: live shapes are 40-80 KiB.
+_WT_BYTES = 96 * 1024
+
+
+def _nchunk(n, nt, ktiles):
+    """Widest multiple of `nt` that divides `n` and fits `_WT_BYTES`.
+
+    This is the fused GEMM's one tuning decision, and it exists because the two
+    costs pull opposite ways: the staged weight has to fit SBUF, and the decode
+    wants to run on as few, as wide instructions as possible (a marginal NKI
+    instruction measures at 130-190 ns on this port, so decoding per *matmul*
+    tile — `[128, 256]` — the way `legacy/moe_short.py` does would add ~200 µs
+    to a `[128, 5120] x [5120, 2304]` GEMM).
+
+    When nothing wider than one matmul tile fits — the MTP input projection,
+    `k = 15360`, is the case: 120 k-tiles leave 409 bytes a partition for the
+    chunk — this returns `nt`, and the staged weight is then exactly the size
+    `_gemm` already allocates for the same shape. So the floor is the current
+    footprint rather than an overflow.
+    """
+    cap = max(nt, _WT_BYTES // (ktiles * 2))
+    best, cand = nt, nt
+    while cand <= cap:
+        if n % cand == 0:
+            best = cand
+        cand += nt
+    return best
+
+
+def _decode_fp8_tile(w, s, dst, kb, c0, nc):
+    """Decode the k-major fp8 tile `w[kb*128:(kb+1)*128, c0:c0+nc]` into `dst`.
+
+    `_dequant_fp8_k`'s body for one tile, writing SBUF instead of HBM: the
+    partition axis is k, so what lands in `dst` is already `nc_matmul`'s moving
+    operand and nothing transposes anything.
+    """
+    nbk = nc // BLK
+    nsb = PT // BLK
+    byte = nl.load(w[kb * PT : (kb + 1) * PT, c0 : c0 + nc], dtype=nl.uint8)
+    wq = _decode_e4m3(byte, PT, nc)
+    sf = nl.ndarray((PT, nbk), dtype=nl.bfloat16, buffer=nl.sbuf)
+    for i in nl.static_range(nsb):
+        sb = nl.load(
+            s[kb * nsb + i : kb * nsb + i + 1, c0 // BLK : c0 // BLK + nbk],
+            dtype=nl.int32,
+        )
+        one = nl.copy(nl.left_shift(nl.add(sb, SC_EXP_ADD), 23)).view(nl.float32)
+        nisa.tensor_copy(
+            dst=sf[i * BLK : (i + 1) * BLK, 0:nbk],
+            src=nl.broadcast_to(one, (BLK, nbk)),
+        )
+    rep = nl.broadcast_to(sf.reshape((PT, nbk, 1)), (PT, nbk, BLK))
+    nisa.tensor_tensor(
+        dst=dst, data1=wq, data2=rep.reshape((PT, nc)), op=nl.multiply
+    )
+
+
+def _stage_x_tile(x_hbm, xt, mgb, mg, ktiles, mi):
+    """One m-tile of the activation, transposed into SBUF."""
+    for kb in nl.static_range(ktiles):
+        nisa.dma_transpose(
+            dst=xt[0:PT, mi, kb, 0:PT],
+            src=x_hbm[
+                (mgb * mg + mi) * PT : (mgb * mg + mi + 1) * PT,
+                kb * PT : (kb + 1) * PT,
+            ],
+        )
+
+
+def _gemm_fp8_fused(x_hbm, w, s, dst_hbm, m, k, n):
+    """`dst[m, n] = x[m, k] @ w[k, n]` with the weight decoded in SBUF.
+
+    The fp8 weight never becomes a bf16 tensor in HBM: each `(k-tile,
+    n-chunk)` tile is loaded as bytes, decoded in place and consumed by the
+    matmuls of that chunk. So against `_dequant_fp8` + `_gemm` this drops, per
+    GEMM, one `n*k*2`-byte write and one `n*k*2`-byte **transposing** read
+    (measured at 104-115 GB/s, against ~464 for a contiguous read) and adds one
+    `n*k`-byte contiguous read. `legacy/moe_short.py:623` is the same shape.
+
+    Accumulation is unchanged — ascending k into one PSUM bank per `(m-tile,
+    n-tile)`, same `k -> partition` map — so the result is bit-identical to the
+    two-phase kernels, which is checked rather than argued (§3 of
+    `.autohelix/notes/iter-1.md`): 0 of 4,587,520 output elements differ over
+    six shapes on device, including the decode width `m=6`, the prefill width
+    `m=512` (`mg=4`), `n=512` where the chunk is one matmul tile, and an
+    `m=130` row-pad tail.
+
+    **Unreachable, and unmeasured for speed.** It needs the k-major weight that
+    commit `bfaf9b1` stored and this iteration reverted, and the one thing
+    nobody has yet is a device *timing* of it: the standalone NKI entry point
+    cannot be profiled (its runtime is not the one
+    `torch.classes.neuron.Runtime().start_profiling` initializes — "Neuron
+    runtime must be initialized before starting profiling"), so the only
+    instrument is an end-to-end verifier run. Wire it, run it once, and compare
+    `device_tpot_ms_long` against 109.63 and `device_ttft_ms_long` against
+    1201.67.
+    """
+    ktiles = k // PT
+    nt = _ntile(n)
+    mg = _mgroup(m // PT, ktiles)
+    nc = _nchunk(n, nt, ktiles)
+    for mgb in nl.affine_range((m // PT) // mg):
+        xt = nl.ndarray((PT, mg, ktiles, PT), dtype=nl.bfloat16, buffer=nl.sbuf)
+        for mi in nl.static_range(mg):
+            _stage_x_tile(x_hbm, xt, mgb, mg, ktiles, mi)
+        for cb in nl.affine_range(n // nc):
+            wt = nl.ndarray((PT, ktiles, nc), dtype=nl.bfloat16, buffer=nl.sbuf)
+            for kb in nl.static_range(ktiles):
+                _decode_fp8_tile(w, s, wt[0:PT, kb, 0:nc], kb, cb * nc, nc)
+            for nb in nl.static_range(nc // nt):
+                for mi in nl.static_range(mg):
+                    acc = nl.ndarray((PT, nt), dtype=nl.float32, buffer=nl.psum)
+                    for kb in nl.static_range(ktiles):
+                        nisa.nc_matmul(
+                            dst=acc,
+                            stationary=xt[0:PT, mi, kb, 0:PT],
+                            moving=wt[0:PT, kb, nb * nt : (nb + 1) * nt],
+                            accumulate=(kb > 0),
+                        )
+                    nl.store(
+                        dst_hbm[
+                            (mgb * mg + mi) * PT : (mgb * mg + mi + 1) * PT,
+                            cb * nc + nb * nt : cb * nc + (nb + 1) * nt,
+                        ],
+                        value=nl.copy(acc, dtype=nl.bfloat16),
+                    )
+
+
+@nki.jit
+def fp8_linear_fused(x, w, scale):
+    """`fp8_linear` with the weight decoded in SBUF — see `_gemm_fp8_fused`.
+
+    `w` is `[k, n]` and `scale` `[k/32, n/32]`: the k-major pair, which is the
+    half of commit `bfaf9b1` worth keeping. **Unreachable** until a loader
+    stores that layout again.
+    """
+    m, k = x.shape
+    n = w.shape[1]
+    assert w.shape[0] == k, f"fp8 weight {w.shape} is not k-major for k={k}"
+    _check(k, n)
+    mpad = -(-m // PT) * PT
+    out = nl.ndarray((mpad, n), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    xq = nl.ndarray((mpad, k), dtype=nl.bfloat16, buffer=nl.private_hbm)
+    _stage_rows(x, m, k, xq, True)
+    _gemm_fp8_fused(xq, w, scale, out, mpad, k, n)
+    return out
+
+
+@nki.jit
+def fp8_linear_kmajor(x, w, scale):
+    """**Unreachable**, and kept as the measured k-major arm — see
+    `_dequant_fp8_k`. Bit-identical to `fp8_linear` on the same weight
+    transposed, and slower end to end.
+
+    Takes `w` as `[k, n]` and `scale` as `[k/32, n/32]`, i.e. the transpose of
+    what the checkpoint stores. `/tmp/it1/ab8.py` is the harness that proved the
+    identity (0 of 4,784,128 elements differ over five shapes); the model-side
+    half of the experiment — `BlockQuantLinear._specs`, `shard_parameter`'s
+    one-line transpose, `verify_shard_plan`'s reversed expectation and
+    `grouped()`'s second-axis slice — is in commit `bfaf9b1` if it is wanted
+    back.
+    """
+    m, k = x.shape
+    n = w.shape[1]
+    assert w.shape[0] == k, f"fp8 weight {w.shape} is not k-major for k={k}"
+    _check(k, n)
+    mpad = -(-m // PT) * PT
+
+    out = nl.ndarray((mpad, n), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    xq = nl.ndarray((mpad, k), dtype=nl.bfloat16, buffer=nl.private_hbm)
+    wd = nl.ndarray((k, n), dtype=nl.bfloat16, buffer=nl.private_hbm)
+
+    _stage_rows(x, m, k, xq, True)
+    _dequant_fp8_k(w, scale, wd, k, n)
+    _gemm(xq, wd, out, mpad, k, n, w_kmajor=True)
     return out
 
 
