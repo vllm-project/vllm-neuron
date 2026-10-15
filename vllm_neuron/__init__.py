@@ -208,6 +208,32 @@ def register():
     return get_platform_class()
 
 
+# Architectures this plugin implements that the pinned vLLM has no class for.
+# The workers register the plugin's models themselves (``NeuronWorker``), but
+# the engine process resolves ``ModelConfig.architecture`` *before* any worker
+# exists, and an architecture vLLM does not know falls through to its
+# Transformers backend there -- whose class the worker then cannot build
+# ("TransformersMoEForCausalLM has no attribute from_configs"). Registered as a
+# lazy "module:Class" string so nothing model-side is imported here.
+#
+# Run as a ``vllm.general_plugins`` entry point, not from ``register()``:
+# importing ``vllm.ModelRegistry`` while the platform is still being resolved
+# pins ``current_platform`` to the unspecified one ("Device string must not be
+# empty").
+_ARCHITECTURES_UNKNOWN_TO_VLLM = {
+    "HYV4ForCausalLM": "vllm_neuron.model.hy_v4:HYV4ForCausalLM",
+}
+
+
+def register_models() -> None:
+    from vllm import ModelRegistry
+
+    known = set(ModelRegistry.get_supported_archs())
+    for arch, path in _ARCHITECTURES_UNKNOWN_TO_VLLM.items():
+        if arch not in known:
+            ModelRegistry.register_model(arch, path)
+
+
 def __getattr__(name):
     import importlib
 

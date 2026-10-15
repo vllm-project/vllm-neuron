@@ -24,6 +24,9 @@ dynamic = ["dependencies", "optional-dependencies"]
 [project.entry-points."vllm.platform_plugins"]
 neuron = "vllm_neuron:register"
 
+[project.entry-points."vllm.general_plugins"]
+neuron_models = "vllm_neuron:register_models"
+
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements/core.txt"]}
 optional-dependencies = {test = {file = ["requirements/test.txt"]}}
