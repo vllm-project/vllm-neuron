@@ -47,7 +47,7 @@ goal: |
   Please refer to DeepSeek-V4.1-Flash-Trainium to see the optimization methods and strategies, as well as refer to the optimized
   fused kernels for different attention blocks, MoEs, Engrams, and DSpark at different input sizes.
 
-  Do not run the verifier more than ONCE per iteration. It is 108 minutes, which is most of the device time you have. Instead, focus on each submodules, write a fused kernel
+  Do not run the verifier more than twice per iteration. It is ~85 minutes a run. Instead, focus on each submodules, write a fused kernel
   for each of the following submodules and optimize in order:
   - Attention Block: refer to l*-attn.py in legacy/ in kernels/. This represents various sparse/swa attention in different layers
     with various types of inputs and outputs. It's recommended to optimize the seperately while refer to the optimization techniques each others.
