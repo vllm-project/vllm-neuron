@@ -131,7 +131,9 @@ def main() -> None:
             "neuron_config": {
                 "quantization": "bf16",
                 "num_batched_tokens_buckets": [chunk],
-                "num_seqs_buckets": [args.max_num_seqs],
+                # A 32K request is alone in the KV cache, so give decode a
+                # batch-1 graph rather than padding to max_num_seqs (2x TPOT).
+                "num_seqs_buckets": sorted({1, args.max_num_seqs}),
                 "on_device_sampling_config": {"all_greedy": True},
                 # No NKI kernel is called by this model yet, which is the case
                 # Qwen3.5's dense checkpoints need the mac threshold suppressed

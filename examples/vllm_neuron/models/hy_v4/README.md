@@ -68,11 +68,23 @@ otherwise the previous trace is compiled again.
 
 | prompt | prefill chunks | output | wall time |
 |---|---|---|---|
-| 1,732 tokens | 1 | `' 71432. I have memorized it.\n\nThe pass key is **71432**.\n\nI have memorized it.\n\nThe pass key is **'` | 136 s |
-| 28,804 tokens | 15 | `' 71432. I have memorized it.\n\nThe pass key is **71432**. I have memorized it.\n\nThe pass key is **714'` | 825 s |
+| 1,732 tokens | 1 | `' 71432. I have memorized it.\n\nThe pass key is **71432**.\n\nI have memorized it.\n\nThe pass key is **'` | 43 s |
+| 28,804 tokens | 15 | `' 71432. I have memorized it.\n\nThe pass key is **71432**. I have memorized it.\n\nThe pass key is **714'` | 129 s |
 
 KV cache 40,384 tokens at `--gpu-memory-utilization 0.8` (704 values x 78 layers
 per token, replicated on every rank); weights 15.08 GiB of each core's 24.
+
+Throughput at a 31,744-token random prompt, 256 output tokens, greedy, median
+of 3 (each run within 0.1%). Only one 32K request fits the KV cache, so this
+single stream is also the maximum at this length:
+
+| decode buckets | TTFT | input tok/s | TPOT | output tok/s |
+|---|---|---|---|---|
+| `[4]` | 97.8 s | 325 | 1197 ms | 0.84 |
+| `[1, 4]` (`run.py` default) | 97.8 s | 325 | 604 ms | 1.66 |
+
+Decode is attention-bound: per layer at a 32K span, a full (indexer) layer
+takes 16.7 ms and a shared layer 3.7 ms at batch 1 (20.7 / 10.0 ms at batch 4).
 
 **2K context**, the first, dense-attention build (before DSA and chunked
 prefill; `run.py`'s demo prompts):
@@ -84,7 +96,7 @@ prefill; `run.py`'s demo prompts):
 'Once upon a time, there was a' -> ' king who was very rich. He had a lot of gold and silver, but he was not happy. He wanted to be the happiest man in the world'
 ```
 
-Weights load in ~55 s per rank. No latency/throughput benchmark yet.
+Weights load in ~55 s per rank.
 
 ## Why the fp8 checkpoint, and why converted
 
