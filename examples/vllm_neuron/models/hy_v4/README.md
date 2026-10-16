@@ -27,15 +27,16 @@ python examples/vllm_neuron/models/hy_v4/run.py --model <dir>/Hy4-preview-neuron
     --needle 30000
 ```
 
-Cold start compiles two graphs; at 32K context the prefill one takes **~35 min**
-at `-O1` (decode ~2 min). `run.py` raises vLLM's `distributed_timeout_seconds` (and the CPU
+Cold start compiles one prefill graph and one decode graph per decode bucket;
+at 32K context the prefill one takes **~17 min** at `-O1`, and a cold start
+with both decode buckets ~40 min. `run.py` raises vLLM's `distributed_timeout_seconds` (and the CPU
 group's) to 4 h because the other 63 ranks wait for rank 0's compile in a gloo
 barrier whose default timeout is 3600 s -- an intermediate build's prefill graph
 took 85 min, and every rank died with `RuntimeError: Operation timed out!` at
 the hour mark.
-Set `NEURON_RT_EXEC_TIMEOUT=1200` too: a 32K prefill chunk takes ~55 s (see
-*Known limitations*), over the runtime's default execution timeout, which
-otherwise surfaces as `TOPSP missing collectives status` / `NRT_TIMEOUT`. While
+Set `NEURON_RT_EXEC_TIMEOUT=1200` too when trying graph changes: earlier builds
+took 55-150 s per 32K prefill chunk, over the runtime's default execution
+timeout, which surfaces as `TOPSP missing collectives status` / `NRT_TIMEOUT`. While
 a chunk runs, `neuron-monitor` shows ~0% core utilisation and every worker sits
 idle in vLLM's message queue -- it looks hung and is not; count completed
 executions over a few minutes before concluding otherwise.
@@ -149,7 +150,10 @@ In prefill the scoring and selection are **split by query** across the 64 ranks
 and the mask all-gathered: done replicated, they were ~90% of the 32K prefill
 graph and pushed it to 15.7M instructions, over neuronx-cc's 10M limit. The
 attention itself is dense attention masked to the selection: exact, but its cost
-still grows with the context.
+still grows with the context. Prefill runs it over the span in 2048-key blocks
+with an online softmax, so the `[chunk, span]` probabilities are never live at
+once (that, plus 128-aligned slices of the cache entry, took the 28.8K needle
+from 825 s to 129 s).
 
 **Chunked prefill** is the plugin's segmented prefill: one chunk of one request
 per step, attending to the `cached_seq_len` tokens already in the cache plus
@@ -158,11 +162,11 @@ must be one of 512/1024/2048/4096/8192.
 
 ## Known limitations
 
-* **Prefill is slow: ~55 s per 2048-token chunk at 32K** (825 s for the 28.8K
-  needle). Every chunk attends to (and every full layer's indexer scores) the
-  whole 32K cache span, because the graph is static: `[2048, 34816]` scores per
-  layer, 78 times. Bucketing the prefix length, and a real sparse gather
-  instead of a masked dense attention, are next.
+* **Cost grows with the cache span, not the prompt.** Every prefill chunk
+  attends to (and every full layer's indexer scores) the whole 32K span, because
+  the graph is static: ~6 s per 2048-token chunk whatever the prefix. Decode
+  likewise reads the whole span (604 ms per token). Bucketing the prefix length,
+  and a real sparse gather instead of a masked dense attention, are next.
 * **Zeroing the gathered context is a 2.8x speed matter, not a correctness
   one.** Keys beyond the prefix are masked out of the scores either way, but a
   build that left the context unmasked ran ~150 s per chunk (2306 s for the
