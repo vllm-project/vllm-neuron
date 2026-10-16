@@ -13,7 +13,7 @@ answers without failing:
   combination are fp32, as in every reference implementation.
 * **MLA is computed in latent space.** The cache holds, per token, the normed
   512-dim KV latent, the shared 64-dim rope key and the 128-dim DSA indexer key
-  -- 704 values, stored as the K and V halves of a 352-wide "head" so that one
+  (stored first) -- 704 values, stored as the K and V halves of a 352-wide "head" so that one
   page is exactly the bytes the planner reserved. ``kv_b_proj`` is absorbed:
   the no-rope query is multiplied into latent space, attention runs against
   the latent directly, and the value up-projection is applied to the attention
@@ -72,6 +72,21 @@ from .config import ROPE_STYLE, HYV4Config
 # neuron_config.tensor_capture). Off, nothing is traced.
 DEBUG_CAPTURE = os.environ.get("HY4_DEBUG_CAPTURE") == "1"
 DEBUG_LAYERS = {int(x) for x in os.environ.get("HY4_DEBUG_LAYERS", "0").split(",")}
+# HY4_PERF_SKIP=collectives,attn,moe -- timing experiments only, outputs are
+# wrong: "collectives" makes the per-layer all-reduces the identity and the
+# DSA mask all-gather a local repeat; "attn"/"moe" replace that sub-block's
+# output with zeros (attention then writes no KV and selects nothing).
+PERF_SKIP = {x for x in os.environ.get("HY4_PERF_SKIP", "").split(",") if x}
+
+
+def _all_reduce(group, t: torch.Tensor) -> torch.Tensor:
+    return t if "collectives" in PERF_SKIP else group.all_reduce(t)
+
+
+def _all_gather(group, t: torch.Tensor, dim: int, world: int) -> torch.Tensor:
+    if "collectives" in PERF_SKIP:
+        return torch.cat([t] * world, dim=dim)
+    return group.all_gather(t, dim=dim)
 
 
 def _capture(layer_idx: int, name: str, tensor: torch.Tensor) -> None:
@@ -365,9 +380,9 @@ class HYV4Indexer(nn.Module):
 class HYV4Attention(nn.Module):
     """Gated MLA with learnable sinks over the keys DSA selects.
 
-    The cache entry per token is 704 wide: the 576-wide MLA latent (normed
-    kv latent + rope key) followed by the 128-wide indexer key, stored as the K
-    and V halves of one 352-wide head. Layers whose indexer is ``"shared"``
+    The cache entry per token is 704 wide: the 128-wide indexer key, then the
+    576-wide MLA latent (normed kv latent + rope key), stored as the K and V
+    halves of one 352-wide head. Layers whose indexer is ``"shared"``
     leave the indexer slot zero and reuse the selection of the last ``"full"``
     layer before them, which the decoder threads through.
     """
@@ -396,6 +411,13 @@ class HYV4Attention(nn.Module):
         self.index_dim = config.index_head_dim
         self.index_topk = config.index_topk
         self.entry_dim = self.latent_dim + self.index_dim
+        # Entry layout [index key 128 | kv latent 512 | rope key 64]: the
+        # indexer key first, so both slices start on a 128-column boundary.
+        # With it last (column 576), the prefill indexer's matmul against
+        # ``keys[:, 576:]`` failed neuronx-cc ISA validation at -O1 ("Copy;
+        # inst failed assertion check: 'start_addr_active_channels'").
+        self.index_slice = slice(0, self.index_dim)
+        self.latent_slice = slice(self.index_dim, self.entry_dim)
         if self.entry_dim % 2:
             raise ValueError(f"cache entry width {self.entry_dim} must be even")
         # The K and V halves of the cache page, each this wide.
@@ -523,7 +545,7 @@ class HYV4Attention(nn.Module):
             index_key = torch.zeros(
                 tokens, self.index_dim, dtype=self.dtype, device=x.device
             )
-        entry = torch.cat((c, k_rope.to(c.dtype), index_key.to(c.dtype)), dim=-1)
+        entry = torch.cat((index_key.to(c.dtype), c, k_rope.to(c.dtype)), dim=-1)
 
         gate = x @ self.gate_proj_weight
         return query, entry, gate, q_resid
@@ -536,7 +558,7 @@ class HYV4Attention(nn.Module):
         out = out * torch.sigmoid(gate.float()).to(out.dtype)
         out = out @ self.o_proj_weight
         if self.world_size > 1:
-            out = self.tp_group.all_reduce(out)
+            out = _all_reduce(self.tp_group, out)
         return out
 
     def _write_kv(self, entry: torch.Tensor, metadata: dict) -> None:
@@ -631,7 +653,7 @@ class HYV4Attention(nn.Module):
         total = keys.shape[0]
         for start in range(0, total, ATTN_KEY_BLOCK):
             stop = min(start + ATTN_KEY_BLOCK, total)
-            lat = keys[start:stop, : self.latent_dim]
+            lat = keys[start:stop, self.latent_slice]
             s = q @ lat.float().t().unsqueeze(0)  # [nh, C, B]
             s = s.masked_fill(~selected[:, start:stop].unsqueeze(0), floor)
             m_new = torch.maximum(m, s.amax(dim=-1, keepdim=True))
@@ -706,7 +728,13 @@ class HYV4Attention(nn.Module):
             local_q = torch.index_select(iq, 0, rows)
             local_w = torch.index_select(iw, 0, rows)
             local_vis = torch.index_select(visible, 0, rows)
-        s = torch.relu(torch.einsum("qhd,kd->qhk", local_q, ik).float())
+        # A flat matmul, not ``einsum("qhd,kd->qhk")``: with the key-blocked
+        # attention in the same graph, neuronx-cc 2.27 failed ISA validation on
+        # the einsum's lowering ("Copy; inst failed assertion check:
+        # 'start_addr_active_channels'") at -O1.
+        rows_q, heads, dim = local_q.shape
+        s = (local_q.reshape(rows_q * heads, dim) @ ik.t()).view(rows_q, heads, -1)
+        s = torch.relu(s.float())
         scores = (s * local_w.unsqueeze(-1)).sum(dim=1)  # [C / world, K]
         local = select_topk(scores, local_vis, self.index_topk)
         _capture(self.layer_idx, "index_scores_local", scores)
@@ -724,8 +752,11 @@ class HYV4Attention(nn.Module):
         # bf16 for the collective, which bool may not be on every backend; back
         # by a cast, not ``> 0.5``: a bf16-vs-Python-float compare lowers to an
         # f64 constant, which neuronx-cc rejects (NCC_ESPP004).
-        gathered = self.tp_group.all_gather(local.to(torch.bfloat16), dim=0)
-        sources = self.tp_group.all_gather(rank.reshape(1).to(torch.float32), dim=0)
+        gathered = _all_gather(self.tp_group, local.to(torch.bfloat16), 0, world)
+        if "collectives" in PERF_SKIP:
+            sources = torch.arange(world, dtype=torch.float32, device=iq.device)
+        else:
+            sources = self.tp_group.all_gather(rank.reshape(1).to(torch.float32), dim=0)
         targets = torch.arange(world, dtype=torch.float32, device=iq.device)
         perm = (targets.view(world, 1) == sources.view(1, world)).to(torch.bfloat16)
         ordered = perm @ gathered.reshape(world, -1)
@@ -771,7 +802,7 @@ class HYV4Attention(nn.Module):
         if self.indexer is not None:
             iq, iw = self.indexer.queries(q_resid, x, cos, sin)
             selected = self._select_prefill(
-                iq, iw, keys[:, self.latent_dim :], visible, rank
+                iq, iw, keys[:, self.index_slice], visible, rank
             )
 
         o_lat = self._attend_blocked(query.transpose(0, 1), keys, selected)
@@ -817,12 +848,12 @@ class HYV4Attention(nn.Module):
 
         if self.indexer is not None:
             iq, iw = self.indexer.queries(q_resid, x, cos, sin)  # [reqs, 32, 128]
-            ik = keys[..., self.latent_dim :]  # [reqs, K, 128]
+            ik = keys[..., self.index_slice]  # [reqs, K, 128]
             s = torch.relu((iq @ ik.transpose(1, 2)).float())  # [reqs, 32, K]
             index_scores = (s * iw.unsqueeze(-1)).sum(dim=1)
             selected = select_topk(index_scores, visible, self.index_topk)
 
-        lat = keys[..., : self.latent_dim]  # [reqs, K, 576]
+        lat = keys[..., self.latent_slice]  # [reqs, K, 576]
         q = query.float()  # [reqs, nh, 576]
         scores = (q @ lat.float().transpose(1, 2)) * self.scaling  # [reqs, nh, K]
         scores = scores.masked_fill(~selected.unsqueeze(1), float("-inf"))
@@ -877,23 +908,26 @@ class HYV4DecoderLayer(nn.Module):
         """-> (streams, DSA key selection for the layers that share it)."""
         residual = streams
         x, post = self.attn_hc(streams)
-        x, selected = self.self_attn(
-            self.input_layernorm(x),
-            positions,
-            position_embeddings,
-            attn_metadata,
-            selected,
-            rank,
-        )
+        if "attn" in PERF_SKIP:
+            x = torch.zeros_like(x)
+        else:
+            x, selected = self.self_attn(
+                self.input_layernorm(x),
+                positions,
+                position_embeddings,
+                attn_metadata,
+                selected,
+                rank,
+            )
         streams = hc_post(x, residual, post)
 
         residual = streams
         x, post = self.ffn_hc(streams)
         x = self.post_attention_layernorm(x)
         _capture(self.layer_idx, "mlp_in", x)
-        x = self.mlp(x)
+        x = torch.zeros_like(x) if "moe" in PERF_SKIP else self.mlp(x)
         if self.world_size > 1:
-            x = self.tp_group.all_reduce(x)
+            x = _all_reduce(self.tp_group, x)
         _capture(self.layer_idx, "mlp_out", x)
         return hc_post(x, residual, post), selected
 
