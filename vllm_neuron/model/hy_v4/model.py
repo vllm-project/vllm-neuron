@@ -689,9 +689,11 @@ class HYV4Attention(nn.Module):
                 f"layer ran before it"
             )
         if metadata["max_query_len"] <= metadata["decode_token_threshold"]:
-            return self.forward_decode(
-                x, positions, position_embeddings, metadata, selected
-            )
+            rows = metadata["block_table_tensor"].shape[0]
+            # See forward_decode_split for why the batch picks the form.
+            split = rows == 1 or rows >= 16
+            decode = self.forward_decode_split if split else self.forward_decode
+            return decode(x, positions, position_embeddings, metadata, selected)
         return self.forward_prefill(x, position_embeddings, metadata, selected, rank)
 
     def _select_prefill(
@@ -860,6 +862,79 @@ class HYV4Attention(nn.Module):
         # Heads first for the sink broadcast, then back.
         probs = self._with_sinks(scores.transpose(0, 1)).transpose(0, 1)
         o_lat = probs.to(self.dtype) @ lat[..., : self.kv_lora_rank]  # [reqs, nh, 512]
+        out = self._finish(o_lat, gate)
+        _capture(self.layer_idx, "attn_in", x)
+        _capture(self.layer_idx, "selected", selected.to(torch.bfloat16))
+        _capture(self.layer_idx, "attn_out", out)
+        return out, selected
+
+    def forward_decode_split(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        position_embeddings: tuple,
+        metadata: dict,
+        selected: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``forward_decode`` with the token's own scores computed apart.
+
+        Same result; it never concatenates the ``[reqs, span, 704]`` keys and does
+        the indexer's head-weighted sum as a matmul. Which form neuronx-cc 2.27
+        lowers better depends on the batch, measured per full-indexer layer at a
+        4K span (attention only, one core): 1 row 1.7 vs 22.5 ms, 16 rows 9.3 vs
+        16.8 ms -- but 2/4/8 rows 3.9/6.1/10.5 vs 3.0/2.7/3.8 ms. At 1 row the
+        original made the batch-1 graph 3x slower per token than the 4-row one.
+        """
+        cos, sin = position_embeddings
+        block_table = metadata["block_table_tensor"]
+        num_reqs = block_table.shape[0]
+        x = x.to(self.dtype)
+        query, entry, gate, q_resid = self._project(x, cos, sin)
+        self._write_kv(entry, metadata)
+
+        live_rows = (metadata["slot_mapping"].view(num_reqs, -1)[:, 0] > 0).view(-1, 1)
+        ctx = self._gather(block_table, live_rows)  # [reqs, ctx_len, 704]
+        ctx_len = ctx.shape[1]
+        key_positions = torch.arange(ctx_len, device=x.device).view(1, ctx_len)
+        in_prefix = key_positions < positions.view(num_reqs, 1)  # [reqs, ctx_len]
+        ctx = _zero_beyond(ctx, positions.view(num_reqs, 1))
+        own = entry.to(ctx.dtype).unsqueeze(1)  # [reqs, 1, 704]
+        visible = torch.cat(
+            (in_prefix, torch.ones(num_reqs, 1, dtype=torch.bool, device=x.device)),
+            dim=1,
+        )
+        # Scores against the cache and against the token itself are computed
+        # separately and concatenated, rather than concatenating the
+        # [reqs, 32K, 704] keys (a full copy of the context per layer).
+
+        if self.indexer is not None:
+            iq, iw = self.indexer.queries(q_resid, x, cos, sin)  # [reqs, 32, 128]
+            s = torch.cat(
+                (
+                    iq @ ctx[..., self.index_slice].transpose(1, 2),
+                    iq @ own[..., self.index_slice].transpose(1, 2),
+                ),
+                dim=-1,
+            )
+            s = torch.relu(s.float())  # [reqs, 32, K]
+            index_scores = (iw.unsqueeze(1) @ s).squeeze(1)  # [reqs, K]
+            selected = select_topk(index_scores, visible, self.index_topk)
+
+        lat = ctx[..., self.latent_slice]  # [reqs, ctx_len, 576]
+        own_lat = own[..., self.latent_slice]  # [reqs, 1, 576]
+        q = query.float()  # [reqs, nh, 576]
+        scores = torch.cat(
+            (q @ lat.float().transpose(1, 2), q @ own_lat.float().transpose(1, 2)),
+            dim=-1,
+        ) * self.scaling  # [reqs, nh, K]
+        scores = scores.masked_fill(~selected.unsqueeze(1), float("-inf"))
+        # Heads first for the sink broadcast, then back.
+        probs = self._with_sinks(scores.transpose(0, 1)).transpose(0, 1).to(self.dtype)
+        rank_v = self.kv_lora_rank
+        o_lat = (
+            probs[..., :ctx_len] @ lat[..., :rank_v]
+            + probs[..., ctx_len:] @ own_lat[..., :rank_v]
+        )  # [reqs, nh, 512]
         out = self._finish(o_lat, gate)
         _capture(self.layer_idx, "attn_in", x)
         _capture(self.layer_idx, "selected", selected.to(torch.bfloat16))
