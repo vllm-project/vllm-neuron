@@ -87,6 +87,16 @@ single stream is also the maximum at this length:
 Decode is attention-bound: per layer at a 32K span, a full (indexer) layer
 takes 16.7 ms and a shared layer 3.7 ms at batch 1 (20.7 / 10.0 ms at batch 4).
 
+Short input, long output -- a decode deployment sized to its workload:
+`max_model_len` 4096, 1024 in / 512 out, decode buckets `[1, 4, 8]`. The
+scheduler admits KV / `max_model_len` ~= 9 requests at a time here.
+
+| concurrency | TPOT | decode tok/s |
+|---|---|---|
+| 1 | 134 ms (576 ms before `forward_decode_split`) | 7.5 |
+| 4 | 175 ms | 22.9 |
+| 8 | 245 ms | 32.7 |
+
 **2K context**, the first, dense-attention build (before DSA and chunked
 prefill; `run.py`'s demo prompts):
 
