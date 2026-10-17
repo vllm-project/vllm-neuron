@@ -1,0 +1,367 @@
+# The deployment target: one trn2.48xlarge.
+#
+# Every number carries `source:` and `confidence:`. Three sources appear:
+#
+#   datasheet   published by AWS, quoted below in `provenance.urls`. Trusted.
+#   nki         read out of the installed NKI toolchain on the dev host, so it is the
+#               compiler's own constant rather than a document's summary of it.
+#   probed      measured by `autohelix floorplan probe` on a trn2.3xlarge. One device
+#               only: anything needing two devices cannot be probed and says so.
+#
+# `confidence: low` is not a disclaimer to skip past. The ranking report is required to
+# list every low-confidence number a scheme's advantage depends on, so a value here
+# decides whether a conclusion is reported as a finding or as a sensitivity.
+
+name: trn2-16device
+description: trn2.48xlarge — 16 Trainium2 devices in a 4x4 2D torus, 64 logical NeuronCores
+
+provenance:
+  urls:
+    - https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/arch/neuron-hardware/trainium2.html
+    - https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/arch/neuron-hardware/trn2-arch.html
+    - https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/arch/neuron-features/logical-neuroncore-config.html
+    - https://aws.amazon.com/ec2/instance-types/trn2/
+  fetched: 2026-09-25
+  dev_host: trn2.3xlarge (1 device) — see systems/trn2-1device.yaml
+
+# ---------------------------------------------------------------------------------------
+# The hierarchy a placement addresses.
+#
+# Terminology follows the Neuron docs, which is worth stating because the informal usage
+# is inverted: the doc's *logical NeuronCore* is the group of two, and the two cores
+# inside it are *physical NeuronCore-v3*. "a logical NeuronCore is a grouping of physical
+# NeuronCores that the Neuron Compiler, Neuron Runtime, Neuron Tools, and Frameworks
+# handle as a single unified NeuronCore."
+#
+# LNC=2 is the default and what the dev host reports. It is what makes the placement
+# grain the logical NeuronCore: at LNC=2 a single physical core is not independently
+# schedulable, so a floorplan places onto one of 64 logical cores and may additionally
+# say how the pair inside it divides the work.
+# ---------------------------------------------------------------------------------------
+lnc: 2
+placement_grain: logical_nc
+
+hierarchy:
+  instance:
+    count: 1
+  device:
+    count: 16
+    per: instance
+    address: d{i}
+  logical_nc:
+    count: 4
+    per: device
+    address: d{i}.l{j}
+    note: LNC=2 groups two physical NeuronCore-v3 into one; they share a single address space
+  physical_nc:
+    count: 2
+    per: logical_nc
+    address: d{i}.l{j}.p{k}
+    schedulable: false
+    note: >
+      Addressable only as a subdivision of its logical core's work, never as an
+      independent placement target, because at LNC=2 the runtime dispatches to the pair.
+
+# ---------------------------------------------------------------------------------------
+# One Trainium2 device.
+# ---------------------------------------------------------------------------------------
+device:
+  name: Trainium2
+
+  hbm:
+    capacity_bytes: 103079215104        # 96 GiB
+    capacity_source: datasheet
+    bandwidth_bytes_per_s: 2.9e12       # 2.9 TB/sec
+    bandwidth_source: datasheet
+    bandwidth_confidence: high
+    banks: 4
+    bank_capacity_bytes: 25769803776    # 24 GiB, one bank per logical NeuronCore
+    banks_source: datasheet
+    banks_note: >
+      The LNC page describes a physical core at LNC=1 reaching "the entire 24GB HBM bank",
+      which is 96 GiB / 4. This is the single most consequential capacity fact in the file:
+      a logical NeuronCore has 24 GiB, not 96, so a module whose shard exceeds 24 GiB is
+      unplaceable however much device memory is free.
+
+  sbuf:
+    capacity_bytes: 234881024           # 224 MiB per device
+    capacity_source: datasheet
+    per_logical_nc_bytes: 58720256      # 56 MiB
+    per_logical_nc_source: derived
+    partitions: 128                     # nki.language.tile_size.pmax
+    partitions_source: nki
+    min_align_bytes: 4
+    min_align_source: nki
+
+  psum:
+    bank_bytes: 262144                  # 128 partitions x 2048 B (psum_bank_fmax_bytes)
+    bank_bytes_source: nki
+    banks: 8
+    banks_source: datasheet_inferred
+    banks_confidence: low
+    banks_note: Bank count is not in the fetched pages; probe or correct before relying on it.
+    free_size_max: 512                  # psum_bank_fmax
+    free_size_max_source: nki
+
+  # The five engines NKI exposes (nki.isa: tensor_engine, vector_engine, scalar_engine,
+  # gpsimd_engine, dma_engine). Per-engine peak rates are not published separately; the
+  # device totals below are what the datasheet gives, so a per-engine share is a modeling
+  # choice the simulator must make explicit rather than smuggle in.
+  engines:
+    tensor:
+      count_per_logical_nc: 1
+      role: matmul
+      stationary_max: 128               # gemm_stationary_fmax
+      moving_max: 512                   # gemm_moving_fmax
+      source: nki
+    vector:
+      count_per_logical_nc: 1
+      role: elementwise, reduction, normalization
+      source: nki
+    scalar:
+      count_per_logical_nc: 1
+      role: activation, scalar transcendental
+      source: nki
+    gpsimd:
+      count_per_logical_nc: 1
+      role: general-purpose SIMD — gather, scatter, custom ops, dynamic control flow
+      source: nki
+      note: >
+        The engine an n-gram or expert gather lands on. Its SBUF interaction with the
+        tensor engine is a text constraint below, not a number here.
+    dma:
+      count_per_device: 1
+      role: HBM<->SBUF and inter-device movement
+      bandwidth_bytes_per_s: 3.5e12     # 3.5 TB/sec of DMA bandwidth
+      source: datasheet
+
+  # Device-total peak. Divide by 4 for a logical NeuronCore.
+  compute:
+    fp8_flops: 1.299e15
+    bf16_flops: 6.67e14
+    fp16_flops: 6.67e14
+    tf32_flops: 6.67e14
+    fp32_flops: 1.81e14
+    sparse_fp8_flops: 2.563e15
+    source: datasheet
+    fp4_flops: null
+    fp4_source: absent
+    fp4_confidence: low
+    fp4_note: >
+      The fetched pages do not quote an fp4 rate, but the model's kernels call
+      `fp4_act_quant`/`fp4_gemm`. Treat an fp4 matmul at the fp8 rate and record it as an
+      assumption; do not invent a 2x.
+
+  collective:
+    cc_cores: 16
+    source: datasheet
+    note: >
+      Collectives are charged to these rather than to the compute engines, which is what
+      makes communication/compute overlap expressible at all.
+
+# ---------------------------------------------------------------------------------------
+# Interconnect.
+#
+# The two NeuronLink figures reconcile: the chip has 1.28 TB/s total, of which 1,024 GB/s
+# is intra-instance and 256 GB/s is inter-instance (the UltraServer figure). 1024 + 256 =
+# 1280. Only the intra-instance share is reachable on a single trn2.48xlarge.
+# ---------------------------------------------------------------------------------------
+topology:
+  kind: torus_2d
+  shape: [4, 4]
+  source: datasheet
+  wrap: true
+  note: >
+    "4x4, 2D Torus topology". Wrap-around links are assumed from the word torus — a mesh
+    would make the far-corner hop count 6 instead of 4.
+  wrap_confidence: medium
+
+links:
+  intra_device:
+    scope: logical_nc <-> logical_nc within one device
+    bandwidth_bytes_per_s: null
+    latency_us: null
+    source: probe_required
+    confidence: low
+    note: >
+      The four logical NeuronCores of a device are NeuronLink-connected. No published
+      figure covers this hop, and it is measurable here — `floorplan probe` runs an NKI
+      collective across the dev host's four logical cores and writes the result into
+      systems/probed.yaml, which overlays this file. Until then the simulator refuses to
+      run rather than substituting a guess, because intra-device bandwidth is what decides
+      whether TP=4 inside a device beats TP=4 across devices.
+
+  inter_device:
+    scope: device <-> device over the torus
+    bandwidth_bytes_per_s: 1.024e12     # 1,024 GB/sec per chip, intra-instance
+    bandwidth_source: datasheet
+    per_hop_latency_us: 1.0
+    per_hop_latency_source: assumed
+    per_hop_latency_confidence: low
+    per_hop_latency_note: Not published and not probeable on one device. A named guess.
+    chip_total_bytes_per_s: 1.28e12
+    chip_total_source: datasheet
+
+  host:
+    scope: device <-> host DRAM over PCIe
+    bandwidth_bytes_per_s: null
+    latency_us: null
+    source: probe_required
+    confidence: low
+
+# ---------------------------------------------------------------------------------------
+# Memory tiers, nearest first. Capacity is enforced as a hard constraint at every tier.
+# ---------------------------------------------------------------------------------------
+tiers:
+  - name: hbm_bank
+    scope: logical_nc
+    capacity_bytes: 25769803776         # 24 GiB
+    bandwidth_bytes_per_s: 7.25e11      # 2.9 TB/s / 4
+    latency_us: 0
+    source: derived
+    reachable_from: own logical_nc
+
+  - name: device_hbm
+    scope: device
+    capacity_bytes: 103079215104        # 96 GiB
+    bandwidth_bytes_per_s: 2.9e12
+    latency_us: 0
+    source: datasheet
+    reachable_from: the 4 logical_nc of that device
+    note: The 4 banks of one device; a cross-bank read stays on-device.
+
+  - name: peer_hbm
+    scope: instance
+    capacity_bytes: 1649267441664       # 1,536 GiB
+    bandwidth_bytes_per_s: 1.024e12     # per chip, over the torus
+    latency_us: 1.0
+    source: datasheet
+    reachable_from: any device, cost scales with torus hop count
+    aggregate_bandwidth_bytes_per_s: 4.64e13   # 46.4 TB/sec device-memory bandwidth
+
+  - name: host_dram
+    scope: instance
+    capacity_bytes: 2199023255552       # 2 TB instance memory
+    capacity_source: datasheet
+    bandwidth_bytes_per_s: null
+    latency_us: null
+    source: probe_required
+    confidence: low
+    reachable_from: any device, over PCIe
+    note: >
+      Where a 94.56 GiB Engram table most plausibly lives. Whether that is affordable is
+      a bandwidth-and-latency question this file cannot yet answer, which is why the probe
+      is required rather than optional.
+
+  - name: nvme
+    scope: instance
+    capacity_bytes: 7680000000000       # 4 x 1.92 TB
+    capacity_source: datasheet
+    devices: 4
+    bandwidth_bytes_per_s: null
+    random_read_iops: null
+    latency_us: null
+    min_transfer_granularity_bytes: 4096
+    via: [host_dram]          # no direct accelerator-to-NVMe path; both legs are charged
+    source: probe_required
+    confidence: low
+    reachable_from: any device, but only *through* host_dram — there is no direct path
+    note: >
+      Charged as NVMe cost plus the PCIe hop, never as bandwidth alone. An Engram lookup
+      is a random read of a ~256 B row, far under the 4 KiB granularity, so this tier is
+      IOPS- and latency-bound and a bandwidth-only model would make it look nearly free.
+
+  - name: ebs
+    scope: instance
+    bandwidth_bytes_per_s: 1.0e10       # 80 Gbps
+    source: datasheet
+    inference_path: false
+    note: Load-time only. A scheme that reads EBS during a forward pass is rejected.
+
+  - name: network
+    scope: instance
+    bandwidth_bytes_per_s: 4.0e11       # 3,200 Gbps EFA
+    source: datasheet
+    inference_path: false
+    note: Load-time only. One instance is the whole deployment; there is nowhere to send.
+
+# ---------------------------------------------------------------------------------------
+# Host.
+# ---------------------------------------------------------------------------------------
+host:
+  vcpus: 192
+  dram_bytes: 2199023255552
+  source: datasheet
+
+# ---------------------------------------------------------------------------------------
+# Achieved fraction of peak, by operation class.
+#
+# Null until probed, and the simulator will not run with a null here. A roofline at 100%
+# of 1,299 fp8 TFLOPS makes compute free and ranks every scheme on communication alone,
+# which is the failure mode this section exists to prevent.
+# ---------------------------------------------------------------------------------------
+efficiency:
+  source: probe_required
+  confidence: low
+  matmul_fp8: null
+  matmul_bf16: null
+  matmul_small_k: null                  # K below gemm_stationary_fmax=128, the MoE case
+  vector_elementwise: null
+  scalar_activation: null
+  gpsimd_gather: null
+  dma_large_contiguous: null
+  dma_small_strided: null
+  collective_allreduce: null
+  collective_all_to_all: null
+
+# ---------------------------------------------------------------------------------------
+# Hardware features and constraints in prose.
+#
+# This is the half of the platform description that is not a number. The step-2 agent
+# turns each numbered item into an executable check or cost term in `sim/constraints.py`
+# and must cite the item's number where it does. An item nothing implements is reported
+# by the invariant suite as unimplemented rather than passing silently.
+#
+# Add to this list freely; it is the intended place for operational knowledge that has no
+# field above.
+# ---------------------------------------------------------------------------------------
+constraints_text: |
+  1. GPSIMD and the Tensor Engine cannot access SBUF simultaneously on Trainium 2. A
+     gather feeding a matmul therefore serializes against it on the same logical core
+     rather than overlapping, which matters most for MoE expert gathers and for Engram
+     n-gram lookups.
+
+  2. At LNC=2 the two physical NeuronCore-v3 of a logical core share one address space.
+     Splitting a module across the pair costs no collective — the halves read each
+     other's SBUF-resident results directly — but it does not add SBUF capacity, since
+     the 56 MiB is the pair's, not each core's.
+
+  3. A logical NeuronCore reaches its own 24 GiB HBM bank at full bandwidth. Reaching
+     another bank on the same device stays on-chip but contends for the device's shared
+     2.9 TB/s.
+
+  4. Collectives run on the 16 CC-Cores and can overlap with compute, but a collective
+     and the compute it feeds cannot overlap with *each other* — the dependency is real.
+     Overlap has to be declared in the floorplan to be credited.
+
+  5. The 4x4 torus is not uniform. A device has 4 nearest neighbours; the farthest device
+     is 4 hops away. Tensor parallelism spanning devices that are not neighbours pays the
+     hop count on every collective, so a TP group's shape on the torus is part of the
+     design, not an afterthought.
+
+  6. There is no direct accelerator-to-NVMe path. Every byte from NVMe crosses host DRAM
+     and then PCIe.
+
+  7. fp8 weights with block scales are the checkpoint's storage format. Compute is bf16.
+     A matmul therefore costs a dequantization pass in addition to the GEMM, and the
+     weight's HBM footprint is the fp8 size while its SBUF working set during compute is
+     larger.
+
+  8. Both Engram tables are ~94.56 GiB of embeddings that a token touches only a few rows
+     of (`engram_max_ngram_size: 4`, `engram_n_heads: 8`). Residency is a genuine choice:
+     in HBM they cost 12% of the instance's memory for an almost entirely cold table, and
+     out of HBM every lookup pays a tier crossing on the critical path of layers 1 and 14.
+
+  9. The MoE layers route 6 of 384 experts per token. At batch 1 decode, a step touches a
+     small and data-dependent subset of 277 GiB of expert weights, so expert placement
+     interacts with the all-to-all and with whether experts are resident at all.

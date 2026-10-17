@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
 
-from .deepseek_v41_timeshare import DeepseekV41ForCausalLM
+from .deepseek_v41 import DeepseekV41ForCausalLM
 from .llama3 import LlamaForCausalLM
 from .gpt_oss import GptOssForCausalLM
 from .llama3 import Eagle3LlamaForCausalLM
@@ -25,9 +25,12 @@ def get_models() -> list[tuple[str, type]]:
         ("Qwen3ForCausalLM", Qwen3ForCausalLM),
         ("Qwen3VLForConditionalGeneration", Qwen3VLForConditionalGeneration),
         # The key is the checkpoint's `architectures` entry, taken from
-        # deepseek-ai/DeepSeek-V4.1-Flash's own config.json. The timeshare port
-        # lives at .deepseek_v41_timeshare and is a scaffold: it registers and
-        # instantiates, then raises NotImplementedError in forward/load_weights.
+        # deepseek-ai/DeepSeek-V4.1-Flash's own config.json. The served port is
+        # .deepseek_v41, the trn2.48xlarge (16-device) deployment.
+        # .deepseek_v41_timeshare is its single-device ancestor, kept for
+        # reference and no longer registered — only one package may claim the
+        # arch string, since both register it with vLLM's ModelRegistry at
+        # import time.
         ("DeepseekV41ForCausalLM", DeepseekV41ForCausalLM),
     ]
 

@@ -1,0 +1,161 @@
+# Written by `autohelix floorplan probe`. Do not hand-edit: re-run the probe.
+#
+# Merged over the system YAML by floorplan/parser.py, `shared` first and then the
+# per-target block. Keeping measurements here rather than in the system files means
+# a diff of trn2-16device.yaml is a diff of the datasheet.
+
+_provenance:
+  probed_on: trn2.3xlarge
+  probed_at: '2026-09-25T07:08:04'
+  not_probeable:
+  - links.inter_device.bandwidth_bytes_per_s
+  - links.inter_device.per_hop_latency_us
+  - collectives wider than the 4 logical cores of one device
+  not_probeable_reason: this host has one Trainium2 device; every inter-device figure
+    stays at its datasheet value and is an extrapolation
+  failures: []
+shared:
+  efficiency:
+    source: probed on trn2.3xlarge
+    confidence: medium
+    probed_at: '2026-09-25'
+    matmul_fp8: 0.181283
+    matmul_bf16: 0.40973
+    matmul_small_k: 0.046136
+    vector_elementwise: 0.222369
+    scalar_activation: 0.258429
+    gpsimd_gather: 0.049602
+    dma_large_contiguous: 0.276968
+    dma_small_strided: 0.003089
+    collective_allreduce: 1.0
+    collective_all_to_all: 1.0
+    collective_note: '1.0 by construction: the measured intra-device link bandwidth
+      already reflects achieved all-reduce throughput, so a second coefficient would
+      double-count. Inter-device collectives inherit the datasheet bandwidth and are
+      extrapolations.'
+  links:
+    intra_device:
+      bandwidth_bytes_per_s: 803207788881.5017
+      latency_us: 1.0
+      source: derived_from_probe
+      confidence: low
+      note: NOT MEASURED. NKI 0.6.0 has no collective primitive and the XLA all-reduce
+        fails to compile (NCC_ISMP902), so no intra-device collective can be timed
+        on this host. Bounded by the on-chip path per text constraint 3.
+      derived_from: device HBM bandwidth (2.9e+12 B/s) x measured dma_large_contiguous
+        (0.2770)
+    host:
+      bandwidth_bytes_per_s: 12988169966.244795
+      latency_us: 2.0
+      source: probed
+      confidence: medium
+trn2-16device:
+  tiers:
+  - name: hbm_bank
+    scope: logical_nc
+    capacity_bytes: 25769803776
+    bandwidth_bytes_per_s: 7.25e11
+    latency_us: 0
+    source: derived
+    reachable_from: own logical_nc
+  - name: device_hbm
+    scope: device
+    capacity_bytes: 103079215104
+    bandwidth_bytes_per_s: 2.9e12
+    latency_us: 0
+    source: datasheet
+    reachable_from: the 4 logical_nc of that device
+    note: The 4 banks of one device; a cross-bank read stays on-device.
+  - name: peer_hbm
+    scope: instance
+    capacity_bytes: 1649267441664
+    bandwidth_bytes_per_s: 1.024e12
+    latency_us: 1.0
+    source: datasheet
+    reachable_from: any device, cost scales with torus hop count
+    aggregate_bandwidth_bytes_per_s: 4.64e13
+  - name: host_dram
+    scope: instance
+    capacity_bytes: 2199023255552
+    capacity_source: datasheet
+    bandwidth_bytes_per_s: 12988169966.244795
+    latency_us: 2.0
+    source: probed
+    confidence: low
+    reachable_from: any device, over PCIe
+    note: 'Where a 94.56 GiB Engram table most plausibly lives. Whether that is affordable
+      is a bandwidth-and-latency question this file cannot yet answer, which is why
+      the probe is required rather than optional.
+
+      '
+  - name: nvme
+    scope: instance
+    capacity_bytes: 7680000000000
+    capacity_source: datasheet
+    devices: 4
+    bandwidth_bytes_per_s: 9141492076.27029
+    random_read_iops: 132866.46714113464
+    latency_us: 29.740476747974753
+    min_transfer_granularity_bytes: 4096
+    via:
+    - host_dram
+    source: probed
+    confidence: low
+    reachable_from: "any device, but only *through* host_dram \u2014 there is no direct\
+      \ path"
+    note: measured on this host's single NVMe drive; the 16-device target has four,
+      so its aggregate bandwidth and IOPS are extrapolations
+  - name: ebs
+    scope: instance
+    bandwidth_bytes_per_s: 1.0e10
+    source: datasheet
+    inference_path: false
+    note: Load-time only. A scheme that reads EBS during a forward pass is rejected.
+  - name: network
+    scope: instance
+    bandwidth_bytes_per_s: 4.0e11
+    source: datasheet
+    inference_path: false
+    note: Load-time only. One instance is the whole deployment; there is nowhere to
+      send.
+trn2-1device:
+  tiers:
+  - name: hbm_bank
+    scope: logical_nc
+    capacity_bytes: 25769803776
+    bandwidth_bytes_per_s: 7.25e11
+    latency_us: 0
+    source: derived
+    reachable_from: own logical_nc
+  - name: device_hbm
+    scope: device
+    capacity_bytes: 103079215104
+    bandwidth_bytes_per_s: 2.9e12
+    latency_us: 0
+    source: datasheet
+    reachable_from: the 4 logical_nc of that device
+  - name: host_dram
+    scope: instance
+    capacity_bytes: 137438953472
+    capacity_source: datasheet
+    bandwidth_bytes_per_s: 12988169966.244795
+    latency_us: 2.0
+    source: probed
+    confidence: low
+    reachable_from: any device, over PCIe
+  - name: nvme
+    scope: instance
+    capacity_bytes: 470000000000
+    capacity_source: datasheet
+    devices: 1
+    bandwidth_bytes_per_s: 2285373019.0675726
+    random_read_iops: 33216.61678528366
+    latency_us: 29.740476747974753
+    min_transfer_granularity_bytes: 4096
+    via:
+    - host_dram
+    source: probed
+    confidence: low
+    reachable_from: any device, but only through host_dram
+    note: measured on this host's single NVMe drive; the 16-device target has four,
+      so its aggregate bandwidth and IOPS are extrapolations

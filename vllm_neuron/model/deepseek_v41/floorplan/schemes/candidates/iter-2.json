@@ -1,0 +1,23 @@
+{
+  "iteration": 2,
+  "metrics": {
+    "prefill_128_b1_ms": 41.623,
+    "prefill_128_b4_ms": 97.744,
+    "prefill_128_b8_ms": 191.528,
+    "prefill_128_b32_ms": 754.464,
+    "prefill_8192_b1_ms": 742.975,
+    "prefill_8192_b4_ms": 1751.938,
+    "prefill_8192_b8_ms": 3469.676,
+    "prefill_8192_b32_ms": 13776.336,
+    "decode_128_b1_ms": 12.612,
+    "decode_128_b4_ms": 13.704,
+    "decode_128_b8_ms": 16.949,
+    "decode_128_b32_ms": 36.417,
+    "decode_8192_b1_ms": 15.479,
+    "decode_8192_b4_ms": 24.151,
+    "decode_8192_b8_ms": 28.23,
+    "decode_8192_b32_ms": 52.702
+  },
+  "accepted": true,
+  "archived_at": "2026-09-26T11:56:00"
+}
