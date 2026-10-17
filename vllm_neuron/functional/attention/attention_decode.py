@@ -26,6 +26,7 @@ from nkilib.core.utils.allocator import SbufManager
 from nkilib.core.utils.common_types import QuantizationType
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from vllm_neuron.parallel.neuron_parallel_state import all_contiguous_replica_groups
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 from vllm_neuron.functional.attention.attention_decode_mask import (
@@ -336,10 +337,10 @@ def _torch_compatible_attention_block_tkg_kernel_dcp(
         sbm_lower_bound, sbm_upper_bound, sbm_use_auto_alloc, sbm_default_stack_alloc
     )
 
-    # ReplicaGroup cannot cross the HOP boundary. Pass the ranks from vLLM's
-    # DCP group and rebuild the single group inside the trace.
+    # ReplicaGroup cannot cross the HOP boundary. Pass the DCP partition as a
+    # tuple of rank tuples and rebuild the ReplicaGroup inside the trace.
     dcp_replica_group = (
-        ncc.ReplicaGroup([list(dcp_group_ranks)])
+        ncc.ReplicaGroup([list(g) for g in dcp_group_ranks])
         if dcp_group_ranks is not None
         else None
     )
@@ -1604,7 +1605,11 @@ def attention_decode(
             dcp_collective_mode_resolved = _resolve_dcp_collective_mode(
                 dcp_collective_mode, dcp_size
             )
-            dcp_group_ranks = tuple(dcp_group.ranks)
+            # Full partition (not just this rank's group) keeps the graph
+            # identical across DCP groups.
+            dcp_group_ranks = tuple(
+                tuple(g) for g in all_contiguous_replica_groups(dcp_group.ranks)
+            )
             wrapped = wrap_nki(_torch_compatible_attention_block_tkg_kernel_dcp)
             kernel_out = wrapped[2](
                 X,

@@ -155,6 +155,29 @@ def rank_to_col(rank, row_size: int, world_size: int):
     return rank % row_size
 
 
+def all_contiguous_replica_groups(group_ranks) -> list[list[int]]:
+    """Return every sub-group of the world partition that ``group_ranks`` belongs to.
+
+    In-kernel collectives take a ``ReplicaGroup`` (a list of non-overlapping
+    sub-groups). Passing only the caller's own sub-group bakes rank-specific
+    constants into the traced graph, so each sub-group compiles its own NEFF.
+    When the group is one block of a contiguous, equal-size partition of the
+    world (e.g. vLLM's DCP groups ``[0..W-1], [W..2W-1], ...``), returning the
+    full partition keeps the graph identical on every rank. Any other layout
+    falls back to the caller's own group.
+    """
+    import torch.distributed as dist
+
+    ranks = list(group_ranks)
+    size = len(ranks)
+    world_size = dist.get_world_size() if dist.is_initialized() else size
+    if ranks != list(range(ranks[0], ranks[0] + size)) or ranks[0] % size != 0:
+        return [ranks]
+    if world_size % size != 0 or ranks[-1] >= world_size:
+        return [ranks]
+    return [list(range(start, start + size)) for start in range(0, world_size, size)]
+
+
 def rank_to_row(rank, row_size: int, world_size: int):
     """Map a global rank to its row position (EP rank) in the 2D mesh.
 
