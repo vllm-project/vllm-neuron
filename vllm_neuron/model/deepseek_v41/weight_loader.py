@@ -1,12 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-DeepSeek-V4.1-Flash (timeshare) weight loading
-==============================================
+DeepSeek-V4.1-Flash weight loading — 16 devices, resident
+=========================================================
 
-The checkpoint is 475.2 GiB across 48 safetensors shards. One Trainium 2 device
-has 96 GiB of HBM, 24 GiB per logical NeuronCore. So the loader cannot be a key
-rename: it has to decide, per tensor, whether that tensor lives on the device for
-the whole run or is streamed in when the computation that needs it runs.
+The checkpoint is 475.2 GiB across 48 safetensors shards. A trn2.48xlarge has
+1,536 GiB of HBM in 64 banks of 24, so the whole checkpoint fits — but no single
+bank holds a 94.6 GiB engram table or a layer's 384 experts, so "it fits" is a
+statement about the *partition*, not about any one rank. This loader builds that
+partition: every tensor lands in HBM, and which rank's HBM is decided per family
+by the axis that divides.
+
+    dense weights   sharded by head/group (8 ways) or by vocab (64), as
+                    `model._build_shard_plan` says per key
+    routed experts  partitioned by expert id, `n_routed / world_size` a rank,
+                    into the slots `MoE.allocate_cache_slots` made
+    engram tables   partitioned by row, `ceil(N / world_size)` a rank,
+                    dequantized to bf16 on the way in
+
+**After this module returns, nothing reads the checkpoint again.** That is the
+difference from the single-device ancestor (`deepseek_v41_timeshare`), whose
+loader had to decide per tensor whether it could be resident at all and left 98%
+of the checkpoint on disk to be streamed per forward. The streaming machinery
+below is kept and still works — `TimeshareWeightStore`, the expert reader, the
+row gather — because a rank that cannot fit its shard should degrade to it
+rather than fail, and because the measurements in its comments are the only
+record of what the disk path cost.
 
 Where the bytes are
 -------------------
@@ -20,20 +38,29 @@ index rather than from these notes):
                      ----------
                      475.24 GiB
 
-98% of the checkpoint is in two places, and both are *sparsely read*:
+98% of the checkpoint is in those two families, and what makes each one fit is
+that it has an axis the world divides:
 
-  - **Routed experts.** 6 of 384 fire per token. A decode step with 4 sequences
-    touches at most 24 experts of 384 in a layer — 6% of that layer's expert
-    bytes. Loading all 384 would be loading 94% of nothing.
-  - **Engram tables.** They are embedding tables. A token needs
-    `(max_ngram_size - 1) * n_heads` = 24 rows of 256 fp8 values, so 6 KiB per
-    token per layer. The 94.6 GiB is the *domain* of the lookup, not its cost.
+  - **Routed experts.** Partitioned by id, and the id axis is 384 (128 in a
+    DSpark stage), so 64 ranks own 6 each per layer: **4.3 GiB a rank** against
+    275.7 across the model. The partition is disjoint and covers the pool, which
+    is what makes the per-rank partial sums add up to the routed set exactly
+    once — `MoE.forward`'s all-reduce depends on that and on the gate being
+    replicated so every rank selects the same experts.
+  - **Engram tables.** Embedding tables, 384,006,168 rows of 256 fp8 values.
+    Partitioned by row, so 64 ranks own ~6.0M rows each: **2.86 GiB a rank** per
+    table in bf16, 5.72 for both. A lookup is reassembled by masking and
+    all-reducing, exactly as the vocab-parallel embedding is.
 
-So the split is: the 9.83 GiB of dense weights are loaded once, sharded 4 ways,
-and stay resident (about 2.5 GiB per rank); the experts and the engram rows are
-fetched per forward by `TimeshareWeightStore` into fixed device-resident staging
-buffers that `model.py` reuses. "Timesharing the HBM" is that: one set of
-buffers, refilled, rather than 475 GiB of parameters.
+Measured on this checkpoint at 64 ranks, from the index rather than from these
+notes (`weight_census`, and `load_weights`'s own log line):
+
+    dense (a rank)      ~3.9 GiB   embedding, LM head, attention, norms, hc,
+                                   gates, shared experts
+    routed experts       4.3 GiB   246 of 15,744, by id
+    engram rows          5.7 GiB   two shards, bf16
+                        ---------
+                        ~13.9 GiB  of a 24 GiB bank
 
 Why not `SafetensorsCheckpoint.load_sharded_pipelined`
 ------------------------------------------------------
@@ -45,21 +72,24 @@ single expert's 2.6 MiB costs one page-fault burst instead of a shard.
 
 Where the bytes are read from
 -----------------------------
-Throughput decides whether the model can run at all, and the two disks on this
-instance differ by 9x:
+Throughput now decides **start-up time only**, not whether the model can run,
+which is the point of making the weights resident. It still matters: the world
+reads the expert pool once (275.7 GiB, disjoint across ranks), both engram
+tables once (183 GiB), and the replicated dense tensors once per rank, so a cold
+start moves ~600 GiB off the volume however fast it is.
 
-    /            (EBS)             131 MB/s   measured, does not scale with
-                                              parallel readers
-    /dev/nvme1n1 (instance store)  1.1 GB/s   measured with O_DIRECT
+Measured on this host, 2026-10-17:
 
-At 131 MB/s, streaming the 286 GiB of non-engram weights once takes 37 minutes,
-and the verifier has to finish 4 prompts in its budget. At 1.1 GB/s the same
-pass is 4.3 minutes. So each shard is read from `TIMESHARE_CACHE_ROOT` when a
-whole copy of it is staged there and from the original path otherwise, decided
-per shard because the fast volume (430 GiB) is smaller than the checkpoint
-(475.24 GiB). The cache holds the same bytes — a faster copy of the same shards,
-admitted only on an exact size match against the original, not a different
-checkpoint.
+    /            (EBS)             67.6 MB/s read, direct — ~2.5 h for that
+    /mnt/nvme    (instance store)   2.6 GB/s read, direct — ~4 min
+
+so the checkpoint belongs on the instance store, and `references/INDEX.md` says
+where it is. `TIMESHARE_CACHE_ROOT` names a faster *copy* of a checkpoint that
+lives elsewhere; with the checkpoint itself on `/mnt/nvme` the cache and the
+original are the same directory and `staged_cache_root` resolves to it without
+copying anything. The per-shard admission rule (an exact size match against the
+original) is unchanged and still what stops a different checkpoint being read as
+a cache of this one.
 
 Intermediate state
 ------------------
@@ -1407,6 +1437,43 @@ class TimeshareWeightStore:
         self._stream_owner: tuple[int, _ExpertStream] | None = None
         #: One expert's worth of host memory, refilled by `_read_expert`.
         self._blob: torch.Tensor | None = None
+        #: Set by `seal()` once every weight is resident. Then `expert()` and
+        #: `engram()` raise rather than read: see `seal`.
+        self._sealed = False
+
+    def seal(self) -> None:
+        """Forbid any further weight read. Called when the model came up resident.
+
+        **This is what makes "a forward reads no weights off disk" an invariant
+        rather than an observation.** Residency is established by
+        `load_resident_experts` and `load_engram_tables`, and the forward path
+        then takes the `self.resident` branch in `MoE._expert` and
+        `DeepseekV41Model._engram_rows`. But those are two `if`s, and an `if`
+        that stops being taken is a silent regression: the model would still
+        produce correct tokens, from disk, at tens of minutes a forward — which
+        is exactly the failure that went five iterations unnoticed on the
+        single-device port when its instance store came up empty.
+
+        So after loading, the door is shut. A read attempt is a loud failure
+        naming what it was reading, instead of an hour of unexplained latency.
+
+        Not called when anything fell back to streaming, because then the
+        forward legitimately needs this store.
+        """
+        self._sealed = True
+
+    def _refuse_if_sealed(self, what: str) -> None:
+        if not self._sealed:
+            return
+        raise RuntimeError(
+            f"weight store: refusing to read {what} — every weight this rank "
+            "needs is resident in HBM and the store was sealed after loading, "
+            "so a read here means the forward path fell back to streaming. "
+            "That is a performance regression of ~3 orders of magnitude, not a "
+            "correctness one, which is why it is raised rather than logged. "
+            "Check MoE.resident and Engram.resident; see "
+            "weight_loader.TimeshareWeightStore.seal."
+        )
 
     # ── Routed experts ────────────────────────────────────────────────────
 
@@ -1509,6 +1576,7 @@ class TimeshareWeightStore:
         the device. The loop below is the unannounced path: the same bytes, read
         now, through the `mmap`.
         """
+        self._refuse_if_sealed(f"expert {expert_id} of layer {layer_id}")
         stream = self._stream
         if stream is not None:
             served = stream.take(layer_id, expert_id)
@@ -1605,6 +1673,7 @@ class TimeshareWeightStore:
         Dequantized here, unlike the experts: a row is 256 values, the gather is
         already random-access, and the bf16 result is 6 KiB per token per layer.
         """
+        self._refuse_if_sealed(f"engram rows for layer {layer_id}")
         if layer_id not in list(self.config.engram_layer_ids):
             raise ValueError(
                 f"layer {layer_id} has no engram table; "
@@ -1740,6 +1809,146 @@ def iter_resident_tensors(
             yield name, as_bytes(index.tensor(key))
 
 
+#: Rows of an engram table dequantized per step by `load_engram_tables`.
+#:
+#: The whole shard cannot be dequantized in one call. A rank's slice at 64 ranks
+#: is 6,000,097 rows, and `dequant_engram_rows` materializes an fp32 value
+#: tensor and an fp32 factor tensor of the same shape — 6.1 GiB each — before it
+#: casts to bf16. Sixty-four ranks doing that at once is 780 GiB of host
+#: commitment against a 1000 GiB `CommitLimit`, which is how a load becomes an
+#: OOM rather than a wait. At 65,536 rows the pair is ~128 MiB a rank, so ~8 GiB
+#: across the world, and the shard arrives in ~92 steps.
+_ENGRAM_LOAD_ROWS = 1 << 16
+
+
+def load_engram_tables(
+    model: DeepseekV41ForCausalLM,
+    index: SafetensorsIndex,
+    device: torch.device,
+) -> int:
+    """Put this rank's rows of each n-gram table in HBM. Returns the bytes.
+
+    The two tables are 188.83 GiB of the checkpoint's 475.24 and they are the
+    reason the single-device port had to stream: 94.6 GiB is 3.9x one 24 GiB
+    bank. They are also embedding tables, so they shard by row exactly as the
+    vocabulary does — `ceil(N / world_size)` rows a rank, 2.86 GiB in bf16 at 64
+    ranks — and `Engram.lookup` reassembles a gather with one all-reduce.
+
+    **Padded to a uniform width.** The last rank's real slice is short (the row
+    counts, 384,006,168 and 384,016,682, divide by nothing), and a shorter
+    buffer would key its own lookup graph, so every rank allocates the full
+    width and the tail rows stay zero. They are unreachable: `NgramHashState`
+    cannot emit an id past the table's end, so an id that falls in a rank's
+    range is always a real row. See `Engram`'s docstring.
+
+    Dequantized here rather than on the device, which costs 2x the HBM
+    (5.72 GiB against 2.95 for both tables) and buys a load path with no
+    device-side fp8 at all. Keeping the stored form is the obvious next
+    optimization; it is not needed to fit.
+
+    A layer whose shard cannot be read leaves `Engram.resident` False and falls
+    back to streaming — it does not get zeros, because zeros would be a
+    different model that still produced fluent text.
+    """
+    loaded = 0
+    for layer_id in list(model.config.engram_layer_ids):
+        engram = model.layers[layer_id].engram
+        if engram is None:
+            continue
+        weight_key = f"layers.{layer_id}.engram.embed.weight"
+        scale_key = f"layers.{layer_id}.engram.embed.scale"
+        if weight_key not in index or scale_key not in index:
+            # Allocated anyway: `model.to(device)` runs after this and cannot
+            # move a meta buffer, so the attribute has to be a real tensor
+            # whichever path the layer ends up on.
+            engram.table = torch.empty(
+                0, engram.head_dim, dtype=torch.bfloat16, device=device
+            )
+            logger.warning(
+                "deepseek_v41: layer %d has no engram table in the checkpoint "
+                "(%s); falling back to the streamed lookup",
+                layer_id, weight_key,
+            )
+            continue
+
+        total_rows = int(index.ref(weight_key).shape[0])
+        width = -(-total_rows // model.world_size)
+        start = model.rank * width
+        have = max(0, min(width, total_rows - start))
+
+        # Refuse a shard that does not fit rather than letting `torch.zeros`
+        # fail on the device: at 8 ranks a shard is 22.9 GiB of a 24 GiB bank.
+        # See `model._ENGRAM_TABLE_BYTES`.
+        from .model import _ENGRAM_TABLE_BYTES
+
+        shard_bytes = width * engram.head_dim * 2
+        budget = _ENGRAM_TABLE_BYTES // max(1, len(list(model.config.engram_layer_ids)))
+        if shard_bytes > budget:
+            engram.table = torch.empty(
+                0, engram.head_dim, dtype=torch.bfloat16, device=device
+            )
+            logger.warning(
+                "deepseek_v41: engram layer %d shard is %.2f GiB (%d rows of "
+                "%d over %d ranks) against a %.2f GiB budget, so this layer "
+                "streams its rows off disk instead. Correct, and disk-bound; "
+                "widen the world or raise "
+                "DEEPSEEK_V41_ENGRAM_TABLE_BYTES.",
+                layer_id, shard_bytes / 2**30, width, total_rows,
+                model.world_size, budget / 2**30,
+            )
+            continue
+
+        table = torch.zeros(
+            width, engram.head_dim, dtype=torch.bfloat16, device=device
+        )
+        for lo in range(0, have, _ENGRAM_LOAD_ROWS):
+            hi = min(lo + _ENGRAM_LOAD_ROWS, have)
+            rows = index.tensor(weight_key)[start + lo : start + hi]
+            scales = index.tensor(scale_key)[start + lo : start + hi]
+            table[lo:hi].copy_(dequant_engram_rows(rows, scales))
+        # The shard is read once and never again, so leaving ~1.5 GiB a rank of
+        # it in the page cache would only crowd out the runtime's host DMA
+        # memory. Same reasoning as `TimeshareWeightStore.expert`.
+        index.release_pages(weight_key)
+        index.release_pages(scale_key)
+
+        engram.bind_table(table, start, width)
+        loaded += table.numel() * table.element_size()
+        logger.info(
+            "deepseek_v41: engram layer %d resident — rows [%d, %d) of %d "
+            "(%.2f GiB bf16, padded to %d) for rank %d/%d",
+            layer_id, start, start + have, total_rows,
+            table.numel() * table.element_size() / 2**30, width,
+            model.rank, model.world_size,
+        )
+    return loaded
+
+
+def load_resident_experts(
+    model: DeepseekV41ForCausalLM, weight_store: "TimeshareWeightStore"
+) -> tuple[int, int]:
+    """Fill every expert slot this rank owns. Returns `(experts, bytes)`.
+
+    The other half of what makes this deployment resident. The experts are
+    partitioned by id, so this reads `275.67 GiB / world_size` — 4.6 GiB at 64
+    ranks — and across the world it reads the expert pool exactly once, because
+    the partitions are disjoint and cover it.
+
+    A layer that could not get a slot per owned expert is left streaming, and
+    the count returned says so: the caller logs whether the model came up
+    resident rather than assuming it.
+    """
+    blocks = list(model.layers) + list(model.mtp)
+    # Measured off the buffers themselves rather than remembered, so the figure
+    # in the load log cannot drift from what was actually allocated.
+    per_expert = sum(
+        buffer.numel() * buffer.element_size()
+        for buffer in blocks[0].ffn.expert_slot.buffers()
+    )
+    experts = sum(block.ffn.load_resident_experts(weight_store) for block in blocks)
+    return experts, experts * per_expert
+
+
 def load_weights(
     model: DeepseekV41ForCausalLM,
     checkpoint_path: str,
@@ -1827,18 +2036,56 @@ def load_weights(
             f"the meta device; first few: {still_meta[:5]}"
         )
 
-    # The expert staging slots, before the runtime's `model.to(device)`: they
-    # have no checkpoint key, so nothing above assigned them, and `Module.to()`
-    # refuses to move a meta tensor.
+    # The expert slots, before the runtime's `model.to(device)`: they have no
+    # checkpoint key, so nothing above assigned them, and `Module.to()` refuses
+    # to move a meta tensor.
     model.allocate_staging_buffers(device)
 
+    # ── The two families that used to be streamed ─────────────────────────
+    #
+    # Both are read once, here, into the slots and shards allocated above, and
+    # neither is touched again for the life of the process. That is the whole
+    # difference between this deployment and the single-device port: a forward
+    # reads no file, so its cost does not depend on a disk.
+    #
+    # Order matters only in that both run after `allocate_staging_buffers`,
+    # which is what created the device buffers they fill.
+    experts, expert_bytes = load_resident_experts(model, model.weight_store)
+    engram_bytes = load_engram_tables(model, index, device)
+
+    wanted_experts = sum(
+        block.ffn.n_local_experts for block in list(model.layers) + list(model.mtp)
+    )
+    engram_resident = all(
+        model.layers[layer_id].engram is None
+        or model.layers[layer_id].engram.resident
+        for layer_id in list(model.config.engram_layer_ids)
+    )
+    resident = experts == wanted_experts and engram_resident
+    if resident:
+        # Shut the door behind the load. From here a weight read is a bug, and
+        # `seal` says why it is raised rather than logged.
+        model.weight_store.seal()
+        # And stand down the host-side housekeeping a streaming forward needed.
+        from .model import _RESIDENT_WEIGHTS
+
+        _RESIDENT_WEIGHTS[0] = True
+    total = loaded_bytes + expert_bytes + engram_bytes
     logger.info(
-        "loaded %.2f GiB of resident weights for rank %d/%d from %s; %d routed "
-        "experts per layer and the two engram tables stay on disk and are "
-        "streamed per forward",
-        loaded_bytes / 2**30,
+        "deepseek_v41: rank %d/%d loaded %.2f GiB from %s — %.2f GiB dense, "
+        "%.2f GiB of %d routed experts (%d wanted), %.2f GiB of engram rows. "
+        "%s",
         model.rank,
         model.world_size,
+        total / 2**30,
         root,
-        model.config.n_routed_experts,
+        loaded_bytes / 2**30,
+        expert_bytes / 2**30,
+        experts,
+        wanted_experts,
+        engram_bytes / 2**30,
+        "Weights are RESIDENT: the forward path reads no file."
+        if resident
+        else "NOT fully resident — the forward will stream what is missing, "
+        "which is correct but disk-bound; see the slot and shard logs above.",
     )

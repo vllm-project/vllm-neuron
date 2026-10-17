@@ -71,10 +71,15 @@ checkpoint layers 40-42 (`add_block(f"mtp.{stage}", ...)` in the shard plan).
 from __future__ import annotations
 
 import logging
+import os
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+#: Verify steps between two acceptance-rate log lines. The figure it reports is
+#: cumulative, so a sample of it is as informative as all of them.
+_LOG_EVERY = max(1, int(os.environ.get("DEEPSEEK_V41_DRAFT_LOG_EVERY", 16)))
 
 #: `speculative_config.method` this proposer answers to.
 METHOD = "deepseek_mtp"
@@ -382,10 +387,18 @@ class DSparkProposer:
         type(self)._offered += offered
         type(self)._kept += kept
         type(self)._verified_steps += 1
-        logger.info(
-            "deepseek_v41: DSpark verify step %d — %d/%d draft tokens "
-            "accepted this step, %d/%d (%.0f%%) over the run",
-            type(self)._verified_steps, kept, offered,
-            type(self)._kept, type(self)._offered,
-            100.0 * type(self)._kept / max(1, type(self)._offered),
-        )
+        # The running acceptance rate is what this is for, and it is a running
+        # total — so logging it every step on every rank said the same thing
+        # 4,992 times in one run at 64 ranks. Every `_LOG_EVERY` steps, on the
+        # rank that speaks for the world, keeps the curve visible at ~1/64th of
+        # the volume; the per-step numbers are still in the message.
+        from .model import _LOG_RANK
+
+        if _LOG_RANK[0] and type(self)._verified_steps % _LOG_EVERY == 0:
+            logger.info(
+                "deepseek_v41: DSpark verify step %d — %d/%d draft tokens "
+                "accepted this step, %d/%d (%.0f%%) over the run",
+                type(self)._verified_steps, kept, offered,
+                type(self)._kept, type(self)._offered,
+                100.0 * type(self)._kept / max(1, type(self)._offered),
+            )

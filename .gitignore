@@ -7,3 +7,17 @@ __pycache__
 # Written by the verifier on every run (see verifier/run_verifier.py DEFAULT_REPORT).
 vllm_neuron/model/deepseek_v41/verifier/verifier_report.json
 vllm_neuron/model/deepseek_v41_timeshare/verifier/verifier_report.json
+
+# NKI/neuronx-cc scratch, written into the *current working directory* rather
+# than TMPDIR. A device run launched from the repo root leaves one directory per
+# compiled kernel (`<kernel name>_<hash>/`, holding a `.colz`), an empty
+# `neuronxcc-<id>/` per compiler invocation, and a metric store — 144 paths and
+# 32 MB after a single verifier run here. It matters beyond tidiness: the
+# AutoHelix loop diffs this worktree to decide what an iteration changed, and
+# compiler droppings in the diff are noise it has to reason about.
+#
+# The launchers under ~/ run from a scratch cwd so these do not appear at all;
+# this is the backstop for a run started from the repo root by hand.
+/c[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*/
+/neuronxcc-*/
+/global_metric_store.json

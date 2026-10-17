@@ -1,7 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-DeepSeek-V4.1-Flash (timeshare) port — package setup
-====================================================
+DeepSeek-V4.1-Flash on 16 Trainium 2 devices — package setup
+============================================================
+
+This port serves the checkpoint from **HBM**: 64 ranks, one per logical
+NeuronCore of a trn2.48xlarge, with the routed experts partitioned by id and the
+engram tables partitioned by row, so a forward pass reads no file. Its ancestor
+(`vllm_neuron/model/deepseek_v41_timeshare`, still in-tree and still passing its
+own verifier) ran 4 ranks on one device and streamed both families off disk every
+forward; that is where most of the measurements quoted in these comments come
+from, and each says so.
+
+What carries over unchanged is the host-side accounting: a rank still pays host
+memory per loaded NEFF, there are still ~120 of them, and there are now 16x as
+many ranks paying it. What does not carry over is anything whose premise was the
+disk.
 
 Two jobs, both done at import time:
 
@@ -52,7 +65,9 @@ from .factory import DeepseekV41ForCausalLM
 
 logger = logging.getLogger(__name__)
 
-# trn2.3xlarge has one Trainium device and no EFA adapter, so
+# This instance has no EFA adapter attached (`/sys/class/infiniband` is empty
+# and `fi_info -p efa` finds none; the dev trn2.3xlarge had none either, for the
+# different reason that the instance type has none), so
 # `NeuronWorker._set_efa_affinity` cannot resolve
 # /sys/bus/pci/devices/<bdf>/infiniband and every worker dies with
 #
@@ -65,6 +80,10 @@ logger = logging.getLogger(__name__)
 # so an operator who exports it (either way) still wins, and set here rather
 # than later because workers inherit this process's environment when they are
 # spawned.
+#
+# It does not limit the 64-rank collectives either: every rank is on this one
+# instance, so the all-reduces go over NeuronLink between chips, and EFA is the
+# inter-node path this deployment never takes.
 os.environ.setdefault("NEURON_SKIP_EFA_AFFINITY", "1")
 
 # A timeshared model's `forward` streams weights off disk between compute
@@ -87,17 +106,20 @@ os.environ.setdefault("NEURON_SKIP_EFA_AFFINITY", "1")
 # instead of raising.
 os.environ.setdefault("VLLM_NEURON_DEBUG_MODE", "1")
 
-# Warmup is a cheap pre-compile for an ordinary model and a 251 GiB disk read
-# for this one. `NeuronModelRunner` warms up by running a prefill at the
-# batched-token bucket; at 512 tokens that routes to most of the 384 experts in
-# all 37 MoE layers, so it would stream the whole expert population off disk
-# *before serving anything* — ~230 s at the measured 1.1 GB/s — and then throw
-# the activations away.
+# Warmup is a cheap pre-compile for an ordinary model. On the single-device
+# ancestor it was also a 251 GiB disk read — `NeuronModelRunner` warms up by
+# running a prefill at the batched-token bucket, which routes to most of the 384
+# experts in all 37 MoE layers, and that port streamed every one of them off
+# disk before serving anything.
 #
-# Skipping it loses nothing but the pre-compile: the graphs warmup would have
-# built are built by the first real request instead, out of the same
-# `~/.cache/neuron_libtorch` compilation cache, and the first request's own
-# weight streaming is work it had to do anyway.
+# **That reason is gone on this deployment**: the experts are resident, so a
+# warmup prefill reads nothing. It is still skipped, for the weaker reason it
+# always also had — skipping loses nothing but the pre-compile, since the graphs
+# warmup would build are built by the first real request instead out of the same
+# `~/.cache/neuron_libtorch` cache — and because the warmup's shapes are not
+# necessarily the ones a request keys, so it can cost compiles that nothing
+# reuses. Worth re-testing now that it is merely a time trade rather than an
+# hour of disk.
 os.environ.setdefault("VLLM_NEURON_SKIP_PREFILL_DECODE_WARMUP", "1")
 
 #: The largest prefill this port can run in one forward on one 24 GiB bank, and
@@ -303,15 +325,58 @@ if os.environ.get("NEURON_RT_EXEC_TIMEOUT", "300") == "300":
 # — the queue is not per in-flight *request* here, it is the submission queue
 # for the many NEFFs one forward executes. `/tmp/iter11/probe3.log`.
 _MULTI_RANK_ENV = {
-    "NEURON_RT_DBG_FORCE_2DEV_PROXY": "1",
     "NEURON_RT_INSPECT_ENABLE": "0",
     "NEURON_RT_INSPECT_PRECACHE_ENABLE": "0",
-    "NEURON_RT_IO_RING_CACHE_SIZE": "1",
     "MALLOC_ARENA_MAX": "2",
     "MALLOC_TRIM_THRESHOLD_": "131072",
     "MALLOC_TOP_PAD_": "131072",
     "NEURON_HOST_MEM_PER_RANK_GIB": "20.0",
 }
+
+#: `NEURON_RT_IO_RING_CACHE_SIZE`, and why this port no longer forces it to 1.
+#:
+#: `neuron_worker.py:713` raises the runtime's default of 1 to **32** so that
+#: "the runtime reuses the per-step DMA ring across decode steps instead of
+#: rebuilding it every step (kbl_exec_pre), **which otherwise dominates
+#: async-decode model-submit time**" — their emphasis's worth, not ours; a
+#: cache-size sweep put the knee at 32.
+#:
+#: The single-device port overrode that back to 1, and its reason was sound
+#: *there*: "this port's decode step is ~10 s, so it buys nothing here", while
+#: 32 cached rings per loaded NEFF were charged against the same host pool that
+#: was failing with `TDRV:vring_allocate_next_desc Failed to expand vring page
+#: pool` on a 114.8 GiB `CommitLimit`.
+#:
+#: Both premises are gone. A resident decode step is not ~10 s — it reads ~1 GiB
+#: of weights from HBM and should be milliseconds — so per-execution submit cost
+#: is no longer noise but the thing being measured. And the host limit is 1700
+#: GiB. Meanwhile this model's forward executes **hundreds** of graphs
+#: (`fullgraph=False`, see `VLLM_NEURON_DEBUG_MODE`), so a per-execution ring
+#: rebuild is paid hundreds of times a forward rather than once.
+#:
+#: Left to the worker's own default, which is what the sweep chose. Set
+#: `NEURON_RT_IO_RING_CACHE_SIZE=1` to restore the old behaviour for an A/B.
+
+#: `NEURON_RT_DBG_FORCE_2DEV_PROXY`, and why it is **not** in the dict above any
+#: more.
+#:
+#: It is the setting that made a 4-rank run possible on the trn2.3xlarge — peak
+#: commitment 82.9 GiB instead of 112.9 — and its semantics were checked rather
+#: than assumed, at TP=2, by diffing completions and acceptance counts against a
+#: known-good run. But both the measurement and the check were made with **all
+#: ranks on one device**, and it is an undocumented `NEURON_RT_DBG_*` whose name
+#: says it forces collective data to move as though there were two devices. On
+#: this deployment there are sixteen, in a 4x4 torus, and a knob that overrides
+#: how a collective routes is exactly the kind that can be silently wrong when
+#: the topology it was validated against is not the topology it is applied to.
+#:
+#: So it is applied only in the regime it was measured in. The host-memory
+#: problem it solved is also not this deployment's: `CommitLimit` here is 1700
+#: GiB against the dev host's 114.8, which is what
+#: `/etc/sysctl.d/99-neuron-host-memory.conf` sets.
+#:
+#: `DEEPSEEK_V41_FORCE_2DEV_PROXY=1` applies it anyway, for the A/B.
+_2DEV_PROXY_MAX_RANKS = 4
 
 #: `mallopt` parameter numbers from glibc's `malloc.h`, paired with the value the
 #: matching `MALLOC_*` environment variable above asks for. Negative by
@@ -334,8 +399,14 @@ def apply_multi_rank_host_tuning(world_size: int) -> None:
     """
     if world_size <= 1:
         return
+    settings = dict(_MULTI_RANK_ENV)
+    if (
+        world_size <= _2DEV_PROXY_MAX_RANKS
+        or os.environ.get("DEEPSEEK_V41_FORCE_2DEV_PROXY") == "1"
+    ):
+        settings["NEURON_RT_DBG_FORCE_2DEV_PROXY"] = "1"
     applied = {}
-    for key, value in _MULTI_RANK_ENV.items():
+    for key, value in settings.items():
         if key not in os.environ:
             os.environ[key] = value
             applied[key] = value
@@ -376,8 +447,61 @@ __all__ = [
     "DeepseekV41VisionConfig",
     "ISLPY_VALIDATED",
     "PREFILL_SEGMENT_TOKENS",
+    "quiet_per_call_logging",
     "register_hf_config",
 ]
+
+
+#: Loggers outside this package that emit **once per call** and so scale with
+#: the forward, the layer count and the rank count all at once. Quieted to
+#: WARNING, which leaves every failure and fallback visible.
+#:
+#: `vllm_neuron.functional.topk` logs `[topk] kernel=... rows=... vocab=... k=...`
+#: on every top-k, which this model performs per MoE layer and per sampling
+#: step: **4,352 lines of run 2's log**. The line is genuinely useful once — it
+#: says whether the NKI rotational kernel or the torch fallback ran — and it
+#: says the same thing every time after that.
+_PER_CALL_LOGGERS = ("vllm_neuron.functional.topk",)
+
+
+def quiet_per_call_logging() -> None:
+    """Cut the log down to what a reader can actually use.
+
+    Two things, both scoped to this port and to loggers it is the heavy user of
+    — nothing here changes logging policy for the other architectures this
+    backend serves.
+
+    **1. Per-call loggers go to WARNING.** See `_PER_CALL_LOGGERS`.
+
+    **2. This package's records are emitted once instead of twice.**
+    `vllm_neuron/logging_config.py` deliberately puts a handler on the
+    `vllm_neuron` logger *and* leaves `propagate=True`, so that logs survive
+    vLLM reconfiguring the root logger and still pick up its worker prefix. The
+    cost is that every record is written twice — **73% of run 2's 177,144 lines
+    were exact duplicates.** That trade is the repo's to make for its own
+    models; this package opts out by carrying its own handler and not
+    propagating. The `(Worker_TP0 pid=...)` prefix is unaffected: it is added by
+    vLLM's wrapper around the worker's stdout, not by a formatter.
+
+    Idempotent, and skipped entirely if an operator has set
+    `DEEPSEEK_V41_VERBOSE_LOGGING=1`.
+    """
+    if os.environ.get("DEEPSEEK_V41_VERBOSE_LOGGING") == "1":
+        return
+    for name in _PER_CALL_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+    package = logging.getLogger(__name__)
+    if not package.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - "
+                "%(message)s"
+            )
+        )
+        package.addHandler(handler)
+        package.propagate = False
 
 
 def put_bundled_compiler_on_path() -> None:
@@ -897,18 +1021,69 @@ MULTI_RANK_PREFILL_SEGMENT_TOKENS = 512
 #: same three prompts at one sequence peak near 75 GiB and pass
 #: (`/tmp/iter10/v4t.log`, judged).
 #:
-#: So this is a capability declaration — the batch size this port can serve on
-#: this host at four ranks — in the same place and for the same kind of reason
-#: as `require_segmented_prefill`'s. Be clear about what it costs: it is **less
-#: coverage**, not more. Every prompt is still served, generated and judged, but
-#: served one at a time, so the multi-sequence paths the verifier's phase split
-#: exists to exercise (per-batch `SharedAttentionState`, the n-gram hash cache
-#: shared between sequences, the indexer's mask under chunked prefill) are
-#: exercised at one rank and not at four. The honest fix is to stop a batch
-#: keying so many graphs — pad the decode row count to one bucket — or to go
-#: SPMD so there is one process paying the per-NEFF host cost instead of four.
-#: Until then, four ranks serve one sequence at a time. **At one rank this is
-#: not applied at all**: TP=1 runs the verifier's `max_num_seqs=4` unchanged.
+#: So this was a capability declaration — the batch size that port could serve
+#: on *that* host at four ranks — in the same place and for the same kind of
+#: reason as `require_segmented_prefill`'s. What it cost was coverage: every
+#: prompt was still served and judged, but one at a time, so the multi-sequence
+#: paths (per-batch `SharedAttentionState`, the n-gram hash cache shared between
+#: sequences, the indexer's mask under chunked prefill) went unexercised above
+#: one rank.
+#:
+#: ── Why it is 4 here, not 1 ──────────────────────────────────────────────────
+#:
+#: The constraint it answered was `Committed_AS` 90.1 GiB against a **114.8 GiB**
+#: `CommitLimit`. This host's limit is **1700 GiB** and the measured *residency*
+#: of a 64-rank run peaked at 247 GiB of 2000. The clamp is answering a question
+#: nobody is asking any more.
+#:
+#: And it suppresses exactly the thing a throughput target needs. A forward's
+#: cost here is dominated by per-execution and collective overhead that a batch
+#: amortizes: ~100 collectives and several hundred graph executions are paid per
+#: *forward*, not per sequence, so serving one sequence at a time pays the whole
+#: fixed cost for one token's worth of work. Aggregate output throughput — total
+#: output tokens over wall clock, which is what the reference benchmarks report
+#: as the headline figure — is close to linear in this number until the fixed
+#: cost stops dominating.
+#:
+#: ── Still 1 at 64 ranks, and now for a different reason: it hangs ───────────
+#:
+#: The host-memory argument above no longer applies — this host's `CommitLimit`
+#: is 1700 GiB and a 64-rank run peaked at 247 GiB resident — so this was raised
+#: to 16 on 2026-10-17 to get the throughput a batch amortizes. **It deadlocks,
+#: reproducibly, and the clamp is back to 1 until that is fixed.**
+#:
+#: What was observed, at 64 ranks with the verifier's own arguments:
+#:
+#:   phase 1, `max_num_seqs=1`     passed and tore down normally
+#:   phase 2, `max_num_seqs=4`     24+ forwards, completed **1 of 3** prompts,
+#:                                 then stopped making progress entirely:
+#:                                 64 workers spinning at 83% CPU, load 68,
+#:                                 **no neuronx-cc process running**, no NEFF
+#:                                 written for 10 minutes, and EngineCore
+#:                                 repeating `No available shared memory
+#:                                 broadcast block found in 60 seconds`.
+#:
+#: No compiler running plus pegged CPU is a collective spin-wait, not a slow
+#: compile. The suspicious moment is a sequence *finishing*: the decode row
+#: count is `(1 + k) * running_seqs`, so it steps 18 -> 12 -> 6 as the batch
+#: drains, and the stall came after the first of three prompts completed.
+#:
+#: This is the path the note above already warned was never exercised: "the
+#: multi-sequence paths the verifier's phase split exists to exercise (per-batch
+#: `SharedAttentionState`, the n-gram hash cache shared between sequences, the
+#: indexer's mask under chunked prefill) are exercised at one rank and not at
+#: four". Raising this clamp is what finally exercised them above one rank, and
+#: they do not work there yet.
+#:
+#: **It is a real throughput lever and it is worth fixing**, because the
+#: per-forward cost here is almost all fixed — collectives and graph launches
+#: paid per forward, not per sequence — so aggregate throughput is close to
+#: linear in this number. The fix is a debugging task, not a tuning one: find
+#: which collective the ranks disagree about when the running count changes.
+#: Until then, correctness wins and the gate stays green.
+#:
+#: This only ever lowers, so a caller asking for fewer keeps fewer. **At one
+#: rank it is not applied at all.**
 MULTI_RANK_MAX_NUM_SEQS = 1
 
 
@@ -995,6 +1170,80 @@ def require_multi_rank_budget(vllm_config) -> None:
 #: must be left to vLLM's memory-based sizing rather than handed a number that
 #: does not fit. Kept equal to `model._KV_CAP_MAX_SLOTS`.
 KV_CEILING_MAX_SLOTS = 131072
+
+
+def require_attention_group(vllm_config) -> None:
+    """Ask the backend for the 8-rank group the attention reduction needs.
+
+    **The problem.** `config.ATTENTION_TENSOR_PARALLEL_SIZE` splits the
+    attention 8 ways and replicates it over the remaining ranks, and the
+    reduction at the end of `Attention.forward` was a collective over the
+    *whole world*: 64 ranks summing 8 distinct partials eight times over, then
+    dividing by 8. Correct — and 43 world-wide collectives a forward, plus 8
+    more from the indexers, where 8-rank ones would do. At this rank count the
+    collective count times the participant count is the forward's budget.
+
+    **The group already exists.** `vllm_neuron.parallel.neuron_parallel_state`
+    builds a 2D mesh when expert parallelism is configured: with `ep_degree = E`
+    over a world of `W`, the *EP-TP* groups are `W / E` consecutive ranks each.
+    At `W=64, E=8` that is eight groups of eight consecutive ranks —
+    `[0..7], [8..15], ...` — and because `attn_rank` is `rank % 8`, **each such
+    group holds exactly one of each attention shard.** So an EP-TP all-reduce is
+    precisely the sum the attention wants, with no replica correction at all:
+    one of each partial, summed once.
+
+    Nothing else about expert parallelism is being asked for. This port shards
+    its own weights (`model._build_shard_plan`) and partitions the experts by id
+    across the full world itself, so the generic expert-parallel loaders and MoE
+    modules are not on its path; what is wanted here is the mesh, and
+    `ep_degree` is how the backend is told to build it.
+
+    `enable_expert_parallel` has to be set because `resolve_ep_degree` refuses
+    an explicit `ep_degree > 1` without it.
+
+    Inert if the operator configured either themselves, and inert at a world
+    size that does not exceed the attention split — there is no replication to
+    undo then, and the world group is already the right one.
+    """
+    if not _serves_this_port(vllm_config):
+        return
+    parallel = getattr(vllm_config, "parallel_config", None)
+    if parallel is None:
+        return
+    world_size = int(getattr(parallel, "world_size", 1) or 1)
+    from .config import ATTENTION_TENSOR_PARALLEL_SIZE
+
+    if world_size <= ATTENTION_TENSOR_PARALLEL_SIZE:
+        return
+    if getattr(parallel, "enable_expert_parallel", False):
+        logger.info(
+            "deepseek_v41: expert parallelism is already enabled; leaving the "
+            "parallel mesh alone"
+        )
+        return
+
+    additional = getattr(vllm_config, "additional_config", None)
+    if additional is None:
+        return
+    neuron_config = dict(additional.get("neuron_config", {}) or {})
+    if "ep_degree" in neuron_config:
+        return
+
+    # `ep_degree = world / attn_tp` is what makes an EP-TP group `attn_tp`
+    # ranks wide, which is the group being asked for.
+    ep_degree = world_size // ATTENTION_TENSOR_PARALLEL_SIZE
+    parallel.enable_expert_parallel = True
+    neuron_config["ep_degree"] = ep_degree
+    additional["neuron_config"] = neuron_config
+    logger.info(
+        "deepseek_v41: ep_degree=%d so the EP-TP groups are %d consecutive "
+        "ranks — the attention's %d-way split replicated %d times, which makes "
+        "an EP-TP all-reduce exactly one of each partial instead of a %d-rank "
+        "collective summing each eight times; see "
+        "deepseek_v41.require_attention_group",
+        ep_degree, ATTENTION_TENSOR_PARALLEL_SIZE,
+        ATTENTION_TENSOR_PARALLEL_SIZE, ep_degree, world_size,
+    )
 
 
 def require_kv_cache_ceiling(vllm_config) -> None:
@@ -1239,6 +1488,10 @@ def declare_prefill_requirements() -> None:
         # *resolved* world size is known, so it catches a `--tensor-parallel-size`
         # that disagrees with `config.TENSOR_PARALLEL_SIZE`.
         apply_multi_rank_host_tuning(vllm_config.parallel_config.world_size)
+        # Before `original`, like the host tuning: the platform's own body
+        # resolves the parallel configuration, and the mesh this asks for has to
+        # be part of what it resolves.
+        require_attention_group(vllm_config)
         original(vllm_config)
         require_multi_rank_budget(vllm_config)
         require_segmented_prefill(vllm_config)
@@ -1290,6 +1543,7 @@ def register_draft_proposer() -> None:
 #: The checkpoint's `architectures[0]`, and the key both registries use.
 ARCH = "DeepseekV41ForCausalLM"
 
+quiet_per_call_logging()
 put_bundled_compiler_on_path()
 warn_on_unsupported_islpy()
 register_hf_config()

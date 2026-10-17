@@ -43,16 +43,44 @@ from transformers import PretrainedConfig
 
 from vllm_neuron.model.neuron_config import NeuronConfig
 
-#: Tensor-parallel degree the verifier launches with. Yours to tune: not an
-#: architectural parameter, so nothing checks it against the official config.
-#: Ceiling is 4 (one device, 4 logical NeuronCores at LNC=2).
+#: Ranks this port launches with: **one per logical NeuronCore of a
+#: trn2.48xlarge**, 16 devices x 4 at LNC=2. Yours to tune; not an architectural
+#: parameter, so nothing checks it against the official config.
+#:
+#: 64 is what makes the weights fit in HBM, which is the whole point of this
+#: deployment. A rank addresses one 24 GiB bank, and the routed experts are
+#: partitioned by expert id (`MoE.experts_start_idx`), so the expert bytes a
+#: rank must hold are `275.7 GiB / world_size`:
+#:
+#:     world_size   experts a rank   resident?
+#:              8        36.1 GiB    no  — 1.5x a 24 GiB bank
+#:             16        18.1 GiB    no  — leaves nothing for engram, KV, graphs
+#:             32         9.0 GiB    yes, but the engram shard then does not fit
+#:             64         4.6 GiB    yes, with room to spare
+#:
+#: and the engram tables divide the same way — 188.8 GiB of fp8 rows become 5.7
+#: GiB a rank of bf16 at 64, against 11.5 at 32. Measured against a 24 GiB bank
+#: the budget at 64 ranks is ~12.3 GiB of weights, leaving ~11 for the KV cache,
+#: the activations and ~120 compiled graphs. See `ATTENTION_TENSOR_PARALLEL_SIZE`
+#: for why the *attention* does not shard 64 ways, and `weight_loader.py`'s
+#: docstring for the census those figures come from.
 #:
 #: Out here rather than on the model because `tensor_parallel_size` is an
 #: engine-construction argument — workers are spawned before this class is
 #: instantiated, once per rank. A model cannot choose its own world size, only
 #: be told.
 #:
-#: **4, and the gate's own verifier passes there.** All four cases generated and
+#: ── What is carried over from the trn2.3xlarge port, and what is not ────────
+#:
+#: The single-device ancestor (`vllm_neuron/model/deepseek_v41_timeshare`, which
+#: this package was copied from and which still passes its verifier) ran at
+#: **4** ranks on one device and streamed the experts and the engram rows off
+#: disk every forward. Everything below this line is that port's measurement,
+#: kept because the *mechanism* each note describes is still live; the numbers
+#: are from a 4-rank, 114.8 GiB-CommitLimit host and are **not** this
+#: configuration's. Re-measure before trusting one at 64 ranks.
+#:
+#: **4, and the gate's own verifier passed there.** All four cases generated and
 #: judged at four ranks on 2026-10-13 — `"tensor_parallel_size": 4,
 #: "passed": true`, every verdict `REASONABLE`, including the 2008-token
 #: needle, whose planted access code comes back from ~1,900 tokens away.
@@ -113,7 +141,57 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 #: single-rank verifier used: every change above is inert at `world_size <= 1`
 #: by construction, and `.autohelix/notes/iter-12.md` §6 lists why, clause by
 #: clause.
-TENSOR_PARALLEL_SIZE = 4
+TENSOR_PARALLEL_SIZE = 64
+
+#: Ranks the **attention and the dense projections** are split across, which is
+#: not the world size and cannot be.
+#:
+#: `o_groups = 8` is the hard ceiling, and it is an architectural fact rather
+#: than a tuning choice. `wo_a` is block-diagonal over the 8 output groups and
+#: group `g` projects query heads `[8g, 8g+8)` into `o_lora_rank`; the shard plan
+#: splits it on the group axis, so a rank owns whole groups and whole heads
+#: together. Above 8 ranks there is no whole group left to own:
+#: `Attention.n_local_groups` is `o_groups // tp` and becomes **0** at 16, which
+#: does not raise — it silently makes the output projection a zero-iteration
+#: loop. Divisibility is not the invariant that breaks (8192 rows divide by 16
+#: cleanly); alignment is, because a rank holding half a group's `wo_a` output
+#: rows would need all 8 of that group's heads to compute them and has 4.
+#:
+#: So the attention is split 8 ways and **replicated** `world_size // 8 = 8`
+#: times. Each rank holds a ws=8 dense shard (~1.2 GiB) and computes the
+#: attention for `rank % 8`'s heads; 8 ranks compute each of the 8 shards.
+#:
+#: What that costs, stated plainly: **the attention arithmetic is done 8 times
+#: over.** It is the easiest correct thing, not the fast one, and it is the
+#: first thing the optimization loop should take apart. Two routes, both
+#: expressible on this hardware:
+#:
+#:   * give `wo_a` an **intra-group reduction** so the 8 heads of one group can
+#:     split across 8 ranks: each rank then holds `wo_a`'s rows for its group
+#:     and only the input columns of its own heads, and the group's 8 ranks
+#:     reduce their partials before `wo_b`. That needs a collective over a
+#:     *subset* of the ranks, which `nki.collectives.ReplicaGroup` expresses
+#:     (https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/api/nki.collectives.html);
+#:     reducing inside the group first and then across groups is the pattern the
+#:     runtime's own collectives page recommends.
+#:   * or run the 8 replicas **data-parallel** over the batch instead of
+#:     redundantly, which needs no new collective but does need the scheduler to
+#:     hand each replica different rows.
+#:
+#: Doing it inside the group matters for a second reason: a group's 8 ranks are
+#: 2 devices' worth of cores, so an intra-group reduce stays on NeuronLink
+#: between neighbours rather than crossing the 4x4 torus.
+#:
+#: What it does *not* cost is correctness, and the reason is worth being precise
+#: about. Every all-reduce of a head- or group-partial sum then sums each
+#: distinct partial `replicas` times, so the result is `replicas x` the true
+#: sum and the collective is followed by a divide (`Attention.forward`,
+#: `Indexer.forward`, `DSparkAttention.forward`). The divisor is a power of two
+#: and the reduction is in fp32, so the division is exact to the bit. The
+#: collectives that are *not* head-partial — the MoE's expert sum, the
+#: vocab-parallel embedding and the logits all-gather — span the real world size
+#: and are untouched.
+ATTENTION_TENSOR_PARALLEL_SIZE = 8
 
 
 @dataclass

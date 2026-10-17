@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-DeepSeek-V4.1-Flash (timeshare) on one Trainium 2 device
-========================================================
+DeepSeek-V4.1-Flash on 16 Trainium 2 devices
+============================================
 
 Module names here are the checkpoint's own module paths — `layers.<i>.attn.wq_b`,
 `layers.<i>.ffn.shared_experts.w1`, `mtp.<s>.markov_head` — which are also the
@@ -43,21 +43,38 @@ candidate blocks that the later indexers score inside.
 **Engram.** Layers 1 and 14 add an n-gram memory read into the residual stream,
 gated by how well the retrieved key matches the stream. The table is
 384,006,168 rows of 256 fp8 values — 94.6 GiB each, 3.9x one HBM bank — so it is
-never resident; `weight_loader.TimeshareWeightStore.engram` gathers the 24 rows
-a token needs.
+sharded by row across the 64 ranks and read with a masked lookup plus an
+all-reduce, which is `embed_input_ids` applied to a different table
+(`_engram_gather`, `Engram.bind_table`).
 
 **DSpark.** Three further blocks stored under `mtp.<stage>`, over their own
 128-expert pool at top-3, reading the attention inputs of layers 37/38/39
 (`dspark_target_layer_ids`) through `mtp.0.main_proj`.
 
-Timesharing
------------
-9.83 GiB of the 475.24 GiB checkpoint is dense; the rest is 384 experts per
-layer (sparsely routed, 6 of 384 per token) and the two engram tables (sparsely
-read). So the dense part is resident and sharded 4 ways (~2.5 GiB per rank), and
-the experts and engram rows are fetched per forward into fixed staging buffers.
-See `weight_loader.py`'s module docstring for the measured census and the
-throughput numbers that make the schedule feasible.
+How the 475 GiB is laid out
+---------------------------
+All of it is in HBM, and which rank's HBM is decided per family by the axis that
+divides. At the 64 ranks of a trn2.48xlarge (`config.TENSOR_PARALLEL_SIZE`):
+
+    dense       ~3.9 GiB a rank   heads/groups 8 ways, vocab 64 ways
+    experts      4.3 GiB a rank   by expert id, 6 of 384 a layer
+    engram       5.7 GiB a rank   by row, ~6.0M of 384M a table
+                ----------------
+                ~13.9 GiB of a 24 GiB bank
+
+**A forward reads no file.** The single-device ancestor
+(`vllm_neuron/model/deepseek_v41_timeshare`) kept 98% of the checkpoint on disk
+and streamed it per forward; this one loads everything once in
+`weight_loader.load_weights` and `MoE._expert` is a pure cache hit. The
+streaming code is still reachable and still correct, for a rank that cannot fit
+its shard, and `MoE.resident` / `Engram.resident` are what say which path a
+layer is on.
+
+The attention is the one thing that does **not** shard 64 ways: `wo_a` is
+block-diagonal over `o_groups = 8`, so it splits 8 ways and is replicated 8
+times, and every all-reduce of a head- or group-partial is divided by the
+replica count. `config.ATTENTION_TENSOR_PARALLEL_SIZE` has the whole argument,
+including what the redundant arithmetic costs and the two ways to remove it.
 
 Where the arithmetic runs
 ------------------------
@@ -97,22 +114,24 @@ numbers** rather than failing.
 
 Status
 ------
-Exercised on the device, against the recorded traces in
-`partition_artifact/trace/`: the hyper-connection coefficients including the
-20-iteration Sinkhorn (cos 1.000000), the unembedding (0.999999), the engram
-read off the 94.6 GiB table (1.000085), the 384-of-6 MoE with 180 real routed
-experts (0.999864) and a whole MLA attention block (0.999895). Also exercised:
-the module tree at the checkpoint's own shapes and dtypes, the per-rank shard
-plan, weight loading, `get_kv_spec`/`bind_kv_cache`, `embed_input_ids`,
-`compute_logits`.
+The arithmetic in this file is the single-device port's, which was exercised on
+the device against the recorded traces in `partition_artifact/trace/`: the
+hyper-connection coefficients including the 20-iteration Sinkhorn (cos
+1.000000), the unembedding (0.999999), the engram read off the 94.6 GiB table
+(1.000085), the 384-of-6 MoE with 180 real routed experts (0.999864) and a whole
+MLA attention block (0.999895). That port passed its own 4-prompt verifier at 4
+ranks on one device.
 
-A prefill now runs end to end on the device — every layer, the engram lookups,
-the streamed experts, the DSpark stages, the head and the sampler. The decode
-step does not: it runs out of HBM loading the last of ~115 compiled graphs.
-`forward`'s own docstring says so precisely, and
-`.autohelix/notes/iter-3.md` §5b-ter has the memory table and the fix. Nothing
-here runs a subset of the layers or substitutes an approximation; where it
-cannot run it raises and names the reason.
+**What is new here is the placement, and it has not run on the device yet.** The
+64-rank shard plan verifies against the real checkpoint for ranks 0, 7, 8 and 63
+(`verify_shard_plan`: every sharded axis divides, every shard matches its
+buffer), the engram's row-sharded gather reassembles bit-identically to direct
+indexing of the whole table, the expert partition is disjoint and complete, and
+the replica correction is exact — all checked on CPU. The first device run is
+what will say whether 64 ranks of ~120 graphs each fit the host.
+
+Nothing here runs a subset of the layers or substitutes an approximation; where
+it cannot run it raises and names the reason.
 """
 
 from __future__ import annotations
@@ -179,22 +198,43 @@ class ShardRule:
             and the checkpoint tensor is zero-padded to match. See
             `vocab_shard_width` for why the unembedding needs it; nothing else
             does, and `align=None` leaves the arithmetic exactly as it was.
+        group: *which* ranks the axis is split across, `"world"` or `"attn"`.
+            Not every axis of this model divides by the world size: `o_groups`
+            is 8, so the attention's head and group axes split 8 ways and are
+            replicated over the remaining ranks, while the expert and vocab axes
+            split across all of them. See
+            `config.ATTENTION_TENSOR_PARALLEL_SIZE`. A rule that names the wrong
+            group produces a model that loads and is wrong, which is why this is
+            spelled per rule rather than inferred from the shape.
     """
 
-    __slots__ = ("dim", "reason", "align")
+    __slots__ = ("dim", "reason", "align", "group")
 
     def __init__(
-        self, dim: int | None, reason: str, align: int | None = None
+        self,
+        dim: int | None,
+        reason: str,
+        align: int | None = None,
+        group: str = "world",
     ) -> None:
         self.dim = dim
         self.reason = reason
         self.align = align
+        if group not in ("world", "attn"):
+            raise ValueError(f"group must be 'world' or 'attn', not {group!r}")
+        self.group = group
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (
             f"ShardRule(dim={self.dim}, reason={self.reason!r}, "
-            f"align={self.align})"
+            f"align={self.align}, group={self.group!r})"
         )
+
+
+#: `ShardRule(..., group="attn")` with the reason spelled once.
+def attn_shard(dim: int, reason: str) -> "ShardRule":
+    """A rule split across the attention ranks rather than the whole world."""
+    return ShardRule(dim, reason, group="attn")
 
 
 REPLICATE = ShardRule(None, "no free axis; every rank needs the whole tensor")
@@ -510,18 +550,30 @@ def _group_name(tp_group) -> str:
 #:
 #: so the split this runtime gives is somewhere in (1 MiB, 4 MiB] and 1 << 18 is
 #: the largest power of two that is safely inside it. Under the runtime's
-#: *default* `INTRA_RING_ALG` there is no assert at any size, and the port no
-#: longer selects the mesh (see `__init__.py`), so chunking is not strictly
-#: needed today — it is kept, and kept as the default, because it is the value
-#: that works under *either* algorithm and the cost is immeasurable: a rank's
-#: host commitment at layer 23 was 6.4-6.8 GiB chunked and 6.4-6.8 GiB
-#: unchunked, i.e. the same. The thing that does cost 13 GiB a rank is the
-#: runtime's debug-info graph, which has nothing to do with this constant.
+#: *default* `INTRA_RING_ALG` there is no assert at any size, and the port does
+#: not select the mesh (see `__init__.py`), so chunking is not needed at all
+#: today.
 #:
-#: Tunable from the environment so that sweep needed no edit of this file. Dead
-#: code at TP=1, where `world_size == 1` means no collective runs at all.
+#: **Off by default here, and the reason the old default was wrong is a
+#: different cost than the one that was measured.** Iteration 9 kept chunking
+#: because "the cost is immeasurable" — and what it measured was *host memory*:
+#: 6.4-6.8 GiB a rank either way. True, and not the cost that matters now.
+#: Chunking multiplies the **number of collectives**, and at a 512-token
+#: prefill the MoE's `[512, 5120]` fp32 reduction is 2.62M elements, so 1 << 18
+#: makes it **10 collectives instead of 1 — on every one of 43 layers, 430
+#: against 43 a prefill forward.** At four ranks with a ~10 s decode step that
+#: was noise. At 64 ranks with a TTFT target of seconds it is the budget.
+#:
+#: A decode step is unaffected either way: `[6, 5120]` is 30,720 elements and
+#: fits one collective at any setting.
+#:
+#: Set `DEEPSEEK_V41_ALLREDUCE_CHUNK_ELEMS=262144` to restore chunking, which is
+#: what to do if `NEURON_RT_CC_ALG_TYPES=INTRA_SINGLE_STEP_MESH_ALG` is ever
+#: selected — under the mesh the assert above is real and chunking is the only
+#: thing that satisfies it. Dead code at TP=1, where `world_size == 1` means no
+#: collective runs at all.
 _ALLREDUCE_CHUNK_ELEMS = int(
-    os.environ.get("DEEPSEEK_V41_ALLREDUCE_CHUNK_ELEMS", 1 << 18)
+    os.environ.get("DEEPSEEK_V41_ALLREDUCE_CHUNK_ELEMS", 1 << 30)
 )
 
 
@@ -1238,13 +1290,33 @@ def _hbm_used_bytes() -> int | None:
 #: Cached `torch.classes.neuron.Runtime` handle for `_hbm_used_bytes`.
 _HBM_RUNTIME = None
 
-#: How many forwards log their HBM use per layer. After that each forward logs
-#: one summary line. The per-layer detail is what identifies *which* step grows
-#: the live set; the summary is what shows whether it comes back down.
-_HBM_TRACE_FORWARDS = 6
+#: How many forwards log their HBM use **per layer**. The per-layer detail
+#: identifies which step grows the live set; the per-forward summary shows
+#: whether it comes back down, and that one is always logged.
+#:
+#: **0 by default here, and that is a change from the single-device port.** On
+#: that host HBM was the binding constraint — a run died loading the last of
+#: ~115 graphs — so tracing every layer of the first 6 forwards was the cheapest
+#: way to see which one grew. On this deployment the weights are 13.9 GiB of a
+#: 24 GiB bank and HBM is not what runs out, so the trace is 43 lines a layer
+#: x 6 forwards x 64 ranks: **65,022 of run 2's 177,144 log lines, 37% of the
+#: log, to watch a number that does not move.**
+#:
+#: `DEEPSEEK_V41_HBM_TRACE=<n>` turns it back on for `n` forwards, which is what
+#: to reach for if a device-memory question comes back.
+_HBM_TRACE_FORWARDS = int(os.environ.get("DEEPSEEK_V41_HBM_TRACE", 0))
 
 #: `[steps seen, previous reading, previous layer id]` for `_hbm_mark`.
 _HBM_STATE = [0, None, -1]
+
+#: `[is this the rank that logs?]`, set by the model's `__init__` once the TP
+#: group is known. 64 ranks emitting the same per-forward line is 64x the log
+#: for 1x the information, and the per-rank facts worth having (which experts,
+#: which engram rows) are already in the one-off load lines.
+#:
+#: True until a rank says otherwise, so a path that logs before the group exists
+#: is not silently muted.
+_LOG_RANK = [True]
 
 #: `[live row count]`, the MoE's real token count while the backbone's layer
 #: loop is running, or `None`.
@@ -1321,9 +1393,64 @@ _GC_STATE = [0, 0.0]
 #: DMA rings and scratchpads of graphs that compile mid-run. Raise it if a run
 #: shows the bank idle; the stats line in `_hbm_mark` reports the hit rate it
 #: buys.
+#:
+#: **On this deployment it is a ceiling rather than the allocator.** At 64 ranks
+#: a rank owns 6 experts a layer, so `allocate_staging_buffers` asks for 6 slots
+#: and this budget allows 10 — the pool goes fully resident and the cache logic
+#: never evicts anything. The budget still has to be enforced, because the same
+#: code at a narrower world asks for more slots than a bank holds: at 8 ranks
+#: full residency would be 34.5 GiB of a 24 GiB bank, and allocating it would
+#: fail on the device rather than fall back to streaming. So the slot count is
+#: `min(experts this rank owns, what this budget pays for)` and a short count is
+#: what puts a layer back on the streaming path.
 _EXPERT_CACHE_BYTES = int(
     os.environ.get("DEEPSEEK_V41_EXPERT_CACHE_BYTES", 8 << 30)
 )
+
+#: HBM, per rank, to spend holding engram table shards. Both tables together, so
+#: 6 GiB covers the 5.72 GiB two 64-rank shards come to in bf16.
+#:
+#: The same ceiling argument as `_EXPERT_CACHE_BYTES`: the shard is
+#: `ceil(384M / world_size)` rows, which is 2.86 GiB a table at 64 ranks and
+#: 22.9 at 8, and `torch.zeros` of the latter on a 24 GiB bank fails rather than
+#: degrading. A shard that does not fit leaves `Engram.resident` False and the
+#: layer reads rows off disk instead — slower, and the same numbers.
+_ENGRAM_TABLE_BYTES = int(
+    os.environ.get("DEEPSEEK_V41_ENGRAM_TABLE_BYTES", 6 << 30)
+)
+
+#: True once `weight_loader.load_weights` has established that every weight this
+#: rank needs is in HBM. What it gates is the *host-side housekeeping* the
+#: streaming design needed and a resident one does not:
+#:
+#:   `_collect_layer_garbage`  a `gc.collect()` every `_GC_STRIDE` layers, to
+#:                             drop the previous layer's mmap'd expert blobs
+#:                             before the next layer's arrive.
+#:   `host_heap_trim`          a `/proc/self/maps` read and a `malloc_trim`
+#:                             every `_HEAP_TRIM_EVERY` layers, to give back the
+#:                             glibc arenas those blobs had grown.
+#:
+#: Both are pure host work on the forward path, and both exist because a forward
+#: used to allocate and free gigabytes of host memory. A resident forward
+#: allocates none, so there is nothing to collect and nothing to trim, and the
+#: measurement says so: the expert path reports `~0.00 GiB fetched, 0.0 s read`
+#: and `gc 0 collections in 0.00 s` on every forward.
+#:
+#: Kept rather than deleted because the streaming path is still reachable for a
+#: rank that cannot fit its shard, and that path still needs them.
+#: `DEEPSEEK_V41_FORCE_HOST_HOUSEKEEPING=1` runs them anyway.
+_RESIDENT_WEIGHTS = [False]
+
+
+def host_housekeeping_needed() -> bool:
+    """Does the forward have host allocations to clean up after?
+
+    False on the resident path, which is the whole point of it.
+    """
+    if os.environ.get("DEEPSEEK_V41_FORCE_HOST_HOUSEKEEPING") == "1":
+        return True
+    return not _RESIDENT_WEIGHTS[0]
+
 
 #: `[hits, misses, admissions]` since the last forward boundary, summed over
 #: every `MoE`. Instrumentation only.
@@ -1402,7 +1529,12 @@ def _collect_layer_garbage() -> None:
 
     Timed, because the cost is the reason for the stride and nobody had
     measured it: `_hbm_mark` logs the per-forward total.
+
+    **A no-op on the resident path**, where a forward makes no host allocation
+    to collect — see `host_housekeeping_needed`.
     """
+    if not host_housekeeping_needed():
+        return
     start = time.perf_counter()
     gc.collect()
     _GC_STATE[0] += 1
@@ -1455,8 +1587,16 @@ def _hbm_mark(layer_id: int, rows: int) -> None:
     That same boundary is where the forward's expert-cache and collection
     counters are logged and reset. One line per forward, for every forward
     rather than only the first few: the hit rate is the number that says
-    whether the cache is sized right, and a run that never prints it is a run
-    that has to be repeated.
+    whether the cache is sized right — it is what shows the expert pool being
+    served 100% from HBM — and a run that never prints it is a run that has to
+    be repeated.
+
+    **One line per forward on one rank**, not on 64. The counters are per rank
+    and the interesting content (hit rate, bytes fetched) is identical across
+    them because every rank runs the same number of experts from its own
+    resident set; 64 copies of it were 4,506 lines of run 2's log. A rank that
+    is *not* at 100% is the case worth seeing, so the line is still emitted on
+    any rank whose hit rate is imperfect, whichever rank that is.
     """
     if layer_id <= _HBM_STATE[2]:
         # Imported here, like every other reference to this module from
@@ -1466,7 +1606,9 @@ def _hbm_mark(layer_id: int, rows: int) -> None:
 
         hits, misses, admitted = _EXPERT_CACHE_STATS
         served, stalled, inline = EXPERT_STREAM_STATS
-        if hits or misses:
+        # Rank 0 speaks for the world; any rank that had a miss speaks for
+        # itself, because that is the one worth reading.
+        if (hits or misses) and (_LOG_RANK[0] or misses):
             logger.info(
                 "deepseek_v41: forward %d experts %d/%d from HBM "
                 "(%.0f%%), %d admitted, ~%.2f GiB fetched; prefetch %d served "
@@ -1553,6 +1695,11 @@ def host_heap_trim(tag: str, world_size: int) -> None:
     """
     global _LIBC
     if world_size <= 1:
+        return
+    # Nothing to reclaim on the resident path: the forward allocates no host
+    # memory, so the `/proc/self/maps` read and the `malloc_trim` below are pure
+    # cost. See `host_housekeeping_needed`.
+    if not host_housekeeping_needed():
         return
     if _LIBC is None:
         import ctypes
@@ -2154,8 +2301,21 @@ class Indexer(nn.Module):
     or reads the ones its source published (`vendor/model.py`'s `Indexer`).
     """
 
-    def __init__(self, config: DeepseekV41Config, layer_id: int, tp_size: int) -> None:
+    def __init__(
+        self,
+        config: DeepseekV41Config,
+        layer_id: int,
+        tp_size: int,
+        replicas: int = 1,
+        attn_group=None,
+    ) -> None:
         super().__init__()
+        #: The group the index-score reduction runs over; see
+        #: `Attention.attn_group`.
+        self.attn_group = attn_group
+        #: See `Attention.replicas`: the index score sums over index heads, so
+        #: a replicated attention makes its all-reduce `replicas x` the sum.
+        self.replicas = max(1, replicas)
         self.owns_k = layer_id in config.kv_source_layer_ids
         self.compress_ratio = config.compress_ratios[layer_id]
         self.is_candidate_source = layer_id == config.candidate_source_layer_id
@@ -2299,7 +2459,14 @@ class Indexer(nn.Module):
             # Heads are split across ranks and the score sums over heads, so the
             # partial sums have to be added before the top-k — a per-rank top-k
             # would pick from a different score.
-            index_score = tp_all_reduce(index_score, tp_group)
+            index_score = tp_all_reduce(
+                index_score, self.attn_group or tp_group
+            )
+            if self.replicas > 1:
+                # The world is wider than the heads are split, so each distinct
+                # partial was summed `replicas` times. Exact: the reduction is
+                # fp32 and the divisor is a power of two.
+                index_score = index_score / self.replicas
 
         # How many compressed positions a query can see: a group becomes visible
         # once the query has passed its last token. Query `t` of this span sits
@@ -2377,9 +2544,22 @@ class Attention(nn.Module):
         layer_id: int,
         tp_size: int,
         max_batch_size: int = 1,
+        replicas: int = 1,
+        attn_group=None,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
+        #: The group this layer's output reduction runs over, or None to use
+        #: whatever group the forward is handed. See
+        #: `DeepseekV41Model.attn_tp_group`.
+        self.attn_group = attn_group
+        #: How many ranks hold *this* rank's head shard. 1 when the attention
+        #: splits across the whole world; `world_size // o_groups` when the
+        #: world is wider than `o_groups` can split, in which case the
+        #: all-reduce at the end of `forward` sums every distinct partial this
+        #: many times and the result is divided back down. See
+        #: `config.ATTENTION_TENSOR_PARALLEL_SIZE`.
+        self.replicas = max(1, replicas)
         self.hidden_size = config.hidden_size
         self.n_heads = config.num_attention_heads
         self.n_local_heads = config.num_attention_heads // tp_size
@@ -2426,7 +2606,10 @@ class Attention(nn.Module):
             Compressor(config, layer_id, max_batch_size) if self.is_kv_source else None
         )
         self.indexer = (
-            Indexer(config, layer_id, tp_size) if self.is_index_source else None
+            Indexer(config, layer_id, tp_size, replicas=self.replicas,
+                    attn_group=attn_group)
+            if self.is_index_source
+            else None
         )
         self.world_size = tp_size
         self.config = config
@@ -2668,7 +2851,13 @@ class Attention(nn.Module):
         if self.world_size > 1 and tp_group is not None:
             # `wo_b` is row-parallel, so each rank holds a partial sum. The
             # reference reduces in fp32.
-            out = tp_all_reduce(out.float(), tp_group)
+            out = tp_all_reduce(out.float(), self.attn_group or tp_group)
+            if self.replicas > 1:
+                # The attention is replicated `replicas` times over a wider
+                # world (see `Attention.replicas`), so the world all-reduce
+                # summed each of the `o_groups` partials that many times.
+                # Dividing in fp32 by a power of two is exact.
+                out = out / self.replicas
             out = out.to(x.dtype)
         return out
 
@@ -2696,7 +2885,23 @@ class Attention(nn.Module):
 
 def _compile_fn(fn):
     """`fn` as a device graph. One call, so every compiled entry point in this
-    file is built the same way as the whole-model compile the runner does."""
+    file is built the same way as the whole-model compile the runner does.
+
+    **Do not wrap the result in host-side instrumentation.** Several of these
+    entry points are reached from *inside* another compiled region —
+    `nki_linear` is called by `HyperConnections.mixes`, which runs inside
+    `Block.attn_half`'s graph — so a timer or counter in the wrapper is traced
+    rather than executed, and dynamo refuses it:
+
+        torch._dynamo.exc.Unsupported: Attempted to call function marked as
+        skipped ... Dynamo does not know how to trace the builtin
+        `time.perf_counter`
+
+    which kills the engine on the first forward. That nesting is also the answer
+    to "how many NEFFs does a forward execute": the NKI entries are *inside*
+    the per-layer graphs, not separate launches, so the count is the number of
+    host-visible entry points, not the number of kernel calls.
+    """
     from vllm_neuron.envs import get_compile_backend_name
 
     _raise_dynamo_limits()
@@ -3195,6 +3400,10 @@ class MoE(nn.Module):
         self._resident: dict[int, int] = {}
         #: Slot indices with nothing in them yet.
         self._free: list[int] = []
+        #: True once `load_resident_experts` has put *every* expert this rank
+        #: owns in a slot. Then `_expert` can only hit, and a miss is a bug
+        #: rather than a fetch — see `_expert`, which raises instead of reading.
+        self.resident = False
         #: `expert_id -> times this rank has fetched it`, the admission and
         #: eviction key. Halved at `_EXPERT_USE_CEILING` so early popularity
         #: does not pin a slot for the rest of the run.
@@ -3224,6 +3433,41 @@ class MoE(nn.Module):
         return count
 
     @torch._dynamo.disable
+    def load_resident_experts(self, weight_store) -> int:
+        """Put every expert this rank owns in its own slot, once, at load time.
+
+        Returns how many were loaded. After this the layer reads nothing from
+        disk for the rest of the run: `_expert` finds every routed expert in
+        `_resident` and hands back the slot it already sits in.
+
+        **Why this is a load-time loop and not a lazy warm-up.** The LRU would
+        reach the same state after enough forwards, but "enough" is
+        data-dependent — an expert no prompt routes to is never fetched — so the
+        first request would pay a disk read per expert it happens to be the
+        first to need, and a later one would too. Loading the owned set up front
+        makes the forward's cost independent of what came before it, which is
+        the property this deployment exists to have.
+
+        A no-op returning 0 unless there is a slot for every owned expert, which
+        is what `allocate_cache_slots` gives when the HBM budget stretches to it
+        (`_EXPERT_CACHE_BYTES`). With fewer the layer stays in streaming mode:
+        a partial preload would fill the slots and then have the LRU evict them,
+        which is slower than not preloading at all and would also leave
+        `resident` claiming something untrue.
+        """
+        if len(self.cache_slots) < self.n_local_experts:
+            return 0
+        for slot, expert_id in enumerate(
+            range(self.experts_start_idx, self.experts_end_idx)
+        ):
+            self._stage(weight_store.expert(self.layer_id, expert_id),
+                        self.cache_slots[slot])
+            self._resident[expert_id] = slot
+        self._free = []
+        self.resident = True
+        return self.n_local_experts
+
+    @torch._dynamo.disable
     def _expert(self, weight_store, expert_id: int) -> Expert:
         """The device buffers holding `expert_id`, fetching it if they must.
 
@@ -3244,6 +3488,27 @@ class MoE(nn.Module):
         weight buffers and it keys a single NEFF (`graph_e8622b49...`, one hash
         for every layer in the profile).
         """
+        if self.resident:
+            # The common path on this deployment, and the only path: every
+            # expert this rank owns has its own slot.
+            slot = self._resident.get(expert_id)
+            if slot is None:
+                # Unreachable unless the router handed us an expert outside this
+                # rank's id range, which would mean `_route_plan`'s filter and
+                # `experts_start_idx` disagree — a wrong answer, not a slow one,
+                # because the partial sums would then not cover the routed set
+                # exactly once. Raise rather than quietly reading it off disk.
+                raise RuntimeError(
+                    f"layer {self.layer_id} routed to expert {expert_id}, which "
+                    f"rank {self.experts_start_idx // max(1, self.n_local_experts)} "
+                    f"does not own (it owns "
+                    f"[{self.experts_start_idx}, {self.experts_end_idx})). The "
+                    "expert pool is resident, so this is a routing/partition "
+                    "disagreement rather than a cache miss."
+                )
+            _EXPERT_CACHE_STATS[0] += 1
+            return self.cache_slots[slot]
+
         uses = self._uses.get(expert_id, 0) + 1
         if uses >= _EXPERT_USE_CEILING:
             # Halve every count, so what the cache holds tracks the recent
@@ -3413,7 +3678,9 @@ class MoE(nn.Module):
         # already resident are left out: `_expert` will not read them, and a
         # read nobody claims holds a ring buffer the next one needs. See
         # `weight_loader._ExpertStream`.
-        if weight_store is not None:
+        # Nothing to prefetch when the pool is resident: every candidate is
+        # already in a slot, which is what `_resident` would filter out anyway.
+        if weight_store is not None and not self.resident:
             weight_store.prefetch_experts(
                 self.layer_id, candidates, self._resident
             )
@@ -3465,12 +3732,12 @@ class MoE(nn.Module):
         Dynamo-disabled, with every arithmetic step a compiled entry point —
         see the section comment above for the error that forces it.
         """
-        if weight_store is None:
+        if weight_store is None and not self.resident:
             raise RuntimeError(
-                f"layer {self.layer_id} MoE has no weight store: the routed "
-                "experts are streamed, so load_weights() must have attached "
-                "one. Running without it would mean running without the "
-                "experts."
+                f"layer {self.layer_id} MoE has no weight store and its expert "
+                "pool is not resident, so the routed experts are streamed and "
+                "load_weights() must have attached one. Running without it "
+                "would mean running without the experts."
             )
         shape = x.shape
         flat = x.reshape(-1, self.hidden_size)
@@ -3494,8 +3761,10 @@ class MoE(nn.Module):
                 _EXPERT_TIME[0] += staged - mark
                 _EXPERT_TIME[1] += time.perf_counter() - staged
         # Hands back the ring buffer the last expert came in, so the reader
-        # thread is not left holding one across the all-reduce below.
-        weight_store.end_expert_loop()
+        # thread is not left holding one across the all-reduce below. Nothing to
+        # hand back when the pool is resident — no host buffer was ever taken.
+        if weight_store is not None and not self.resident:
+            weight_store.end_expert_loop()
 
         if tp_group is not None and self.n_local_experts != self.n_routed_experts:
             # Each rank holds the partial sum over its own experts. The
@@ -3760,6 +4029,45 @@ class NgramHashState(nn.Module):
         return torch.cat(hashes, dim=-1) + self.offsets
 
 
+def _engram_gather(
+    hashes: torch.Tensor,
+    table: torch.Tensor,
+    index: int,
+    row_start: torch.Tensor,
+    row_width: int,
+) -> torch.Tensor:
+    """This rank's contribution to the n-gram rows, `[1, T, n_hash_cols, dim]`.
+
+    The rows this rank does not own come back as zeros, so an all-reduce over
+    the world assembles the gather. Identical in form to
+    `DeepseekV41Model.embed_input_ids`, which is the proven path for a
+    vocab-parallel lookup on this backend, and compiled for the same reason: the
+    middle-axis slice `hashes[:, :, index, :]` leaves a strided view, and the
+    backend's eager fallback cannot flatten one
+    (`RuntimeError: Expected self.is_contiguous() to be true`). Inside a graph
+    it is just a slice.
+
+    **`row_start` is a device tensor, and that is the difference between 2
+    compiled graphs and 128.** `index` and `row_width` are Python ints, which
+    dynamo bakes in as constants — fine, because both are the same on every
+    rank, so the world shares the graph. `row_start` is `rank * row_width` and
+    is therefore *different on every rank*: as an int it keyed a separate graph
+    per rank per engram layer, and the first 64-rank run compiled 64 x 2 = 128
+    of them where 2 would do (visible in the compile cache as 128 entries
+    against the one input shape `(1, 512, 2, 24)`). As a 0-d device tensor it is
+    a graph *input*, the arithmetic is identical, and all 64 ranks hit one cache
+    entry.
+
+    The same trap is in `embed_input_ids`, which bakes `rank * part_vocab_size`
+    the same way; harmless at 4 ranks, 64 graphs at 64.
+    """
+    ids = hashes[:, :, index, :]
+    off_rank = (ids < row_start) | (ids >= row_start + row_width)
+    local = (ids - row_start).masked_fill(off_rank, 0)
+    out = F.embedding(local, table)
+    return out.masked_fill(off_rank.unsqueeze(-1), 0)
+
+
 class Engram(nn.Module):
     """n-gram memory read, gated by its match against the residual stream.
 
@@ -3768,11 +4076,33 @@ class Engram(nn.Module):
     normalized dot product of stream against key, per (token, hc copy), with a
     signed square root before the sigmoid to match the training kernel.
 
-    The table is absent from this module on purpose — 94.6 GiB against a 24 GiB
-    bank. `weight_loader.TimeshareWeightStore.engram` gathers rows by index and
-    dequantizes them; `forward` consumes that result. Skipping the lookup, or
-    substituting zeros for it, would change the model, so the store raises
-    rather than returning anything if a row is unreachable.
+    **The table is row-sharded and resident.** 94.6 GiB is 3.9x one 24 GiB bank,
+    but it is an embedding table and it divides by the world the same way the
+    vocabulary does: at 64 ranks a rank holds `ceil(384,006,168 / 64)` rows of
+    256 values, which is 2.86 GiB in bf16, and the two engram layers come to
+    5.7 GiB. `bind_table` installs the shard; `lookup` reads it.
+
+    `lookup` is `DeepseekV41Model.embed_input_ids` applied to a different table:
+    mask the ids this rank does not own, look up the rest, zero the masked rows,
+    all-reduce. The contributions are disjoint by construction — one rank owns
+    each row — so the sum is the gathered row and nothing is approximated. The
+    ids cannot fall outside the table: `NgramHashState` produces
+    `(rolling % prime) + offset` over disjoint bucket ranges that sum to at most
+    `engram_num_embeddings`, so every id is a real row, which is what lets each
+    rank's shard be zero-padded to a uniform width and still masked by that
+    width alone. A uniform width matters beyond tidiness: it keeps the lookup
+    graph shape-identical on all 64 ranks, so they share one compile.
+
+    Stored dequantized, which is the one place this trades HBM for simplicity:
+    the checkpoint holds the table as fp8 with `e8m0` block scales, 1.48 GiB a
+    rank, and keeping it that way would halve the 5.7 GiB at the cost of a
+    device-side fp8 dequantization of every gathered row. That is the obvious
+    next optimization and it is not needed to fit.
+
+    If `bind_table` has not run, `forward`'s caller falls back to the streaming
+    path in `weight_loader.TimeshareWeightStore.engram`. Skipping the lookup, or
+    substituting zeros for it, would change the model, so neither path is
+    allowed to return nothing.
     """
 
     #: The floor under `|dot|` before the gate's square root, so its derivative
@@ -3802,6 +4132,54 @@ class Engram(nn.Module):
             "k_weight",
             torch.ones(config.hc_mult, config.hidden_size, dtype=torch.bfloat16),
         )
+        #: This rank's rows of the n-gram table, `[row_width, head_dim]` bf16.
+        #: Non-persistent: it carries no checkpoint key of its own (the
+        #: checkpoint's `engram.embed.weight` is fp8 and whole, and this is a
+        #: dequantized slice of it), so `weight_loader.load_engram_tables`
+        #: assigns it rather than the generic resident pass, and it stays out of
+        #: `state_dict` and out of `load_weights`'s still-on-meta check.
+        self.register_buffer(
+            "table",
+            torch.empty(0, config.engram_head_dim, dtype=torch.bfloat16),
+            persistent=False,
+        )
+        #: Global row this rank's shard starts at, as a 0-d device tensor so it
+        #: reaches the lookup graph as an *input* and the 64 ranks share one
+        #: compile rather than keying 64 — see `_engram_gather`. `row_width` is
+        #: the same on every rank, so it stays an int and is baked in.
+        self.row_start: torch.Tensor | None = None
+        self.row_width = 0
+        #: True once `bind_table` has installed a shard. False means the caller
+        #: has to use the streaming path.
+        self.resident = False
+
+    def bind_table(self, table: torch.Tensor, row_start: int, row_width: int) -> None:
+        """Install this rank's rows of the n-gram table.
+
+        `table` is `[row_width, head_dim]` bf16 on the device, zero-padded past
+        the real end of the global table. `row_start` is the global row its
+        first entry is.
+        """
+        if table.shape[0] != row_width:
+            raise ValueError(
+                f"engram layer {self.layer_id}: shard is {table.shape[0]} rows, "
+                f"row_width says {row_width}. The width has to be exact — it is "
+                "the bound `lookup` masks with, and it has to be the same on "
+                "every rank for the graph to be shared."
+            )
+        if table.shape[1] != self.head_dim:
+            raise ValueError(
+                f"engram layer {self.layer_id}: shard is {table.shape[1]} wide, "
+                f"engram_head_dim is {self.head_dim}"
+            )
+        self.table = table
+        # int64 to match the hash ids it is compared against; a dtype mismatch
+        # here would promote the comparison and change the index arithmetic.
+        self.row_start = torch.tensor(
+            int(row_start), dtype=torch.int64, device=table.device
+        )
+        self.row_width = int(row_width)
+        self.resident = True
 
     def forward(
         self,
@@ -3990,12 +4368,28 @@ class Block(nn.Module):
         tp_size: int,
         tp_rank: int,
         max_batch_size: int = 1,
+        attn_tp: int | None = None,
+        attn_rank: int | None = None,
+        attn_group=None,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
+        # `tp_size`/`tp_rank` are the world: they shard the experts, whose id
+        # axis divides by any of them. `attn_tp`/`attn_rank` are the attention's
+        # own, capped at `o_groups`. They are the same thing at world sizes up
+        # to the cap, which is why they default to it and why a <= 8-rank run is
+        # byte-identical to the single-device port.
+        attn_tp = tp_size if attn_tp is None else attn_tp
+        attn_rank = tp_rank if attn_rank is None else attn_rank
         self.attn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.attn = self.attention_cls(config, layer_id, tp_size, max_batch_size)
+        self.attn = self.attention_cls(
+            config, layer_id, attn_tp, max_batch_size,
+            # 1 when the reduction runs over a group that holds one of each
+            # shard, which is what makes the correction unnecessary.
+            replicas=1 if attn_group is not None else tp_size // attn_tp,
+            attn_group=attn_group,
+        )
         self.ffn = MoE(config, layer_id, tp_size, tp_rank)
         self.hc_attn = HyperConnections(config)
         self.hc_ffn = HyperConnections(config)
@@ -4023,6 +4417,15 @@ class Block(nn.Module):
         FFN's `pre` is returned for the next layer.
 
         Returns `(stream, next_pre_mix)`.
+
+        The `int(start_pos)` below reads a one-element device tensor to the
+        host, which is a device sync. It is kept because **this method is not
+        the live path**: inference goes through `_run_block` ->
+        `_block_entry(block, "attn_half")`, which takes `span.pos` as a tensor
+        and never reads it. `Block.forward` is the reference-shaped path that
+        runs one layer at a time, so the sync costs a comparison there and
+        nothing on a served request. If this ever becomes the live path, hoist
+        the check to once per forward rather than deleting it.
         """
         if int(start_pos) != paged.start_pos:
             raise ValueError(
@@ -4305,7 +4708,12 @@ class DSparkAttention(Attention):
         ).reshape(bsz, block_size, -1)
         out = self.wo_b(o)
         if self.world_size > 1 and tp_group is not None:
-            out = tp_all_reduce(out.float(), tp_group)
+            out = tp_all_reduce(out.float(), self.attn_group or tp_group)
+            if self.replicas > 1:
+                # Same correction as `Attention.forward`'s, for the same
+                # reason: a replicated attention's world all-reduce sums each
+                # group partial `replicas` times.
+                out = out / self.replicas
             out = out.to(x.dtype)
         return out
 
@@ -4330,9 +4738,15 @@ class DSparkBlock(Block):
         tp_size: int,
         tp_rank: int,
         max_batch_size: int = 1,
+        attn_tp: int | None = None,
+        attn_rank: int | None = None,
+        attn_group=None,
     ) -> None:
         layer_id = config.num_hidden_layers + stage
-        super().__init__(config, layer_id, tp_size, tp_rank, max_batch_size)
+        super().__init__(
+            config, layer_id, tp_size, tp_rank, max_batch_size,
+            attn_tp=attn_tp, attn_rank=attn_rank, attn_group=attn_group,
+        )
         self.stage = stage
         self.block_size = config.dspark_block_size
         self.noise_token_id = config.dspark_noise_token_id
@@ -4558,6 +4972,71 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.world_size = tp_group.world_size
         self.rank = tp_group.rank_in_group
 
+        # The attention's own shard degree, capped at `o_groups` because `wo_a`
+        # is block-diagonal over the groups and a rank has to own whole ones.
+        # Above the cap the attention is *replicated*: `attn_replicas` ranks
+        # compute each of the `attn_tp` shards, so every all-reduce of a head-
+        # or group-partial sum lands at `attn_replicas x` the true sum and is
+        # divided back down. See `config.ATTENTION_TENSOR_PARALLEL_SIZE`, which
+        # also records what the redundant arithmetic costs and how to remove it.
+        from .config import ATTENTION_TENSOR_PARALLEL_SIZE
+
+        self.attn_tp = max(1, min(self.world_size, ATTENTION_TENSOR_PARALLEL_SIZE))
+        if self.world_size % self.attn_tp:
+            raise ValueError(
+                f"world_size {self.world_size} is not a multiple of the "
+                f"attention shard degree {self.attn_tp}, so the attention "
+                "cannot be replicated evenly and an all-reduce of a head "
+                "partial would not be a whole multiple of the true sum. Choose "
+                "a tensor_parallel_size divisible by "
+                f"{ATTENTION_TENSOR_PARALLEL_SIZE}."
+            )
+        self.attn_rank = self.rank % self.attn_tp
+        self.attn_replicas = self.world_size // self.attn_tp
+        # The group the attention's own reduction runs over. See
+        # `__init__.require_attention_group`: when the backend has built the
+        # EP-TP mesh this is `attn_tp` consecutive ranks holding one of each
+        # attention shard, so the reduce is one of each partial and needs no
+        # replica correction. Without it, fall back to the world group and the
+        # divide — correct, and 8x the participants.
+        self.attn_tp_group = self.tp_group
+        self.attn_group_is_world = True
+        if self.attn_replicas > 1:
+            try:
+                from vllm_neuron.parallel.neuron_parallel_state import (
+                    get_neuron_ep_tp_group,
+                )
+
+                candidate = get_neuron_ep_tp_group()
+            except Exception as exc:  # noqa: BLE001 - absence is the normal case
+                logger.info(
+                    "deepseek_v41: no EP-TP group (%s), so the attention "
+                    "reduces over all %d ranks and divides by %d; see "
+                    "deepseek_v41.require_attention_group",
+                    exc, self.world_size, self.attn_replicas,
+                )
+            else:
+                if candidate.world_size == self.attn_tp:
+                    self.attn_tp_group = candidate
+                    self.attn_group_is_world = False
+                else:
+                    logger.warning(
+                        "deepseek_v41: the EP-TP group is %d ranks but the "
+                        "attention splits %d ways, so it is not the group this "
+                        "reduction needs; reducing over the world instead",
+                        candidate.world_size, self.attn_tp,
+                    )
+        # Per-forward chatter goes to one rank from here on; see `_LOG_RANK`.
+        _LOG_RANK[0] = self.rank == 0
+        if self.attn_replicas > 1 and _LOG_RANK[0]:
+            logger.info(
+                "deepseek_v41: rank %d/%d — attention sharded %d ways "
+                "(attn_rank %d) and replicated %dx; experts and vocab sharded "
+                "%d ways",
+                self.rank, self.world_size, self.attn_tp, self.attn_rank,
+                self.attn_replicas, self.world_size,
+            )
+
         self.hc_mult = config.hc_mult
         self.part_vocab_size = vocab_shard_width(config.vocab_size, self.world_size)
         #: Columns of `logits_shard` this rank owns that are *not* real tokens.
@@ -4580,7 +5059,11 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.layers = nn.ModuleList(
             [
                 Block(
-                    config, layer_id, self.world_size, self.rank, self._max_batch_size()
+                    config, layer_id, self.world_size, self.rank,
+                    self._max_batch_size(),
+                    attn_tp=self.attn_tp, attn_rank=self.attn_rank,
+                    attn_group=None if self.attn_group_is_world
+                    else self.attn_tp_group,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
@@ -4593,7 +5076,11 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.mtp = nn.ModuleList(
             [
                 DSparkBlock(
-                    config, stage, self.world_size, self.rank, self._max_batch_size()
+                    config, stage, self.world_size, self.rank,
+                    self._max_batch_size(),
+                    attn_tp=self.attn_tp, attn_rank=self.attn_rank,
+                    attn_group=None if self.attn_group_is_world
+                    else self.attn_tp_group,
                 )
                 for stage in range(config.num_nextn_predict_layers)
             ]
@@ -4734,7 +5221,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         }
 
         def add_attention(prefix: str, layer_id: int) -> None:
-            plan[f"{prefix}.attn_sink"] = ShardRule(
+            plan[f"{prefix}.attn_sink"] = attn_shard(
                 0, "one bias per query head; shards with the heads of wq_b"
             )
             plan[f"{prefix}.q_norm.weight"] = REPLICATE
@@ -4743,8 +5230,8 @@ class DeepseekV41ForCausalLM(nn.Module):
             plan[f"{prefix}.wq_a.weight"] = REPLICATE
             plan[f"{prefix}.wq_a.scale"] = REPLICATE
             # wq_b: 1280 -> 64*512. Column-parallel on the head axis.
-            plan[f"{prefix}.wq_b.weight"] = ShardRule(0, "column-parallel: query heads")
-            plan[f"{prefix}.wq_b.scale"] = ShardRule(0, "follows wq_b.weight dim 0")
+            plan[f"{prefix}.wq_b.weight"] = attn_shard(0, "column-parallel: query heads")
+            plan[f"{prefix}.wq_b.scale"] = attn_shard(0, "follows wq_b.weight dim 0")
             # One shared latent KV for every head: nothing to shard.
             plan[f"{prefix}.wkv.weight"] = REPLICATE
             plan[f"{prefix}.wkv.scale"] = REPLICATE
@@ -4753,15 +5240,15 @@ class DeepseekV41ForCausalLM(nn.Module):
             # rows a column-parallel split of out_features gives, which is why
             # the group partition has to agree with the head partition: group g
             # projects heads [8g, 8g+8).
-            plan[f"{prefix}.wo_a.weight"] = ShardRule(
+            plan[f"{prefix}.wo_a.weight"] = attn_shard(
                 0, "column-parallel over o_groups; must agree with the head split"
             )
-            plan[f"{prefix}.wo_a.scale"] = ShardRule(0, "follows wo_a.weight dim 0")
+            plan[f"{prefix}.wo_a.scale"] = attn_shard(0, "follows wo_a.weight dim 0")
             # wo_b: row-parallel, so each rank holds a partial sum.
-            plan[f"{prefix}.wo_b.weight"] = ShardRule(
+            plan[f"{prefix}.wo_b.weight"] = attn_shard(
                 1, "row-parallel: the o_groups*o_lora_rank contraction"
             )
-            plan[f"{prefix}.wo_b.scale"] = ShardRule(1, "follows wo_b.weight dim 1")
+            plan[f"{prefix}.wo_b.scale"] = attn_shard(1, "follows wo_b.weight dim 1")
 
             if layer_id in config.kv_source_layer_ids:
                 plan[f"{prefix}.compressor.norm.weight"] = REPLICATE
@@ -4769,13 +5256,13 @@ class DeepseekV41ForCausalLM(nn.Module):
                 if config.compress_ratios[layer_id] > 1:
                     plan[f"{prefix}.compressor.wgate.weight"] = REPLICATE
             if layer_id in config.index_source_layer_ids:
-                plan[f"{prefix}.indexer.wq_b.weight"] = ShardRule(
+                plan[f"{prefix}.indexer.wq_b.weight"] = attn_shard(
                     0, "column-parallel: index heads"
                 )
-                plan[f"{prefix}.indexer.wq_b.scale"] = ShardRule(
+                plan[f"{prefix}.indexer.wq_b.scale"] = attn_shard(
                     0, "follows indexer.wq_b.weight dim 0"
                 )
-                plan[f"{prefix}.indexer.weights_proj.weight"] = ShardRule(
+                plan[f"{prefix}.indexer.weights_proj.weight"] = attn_shard(
                     0, "one weight per index head; shards with indexer.wq_b"
                 )
                 if layer_id in config.kv_source_layer_ids:
@@ -4853,7 +5340,8 @@ class DeepseekV41ForCausalLM(nn.Module):
                 "loads needs one — add it to _build_shard_plan rather than "
                 "defaulting to replicate."
             )
-        if rule.dim is None or self.world_size == 1:
+        degree, rank = self.shard_group(rule)
+        if rule.dim is None or degree == 1:
             return tensor.to(device)
 
         extent = tensor.shape[rule.dim]
@@ -4865,8 +5353,8 @@ class DeepseekV41ForCausalLM(nn.Module):
             # slice and pad only the shortfall — which is zero for every rank
             # but the last, and zero for every world size whose exact division
             # is already aligned.
-            width = vocab_shard_width(extent, self.world_size)
-            start = min(self.rank * width, extent)
+            width = vocab_shard_width(extent, degree)
+            start = min(rank * width, extent)
             have = max(0, min(width, extent - start))
             shard = tensor.narrow(rule.dim, start, have)
             if have < width:
@@ -4877,13 +5365,28 @@ class DeepseekV41ForCausalLM(nn.Module):
                 )
             return shard.to(device)
 
-        if extent % self.world_size:
+        if extent % degree:
             raise ValueError(
                 f"{key}: dim {rule.dim} has extent {extent}, which is not "
-                f"divisible by world_size {self.world_size} ({rule.reason})"
+                f"divisible by the {rule.group} shard degree {degree} "
+                f"({rule.reason})"
             )
-        width = extent // self.world_size
-        return tensor.narrow(rule.dim, self.rank * width, width).to(device)
+        width = extent // degree
+        return tensor.narrow(rule.dim, rank * width, width).to(device)
+
+    def shard_group(self, rule: ShardRule) -> tuple[int, int]:
+        """`(degree, rank)` for `rule` — which ranks it splits across.
+
+        `"world"` is every rank. `"attn"` is the `o_groups`-capped attention
+        group: `ATTENTION_TENSOR_PARALLEL_SIZE` distinct shards, each held by
+        `world_size // that` ranks, with `rank % degree` choosing which. The
+        modulo rather than the division so that the 8 *distinct* shards sit on
+        consecutive ranks — i.e. within two devices' worth of cores — which is
+        where an intra-group reduction would want them if one is ever added.
+        """
+        if rule.group == "attn":
+            return self.attn_tp, self.attn_rank
+        return self.world_size, self.rank
 
     def verify_shard_plan(self, index) -> list[str]:
         """Check the plan against the checkpoint: every key present, every
@@ -4906,17 +5409,19 @@ class DeepseekV41ForCausalLM(nn.Module):
             if rule is None:
                 problems.append(f"{name}: no sharding rule")
                 continue
+            degree, _ = self.shard_group(rule)
             shape = list(index.ref(key).shape)
             if rule.dim is not None and rule.align is not None:
-                shape[rule.dim] = vocab_shard_width(shape[rule.dim], self.world_size)
+                shape[rule.dim] = vocab_shard_width(shape[rule.dim], degree)
             elif rule.dim is not None:
-                if shape[rule.dim] % self.world_size:
+                if shape[rule.dim] % degree:
                     problems.append(
                         f"{key}: dim {rule.dim} extent {shape[rule.dim]} is not "
-                        f"divisible by {self.world_size} ({rule.reason})"
+                        f"divisible by the {rule.group} shard degree {degree} "
+                        f"({rule.reason})"
                     )
                     continue
-                shape[rule.dim] //= self.world_size
+                shape[rule.dim] //= degree
             target = buffers.get(_buffer_name(name))
             if target is None:
                 problems.append(f"{name}: no buffer named {_buffer_name(name)!r}")
@@ -5105,16 +5610,26 @@ class DeepseekV41ForCausalLM(nn.Module):
 
             NotImplementedError: Cannot copy out of meta tensor; no data!
 
-        One expert's worth of HBM per layer (17.9 MiB of fp4 weights plus 1.1
-        MiB of scales), refilled per forward by `MoE._stage`. 43 layers of that
-        is ~0.8 GiB, against the 276 GiB the 384-per-layer pool would need.
+        **A slot per expert this rank owns, so the pool is resident.** That is
+        the whole difference between this deployment and the single-device
+        ancestor it was copied from, and it is affordable only because the world
+        is wide: the experts are partitioned by id, so a rank owns
+        `n_routed / world_size` of them per layer — 6 of 384 at 64 ranks, 2 of
+        128 in a DSpark stage — and 6 x 18.8 MiB x 40 layers plus the three
+        stages is **4.6 GiB** of a 24 GiB bank. At 8 ranks the same pool is
+        36.1 GiB and does not fit, which is what `config.TENSOR_PARALLEL_SIZE`'s
+        table is about.
 
-        Then `_EXPERT_CACHE_BYTES` more, divided evenly over the same layers, as
-        the expert cache: slots that keep a fetched expert on the device so the
-        next step that routes to it reads nothing. That constant's note has the
-        measurement that makes this the most valuable HBM on the bank — the
-        model is weight-fetch bound on a 140 MB/s root volume, not
-        compute bound.
+        `load_resident_experts` then fills every slot once, at load time, and
+        `MoE._expert` becomes a pure cache hit: **no file, no PCIe, no copy on
+        the forward path.** The LRU admission machinery is left in place and
+        simply never fires, because the alternative — deleting it — would make a
+        rank that cannot afford full residency fail instead of degrade.
+
+        `expert_slot` is still allocated, one expert's worth per layer (~0.8 GiB
+        over 43), and is now only reached if a slot allocation came up short.
+        Cheap insurance against a silent wrong answer: `_stage` has somewhere to
+        put an expert that has no slot.
         """
         blocks = list(self.layers) + list(self.mtp)
         for block in blocks:
@@ -5125,16 +5640,28 @@ class DeepseekV41ForCausalLM(nn.Module):
             for buffer in blocks[0].ffn.expert_slot.buffers()
         )
         _EXPERT_BYTES[0] = per_expert
-        want = _EXPERT_CACHE_BYTES // (per_expert * max(1, len(blocks)))
+        wanted = sum(block.ffn.n_local_experts for block in blocks)
+        # The budget is a ceiling, not the target: asking for every owned expert
+        # is what makes the pool resident, and this is what stops the same
+        # request allocating 34 GiB on a 24 GiB bank at a narrower world. See
+        # `_EXPERT_CACHE_BYTES`.
+        affordable = _EXPERT_CACHE_BYTES // (per_expert * max(1, len(blocks)))
         allocated = sum(
-            block.ffn.allocate_cache_slots(self.config, device, want)
+            block.ffn.allocate_cache_slots(
+                self.config, device, min(block.ffn.n_local_experts, affordable)
+            )
             for block in blocks
         )
         logger.info(
-            "deepseek_v41: expert cache %d slots over %d layers "
-            "(%d each of %.1f MiB, %.2f GiB of HBM) for rank %d",
-            allocated, len(blocks), want, per_expert / 1024**2,
-            allocated * per_expert / 1024**3, self.rank,
+            "deepseek_v41: expert slots %d of %d owned over %d layers "
+            "(%.1f MiB each, %.2f GiB of HBM, budget pays for %d a layer) for "
+            "rank %d/%d — %s",
+            allocated, wanted, len(blocks), per_expert / 1024**2,
+            allocated * per_expert / 1024**3, affordable,
+            self.rank, self.world_size,
+            "pool is RESIDENT" if allocated == wanted else
+            "NOT resident: the budget is short, so these layers stream. Raise "
+            "DEEPSEEK_V41_EXPERT_CACHE_BYTES or widen the world.",
         )
 
     def _build_ngram_hash(self, device) -> NgramHashState:
@@ -5665,16 +6192,27 @@ class DeepseekV41ForCausalLM(nn.Module):
     def _engram_rows(
         self, layer_id: int, hashes: torch.Tensor, index: int, device
     ) -> torch.Tensor:
-        """This layer's n-gram rows for every token, off the 94.6 GiB table.
+        """This layer's n-gram rows for every token, `[1, T, 24, 256]` bf16.
 
-        The hash ids name rows the store gathers and dequantizes — 24 per token
-        — so the table is never resident and never materialized, but every
-        lookup a token needs does happen. This is the engram half of the
-        timeshare.
+        Two paths, and the first is this deployment's:
 
-        Dynamo-disabled for the same reason as `MoE._stage`: the gather happens
-        on the host against an mmap, and `rows.to(device)` is a traceable op, so
-        inlined it would drag a CPU tensor into the surrounding graph.
+        **Resident.** The table is row-sharded across the world and lives in
+        HBM, so the gather is a masked device lookup plus an all-reduce —
+        `_engram_gather` and `Engram`'s docstring have the argument for why that
+        is exact. Nothing touches the host and nothing touches a file.
+
+        **Streamed**, when `bind_table` has not run: the hash ids go back to the
+        host and `weight_loader.TimeshareWeightStore.engram` gathers and
+        dequantizes 24 rows a token out of the mmap'd 94.6 GiB table. That is
+        the single-device ancestor's path, kept so a rank that cannot hold a
+        shard degrades instead of failing.
+
+        Dynamo-disabled for the same reason as `MoE._stage`: on the streamed
+        path the gather happens on the host against an mmap, and `rows.to(device)`
+        is a traceable op, so inlined it would drag a CPU tensor into the
+        surrounding graph. The resident path's own arithmetic is compiled —
+        `_engram_gather` is a separate entry point, which is the rule this file
+        follows everywhere host code and device code meet.
 
         The ids come back to the host *before* the layer slice, because slicing
         a middle axis leaves a strided view and the backend's eager fallback
@@ -5688,15 +6226,29 @@ class DeepseekV41ForCausalLM(nn.Module):
         `[1, T, n_engram_layers, 24]` of int64 is 196 KiB at the 512-token
         bucket, so the whole-tensor copy is cheaper than the gather it feeds.
         """
-        ids = hashes.cpu()[:, :, index, :].contiguous()
-        rows = self.weight_store.engram(layer_id, ids)
+        engram = self.layers[layer_id].engram
+        if engram is not None and engram.resident:
+            rows = _compiled(_engram_gather)(
+                hashes, engram.table, index, engram.row_start, engram.row_width
+            )
+            if self.world_size > 1:
+                # Disjoint contributions: one rank owns each row and the rest
+                # sent zeros, so the sum *is* the gathered row. Not an averaged
+                # partial, so unlike the attention's reduce this one takes no
+                # replica correction.
+                rows = tp_all_reduce(rows, self.tp_group)
+        else:
+            ids = hashes.cpu()[:, :, index, :].contiguous()
+            rows = self.weight_store.engram(layer_id, ids)
         # Into a buffer shared by both engram layers rather than a fresh
         # device allocation each time, for the reason in `_layer_io`: the
         # executor retains a binding to the tensors its last call was handed,
         # so a fresh input per engram layer per forward is retained per engram
         # layer. `[1, T, 24, 256]` bf16 is 12 KiB a token, i.e. 96 MiB a layer
         # at the 8192-token prefill segment. Host-side and dynamo-disabled, so
-        # no traced code and no compiled graph is touched.
+        # no traced code and no compiled graph is touched. The resident path
+        # needs it for the same reason: `rows` is an *input* to `_run_block`
+        # whichever way it was produced.
         key = (tuple(rows.shape), rows.dtype, str(device))
         buf = self._engram_row_slots.get(key)
         if buf is None:
