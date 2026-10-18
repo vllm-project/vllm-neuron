@@ -45,6 +45,40 @@ goal: |
   - **parallelism-schema** — the scheme is chosen, not inherited: follow the floorplan, and
     measure TP=4 x PP=16 and TP=16 x PP=4 or name what blocks them.
 
+  FIRST THING EVERY ITERATION, BEFORE YOU RUN ANYTHING ON THE DEVICE: check that the 16
+  devices are actually free, and reclaim them if they are not. A verifier or bench run that
+  timed out usually leaves its 64 workers alive and holding all the HBM, and the next thing you
+  launch then fails for a reason that has nothing to do with your change.
+
+      neuron-ls                      # the PID column is empty when the devices are free
+      sudo lsof /dev/neuron*         # same question, from the other side
+
+  If anything is attached, kill the **top of its process tree first** so it cannot start
+  another cell, then work down (`autohelix` -> `io_monitor` -> `run_verifier`/`run_bench` ->
+  `_serve_main` -> `EngineCore`; the 64 workers die with their EngineCore). SIGTERM, wait ~15 s,
+  then verify with `lsof` again and SIGKILL anything left. Do not kill the `autohelix` process
+  that is running this loop — that is your own driver.
+
+  DO NOT RAISE `MAX_NUM_SEQS` ABOVE 1 UNTIL BATCHED INFERENCE IS ACTUALLY CORRECT. This model
+  keys a decode graph per `(1 + k) * running_seqs` row count, and the per-sequence state is the
+  part most likely to be wrong: iteration 4 found three separate bugs here (`SharedAttentionState`
+  shared across the batch, the n-gram hash cache shared between sequences, the indexer's mask
+  under chunked prefill) and every one of them was invisible at `max_num_seqs=1`. The failure
+  mode is not a wrong answer — it is that **the run stops producing and keeps holding the
+  devices**, which costs the whole iteration and needs the reclaim above.
+
+  Two honest caveats on that, because the evidence is weaker than it looks. The *mechanism* is
+  not established — divergent graph selection across ranks stalling a collective is a
+  hypothesis, not a finding. And a freeze that looked exactly like this one, on 2026-10-18,
+  turned out on inspection to be a healthy engine receiving an external SIGTERM with a client
+  that has no per-request timeout; see the `bench` constraint. So treat the stall as real but
+  unexplained, and when you see one, read the **server's** log for what the engine was doing
+  before concluding anything. `~/ds41_repro_hang.py` is the minimal reproduction to start from.
+
+  So: prove the batched path on CPU with `nki.simulate(kernel)(...)` and on a single short
+  prompt before you let the verifier or the bench near it, and raise `MAX_NUM_SEQS` one step at
+  a time rather than straight to 32.
+
   Weight Checkpoint: `/mnt/nvme/hf` — 475.3 GiB, 48 shards, revision
   `314113f8a7dadb388215396ba5fbee2c610a04d6`. Do not redownload from huggingface. It is on the
   instance store, which does not survive a stop/start; `~/download_ckpt.sh` re-pulls it in ~3 min
