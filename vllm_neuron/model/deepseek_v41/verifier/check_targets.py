@@ -148,19 +148,34 @@ def _check_latency(report: dict, args) -> list[str]:
         # Normalising by the name would quietly credit or penalise the port for
         # the dataset's rounding.
         n_in = m.get("mean_input_tokens") or cell.get("input_len")
-        per_1k = (ttft / (n_in / 1024.0)) if ttft and n_in else None
+        # A capped cell's TTFT is queue wait, not prefill, so it cannot be
+        # normalised by input length. Measured 2026-10-18: `in512_bs10` clamped
+        # to 1 with the client holding 10 in flight reported a 165 s median
+        # TTFT over 500 input tokens, which divides out to 339328 ms per 1k --
+        # a number about the queue the engine never agreed to serve. Gating on
+        # it would have failed `performance-targets` while telling the next
+        # reader something false about prefill.
+        #
+        # Its TPOT and decode figures stay in the table: those are per-token and
+        # unaffected by admission delay.
+        capped = bool(cell.get("concurrency_capped"))
+        per_1k = (ttft / (n_in / 1024.0)) if ttft and n_in and not capped else None
         decode = m.get("decode_tok_s")
         stream = m.get("per_stream_tok_s")
         tpot = m.get("tpot_p50_ms")
         over = "" if per_1k is None or per_1k <= args.ttft_ms_per_1k else " OVER"
         ttft_s = f"{ttft:.0f} ms" if ttft else "-"
-        per_1k_s = f"{per_1k:.0f} ms" if per_1k else "-"
+        per_1k_s = f"{per_1k:.0f} ms" if per_1k else ("queued" if capped else "-")
         tpot_s = f"{tpot:.0f} ms" if tpot else "-"
         decode_s = f"{decode:.1f}" if decode else "-"
         stream_s = f"{stream:.1f}" if stream else "-"
         print(f"  {_label(cell):<13} {n_in or 0:>5.0f}   {ttft_s:>9}   "
               f"{per_1k_s:>7}{over:<5}   {tpot_s:>9}  {decode_s:>7}  {stream_s:>10}")
-        if per_1k is None:
+        if capped:
+            print(f"      ^ TTFT not normalised: engine capped to "
+                  f"{cell.get('engine_max_num_seqs')} of {cell['batch']} requested, so this "
+                  "is queue wait. See `concurrency-32` for the cap itself.")
+        elif per_1k is None:
             problems.append(f"cell {_label(cell)} reported no TTFT.")
         elif per_1k > args.ttft_ms_per_1k:
             problems.append(
