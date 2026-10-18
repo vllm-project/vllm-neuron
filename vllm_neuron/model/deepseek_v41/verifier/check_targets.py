@@ -174,7 +174,7 @@ def _check_latency(report: dict, args) -> list[str]:
         if capped:
             print(f"      ^ TTFT not normalised: engine capped to "
                   f"{cell.get('engine_max_num_seqs')} of {cell['batch']} requested, so this "
-                  "is queue wait. See `concurrency-32` for the cap itself.")
+                  "is queue wait. See `config.MAX_NUM_SEQS` for the cap itself.")
         elif per_1k is None:
             problems.append(f"cell {_label(cell)} reported no TTFT.")
         elif per_1k > args.ttft_ms_per_1k:

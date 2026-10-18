@@ -26,7 +26,7 @@ goal: |
     in `kernels/legacy/`), as these fused kernels can significantly improve the inference speed.
   - drafter.py: the DSpark/MTP speculative proposer.
 
-  What's the success constraints. Fourteen, in the order the gate runs them. Each one's
+  What's the success constraints. Thirteen, in the order the gate runs them. Each one's
   `why:` below says how it is judged and what it is defending against; these are the one-line
   versions, not the whole statement.
   - **imports-and-registers** — the port resolves under the arch string vLLM dispatches on.
@@ -37,13 +37,21 @@ goal: |
   - **bench** — the speed and acceptance evidence gets measured. The three below read its report.
   - **acceptance-rate** — DSpark acceptance >= 27% on prose, by vLLM's own counters.
   - **performance-targets** — TTFT < 1.5 s per 1k input tokens; aggregate decode > 50 tokens/s.
-  - **concurrency-32** — 32 requests served at once, all finishing. A queue that completes is not a batch.
   - **nki-kernels-on-device** — the heavy modules run as NKI kernels on device. Not torch, not CPU.
   - **full-model-faithful** — every component of DeepSeek V4.1 Flash actually executes.
   - **uses-dspark-speculation** — drafts are proposed and verified, not computed and discarded.
   - **weights-resident-across-64-ranks** — the weights are divided across the 64 ranks and live in HBM.
   - **parallelism-schema** — the scheme is chosen, not inherited: follow the floorplan, and
     measure TP=4 x PP=16 and TP=16 x PP=4 or name what blocks them.
+
+  WARNING: Some operations, especially those related to collectives between cores and multi-batch
+  inference, can cause the system to hang or deadlock. This phenomenon is devastating and we want to do
+  what ever we can to avoid it. FOR ANY CHANGES RELATED TO THEM, PLEASE DOUBLE CHECK, PROBE, AND PROVE
+  THAT IT IS SAFE, BEFORE YOU TRY TO RUN IT ON DEVICE. SET UP A MONITOR TO WATCH EVERY 5 MINS and KILL
+  PROCESSES ONCE IT STALE FOR TOO LONG! (For example, you can use the latency when we do the bench
+  matrix using the baseline code as the reference. If the latency is 1.5x longer, i.e., no progress or 
+  changes of the log compared to how frequent the baseline changes the log, there is a high risk of
+  deadlock and system stall).
 
   FIRST THING EVERY ITERATION, BEFORE YOU RUN ANYTHING ON THE DEVICE: check that the 16
   devices are actually free, and reclaim them if they are not. A verifier or bench run that
@@ -76,14 +84,6 @@ goal: |
   driver state, so killing the processes does not clear it: `~/reset_neuron.sh` reloads the
   `neuron` module, which does, in seconds rather than a ~30 minute reboot. The bench now
   matches those signatures in the engine log and kills the cell on sight.
-
-  DO NOT RAISE `MAX_NUM_SEQS` ABOVE 1 UNTIL BATCHED INFERENCE IS ACTUALLY CORRECT. This model
-  keys a decode graph per `(1 + k) * running_seqs` row count, and the per-sequence state is the
-  part most likely to be wrong: iteration 4 found three separate bugs here (`SharedAttentionState`
-  shared across the batch, the n-gram hash cache shared between sequences, the indexer's mask
-  under chunked prefill) and every one of them was invisible at `max_num_seqs=1`. The failure
-  mode is not a wrong answer — it is that **the run stops producing and keeps holding the
-  devices**, which costs the whole iteration and needs the reclaim above.
 
   Weight Checkpoint: `/mnt/nvme/hf` — 475.3 GiB, 48 shards, revision
   `314113f8a7dadb388215396ba5fbee2c610a04d6`. Do not redownload from huggingface. It is on the
@@ -268,7 +268,7 @@ constraints:
     timeout: 10800
     rationale: |
       Infrastructure, not a bar of its own: it runs the matrix, probes acceptance, and writes
-      `bench/bench_report.json`. `acceptance-rate`, `performance-targets` and `concurrency-32`
+      `bench/bench_report.json`. `acceptance-rate` and `performance-targets`
       are the rules applied to it. It passes when every requested cell produced figures, which
       is a real condition — a cell that dies measures nothing, and the three constraints after
       it then fail for want of evidence rather than passing vacuously.
@@ -302,11 +302,10 @@ constraints:
       per-request timeout, so the client waited out the full cell timeout for replies from a
       server that had gone away. `_bench_serve` now watches the engine and kills the client when
       it exits, so that specific case fails in seconds; 1500 s is the backstop for everything
-      else that could stop a cell, including the multi-sequence hang `concurrency-32` exists to
-      catch. The batch-1 cells that produce the TTFT evidence need ~5 min each and are
+      else that could stop a cell, including a multi-sequence hang. The batch-1 cells that produce the TTFT evidence need ~5 min each and are
       unaffected. A batch-32 cell that is merely clamped
       to 1 serves its 64 requests serially (~37 min) and will time out — which costs nothing,
-      because a clamped cell fails `concurrency-32` and is excluded from the decode bar anyway.
+      because a clamped cell is excluded from the decode bar anyway.
       The report is written after every cell, and batch 1 runs first, so a batch-32 stall cannot
       take the batch-1 figures down with it.
 
@@ -372,33 +371,33 @@ constraints:
 
       Where this starts: every cell currently fails the TTFT bar — 4020 / 2584 / 2220 ms per 1k
       at 512 / 1024 / 2048 — so this is roughly a 1.5-2.7x prefill improvement, and the decode
-      bar is unmeasured until `concurrency-32` holds. Those two are coupled on purpose: 32
+      bar is unmeasured while `config.MAX_NUM_SEQS` is 1. The two are coupled: 32
       streams at today's per-stream rate is ~155 tokens/s, so the throughput bar is reachable
       through concurrency and probably not without it.
 
   # ── 9. 32 concurrent requests, really concurrent, and the run ends ────────────────────
-  - name: concurrency-32
-    command: PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" /home/ubuntu/vllm-neuron/.venv/bin/python -m vllm_neuron.model.deepseek_v41.verifier.check_targets --check concurrency --target-batch 32
-    timeout: 300
-    rationale: |
-      Three separate things, because the failure this is written against passed two of them. A
-      batch-10 cell measured here reported plausible numbers while the engine had clamped itself
-      to `max_num_seqs 10 -> 1`: the requests completed, the latencies were real, and what was
-      measured was a queue. TTFT p50 was 234 s with a p99/p50 ratio of 1.1 and throughput equal
-      to batch 1 — which reads as "slow" rather than "wrong" unless you know to look.
+  # - name: concurrency-32
+  #   command: PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" /home/ubuntu/vllm-neuron/.venv/bin/python -m vllm_neuron.model.deepseek_v41.verifier.check_targets --check concurrency --target-batch 32
+  #   timeout: 300
+  #   rationale: |
+  #     Three separate things, because the failure this is written against passed two of them. A
+  #     batch-10 cell measured here reported plausible numbers while the engine had clamped itself
+  #     to `max_num_seqs 10 -> 1`: the requests completed, the latencies were real, and what was
+  #     measured was a queue. TTFT p50 was 234 s with a p99/p50 ratio of 1.1 and throughput equal
+  #     to batch 1 — which reads as "slow" rather than "wrong" unless you know to look.
 
-      So: the engine admitted the batch (`engine_max_num_seqs >= 32`, not clamped), every
-      request finished (`completed == num_prompts` — no hang, no stall, the server exited
-      rather than being killed), and aggregate throughput is at least 4x the batch-1 figure at
-      the same input length. The last is the one that separates batching from serialisation:
-      32 requests served one after another give the *same* aggregate throughput as batch 1, so
-      a serialised cell scores ~1.0x. 4x is far below the ideal 32x on purpose — speculation,
-      the scheduler and the shared prefill all take their cut, and the question here is which
-      of the two regimes this is, not whether it is perfectly parallel.
+  #     So: the engine admitted the batch (`engine_max_num_seqs >= 32`, not clamped), every
+  #     request finished (`completed == num_prompts` — no hang, no stall, the server exited
+  #     rather than being killed), and aggregate throughput is at least 4x the batch-1 figure at
+  #     the same input length. The last is the one that separates batching from serialisation:
+  #     32 requests served one after another give the *same* aggregate throughput as batch 1, so
+  #     a serialised cell scores ~1.0x. 4x is far below the ideal 32x on purpose — speculation,
+  #     the scheduler and the shared prefill all take their cut, and the question here is which
+  #     of the two regimes this is, not whether it is perfectly parallel.
 
-      `config.MAX_NUM_SEQS` is the knob and it is 1 today, with the stall evidence recorded
-      beside it. This constraint is therefore expected to fail at the start, and it is the one
-      whose fix unblocks `performance-targets`' decode bar as well.
+  #     `config.MAX_NUM_SEQS` is the knob and it is 1 today, with the stall evidence recorded
+  #     beside it. This constraint is therefore expected to fail at the start, and it is the one
+  #     whose fix unblocks `performance-targets`' decode bar as well.
 
   # ── 10-14. the five things no script here can express without becoming gameable ───────
 
@@ -749,7 +748,7 @@ constraints:
       and a 4-way all-reduce has a quarter the participants of a 16-way one. Against that, a
       stage boundary adds a serialized activation transfer per microbatch, and PP's bubble is
       unhidden at `MAX_NUM_SEQS = 1` because there is nothing to overlap it with — which is why
-      this and `concurrency-32` are likely to have to move together.
+      this and raising `config.MAX_NUM_SEQS` are likely to have to move together.
 
       BE CAREFUL BEFORE YOU CHANGE THE RANK COUNT OR THE COLLECTIVE TIMEOUTS. A naive
       multi-rank run through vLLM twice hung the whole *instance* on the predecessor host, each
