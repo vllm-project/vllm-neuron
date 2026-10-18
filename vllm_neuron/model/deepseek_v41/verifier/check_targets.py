@@ -106,17 +106,28 @@ def _load(path: Path) -> dict | None:
 
 
 def _cells(report: dict) -> list[dict]:
-    return [c for c in (report.get("cells") or []) if c.get("metrics")]
+    """The measured cells the latency and concurrency bars apply to.
+
+    Every cell is a random-token cell of a known input length, which is what
+    makes a TTFT-per-1k figure mean anything. The prose measurement is not a
+    cell at all -- it is `report["prose"]`, a probe that rides along on one of
+    these servers -- so it is not here to be excluded. The `dataset` filter is
+    kept so that a future prose cell could not silently acquire a latency bar
+    normalised against prompt lengths it does not control.
+    """
+    return [c for c in (report.get("cells") or [])
+            if c.get("metrics") and c.get("dataset") != "prose"]
 
 
 def _label(cell: dict) -> str:
-    return f"in{cell['input_len']}_bs{cell['batch']}"
+    return cell.get("name") or f"in{cell['input_len']}_bs{cell['batch']}"
 
 
 def _check_latency(report: dict, args) -> list[str]:
     problems: list[str] = []
     cells = _cells(report)
-    skipped = [c for c in (report.get("cells") or []) if not c.get("metrics")]
+    skipped = [c for c in (report.get("cells") or [])
+               if not c.get("metrics") and c.get("dataset") != "prose"]
 
     if not cells:
         return ["the bench report has no cell with measurements in it."]
@@ -182,7 +193,8 @@ def _check_latency(report: dict, args) -> list[str]:
 def _check_concurrency(report: dict, args) -> list[str]:
     problems: list[str] = []
     target = args.target_batch
-    all_cells = report.get("cells") or []
+    all_cells = [c for c in (report.get("cells") or [])
+                 if c.get("dataset") != "prose"]
     at_target = [c for c in all_cells if c["batch"] == target]
 
     if not at_target:

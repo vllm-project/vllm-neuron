@@ -108,6 +108,28 @@ and one column that is not a speed figure but conditions every speed figure:
 |---|---|
 | `accept %` | DSpark speculative acceptance over the cell, read from that cell's own server log |
 
+## The prose acceptance probe
+
+The matrix is random-token input, and that very nearly switches speculation off:
+a drafter predicts the next token, and there is nothing to predict in noise. So
+acceptance gets its own measurement, on real text.
+
+It is a **probe, not a cell**. After the widest-context cell's measurement, and
+before that server is torn down, the bench sends the verifier's own cases to
+`/v1/completions` and takes the delta in vLLM's `vllm:spec_decode_*` counters
+around them. No extra engine build, and the counters are vLLM's own — the
+scheduler accumulates them in `update_from_output`, in code the port cannot
+edit, which is what makes them usable as a gate when `drafter.py` is editable.
+It lands in `bench_report.json` as `report["prose"]` and
+`verifier/check_acceptance.py` is the bar applied to it.
+
+Prompts longer than the server's context are skipped, and which ones were sent
+is recorded — a 2008-token needle has nothing to do with a 768-token engine.
+
+`vllm bench serve --dataset-name custom` would have been less code and is not
+available: `CustomDataset` reads its JSONL through pandas, which is absent from
+this environment and resolves to a `PlaceholderModule` that raises on use.
+
 **Read the acceptance column before comparing throughput to anything.** A decode
 step emits `1 + accepted` tokens, so acceptance is a first-order term here — and
 on `--dataset-name random` it very nearly switches itself off. Random input is

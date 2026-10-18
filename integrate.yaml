@@ -310,51 +310,16 @@ constraints:
       gate on, so they are reported, as is the list of checkpoint files still mapped at the
       end. `check_hbm_resident.py`'s docstring says this plainly instead of overclaiming.
 
-  # ── 6. speculation is worth having, counted by vLLM rather than by the port ────────────
-  - name: acceptance-rate
-    command: . /home/ubuntu/ds41-env.sh && export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" && mkdir -p /mnt/nvme/tmp/run && cd /mnt/nvme/tmp/run && exec /home/ubuntu/vllm-neuron/.venv/bin/python -u -m vllm_neuron.model.deepseek_v41.verifier.check_acceptance --model /mnt/nvme/hf --min-acceptance-pct 27
-    timeout: 3600
-    rationale: |
-      DSpark acceptance >= 27%, where the 27% is a constant on this command line and nowhere
-      else, so moving the bar is a config change rather than a code change.
-
-      **The number comes from vLLM, not from the port.** `drafter.py`'s `_report_acceptance`
-      logs a running rate and the bench reads it; `drafter.py` is editable, so that figure
-      cannot be the gate. This reads `vllm:spec_decode_num_draft_tokens` and
-      `vllm:spec_decode_num_accepted_tokens` through `LLM.get_metrics()`. vLLM's scheduler
-      accumulates them in `update_from_output` from the model runner's output, and
-      `NeuronScheduler` subclasses that scheduler and calls `super()`, which is what makes them
-      available on this backend. Checked against four real server logs: the two sources agree
-      to a few tenths of a point today (13.0 vs 12.9, 13.2 vs 13.5, 16.8 vs 16.8), which is
-      evidence the port's own counter is honest *now* and not a reason to keep depending on it.
-      `num_accepted_tokens_per_pos` is reported too, because a drafter that only ever lands its
-      first token is a different problem from one that lands a short run.
-
-      **Measured on prose, deliberately.** The input is the verifier's own four cases. This is
-      the one judgement call in the constraint and it is worth stating, because it is the
-      difference between a bar that can be met and one that cannot: acceptance is a statement
-      about how predictable the text is, and `vllm bench serve --dataset-name random` feeds
-      random token *ids*, which an n-gram/Markov drafter cannot predict even in principle.
-      Measured on this port: 49% on prose against 16-18% on random. A 27% bar against random
-      data would be a bar on the dataset, unreachable by any change to the model — so the bench
-      keeps recording its per-cell rate (now from vLLM's counters as well as the port's) and
-      that figure is not a pass/fail line. If the intent was 27% on random input too, say so
-      and this splits into two constraints; it is not a thing to leave implicit.
-
-      Its own engine, which is why it is a separate device run rather than folded into the
-      verifier: measuring acceptance needs stat logging on and ~96 tokens a case, and the
-      correctness gate is not to be modified for the convenience of a different measurement.
-
-  # ── 7. the speed evidence. the two constraints after this one read its report ──────────
+  # ── 6. the speed and acceptance evidence. the three constraints after it read its report ─
   - name: bench
     command: . /home/ubuntu/ds41-env.sh && export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" && mkdir -p /mnt/nvme/tmp/run && cd /mnt/nvme/tmp/run && exec /home/ubuntu/vllm-neuron/.venv/bin/python -u -m vllm_neuron.model.deepseek_v41.bench.run_bench --model /mnt/nvme/hf --input-lens 1024,2048 --batch-sizes 1,32
-    timeout: 9000
+    timeout: 10800
     rationale: |
-      Infrastructure, not a bar of its own: it runs the matrix and writes
-      `bench/bench_report.json`, and `performance-targets` and `concurrency-32` are the rules
-      applied to it. It passes when every requested cell produced figures, which is a real
-      condition — a cell that dies measures nothing, and the two constraints after it then fail
-      for want of evidence rather than passing vacuously.
+      Infrastructure, not a bar of its own: it runs the matrix, probes acceptance, and writes
+      `bench/bench_report.json`. `acceptance-rate`, `performance-targets` and `concurrency-32`
+      are the rules applied to it. It passes when every requested cell produced figures, which
+      is a real condition — a cell that dies measures nothing, and the three constraints after
+      it then fail for want of evidence rather than passing vacuously.
 
       **A reduced matrix, on purpose.** Four cells — input 1024 and 2048, batch 1 and 32 —
       against the 8-cell matrix `bench/README.md` describes. Each cell builds its own engine
@@ -366,7 +331,52 @@ constraints:
       matrix, including 8k, belongs to `integrate-run.yaml`, where throughput is a metric being
       improved rather than a bar being met.
 
-      This is the dominant term in the gate's wall clock. See the note on `budget` below.
+      **Acceptance rides along, at no extra cell.** It is the one figure the random cells
+      cannot produce — random token *ids* are unpredictable to an n-gram drafter in principle —
+      so the bench sends the verifier's own cases to the widest-context server it already has
+      up (`in2048_bs1`'s) and records the delta in vLLM's `vllm:spec_decode_*` counters around
+      them as `report["prose"]`. A probe rather than a fifth cell because a cell is another
+      engine build, and `vllm bench serve --dataset-name custom` is unavailable anyway:
+      `CustomDataset` reads its JSONL through pandas, which is absent from this environment and
+      resolves to a `PlaceholderModule` that raises on use. `--no-prose-probe` drops it, and
+      then `acceptance-rate` fails for want of evidence, which is intended.
+
+      This is the dominant term in the gate's wall clock: 10,800 s of a 25,800 s budget.
+
+  # ── 7. speculation is worth having, counted by vLLM rather than by the port ────────────
+  - name: acceptance-rate
+    command: PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" /home/ubuntu/vllm-neuron/.venv/bin/python -m vllm_neuron.model.deepseek_v41.verifier.check_acceptance --min-acceptance-pct 27
+    timeout: 300
+    rationale: |
+      DSpark acceptance >= 27%, where the 27% is a constant on this command line and nowhere
+      else, so moving the bar is a config change rather than a code change. Reads the bench
+      report, so it costs seconds and needs no device of its own.
+
+      **The number comes from vLLM, not from the port.** `drafter.py`'s `_report_acceptance`
+      logs a running rate; `drafter.py` is editable, so that figure cannot be the gate. The
+      bench reads `vllm:spec_decode_num_{draft,accepted}_tokens` off a live server's
+      `/metrics` instead, before and after the prose requests, and each random cell's rate out
+      of its own server log — counts vLLM's scheduler accumulates in `update_from_output` from
+      the model runner's output, available on this backend because `NeuronScheduler` subclasses
+      that scheduler and calls `super()`. The port's own figure is reported beside them, and a gap
+      above 2 points is called out, so a divergence is visible rather than silent. Checked
+      against four real server logs: they agree to a few tenths today (13.0 vs 12.9, 13.2 vs
+      13.5, 16.8 vs 16.8), which is evidence the port's counter is honest *now* and not a
+      reason to keep depending on it.
+
+      **The bar applies to the bench's prose probe only**, and this is the one judgement in the
+      constraint. Acceptance is a statement about how predictable the text is, and
+      `--dataset-name random` feeds random token *ids* — nothing for an n-gram/Markov drafter
+      to predict even in principle. This port measures 49% on prose against 16-18% on random.
+      A 27% bar against the random cells would be a bar on the dataset, unreachable by any
+      change to the model, so the bench probes the verifier's own four cases against a server
+      it already has up — no extra engine build — and that measurement is what is gated here. The random cells' rates are
+      reported, because they condition every throughput figure in the matrix, and are not
+      pass/fail. If the intent was 27% on random input too, say so — it is not a thing to leave
+      implicit, and it would need a different bar.
+
+      It also refuses a rate computed from fewer than 100 offered drafts. A gate that passes on
+      noise is worse than one that says it could not tell.
 
   # ── 8. the latency and throughput bars ────────────────────────────────────────────────
   - name: performance-targets

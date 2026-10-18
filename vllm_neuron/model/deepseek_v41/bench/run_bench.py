@@ -63,6 +63,14 @@ DEFAULT_INPUT_LENS = (512, 1024, 2048, 8192)
 DEFAULT_BATCH_SIZES = (1, 10)
 DEFAULT_OUTPUT_LEN = 128
 
+#: Tokens per prompt in the prose cell. Acceptance is sampled over decode
+#: steps, so this is the sample size: 96 tokens over the verifier's 4 cases
+#: at ~1.5 accepted a step is ~250 draft decisions.
+DEFAULT_PROSE_OUTPUT_LEN = 96
+
+#: `--served-model-name`, and what every client here asks for.
+SERVED_NAME = "deepseek-v41-flash"
+
 #: Requests per cell. Enough that a median means something, few enough that the
 #: 8k x 10 cell does not dominate the run: at batch `b` this is `max(8, 2 * b)`,
 #: so batch 1 sends 8 sequentially and batch 10 sends 20 as two full rounds.
@@ -132,6 +140,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=7200,
         help="seconds for one cell",
     )
+    p.add_argument(
+        "--prose-output-len", type=int, default=DEFAULT_PROSE_OUTPUT_LEN,
+        help="tokens generated per prompt in the prose acceptance probe. Acceptance "
+             "is sampled over decode steps, so this is the sample size.",
+    )
+    p.add_argument(
+        "--no-prose-probe", action="store_true",
+        help="skip the prose acceptance probe. `check_acceptance` then has nothing to "
+             "read and fails, which is intended: an unmeasured bar is not a met one.",
+    )
     p.add_argument("--report", default=str(DEFAULT_REPORT))
     p.add_argument(
         "--keep-server",
@@ -185,7 +203,7 @@ def _serve(
         sys.executable, "-m",
         "vllm_neuron.model.deepseek_v41.bench._serve_main",
         "--model", model,
-        "--served-model-name", "deepseek-v41-flash",
+        "--served-model-name", SERVED_NAME,
         "--tensor-parallel-size", str(tp),
         "--max-model-len", str(max_model_len),
         "--max-num-seqs", str(max_num_seqs),
@@ -258,8 +276,145 @@ def _stop(proc: subprocess.Popen) -> None:
 WARMUP_OUTPUT_LEN = 8
 
 
+def _random_flags(input_len: int) -> callable:
+    """`vllm bench serve` flags for a random-token cell of a given input length.
+
+    Returns a callable taking the output length, because the warm-up and the
+    measurement of one cell differ only in that.
+    """
+    def build(output_len: int) -> list[str]:
+        return [
+            "--dataset-name", "random",
+            "--random-input-len", str(input_len),
+            "--random-output-len", str(output_len),
+            # Exact lengths, not a range: the cell is named for its shape.
+            "--random-range-ratio", "0",
+        ]
+    return build
+
+
+#: vLLM's own spec-decode counters, as the Prometheus endpoint spells them.
+_SPEC_METRICS = {
+    "draft_tokens": "vllm:spec_decode_num_draft_tokens_total",
+    "accepted_tokens": "vllm:spec_decode_num_accepted_tokens_total",
+    "num_drafts": "vllm:spec_decode_num_drafts_total",
+}
+
+
+def _scrape_spec_counters(port: int) -> dict[str, float]:
+    """vLLM's spec-decode counters from a live server's `/metrics`.
+
+    Summed over label sets: one engine has one, but a counter that grew under
+    two must not be read as whichever was exposed last.
+    """
+    out = {k: 0.0 for k in _SPEC_METRICS}
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/metrics", timeout=30
+        ) as resp:
+            text = resp.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        print(f"bench:   /metrics unreachable: {exc}", file=sys.stderr)
+        return out
+    for line in text.splitlines():
+        if line.startswith("#"):
+            continue
+        name, _, value = line.rpartition(" ")
+        bare = name.split("{", 1)[0].strip()
+        for key, metric in _SPEC_METRICS.items():
+            if bare == metric:
+                try:
+                    out[key] += float(value)
+                except ValueError:
+                    pass
+    return out
+
+
+def _prose_probe(model: str, port: int, output_len: int, timeout: int) -> dict:
+    """Measure speculative acceptance on real prose, on a server already up.
+
+    **Why this is a probe and not a cell.** Acceptance is the one figure the
+    random cells cannot produce: it is a statement about how predictable the
+    text is, and `--dataset-name random` feeds random token *ids*, which an
+    n-gram/Markov drafter cannot predict even in principle. This port measures
+    49% on prose against 16-18% on random.
+
+    So the prompts have to be real text -- and they are the verifier's own
+    cases, imported rather than copied, because "the verifier and the bench
+    serve the same model" is a requirement of this port and the same prompts is
+    that requirement one level down. `prompts.render` has already applied the
+    chat template, which is why these go to `/v1/completions` rather than the
+    chat endpoint: templating them twice would change the tokens.
+
+    It runs on an engine that is **already serving**, so it costs no extra
+    engine build -- which is the whole point. A cell of its own would have been
+    a fifth context to compile. `vllm bench serve --dataset-name custom` would
+    have been less code and is not available: `CustomDataset` reads its JSONL
+    through pandas, and pandas is not installed in this environment, where it
+    resolves to a `PlaceholderModule` that raises on use.
+
+    The counters are read **before and after**, so the figure is this probe's
+    and not contaminated by the random traffic this server has already served.
+
+    Only prompts that fit the server's context are sent, and which ones is
+    recorded: a 2008-token needle has nothing to do with a 768-token engine.
+    """
+    from ..verifier import prompts
+    from ..verifier.run_verifier import CHAT_TEMPLATE
+
+    case_set = prompts.build_cases()
+    rendered, notes = prompts.render(case_set, model, CHAT_TEMPLATE)
+    for note in notes:
+        print(f"bench:   {note}")
+
+    before = _scrape_spec_counters(port)
+    sent: list[str] = []
+    generated = 0
+    for case, (text, n_tok) in zip(case_set.cases, rendered):
+        payload = json.dumps({
+            "model": SERVED_NAME,
+            "prompt": text,
+            "max_tokens": output_len,
+            "temperature": 0.0,
+            # Every request emits exactly `output_len` tokens, so the number of
+            # decode steps the rate is sampled over is known.
+            "ignore_eos": True,
+        }).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/completions", data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = json.loads(resp.read().decode())
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError,
+                TimeoutError) as exc:
+            # A prompt longer than the engine's context is the expected
+            # rejection here, not a bug: say which and carry on.
+            print(f"bench:   prose prompt {case.id} ({n_tok} tok) rejected: {exc}",
+                  file=sys.stderr)
+            continue
+        sent.append(case.id)
+        generated += (body.get("usage") or {}).get("completion_tokens") or 0
+
+    after = _scrape_spec_counters(port)
+    drafted = int(after["draft_tokens"] - before["draft_tokens"])
+    accepted = int(after["accepted_tokens"] - before["accepted_tokens"])
+    drafts = int(after["num_drafts"] - before["num_drafts"])
+    return {
+        "cases": sent,
+        "output_len": output_len,
+        "tokens_generated": generated,
+        "source": "vllm:spec_decode_* /metrics delta around the prose requests",
+        "num_drafts": drafts,
+        "draft_tokens": drafted,
+        "accepted_tokens": accepted,
+        "acceptance_pct": (100.0 * accepted / drafted) if drafted else None,
+    }
+
+
 def _bench_serve(
-    model: str, port: int, input_len: int, output_len: int, batch: int,
+    model: str, port: int, dataset_flags: list[str], batch: int,
     num_prompts: int, result_dir: Path, result_file: str, timeout: int,
 ) -> dict | None:
     """One `vllm bench serve` invocation. Returns its parsed result, or None."""
@@ -276,13 +431,9 @@ def _bench_serve(
         # in a template and change the input length the cell is named for.
         "--backend", "openai",
         "--host", "127.0.0.1", "--port", str(port),
-        "--model", "deepseek-v41-flash",
+        "--model", SERVED_NAME,
         "--tokenizer", model,
-        "--dataset-name", "random",
-        "--random-input-len", str(input_len),
-        "--random-output-len", str(output_len),
-        # Exact lengths, not a range: the cell is named for its shape.
-        "--random-range-ratio", "0",
+        *dataset_flags,
         "--num-prompts", str(num_prompts),
         "--max-concurrency", str(batch),
         # Every request emits exactly `output_len` tokens, so TPOT and the
@@ -311,7 +462,7 @@ def _bench_serve(
 
 
 def _bench_cell(
-    model: str, port: int, input_len: int, output_len: int, batch: int,
+    model: str, port: int, name: str, flags: callable, output_len: int, batch: int,
     num_prompts: int, result_dir: Path, timeout: int,
 ) -> dict | None:
     """One cell: warm it up, then measure it.
@@ -342,11 +493,10 @@ def _bench_cell(
     then simply a cold one, and it is better to report a number with that
     caveat than to drop the cell.
     """
-    name = f"in{input_len}_bs{batch}"
     print(f"\nbench: cell {name} — warm-up: {num_prompts} prompts, "
-          f"{input_len} in / {WARMUP_OUTPUT_LEN} out (discarded)")
+          f"{WARMUP_OUTPUT_LEN} out (discarded)")
     warm = _bench_serve(
-        model, port, input_len, WARMUP_OUTPUT_LEN, batch, num_prompts,
+        model, port, flags(WARMUP_OUTPUT_LEN), batch, num_prompts,
         result_dir, f"{name}.warmup.json", timeout,
     )
     if warm is None:
@@ -354,9 +504,9 @@ def _bench_cell(
               "below is a cold one", file=sys.stderr)
 
     print(f"bench: cell {name} — measuring: {num_prompts} prompts, "
-          f"concurrency {batch}, {input_len} in / {output_len} out")
+          f"concurrency {batch}, {output_len} out")
     measured = _bench_serve(
-        model, port, input_len, output_len, batch, num_prompts,
+        model, port, flags(output_len), batch, num_prompts,
         result_dir, f"{name}.json", timeout,
     )
     if measured is not None:
@@ -513,29 +663,30 @@ def _print_table(cells: list[dict]) -> None:
     print("\n" + "=" * 86)
     print("DeepSeek-V4.1-Flash — forward inference, `vllm bench serve`, random input")
     print("=" * 94)
-    header = (f"{'input':>7} {'batch':>6} {'out':>5} {'ctx':>7} "
+    header = (f"{'cell':>13} {'out':>5} {'ctx':>7} "
               f"{'TTFT p50':>10} {'TPOT p50':>10} {'decode':>10} "
-              f"{'per-str':>9} {'accept':>7} {'done':>5}")
+              f"{'per-str':>9} {'accept':>7} {'vllm':>6} {'done':>5}")
     print(header)
-    print(f"{'':>7} {'':>6} {'':>5} {'':>7} {'ms':>10} {'ms':>10} "
-          f"{'tok/s':>10} {'tok/s':>9} {'%':>7} {'':>5}")
+    print(f"{'':>13} {'':>5} {'':>7} {'ms':>10} {'ms':>10} "
+          f"{'tok/s':>10} {'tok/s':>9} {'%':>7} {'%':>6} {'':>5}")
     print("-" * 94)
     for c in cells:
         m = c["metrics"]
         if m is None:
-            print(f"{c['input_len']:>7} {c['batch']:>6} {c['output_len']:>5} "
+            print(f"{c['name']:>13} {c['output_len']:>5} "
                   f"{c.get('max_model_len', '-'):>7} {'FAILED':>10}")
             continue
 
         def fmt(v, spec=".1f"):
             return format(v, spec) if isinstance(v, (int, float)) else "-"
 
-        print(f"{c['input_len']:>7} {c['batch']:>6} {c['output_len']:>5} "
+        print(f"{c['name']:>13} {c['output_len']:>5} "
               f"{c.get('max_model_len', '-'):>7} "
               f"{fmt(m['ttft_p50_ms']):>10} {fmt(m['tpot_p50_ms']):>10} "
               f"{fmt(m['decode_tok_s'], '.2f'):>10} "
               f"{fmt(m['per_stream_tok_s'], '.2f'):>9} "
               f"{fmt(m.get('draft_acceptance_pct'), '.0f'):>7} "
+              f"{fmt(m.get('vllm_acceptance_pct'), '.0f'):>6} "
               f"{m['completed'] if m['completed'] is not None else '-':>5}"
               + ("" if m.get("warmed") else "  COLD")
               + ("" if not c.get("concurrency_capped")
@@ -603,63 +754,104 @@ def main(argv: list[str] | None = None) -> int:
     # which is the right thing when the question is "what does serving an 8k
     # context cost a short request" rather than "how fast is a 512-token
     # request".
+    def run_cell(name: str, flags: callable, context: int, batch: int,
+                 num_prompts: int, output_len: int, extra: dict,
+                 probe_prose: bool = False) -> None:
+        """Serve one engine, warm it, measure it, and record the cell.
+
+        When `probe_prose`, the prose acceptance probe runs on this cell's
+        server before teardown -- see `_prose_probe` for why it rides along on
+        an engine that is already up instead of building one of its own.
+        """
+        port = _free_port(args.port)
+        log = log_dir / f"server_{name}.log"
+        proc = _serve(args.model, tp, context, batch, port, log)
+        raw = None
+        served_batch = batch
+        try:
+            _wait_healthy(proc, port, args.server_timeout)
+            served_batch = _engine_batch(log, batch)
+            if served_batch < batch:
+                print(
+                    f"bench: WARNING cell {name} — the engine clamped "
+                    f"max_num_seqs to {served_batch}, so it serves "
+                    f"{served_batch} sequence(s) at a time while the client "
+                    f"keeps {batch} in flight. TTFT will be mostly queue wait "
+                    f"and the throughput will be {served_batch}-way, not "
+                    f"{batch}-way. See config.MAX_NUM_SEQS.",
+                    file=sys.stderr,
+                )
+            raw = _bench_cell(
+                args.model, port, name, flags, output_len, batch, num_prompts,
+                result_dir, args.bench_timeout,
+            )
+            if probe_prose:
+                print(f"\nbench: prose acceptance probe on {name}'s server "
+                      f"(context {context}, {args.prose_output_len} out)")
+                report["prose"] = _prose_probe(
+                    args.model, port, args.prose_output_len, args.bench_timeout,
+                )
+                report["prose"]["host_cell"] = name
+                report["prose"]["max_model_len"] = context
+                pr = report["prose"]
+                pct = pr["acceptance_pct"]
+                print(f"bench:   {pr['accepted_tokens']}/{pr['draft_tokens']} drafts "
+                      f"accepted = {(f'{pct:.1f}%' if pct is not None else 'unmeasured')} "
+                      f"over case(s) {pr['cases']}")
+                _write()
+        finally:
+            if not args.keep_server:
+                _stop(proc)
+        metrics = _metrics(raw) if raw else None
+        if metrics is not None:
+            # Read after teardown: the counters are cumulative and this server
+            # served exactly this cell, so they are this cell's and nothing
+            # else's.
+            metrics["draft_acceptance_pct"] = _acceptance(log)
+            # The same quantity from vLLM's own counters, which the port cannot
+            # edit. See `_vllm_acceptance`.
+            vllm_spec = _vllm_acceptance(log)
+            metrics["vllm_acceptance_pct"] = vllm_spec["pct"]
+            metrics["vllm_accepted_tokens"] = vllm_spec["accepted"]
+            metrics["vllm_draft_tokens"] = vllm_spec["drafted"]
+        report["cells"].append({
+            "name": name,
+            "output_len": output_len,
+            "batch": batch,
+            "max_model_len": context,
+            "engine_max_num_seqs": served_batch,
+            "concurrency_capped": served_batch < batch,
+            "num_prompts": num_prompts,
+            "metrics": metrics,
+            "server_log": str(log),
+            **extra,
+        })
+        _write()  # after every cell, so a crash keeps what ran
+
+    # The prose probe needs the widest context the matrix offers, and batch 1 so
+    # it is not competing with 31 other sequences for the counters it reads.
+    probe_cell = None
+    if not args.no_prose_probe:
+        widest = max(input_lens)
+        probe_batch = min(batch_sizes)
+        probe_cell = f"in{widest}_bs{probe_batch}"
+
     for batch in batch_sizes:
         for input_len in input_lens:
-            context = args.max_model_len or (
-                input_len + args.output_len + CONTEXT_HEADROOM
+            name = f"in{input_len}_bs{batch}"
+            run_cell(
+                name=name,
+                flags=_random_flags(input_len),
+                context=args.max_model_len or (
+                    input_len + args.output_len + CONTEXT_HEADROOM
+                ),
+                batch=batch,
+                num_prompts=args.num_prompts or _num_prompts(batch),
+                output_len=args.output_len,
+                extra={"input_len": input_len, "dataset": "random"},
+                probe_prose=(name == probe_cell),
             )
-            port = _free_port(args.port)
-            log = log_dir / f"server_in{input_len}_bs{batch}.log"
-            proc = _serve(args.model, tp, context, batch, port, log)
-            raw = None
-            served_batch = batch
-            try:
-                _wait_healthy(proc, port, args.server_timeout)
-                served_batch = _engine_batch(log, batch)
-                if served_batch < batch:
-                    print(
-                        f"bench: WARNING cell in{input_len}_bs{batch} — the "
-                        f"engine clamped max_num_seqs to {served_batch}, so it "
-                        f"serves {served_batch} sequence(s) at a time while the "
-                        f"client keeps {batch} in flight. TTFT will be mostly "
-                        "queue wait and the throughput will be "
-                        f"{served_batch}-way, not {batch}-way. See "
-                        "deepseek_v41.MULTI_RANK_MAX_NUM_SEQS.",
-                        file=sys.stderr,
-                    )
-                n = args.num_prompts or _num_prompts(batch)
-                raw = _bench_cell(
-                    args.model, port, input_len, args.output_len, batch, n,
-                    result_dir, args.bench_timeout,
-                )
-            finally:
-                if not args.keep_server:
-                    _stop(proc)
-            metrics = _metrics(raw) if raw else None
-            if metrics is not None:
-                # Read after teardown: the drafter's counters are cumulative and
-                # this server served exactly this cell, so its last line is this
-                # cell's acceptance rate and nothing else's.
-                metrics["draft_acceptance_pct"] = _acceptance(log)
-                # The same quantity from vLLM's own counters, which the port
-                # cannot edit. See `_vllm_acceptance`.
-                vllm_spec = _vllm_acceptance(log)
-                metrics["vllm_acceptance_pct"] = vllm_spec["pct"]
-                metrics["vllm_accepted_tokens"] = vllm_spec["accepted"]
-                metrics["vllm_draft_tokens"] = vllm_spec["drafted"]
-            cell = {
-                "input_len": input_len,
-                "output_len": args.output_len,
-                "batch": batch,
-                "max_model_len": context,
-                "engine_max_num_seqs": served_batch,
-                "concurrency_capped": served_batch < batch,
-                "num_prompts": args.num_prompts or _num_prompts(batch),
-                "metrics": metrics,
-                "server_log": str(log),
-            }
-            report["cells"].append(cell)
-            _write()  # after every cell, so a crash keeps what ran
+
 
     _print_table(report["cells"])
 
@@ -672,8 +864,13 @@ def main(argv: list[str] | None = None) -> int:
         m = c["metrics"]
         if not m:
             continue
-        suffix = f"in{c['input_len']}_bs{c['batch']}"
-        for key in ("ttft_p50_ms", "tpot_p50_ms", "decode_tok_s"):
+        suffix = c["name"]
+        keys = ("ttft_p50_ms", "tpot_p50_ms", "decode_tok_s")
+        if c.get("dataset") == "prose":
+            # Its latencies are not comparable to the random cells', so only the
+            # figure it exists for is emitted.
+            keys = ("vllm_acceptance_pct",)
+        for key in keys:
             value = m.get(key)
             if isinstance(value, (int, float)):
                 print(f"##autohelix[{key}_{suffix}={value:.6g}]")
