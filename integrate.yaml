@@ -41,8 +41,8 @@ goal: |
   - **full-model-faithful** — every component of DeepSeek V4.1 Flash actually executes.
   - **uses-dspark-speculation** — drafts are proposed and verified, not computed and discarded.
   - **weights-resident-across-64-ranks** — the weights are divided across the 64 ranks and live in HBM.
-  - **parallelism-schema** — the scheme is chosen, not inherited: follow the floorplan, and
-    measure TP=4 x PP=16 and TP=16 x PP=4 or name what blocks them.
+  - **parallelism-schema** — implement the floorplan's scheme (TP=8 x PP=8) and measure it,
+    then TP=4 x PP=16 and TP=16 x PP=4. Naming a blocker is not a pass.
 
   WARNING: Some operations, especially those related to collectives between cores and multi-batch
   inference, can cause the system to hang or deadlock. This phenomenon is devastating and we want to do
@@ -771,10 +771,11 @@ constraints:
 
       **PP does not exist in the execution path yet.** There is no `IntermediateTensors`
       anywhere in `vllm_neuron`, so there is no activation transfer to schedule; the files to
-      build it in are in `scope.editable` and the goal says what is missing. So a FAIL here is
-      expected at the start, and "we could not measure PP because it is not implemented" is a
-      legitimate state to be in — once. It stops being legitimate when it is the same sentence
-      two iterations running with nothing built in between.
+      build it in are in `scope.editable` and the goal says what is missing. So a FAIL here was
+      expected at the start — but "we could not measure PP because it is not implemented" is a
+      description of the work, not a substitute for it. Implementing PP *is* this constraint.
+      Iteration 1 added `send`/`recv` and documented the blockers accurately; the next step is
+      an activation transport that runs, not a better description of its absence.
     prompt: |
       Decide whether this iteration's parallelism scheme is a chosen one or an inherited one.
 
@@ -792,15 +793,20 @@ constraints:
         - it was **measured** this iteration: say which configuration ran, and give the figures
           it produced beside the current scheme's — TTFT, TPOT, aggregate decode, and whether
           the verifier still passed. A scheme that is faster and wrong is not better.
-        - it was **blocked**, by something specific you can name in the code. "Pipeline
-          parallelism has no activation transport: there is no `IntermediateTensors` in
-          `vllm_neuron` and `NeuronDeviceCommunicator` implements no send/recv" is such a
-          reason. "We did not get to it" is not.
+        - it was **ruled out by a figure from a run** — a pipeline that executed and was
+          slower, or a configuration that failed the verifier. A blocker named in the code is
+          not this. Iteration 1 named four accurate blockers and passed on the old wording;
+          that route is closed.
+
+      The floorplan's own scheme comes first, before either candidate: TP=8 x PP=8, which
+      iteration 1 established by reading `floorplan/REPORT.md:95-118` and confirmed against
+      `floorplan.yaml:145-150`. It is the stated priority, so measure it first and report it
+      beside TP=64 x PP=1.
 
       Then decide whether the right scheme is in place. Adopting a candidate requires that it
-      measured better; keeping the current one requires that the candidates measured worse or
-      were blocked. Both are passing outcomes. What is not passing is a scheme that is still
-      flat TP=64 because nobody looked.
+      measured better; keeping the current one requires that the others ran and were worse.
+      What is not passing is a scheme that is still flat TP=64 with no pipeline ever having
+      executed.
 
       Things that would make this FAIL — look for each specifically:
         - the floorplan was not read, or was read and contradicted without the contradiction
@@ -817,11 +823,37 @@ constraints:
           `o_groups` was not thought through: `n_local_groups = o_groups // tp` reaches 0 above
           8, which is why attention is capped there and replicated.
     criteria: |
-      PASS if the floorplan was consulted and cited, AND each of TP=4 x PP=16 and TP=16 x PP=4
-      has either a measured comparison or a specific named blocker, AND the scheme now in place
-      is the best of those that could be measured — which may well be the current TP=64 x PP=1.
-      Keeping the current scheme is a pass when the evidence supports it; say so explicitly and
-      give the numbers.
+      PASS requires a pipeline that actually ran. Specifically: the floorplan's own scheme —
+      TP=8 x PP=8, 16 stages on 16 devices with 8-wide tensor-parallel groups — is implemented
+      and measured against TP=64 x PP=1 with the verifier still passing, and TP=4 x PP=16 and
+      TP=16 x PP=4 are each either measured too or ruled out by a figure from a run. The scheme
+      left in place is then the fastest of the measured ones, which may still be TP=64 x PP=1 —
+      keeping it is a pass only when numbers from a working pipeline say so.
+
+      **Naming a blocker is not a pass.** Iteration 1 passed this constraint on the earlier
+      wording, which accepted "measured comparison OR specific named blocker": it cited the
+      floorplan correctly, added `NeuronDeviceCommunicator.send/recv`, documented four real
+      blockers — and left the scheme at flat TP=64 x PP=1, measuring none of the three. That is
+      progress worth having and it is not what this constraint is for. The operator's
+      instruction is to implement the floorplan's scheme as the priority and then compare the
+      two candidates, so until a pipeline executes this FAILs, and the FAIL is the signal to
+      build it rather than to describe it again.
+
+      The blockers are real and all of them are reachable from `scope.editable`; a FAIL here is
+      a work item, not an impossibility:
+        - no `IntermediateTensors` in `vllm_neuron` — thread them through `model.py` and
+          `vllm/worker/neuron_model_runner.py`, both editable;
+        - no pipeline process group — `parallel/neuron_parallel_state.py` is editable and is
+          where the groups are built;
+        - `NeuronDeviceCommunicator.send/recv` stage through host DRAM over gloo, which puts a
+          host round trip on every stage boundary. `nki.collectives.collective_permute` exists
+          in the installed toolchain and `kernels/` is editable, so a device-side p2p kernel is
+          the in-scope route. The XLA lowering in `libtorch_neuronx_lite/overrides/
+          xla_collectives.py` is vendored and NOT editable — go around it, not through it.
+
+      Report the floorplan's bandwidth case on its own terms. Its argument for pipelining is
+      bank-bandwidth-bound decode and lower per-bank weight residency, not capacity. "The
+      weights already fit" answers a different question and does not settle it.
       FAIL if the floorplan was not read, if a candidate was dismissed or adopted without
       evidence, if a measured candidate's verifier run did not pass, if the factorization does
       not account for all 64 ranks, or if the evidence does not let you tell.
