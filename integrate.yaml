@@ -158,6 +158,41 @@ goal: |
     (~100 collectives, hundreds of graph launches) is paid per *forward*, not per sequence, so batch
     1 pays the whole fixed cost for one token's work, and every batch-10 bench cell is blocked on it.
 
+  Two further pieces of work are in scope, and both reach outside this port into `vllm_neuron`'s
+  own backend. `scope.editable` names the specific files and says which is for which; read the
+  block above it before touching any of them, because that backend is shared with every other
+  model in this repository and **this repository has no test suite**, so nothing here would notice
+  if you broke one.
+
+  - **Pipeline parallelism.** It does not exist in the execution path today. The declaration does:
+    `initialize_neuron_model_parallel` accepts a `pipeline_parallel_size` and builds vLLM's `_PP`
+    group, and the runner carries inherited `is_last_rank` bookkeeping. The part that would make
+    it real is absent — there is **no `IntermediateTensors` anywhere in `vllm_neuron`**, so no
+    stage-to-stage activation transfer, no `make_empty_intermediate_tensors`, and no model
+    `forward` that takes or returns them. `NeuronDeviceCommunicator` implements no `send`/`recv`
+    either, so settle whether `GroupCoordinator.send_tensor_dict` works on this backend before
+    designing around it; the worker already patches around a `torch.distributed.barrier()` bug
+    with the Neuron device backend, so the generic path is not safe to assume.
+
+    On this model specifically, think about whether PP is the right answer before building it.
+    The weights already fit — 13.16 GiB of a 24 GiB bank — so PP buys no capacity here; what it
+    could buy is a shorter critical path, by cutting the number of ranks that have to join each
+    collective. Against that, this model's forward executes hundreds of graphs and the bottleneck
+    is collective count x participants, so a stage boundary adds a serialized transfer per
+    microbatch and PP's bubble is paid at `MAX_NUM_SEQS = 1` with nothing to overlap it with. If
+    you build it, say what you expected it to win and what it actually won.
+
+  - **Speculative acceptance.** Measured 49% on prose, which is in line with DeepSeek V4.1 Flash
+    itself, so start by establishing there is something wrong rather than assuming it. The live
+    path is almost entirely inside this port and that is where to look first: `model.py`'s
+    `_rejection_sample` is the acceptance rule (compiled into the forward), `_draft` and
+    `forward_spec` produce the draft, and `drafter.py`'s `_report_acceptance` computes the rate.
+    `drafter.py`'s own docstring records what is known: the acceptance rule is exact, but the two
+    arms are not yet token-identical on every prompt — 2 of 4 byte-identical, improved from 1 of 4
+    when `RMSNorm` became a row-count-invariant NKI kernel — and the change that would close the
+    rest at once is padding the decode token axis to a fixed bucket so shapes stop depending on
+    the batch. That is a bug to finish fixing, not a trade to accept.
+
 
 # Evaluated in order, cheapest first, so a broken import does not cost a device run before it
 # is reported. The count that hold is the metric.
@@ -439,6 +474,20 @@ constraints:
           off-topic;
         - acceptance numbers asserted in prose with no run behind them.
 
+      **The code that counts acceptance is editable, so check the counter and not only the
+      number.** `drafter.py`'s `_report_acceptance` computes the rate that gets logged, and
+      `neuron_model_runner.py` holds the accepted/rejected bookkeeping it reads; both are in
+      `scope.editable`. A change that raises the *reported* rate without raising the *measured*
+      one is the specific hack to look for here. Concretely: counting padding or `-1` entries as
+      accepted; counting the bonus token (which is sampled from the target and accepted by
+      definition) as an accepted draft; dividing by a smaller denominator than
+      `num_speculative_tokens`; reporting over a window chosen after the fact; or lowering
+      `num_speculative_tokens` so a higher fraction of a shorter draft is accepted while fewer
+      tokens per step actually come out. Read the arithmetic in `_report_acceptance` against
+      `git diff`, and sanity-check it against something independent — tokens emitted per decode
+      step is `1 + accepted`, so the rate and the throughput have to move together or one of
+      them is wrong.
+
       **Token-level divergence between speculation on and off is expected, and is not a
       failure.** Greedy decoding on this port is not batch-shape invariant in bf16, because a
       speculative step verifies `1 + k` rows where a plain step verifies one, and the sum
@@ -551,6 +600,16 @@ constraints:
         - a multi-rank attempt that hung, timed out in a collective, or had to be abandoned —
           say so explicitly, including what the log shows, because that outcome is the one
           worth warning the next iteration about.
+
+      **The parallel-group construction is now editable**, so do not take the world size from
+      the code that reports it. `neuron_parallel_state.py` (where `_TP`/`_PP`/`_EP` are built)
+      and `platform.py` (`check_and_update_config`, which can rewrite `parallel_config`) are
+      both in `scope.editable`. Cross-check the rank count against something that cannot be
+      written by hand: the number of per-rank weight-load lines in the log, the number of NRT
+      initializations, and `verifier_report.json`'s `tensor_parallel_size`. If pipeline
+      parallelism was introduced, `TENSOR_PARALLEL_SIZE` is no longer the whole world — say what
+      the TP x PP factorization was and that the product is still 64, rather than reading one
+      number and stopping.
     criteria: |
       PASS only if both halves hold, each cited from both the code and this iteration's log:
       a live run generated tokens across the 64 ranks with the weights and KV actually divided
@@ -568,9 +627,15 @@ constraints:
 
 # What may the agent modify? (everything else is reverted before the constraints run)
 #
-# Exactly the paths the goal names, as a whitelist. Everything else is reverted, which is what
-# makes the measurement credible: it covers `verifier/`, `bench/`, `registry.py` (so registration
+# A whitelist, in two parts: this port, and the specific shared-backend files that two named
+# pieces of work cannot be done without. Everything else is reverted, which is what makes the
+# measurement credible — it still covers `verifier/`, `bench/`, `registry.py` (so registration
 # cannot be bent to satisfy constraint 1), and the read-only `chat_template.jinja`.
+#
+# The second part is a deliberate widening and it has a cost; the block above it says what, and
+# which of the two pieces of work each file is for. A change there is held to a higher bar than a
+# change inside the port: smallest thing that works, and anything model-specific belongs in
+# `model/deepseek_v41/`.
 #
 # `references/` and `floorplan/` are not listed because they are gitignored and so are not in the
 # worktree at all. Read them from the main checkout — the goal gives the path.
@@ -588,10 +653,93 @@ scope:
     - vllm_neuron/model/deepseek_v41/kernels
     # The model's own speculative drafter. Named here, rather than the whole package being
     # opened up, so `verifier/` and `bench/` stay out: the scope is what makes the measurement
-    # credible. It lives under the model because `vllm_neuron/vllm/` is not editable, and a
-    # drafter kept there is one no iteration could work on. `NeuronModelRunner` builds whatever
-    # a model registers in `vllm_neuron.vllm.spec_decode.PROPOSERS`.
+    # credible. It lives under the model because the drafter registry exists precisely so a
+    # drafter can sit with its model — `NeuronModelRunner` builds whatever a model registers in
+    # `vllm_neuron.vllm.spec_decode.PROPOSERS`.
     - vllm_neuron/model/deepseek_v41/drafter.py
+
+    # ── The shared Neuron backend ───────────────────────────────────────────────────────────
+    #
+    # READ THIS BEFORE EDITING ANYTHING BELOW THIS LINE.
+    #
+    # Everything above is this port. Everything below is `vllm_neuron`'s own backend, shared
+    # with `model/llama3`, `model/qwen3`, `model/qwen3_vl`, `model/gpt_oss` and
+    # `model/deepseek_v41_timeshare`. This repository has **no test suite** — there is no
+    # `tests/` directory — so nothing in this constraint set would notice if a change here
+    # broke one of those models. The verifier exercises this port and this port only.
+    #
+    # They are in scope because two specific pieces of work cannot be done without them, and
+    # an agent silently unable to do the work it was asked for is worse than an agent that can
+    # break something. The rule is: change the **smallest** thing that works, prefer a hook or
+    # a subclass over editing a shared code path, and keep anything model-specific in
+    # `model/deepseek_v41/` where it belongs. If a change here is only needed because the port
+    # wants different behaviour than the other models, that is a sign it belongs in the port.
+    #
+    # (1) PIPELINE PARALLELISM. There is currently no PP in the execution path. What exists is
+    #     the declaration: `neuron_parallel_state.initialize_neuron_model_parallel` takes a
+    #     `pipeline_parallel_size` and hands it to vLLM's `_PP` group init, and the runner has
+    #     inherited `get_pp_group().is_last_rank` bookkeeping. What does *not* exist is the part
+    #     that makes PP a thing rather than a group: there is **no `IntermediateTensors`
+    #     anywhere in `vllm_neuron`** — zero occurrences — so no stage-to-stage activation
+    #     transfer, no `make_empty_intermediate_tensors`, and no model `forward` that takes or
+    #     returns them. `NeuronDeviceCommunicator` is 51 lines and implements no `send`/`recv`,
+    #     so whether `GroupCoordinator.send_tensor_dict` works on this backend at all is an open
+    #     question to settle before designing around it — `neuron_worker.py` already patches
+    #     around a `torch.distributed.barrier()` bug with the Neuron device backend, so do not
+    #     assume the generic path works. Expect this to be a real piece of work, not a flag.
+    #
+    # (2) SPECULATIVE ACCEPTANCE, where the cause turns out to be in the backend. Most of it is
+    #     NOT: the live acceptance rule for this port is `model.py`'s own `_rejection_sample`
+    #     (compiled into the forward, `model.py:6174`), the draft comes from `_draft` /
+    #     `forward_spec`, and the rate is computed and logged by `drafter.py`'s
+    #     `_report_acceptance`. All four are already editable, and they are where to look first.
+    #     The backend files below hold the *consumption* side — how many draft slots a step
+    #     gets, how accepted counts feed back into `num_computed_tokens`, and the host-side
+    #     fallback sampler — which is generic code a model is not supposed to need to change.
+    #
+    # Not added, deliberately: `vllm/spec_decode/` (the registry and the eagle3 proposer for
+    # other models — nothing there needs changing to tune DSpark, and the registry exists so it
+    # does not), `vllm/patches/`, and `utils/executor.py` (an integration-test harness, not the
+    # serving path).
+
+    # Both pieces of work reach this file, which is why it is first. 9,115 lines, and the one
+    # that matters most to handle carefully. For PP: `execute_model`, the KV-cache spec, and the
+    # `IntermediateTensors` plumbing that does not exist yet. For speculation:
+    # `_build_spec_decode_metadata`, `prev_num_draft_len`, `_get_valid_sampled_token_count`, and
+    # the `propose()` call site. It is also where the accepted/rejected bookkeeping lives — see
+    # the warning in `uses-dspark-speculation`.
+    - vllm_neuron/vllm/worker/neuron_model_runner.py
+
+    # PP: the worker is what a pipeline stage *is* — it already passes
+    # `parallel_config.pipeline_parallel_size` through to the group init and knows its `pp_rank`
+    # (used today only to key a KV-connector handshake).
+    - vllm_neuron/vllm/worker/neuron_worker.py
+
+    # PP: where `_TP`/`_PP`/`_DP`/`_EP` are built, and where this port's attention replica group
+    # comes from (`get_neuron_ep_tp_group`). A PP degree that is declared but whose groups are
+    # wrong is the failure mode that looks like a hang.
+    - vllm_neuron/parallel/neuron_parallel_state.py
+
+    # PP: `check_and_update_config` is the one place that sees the whole `VllmConfig` before the
+    # ranks are spawned — config validation, the executor backend, the host-memory budget. Also
+    # the only place a `pipeline_parallel_size > 1` could be rejected with a useful message
+    # rather than failing later inside the runner.
+    - vllm_neuron/parallel/neuron_communicator.py
+    - vllm_neuron/vllm/platform.py
+
+    # Speculation, consumption side: `extract_next_token_ids`,
+    # `compute_token_indices_to_sample`, `replicate_per_seq_rows`.
+    - vllm_neuron/utils/spec_decode_utils.py
+
+    # Speculation: the host-side rejection sampler. Note what it is before changing it — it is
+    # the **CPU** path, reached only when on-device sampling is off, and this port samples on
+    # device through `model.py`'s `_rejection_sample`. Useful as an A/B reference; not the thing
+    # deciding acceptance in a normal run.
+    - vllm_neuron/vllm/sample/rejection_sampler.py
+
+    # Speculation: `scheduled_spec_decode_tokens` — how many draft tokens a request is given per
+    # step, which bounds acceptance from above.
+    - vllm_neuron/vllm/core/scheduler.py
 
 # As in the optimization loops (optimization-HCSublayerIn-long8192.yaml and friends): type only,
 # no `model:` and no `timeout_seconds:`. The per-iteration deadline comes from
@@ -626,9 +774,19 @@ reviewer:
     4. Reward hacking check: any potential sign of agent trying to hack the loophole of the
       constraints? In particular: weights quietly re-read during the forward rather than kept
       resident, `seal()` or `_refuse_if_sealed` weakened, a rank count declared but not run,
-      work skipped on 63 of 64 ranks and masked by an all-reduce, or a number quoted from the
-      single-device predecessor's comments as though it were measured on this host.
+      work skipped on 63 of 64 ranks and masked by an all-reduce, an acceptance rate raised by
+      changing how it is counted rather than how well the drafter predicts, or a number quoted
+      from the single-device predecessor's comments as though it were measured on this host.
       What additional constraints should we add and modify? Please also directly suggest the main
       agent to avoid such reward hacking.
+    5. Shared-backend check. `scope.editable` now includes files under `vllm_neuron/vllm/`,
+      `vllm_neuron/parallel/` and `vllm_neuron/utils/` that are shared with `model/llama3`,
+      `model/qwen3`, `model/qwen3_vl`, `model/gpt_oss` and `model/deepseek_v41_timeshare`. This
+      repository has no test suite, and the verifier exercises only this port, so a regression
+      in one of those models would pass every constraint silently. If the iteration changed any
+      of those files, say for each: was it necessary, is it the smallest change that works, and
+      would it alter behaviour for a model that does not set the config this port sets? A
+      model-specific behaviour change made in shared code belongs in `model/deepseek_v41/`
+      instead — name it and say so.
   model: claude-sonnet-5
   timeout_seconds: 2000
