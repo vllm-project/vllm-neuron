@@ -1,41 +1,10 @@
 """The engram read-out's gate — the normalized stream-against-key dot product,
 the signed square root, the sigmoid and the gated add — as one NKI kernel.
 
-`model.Engram.forward` is two pieces: `wkv`, which turns the 24 looked-up n-gram
-rows into one key per hc copy plus one shared value and is already
-`kernels/blockquant`, and everything after it. This is everything after it.
-
-Derived from `engram_short.py`, which is the shipped 4-rank / 2-core kernel for
-`layers.1.engram` and carries this same arithmetic at the bottom (its `gpad`
-block). What changes here: the token count is ragged rather than a baked 128,
-`dim`/`hc` come from the operand shapes rather than module constants, `wkv` and
-the collectives are gone (the GEMM is `blockquant`'s and this port runs one
-rank), and `nl.rsqrt` gets the Newton correction `hc_mixes._rms_recip` uses —
-the hardware instruction is an approximation and the reference is a torch
-`rsqrt`.
-
-Interface
----------
-    h      [rows, hc * dim]  bf16   the residual stream, hc-major
-    key    [rows, hc * dim]  bf16   `wkv`'s key output, same layout
-    value  [rows, dim]       bf16   `wkv`'s value output, shared by the copies
-    weight [1, hc * dim]     fp32   `q_weight * k_weight`, flattened
-    ->     [rows, hc * dim]  bf16   `h + gate * value`
-
-`dim` is read off `value`, so `hc = (hc * dim) / dim`; `rows` is whatever the
-scheduler handed the step.
-
-The arithmetic, per (token, hc copy), transcribed from `Engram.forward`:
-
     rstd = rsqrt(mean(h^2) + eps) * rsqrt(mean(key^2) + eps)
     dot  = sum(h * weight * key) * rstd * dim**-0.5
     gate = sigmoid(sign(dot) * sqrt(max(|dot|, clamp)))
     out  = h + gate * value
-
-Normalized **per (token, copy)** over `dim`, not jointly over the copies, which
-is why the copy loop is outside the reduction rather than folded into the free
-axis. `sign` is `2 * (dot >= 0) - 1`, so a dot of exactly zero gives `+mag` —
-`Engram.forward`'s `torch.where(dot < 0, ...)` convention, not `copysign`'s.
 """
 
 import nki
@@ -53,7 +22,8 @@ CLAMP = 1e-6
 
 def _chunk(dim):
     """Free-axis chunk for the reductions: a divisor of `dim`, small enough that
-    one fp32 copy is a few KiB per partition. `hc_mixes._sqchunk`'s rule."""
+    one fp32 copy is a few KiB per partition. `hc_mixes._sqchunk`'s rule.
+    """
     for cand in (2048, 1024, 512, 256, 128):
         if dim % cand == 0:
             return cand
@@ -61,11 +31,7 @@ def _chunk(dim):
 
 
 def _rsqrt(m):
-    """`1 / sqrt(m)` with one Newton step: `y * (1.5 - 0.5 * m * y^2)`.
-
-    `nl.rsqrt` on its own is a hardware approximation and the reference is a
-    torch `rsqrt`; `hc_mixes._rms_recip` corrects it the same way.
-    """
+    """`1 / sqrt(m)` with one Newton step: `y * (1.5 - 0.5 * m * y^2)`."""
     y = nl.rsqrt(m)
     corr = nl.add(nl.multiply(nl.multiply(m, nl.multiply(y, y)), -0.5), 1.5)
     return nl.multiply(y, corr)
@@ -93,9 +59,6 @@ def gated_add(h, key, value, weight):
     def body(r0, nr):
         for c in range(hc):
             base = c * dim
-            # This copy's stream rows, kept in fp32 because the gated add below
-            # needs them again once the gate — which depends on every chunk —
-            # is known. At `dim = 5120` that is 20 KiB per partition.
             hf = nl.ndarray((nr, dim), dtype=nl.float32, buffer=nl.sbuf)
             hsq = ksq = dotp = None
             for j in range(nchunks):
@@ -103,8 +66,6 @@ def gated_add(h, key, value, weight):
                 hj = nl.load(h[r0 : r0 + nr, lo : lo + ch], dtype=nl.float32)
                 nisa.tensor_copy(dst=hf[0:nr, j * ch : (j + 1) * ch], src=hj)
                 kj = nl.load(key[r0 : r0 + nr, lo : lo + ch], dtype=nl.float32)
-                # A freshly loaded `(1, n)` tile broadcasts; a slice of a staged
-                # one does not — see `hc_mixes`' module docstring.
                 wj = nl.broadcast_to(nl.load(weight[0:1, lo : lo + ch]), (nr, ch))
                 prod = nl.multiply(nl.multiply(hj, wj), kj)
                 sh = nl.sum(nl.square(hj), axis=1, keepdims=True)
@@ -133,8 +94,6 @@ def gated_add(h, key, value, weight):
                 vj = nl.load(value[r0 : r0 + nr, j * ch : (j + 1) * ch],
                              dtype=nl.float32)
                 yv = nl.ndarray((nr, ch), dtype=nl.float32, buffer=nl.sbuf)
-                # `gate * value` rides the activation's per-partition scale,
-                # which is what `engram_short` does with the same operands.
                 nisa.activation(dst=yv, op=nl.copy, data=vj, scale=gate)
                 nisa.tensor_tensor(
                     dst=yv, data1=yv, op=nl.add,
@@ -145,8 +104,6 @@ def gated_add(h, key, value, weight):
                     value=nl.copy(yv, dtype=h.dtype),
                 )
 
-    # The ragged-row pattern every kernel in this directory uses: full tiles in
-    # `affine_range`, then one more call with a Python row count for the tail.
     full, tail = rows // PT, rows % PT
     for t in nl.affine_range(full):
         body(t * PT, PT)

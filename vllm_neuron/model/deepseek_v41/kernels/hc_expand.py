@@ -26,12 +26,7 @@ def _chunk(dim):
 
 @nki.jit
 def kernel(hidden_states):
-    """`[batch, seqlen, dim]` -> (`[batch, seqlen, HC, dim]`, `[batch, seqlen, HC]`).
-
-    Generalized from the partition-trace version to a ragged row count and any
-    `dim` with a small power-of-two divisor; see `hc_collapse.py` for why the
-    tail tile is handled outside `nl.affine_range`.
-    """
+    """`[batch, seqlen, dim]` -> (`[batch, seqlen, HC, dim]`, `[batch, seqlen, HC]`)."""
     batch, seqlen, dim = hidden_states.shape
     rows = batch * seqlen
     chunk = _chunk(dim)

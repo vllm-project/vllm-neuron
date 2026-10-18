@@ -1,12 +1,6 @@
 """`hc_collapse` — `HyperConnectCollapse`, the mHC `hc_pre`: the `hc` parallel copies of the
 residual stream are mixed back down into the single hidden state a sublayer reads. One fp32
 multiply-accumulate over the copies, no parameters. Whole module on one core; no collective.
-
-Generalized from the partition-trace version in two ways, both so a timeshared port can call it
-at whatever shape the scheduler produces: the row count no longer has to be a multiple of 128
-(the tail tile is handled separately rather than with a `min()` inside `nl.affine_range`, whose
-index is symbolic), and the free-axis chunk is chosen from the divisors of `dim` instead of being
-fixed at 1024.
 """
 
 import nki
@@ -28,12 +22,7 @@ def _chunk(dim):
 
 @nki.jit
 def kernel(input_0, input_1):
-    """`sum(pre_mix[..., c, None] * x[..., c, :] for c in range(hc))`.
-
-    `input_0` is `[batch, n_tok, hc, dim]`, `input_1` is `[batch, n_tok, hc]` fp32, and the
-    result is `[batch, n_tok, dim]` in `input_0`'s dtype — the accumulation is fp32 and only
-    the store narrows, which is what the reference does.
-    """
+    """`sum(pre_mix[..., c, None] * x[..., c, :] for c in range(hc))`."""
     batch, n_tok, hc, dim = input_0.shape
     rows = batch * n_tok
     chunk = _chunk(dim)

@@ -46,36 +46,12 @@ ACC_DTYPE = nl.bfloat16
 
 GSEL_IN_PSUM = True
 
-# One `nc_matmul` per 128-feature chunk instead of two.  The `gram` and the `mix` share the
-# same stationary -- the transposed x chunk -- and differ only in the moving operand, so
-# storing each chunk's 24 weight columns immediately after its 128 `xt` columns lets a single
-# 152-column moving operand carry both, and the PSUM result holds the gram in [0:128] and the
-# mix in [128:152] of one 608 B bank.  Profiling priced this: LDWEIGHTS is *not* exposed
-# (99.9% of its footprint overlaps a running MATMUL, 278 ns in the whole kernel), but every PE
-# instruction costs ~17.5 ns of issue cadence on top of its moving columns, and the `mix`
-# matmul was paying that 2560 times for 24 columns of work -- 70 us of the Tensor engine for
-# 8.6% of its flops.  Measured worth of the merge alone: -43 us.
 FUSE_MG = True
 
-# The SBUF slot each [xt chunk | weights] pair occupies, in bf16 elements.  Only
-# KCHUNK + mix_hc = 152 of it holds data and the other 360 are padding -- and the padding is
-# the whole trick.  Interleaving makes the PSUM drain write five 128-element runs per group at
-# this stride instead of one contiguous 640, and that strided write is violently
-# stride-sensitive: at the natural 152 (304 B) it costs ~50 us and swallows the merge whole
-# (0.4377 with the merge backed out, 0.3946 with it), at 160 it is no better, at 256 (512 B)
-# most of it is gone (0.3898), and at 512 (1024 B) it is free (0.3732).  1024 B is this
-# engine's SBUF access granularity; 2048 B buys nothing back (0.3847).
 WSLOT_PAD = 512
 
 FLAT_DIM_FULL = 20480
 
-# Every DMA in this kernel shares the one `qGpSimdDynamic` ring, and with descriptors
-# generated at runtime (SWDGE, on GpSimd) the two thin stores alone cost as many
-# descriptors as the whole 84 MB `x` load does -- 128 descriptors of 4 B for `meansq` and
-# of 96 B for `mix`, per 128-token block -- for 0.8% of the bytes.  Pre-generating the
-# descriptors for everything except `x` takes those rings off GpSimd and out of the shared
-# ring's credit path.  `x` itself is left on the compiler's choice: its descriptors are
-# 5120 B each and already 1:1 with packets, and making them static measures worse.
 STATIC_DGE = True
 
 
@@ -248,11 +224,6 @@ def kernel(input_0, input_1, layers_0_hc_attn_in_fn):
             n_vec = (n_sub - DRAIN_SCALAR_BLOCKS) * KCHUNK
             if n_vec == KGROUP:
                 if (g * DRAIN_SCALAR_GROUPS) % n_group < DRAIN_SCALAR_GROUPS:
-                    # `tensor_copy` on the Scalar engine, not `activation`: both drain the
-                    # same 640 elements per partition, but activation's throughput for this
-                    # is poor enough that routing groups to it loses, while tensor_copy's
-                    # wins.  (`tensor_copy` cannot be put on GpSimd at all -- it rejects a
-                    # PSUM source.)
                     nisa.tensor_copy(dst=xt, src=xt_ps, engine=nisa.scalar_engine)
                 elif DRAIN_SPLIT == 1:
                     nisa.tensor_copy(dst=xt, src=xt_ps)
@@ -339,13 +310,6 @@ def kernel(input_0, input_1, layers_0_hc_attn_in_fn):
 
           if STAT_ON_PE:
               sumsq = nl.ndarray((PMAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-              # `select_reduce`'s `dst` is write-only here -- only `reduce_res` is ever read --
-              # and it has to be fp32 to match `on_true` (a bf16 `dst` is rejected), so as an
-              # SBUF tile it is 32 KB/partition of pure write traffic over the token stream.
-              # Aiming it back at the gram's own PSUM bank is semantically a no-op (the
-              # diagonal keeps its value, the rest is zeroed and the bank is reset by the next
-              # tile's first `accumulate=False` matmul) and takes those writes off the SBUF
-              # port, which on this kernel is a first-class resource: -0.9%.
               gsel = gram if GSEL_IN_PSUM else \
                   nl.ndarray((PMAX, PMAX), dtype=nl.float32, buffer=nl.sbuf)
               nisa.select_reduce(dst=gsel, predicate=diag_pred, on_true=gram, on_false=0.0,

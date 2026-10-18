@@ -2,11 +2,6 @@
 to `hc` copies of the residual stream, with the residual stream mixed back in through the
 doubly-stochastic `comb`. Broadcast plus an `hc x hc` stream mix, no parameters. Whole module on
 one core; no collective.
-
-Generalized from the partition-trace version the same way `hc_collapse.py` is: the tail row tile
-is handled outside `nl.affine_range` (whose index is symbolic, so a Python `min()` on it cannot
-size a tile) and the free-axis chunk is a divisor of `dim` rather than a fixed 1024. The mix
-accumulates in fp32 and only the store narrows, matching `HyperConnections.post`.
 """
 
 import nki
@@ -27,13 +22,7 @@ def _chunk(dim):
 
 @nki.jit
 def kernel(input_0, input_1, input_2, input_3):
-    """`post[..., j, None] * x + sum(comb[..., i, j] * residual[..., i, :] for i)`.
-
-    `input_0` is the sublayer output `[batch, seqlen, dim]`, `input_1` the residual stream
-    `[batch, seqlen, hc, dim]`, `input_2` the `post` coefficients `[batch, seqlen, hc]` and
-    `input_3` the Sinkhorn-normalized `comb` `[batch, seqlen, hc, hc]`. Note the orientation:
-    the *first* `hc` axis of `comb` is the one summed over.
-    """
+    """`post[..., j, None] * x + sum(comb[..., i, j] * residual[..., i, :] for i)`."""
     batch, seqlen, dim = input_0.shape
     hc = input_2.shape[-1]
     rows = batch * seqlen

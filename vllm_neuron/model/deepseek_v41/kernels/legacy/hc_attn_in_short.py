@@ -1,11 +1,5 @@
 """The NKI kernel for layers.0.hc_attn_in.
 
-One partition module of hf:deepseek-ai/DeepSeek-V4.1-Flash: `layers.0.hc_attn_in`, a
-sequential group over 1 submodule(s) (layers.0.hc_attn_in) — `HyperConnectSublayerIn`.
-
-What this computes, from the frozen spec in `reference_torch.py`
-(`HyperConnectSublayerIn.forward`) plus `hc_split_sinkhorn` in `vendor/kernel.py`, in words:
-
     flat  = x.flatten(2).float()                        # (tok, hc*dim) = (128, 20480)
     rsqrt = 1 / sqrt(mean(flat**2, -1) + norm_eps)       # one statistic per token
     mixes = (flat @ fn.T) * rsqrt                       # (128, 24), fp32
@@ -17,12 +11,6 @@ What this computes, from the frozen spec in `reference_torch.py`
     repeat 19x:  comb = comb / (comb.sum(-1) + eps);  comb = comb / (comb.sum(-2) + eps)
     y     = sum_j pre_mix[..., j] * x[..., j, :]         # fp32, then back to bfloat16
     return y, post, comb, pre
-
-The returned order is the spec's `(x_in, post, comb, pre)`, which is what the four recorded
-golden tensors hold (bf16 (1,128,5120), fp32 (1,128,4), fp32 (1,128,4,4), fp32 (1,128,4)).
-Nothing here touches act_quant/fp8_gemm/fp4_*/sparse_attn: the slice is plain
-float32/bfloat16 arithmetic.
-
 """
 
 import nki
@@ -36,7 +24,7 @@ PMAX = 128
 #: partitions, so this is exactly the partition count.
 KCHUNK = 128
 
-#: Elements of that axis brought in per DMA. 
+#: Elements of that axis brought in per DMA.
 KGROUP = 1024
 
 #: Columns of `y` written per store. The accumulator is built for the whole row, so this is
@@ -58,14 +46,12 @@ def _col(shape0):
 
 
 def _inv_eps(dst, data):
-    """`dst = 1 / (data + eps)`, one instruction on the Scalar Engine.
-    """
+    """`dst = 1 / (data + eps)`, one instruction on the Scalar Engine."""
     nisa.activation(dst=dst, op=nl.reciprocal, data=data, bias=HC_EPS)
 
 
 def _row_softmax(comb):
-    """`comb.softmax(-1) + eps`, row by row, in place.
-    """
+    """`comb.softmax(-1) + eps`, row by row, in place."""
     p = comb.shape[0]
     for j in range(HC):
         row = comb[:, j, :]
@@ -83,8 +69,7 @@ def _row_softmax(comb):
 
 
 def _row_normalize(comb):
-    """`comb = comb / (comb.sum(-1) + eps)`, in place.
-    """
+    """`comb = comb / (comb.sum(-1) + eps)`, in place."""
     p = comb.shape[0]
     row_sum = nl.ndarray((p, HC), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_reduce(dst=row_sum, op=nl.add, data=comb, axis=(2,))
@@ -96,11 +81,8 @@ def _row_normalize(comb):
 
 
 def _col_normalize(comb):
-    """`comb = comb / (comb.sum(-2) + eps)`, in place.
-    """
+    """`comb = comb / (comb.sum(-2) + eps)`, in place."""
     p = comb.shape[0]
-    # The halving tree needs a power-of-two hc, and at hc = 1 there would be no add left to
-    # carry the epsilon — either shape has to fail the trace rather than drop the `+ eps`.
     assert HC >= 2 and HC & (HC - 1) == 0, "hc must be a power of two and at least 2"
     col_sum = comb.reshape((p, HC * HC))
     n = HC
@@ -126,29 +108,13 @@ def _col_normalize(comb):
 @nki.jit
 def kernel(input_0, input_1, layers_0_hc_attn_in_base, layers_0_hc_attn_in_fn,
            layers_0_hc_attn_in_scale):
-    """Compute layers.0.hc_attn_in (hc_attn_in) in NKI.
-
-    Inputs, in order:
-      input_0: bfloat16[1, 128, 4, 5120]                 the rank-4 residual stream, `x`
-      input_1: float32[1, 128, 4]                        `pre_mix`, the previous sublayer's
-                                                         `pre` coefficients
-      layers_0_hc_attn_in_base: float32[24]              `base`
-      layers_0_hc_attn_in_fn: float32[24, 20480]         `fn`
-      layers_0_hc_attn_in_scale: float32[3]              `scale`
-
-    Returns the group's output: 4 tensors, in order: bfloat16[1, 128, 5120],
-    float32[1, 128, 4], float32[1, 128, 4, 4], float32[1, 128, 4].
-    """
+    """Compute layers.0.hc_attn_in (hc_attn_in) in NKI."""
     n_tok = input_0.shape[1]
     hc = input_0.shape[2]
     dim = input_0.shape[3]
     flat_dim = hc * dim
     mix_hc = layers_0_hc_attn_in_fn.shape[0]
 
-    # The group loop below folds the projection, the norm statistic and the `y` collapse into
-    # one pass over `x`, which only works if a group's columns land inside one copy `j`. Both
-    # divisions are exact for this module (KGROUP 1024 into dim 5120 and hc*dim 20480); this
-    # says so out loud rather than silently computing the wrong `y` if a later shape breaks it.
     assert flat_dim % KGROUP == 0 and dim % KGROUP == 0 and KGROUP % KCHUNK == 0
     assert dim % YCHUNK == 0 and n_tok % PMAX == 0
 
@@ -157,9 +123,6 @@ def kernel(input_0, input_1, layers_0_hc_attn_in_base, layers_0_hc_attn_in_fn,
     comb_out = nl.ndarray((1, n_tok, hc, hc), dtype=nl.float32, buffer=nl.shared_hbm)
     pre_out = nl.ndarray((1, n_tok, hc), dtype=nl.float32, buffer=nl.shared_hbm)
 
-    # Flat views. `x2[t, j*dim + f]` is `x[0, t, j, f]`, so both the projection's contraction
-    # axis and the collapse's `hc` slices are plain column ranges of one 2-D tensor and every
-    # DMA stays a row-major strided copy.
     x2 = input_0.reshape((n_tok, flat_dim))
     pm2 = input_1.reshape((n_tok, hc))
     y2 = y_out.reshape((n_tok, dim))
@@ -172,19 +135,9 @@ def kernel(input_0, input_1, layers_0_hc_attn_in_base, layers_0_hc_attn_in_fn,
     for t in nl.affine_range(n_tok // PMAX):
         t0 = t * PMAX
 
-        # ---- the projection, and the norm statistic that scales it --------------------
-        # One PSUM bank accumulates every block product (the PE adds into it itself, which
-        # is why it is deliberately *not* zeroed first: accumulating onto a PSUM location a
-        # matmul did not initialise is undefined on this generation, so the first block
-        # writes it with `accumulate=False` instead). `ss` collects each group's sum of
-        # squares in its own column, and the 20 partials are added once at the end.
         mix = nl.ndarray((PMAX, mix_hc), dtype=nl.float32, buffer=nl.psum)
         ss = nl.ndarray((PMAX, flat_dim // KGROUP), dtype=nl.float32, buffer=nl.sbuf)
 
-        # `pre_mix` is one value per token per copy, i.e. a per-partition scalar, which is
-        # the operand shape the engines multiply a tile by for free — and `y`'s accumulator,
-        # one float32 row of `dim` per token (20 KiB per partition), which each group adds
-        # its own column range into as it goes by.
         pm = nl.load(pm2[t0:t0 + PMAX, :])
         acc = nl.ndarray((PMAX, dim), dtype=nl.float32, buffer=nl.sbuf)
 
@@ -210,14 +163,6 @@ def kernel(input_0, input_1, layers_0_hc_attn_in_base, layers_0_hc_attn_in_fn,
                             reduce_op=nl.add, reduce_res=ss[:, g:g + 1],
                             reduce_cmd=nisa.reduce_cmd.reset_reduce)
 
-            # Both matmul operands need the contraction axis (`k`) on partitions, and
-            # neither recorded tensor is laid out that way, so both go through a PE
-            # transpose. A transpose writes PSUM, matmul operands must come from SBUF, and
-            # the copy in between was the single most expensive thing in the kernel at one
-            # copy per block (320 instructions, 61 us of Vector Engine time) -- so all
-            # `n_sub` transposes of a group land side by side in one PSUM tile and come back
-            # in one copy. `k` blocks are laid out along the free axis: block `i` of the
-            # transposed `x` is `xt[:, i*128:(i+1)*128]`, whose partition axis is `k`.
 
             n_sub = KGROUP // KCHUNK
             xt_ps = nl.ndarray((PMAX, KGROUP), dtype=nl.bfloat16, buffer=nl.psum)
@@ -233,30 +178,19 @@ def kernel(input_0, input_1, layers_0_hc_attn_in_base, layers_0_hc_attn_in_fn,
             nisa.tensor_copy(dst=wt, src=wt_ps, engine=nisa.scalar_engine)
 
             for i in range(n_sub):
-                # out[tok, j] = sum_k xt[k, tok] * wt[k, j]: `nc_matmul` computes
-                # stationary.T @ moving, so the (128 k, 128 tok) and (128 k, 24) operands
-                # give the (128 tok, 24) block product straight out, in float32.
                 nisa.nc_matmul(dst=mix,
                                stationary=xt[:, i * KCHUNK:(i + 1) * KCHUNK],
                                moving=wt[:, i * mix_hc:(i + 1) * mix_hc],
                                accumulate=(g > 0 or i > 0))
 
-        # mixes = (flat @ fn.T) * rsqrt: one per-token scalar, which `tensor_scalar`
-        # broadcasts along the free axis without materialising anything.
         rsqrt = nl.rsqrt(nl.add(nl.multiply(nl.sum(ss, axis=1, keepdims=True),
                                            1.0 / flat_dim), NORM_EPS))
         mixes = nl.ndarray((PMAX, mix_hc), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=mixes, data=mix, op0=nl.multiply, operand0=rsqrt)
 
-        # ---- hc_split_sinkhorn -------------------------------------------------------
-        # `base` is per-column (one value per mix slot) and `scale` is one value per slice,
-        # so both are broadcast across the token partitions once.
         base_b = nl.broadcast_to(nl.load(base2), (PMAX, mix_hc))
         scale_row = nl.load(scale2)
 
-        # mixes * scale[i] + base: the scale is one number per slice, held in a (128, 1)
-        # column so `tensor_scalar` can apply it without materialising a tile, while `base`
-        # varies along the free axis and so is a genuine tensor_tensor operand.
         scaled = nl.ndarray((PMAX, mix_hc), dtype=nl.float32, buffer=nl.sbuf)
         for i in range(3):
             width = hc if i < 2 else hc * hc
