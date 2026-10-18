@@ -17,90 +17,33 @@ goal: |
   - __init__.py: setup scripts, the runtime environment the port establishes, and the
     registration hooks.
   - config.py: The model configuration setup. DO NOT CHANGE THE SPECIFIC ARCHITECTURAL PARAMETERS!
-    YOU NEED TO ALIGN WITH THE FULL MODEL! The *deployment* knobs in it are yours:
-    `TENSOR_PARALLEL_SIZE` (64), `ATTENTION_TENSOR_PARALLEL_SIZE` (8) and `MAX_NUM_SEQS` (1).
+    YOU NEED TO ALIGN WITH THE FULL MODEL! You can change the other design knobs.
   - factory.py: Model instantiation.
   - model.py: The entry point of the model. Where you put the implementations.
-  - weight_loader.py: the module that loads the weights. On this host its job is a resident shard
-    plan — read each tensor once, place this rank's slice in HBM, and then make any later read an
-    error (`TimeshareWeightStore.seal()`), so "the forward reads no file" is enforced rather than
-    hoped for.
+  - weight_loader.py: the module that loads the weights. 
   - kernels: A library of optimized kernels you can use for implementing the model. They are in NKI
-    format. Please modify and use them since they are the optimized starting point and can reduce
-    the turnaround time. Check vllm_neuron to see how to utilize NKI kernels under the vllm
-    environment.
+    format. They are optimized for specific shapes. Please modify and use them (especially the ones
+    in `kernels/legacy/`), as these fused kernels can significantly improve the inference speed.
   - drafter.py: the DSpark/MTP speculative proposer.
 
-  What's the success constraints (fourteen; nine are scripts, five are judged by an agent):
-  - The port imports and registers under the arch string vLLM dispatches on.
-  - The checkpoint directory being served is complete and full-size.
-  - The model configuration matches the official checkpoint: no shrinking the model to make it fit.
-  - The verifier should pass: verifier will run a smoke test on the registered model and check if the
-    output tokens make sense.
-  - The forward pass reads no weight from disk or host DRAM. Measured from `/proc` while the
-    verifier runs, not from the port's own log lines — see `hbm-resident-forward`.
-  - DSpark speculative acceptance >= 27%, counted by vLLM's own `vllm:spec_decode_*` counters
-    and measured on prose. Read `acceptance-rate`'s rationale before changing the bar: 27%
-    against `--dataset-name random` would be a bar on the dataset rather than on the model.
-  - TTFT < 1.5 s per 1k input tokens on every measured configuration, and aggregate decode
-    throughput > 50 tokens/s on the concurrent ones.
-  - 32 concurrent requests, really concurrent: the engine admits the batch, every request
-    finishes, and aggregate throughput is several times the batch-1 figure. A queue that
-    completes is not support for a batch.
-  - The parallelism scheme is a chosen one. The floorplan is the priority, and TP=4 x PP=16 and
-    TP=16 x PP=4 each need either a measured comparison against today's TP=64 x PP=1 or a named
-    blocker. Keeping the current scheme is a passing outcome when the evidence says so.
-  - The heavy modules run as NKI kernels on the Trainium device. Two halves of one requirement: the
-    computation happens on device (no reward hacking, no tricking by using the CPU execution) AND the
-    modules that have an implementation under `kernels/legacy/` — sparse attention, MoE,
-    hyper-connections (MHC), engram, DSpark — reach a NKI kernel rather than a torch subgraph. Torch
-    stays on sampling, glue, reshapes and control flow.
-  - The implementation faithfully runs all computations needed for DeepSeek V4.1 Flash.
-  - Inference uses DSpark for speculative decoding. The MTP stages already compute a draft on every
-    forward; the draft has to be proposed to the scheduler and verified, so the tokens the model
-    emits come through the speculative path. What makes it count is the acceptance rate and the
-    quality, not bit-exactness: the tokens may differ between speculation on and off — greedy
-    decoding here is not batch-shape invariant in bf16, because a speculative step verifies `1 + k`
-    rows where a plain step verifies one — but the distribution must not drift (both arms of
-    equivalent quality, agreeing wherever there is a right answer) and the acceptance rate must be
-    high enough that the drafter pays for itself. Aim for exactness anyway: two arms agreeing token
-    for token is better evidence than two arms agreeing in quality, so narrowing that gap is real
-    progress and worth reporting. It is unenforced only because it may not be reachable on this port.
-  - The weights are divided over the 64 ranks and resident in HBM, and the forward fetches none of
-    them. 64 logical NeuronCores, 24 GiB each, and a rank addresses only its own bank — so the
-    budget is 24 GiB a rank, not 1536 GiB in aggregate. The measured baseline is 13.16 GiB a rank:
-    3.13 GiB dense (replicated), 4.31 GiB of 246 routed expert slots, 5.72 GiB of engram rows,
-    leaving ~10 GiB for KV, graphs and scratch. Weight load takes 62.57 s and then the store is
-    sealed.
-
-    This does NOT have to be vLLM's `tensor_parallel_size` — driving the cores SPMD from a single
-    process, with the collectives inside the NKI kernels, counts equally — but it currently *is*:
-    `config.TENSOR_PARALLEL_SIZE = 64`. Attention is the exception and has to be: `o_groups = 8` is
-    a hard ceiling, since `n_local_groups = o_groups // tp` reaches 0 above it, so attention runs
-    8-way (`ATTENTION_TENSOR_PARALLEL_SIZE`) replicated 8 times, with the replica group from
-    `get_neuron_ep_tp_group()` and the three head-partial reductions divided by `replicas`. MoE,
-    the Markov head, the embedding and engram reduce world-wide. `ShardRule.group` selects between
-    the two via `shard_group()`.
-
-    BE CAREFUL WITH TENSOR PARALLELISM — READ THIS BEFORE YOU CHANGE THE RANK COUNT OR THE TIMEOUTS.
-    A naive multi-rank run through vLLM twice hung the whole *instance* on the predecessor host,
-    each time needing a reboot. That is fatal and not recoverable for this optimization: the
-    iteration, the devices and everything in flight are lost. The mechanism is three timeouts
-    ordered wrong: graphs here compile mid-forward (warmup is skipped and the shape set is
-    router-dependent), a measured compile took 1045-1167 s, and a peer waiting inside a collective
-    gave up at 960 s — so a rank still compiling outlasts the peers waiting on it, they time out,
-    retry against a rank still compiling, and leave the collective's device-side state in a
-    condition no process can clear.
-
-    The mitigation is already in place and you should not undo it: `__init__.py` raises
-    `NEURON_RT_EXEC_TIMEOUT` from the runtime default of 300 s to 7200, which is above any compile
-    measured here. 64 ranks has since run the verifier to completion repeatedly. One reboot did
-    occur during bring-up and was traced to AWS degraded hardware with an active scheduled
-    `instance-stop` event, not to this workload. Keep the ordering safe: either prove every graph is
-    compiled before any collective executes (a warm NEFF cache, or a compile-only pass), or keep the
-    RX timeout above the worst compile you have measured. Check correctness with
-    `nki.simulate(kernel)(...)` on CPU first, then a single short prompt, and only then the full
-    verifier. A lot of double-checking here is cheaper than one reboot.
+  What's the success constraints. Fourteen, in the order the gate runs them. Each one's
+  `why:` below says how it is judged and what it is defending against; these are the one-line
+  versions, not the whole statement.
+  - **imports-and-registers** — the port resolves under the arch string vLLM dispatches on.
+  - **checkpoint-is-complete** — the checkpoint directory is whole: every shard, every layer.
+  - **config-matches-official** — the config matches the official one. No shrinking the model to fit.
+  - **verifier** — four prompts generate, and an LLM judge finds the tokens sensible.
+  - **hbm-resident-forward** — the forward reads no weight from disk or host DRAM.
+  - **bench** — the speed and acceptance evidence gets measured. The three below read its report.
+  - **acceptance-rate** — DSpark acceptance >= 27% on prose, by vLLM's own counters.
+  - **performance-targets** — TTFT < 1.5 s per 1k input tokens; aggregate decode > 50 tokens/s.
+  - **concurrency-32** — 32 requests served at once, all finishing. A queue that completes is not a batch.
+  - **nki-kernels-on-device** — the heavy modules run as NKI kernels on device. Not torch, not CPU.
+  - **full-model-faithful** — every component of DeepSeek V4.1 Flash actually executes.
+  - **uses-dspark-speculation** — drafts are proposed and verified, not computed and discarded.
+  - **weights-resident-across-64-ranks** — the weights are divided across the 64 ranks and live in HBM.
+  - **parallelism-schema** — the scheme is chosen, not inherited: follow the floorplan, and
+    measure TP=4 x PP=16 and TP=16 x PP=4 or name what blocks them.
 
   Weight Checkpoint: `/mnt/nvme/hf` — 475.3 GiB, 48 shards, revision
   `314113f8a7dadb388215396ba5fbee2c610a04d6`. Do not redownload from huggingface. It is on the
@@ -145,11 +88,6 @@ goal: |
     "if only opt-rank0 exists, 4-rank communication overhead was larger than the speedup, so a
     single rank is preferred" is a conclusion about **4 ranks inside one device**, where a collective
     never leaves that device's NeuronLink. It does not carry over unchanged to 64 ranks across 16.
-  - `vllm_neuron/model/deepseek_v41_timeshare/` is the working predecessor: the same model on one
-    device, streaming weights from disk. It is a good reference for *what* each module computes.
-    Its host facts, its memory budgets and its latencies are from a host with 1/16th the devices
-    and 1/15th the host memory. Check which host a number was measured on before trusting
-    it; references/INDEX.md records the comparison.
 
   Two pieces of work reach outside this port into `vllm_neuron`'s own backend, and each has a
   constraint of its own — `parallelism-schema` and `acceptance-rate`. `scope.editable` names the
@@ -695,8 +633,10 @@ constraints:
       per rank.
 
       Attention being 8-way and replicated 8 times is correct, not a shortfall: `o_groups = 8`
-      is the ceiling, since `n_local_groups = o_groups // tp` reaches 0 above it. What to check
-      instead is that the replication is accounted for — the head-partial reductions divide by
+      is the ceiling, since `n_local_groups = o_groups // tp` reaches 0 above it. It is the only
+      exception — MoE, the Markov head, the embedding and engram all reduce world-wide, and
+      `ShardRule.group` is what selects between the two regimes via `shard_group()`. What to
+      check instead is that the replication is accounted for — the head-partial reductions divide by
       `replicas`, and the replica group comes from `get_neuron_ep_tp_group()`. A replicated
       reduction that is not divided double-counts.
 
@@ -779,6 +719,25 @@ constraints:
       stage boundary adds a serialized activation transfer per microbatch, and PP's bubble is
       unhidden at `MAX_NUM_SEQS = 1` because there is nothing to overlap it with — which is why
       this and `concurrency-32` are likely to have to move together.
+
+      BE CAREFUL BEFORE YOU CHANGE THE RANK COUNT OR THE COLLECTIVE TIMEOUTS. A naive
+      multi-rank run through vLLM twice hung the whole *instance* on the predecessor host, each
+      time needing a reboot — which loses the iteration, the devices and everything in flight.
+      The mechanism is three timeouts ordered wrong: graphs here compile mid-forward (warmup is
+      skipped, the shape set is router-dependent), a measured compile took 1045-1167 s, and a
+      peer waiting inside a collective gave up at 960 s. The rank still compiling outlasts the
+      peers waiting on it, they time out, retry against a rank still compiling, and leave the
+      collective's device-side state in a condition no process can clear.
+
+      The mitigation is in place and should not be undone: `__init__.py` raises
+      `NEURON_RT_EXEC_TIMEOUT` from the runtime default of 300 s to 7200, above any compile
+      measured here. 64 ranks has since run the verifier to completion repeatedly; the one
+      reboot during bring-up was AWS degraded hardware with a scheduled `instance-stop`, not
+      this workload. Keep the ordering safe either way — prove every graph is compiled before
+      any collective executes (a warm NEFF cache, or a compile-only pass), or keep the RX
+      timeout above the worst compile you have measured. Check with `nki.simulate(kernel)(...)`
+      on CPU, then one short prompt, then the verifier. A lot of double-checking here is
+      cheaper than one reboot.
 
       **PP does not exist in the execution path yet.** There is no `IntermediateTensors`
       anywhere in `vllm_neuron`, so there is no activation transfer to schedule; the files to
