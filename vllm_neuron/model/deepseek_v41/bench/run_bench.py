@@ -324,21 +324,29 @@ def _bench_cell(
     default prompt count, so an unwarmed cell does not report a slow median: it
     reports a compile.
 
-    So each cell runs twice. The first run is discarded, generates
-    `WARMUP_OUTPUT_LEN` tokens instead of the full output, and sends
-    `max(batch, 2)` requests — enough that every concurrency slot is exercised
-    and both the prefill and the decode graph of this shape exist before
-    anything is timed.
+    So each cell runs twice. The first run is discarded and generates
+    `WARMUP_OUTPUT_LEN` tokens instead of the full output, which is what makes
+    it cheap.
+
+    **It sends the same number of requests as the measurement, not fewer.** That
+    looks like waste and is not: with `--max-concurrency b` and `2b` requests,
+    the scheduler admits a new request each time one finishes, so a *prefill
+    runs concurrently with `b - 1` decodes* — a shape that never occurs if the
+    warm-up submits exactly `b` requests which all start together and drain
+    together. Matching the request count makes the warm-up traverse the same
+    scheduling trajectory, so every shape the measurement will key already
+    exists. An earlier cut sent `max(batch, 2)`, which left that mixed
+    prefill/decode shape to compile inside the batch-10 measurements.
 
     A failed warm-up is a note, not a failure: the measurement that follows is
     then simply a cold one, and it is better to report a number with that
     caveat than to drop the cell.
     """
     name = f"in{input_len}_bs{batch}"
-    print(f"\nbench: cell {name} — warm-up: {max(batch, 2)} prompts, "
+    print(f"\nbench: cell {name} — warm-up: {num_prompts} prompts, "
           f"{input_len} in / {WARMUP_OUTPUT_LEN} out (discarded)")
     warm = _bench_serve(
-        model, port, input_len, WARMUP_OUTPUT_LEN, batch, max(batch, 2),
+        model, port, input_len, WARMUP_OUTPUT_LEN, batch, num_prompts,
         result_dir, f"{name}.warmup.json", timeout,
     )
     if warm is None:
@@ -356,6 +364,39 @@ def _bench_cell(
         # measurement from a cold one without going back to the console.
         measured["_warmed"] = warm is not None
     return measured
+
+
+#: The port's own clamp line, e.g. `max_num_seqs 10 -> 1`.
+_CLAMP_RE = re.compile(r"max_num_seqs (\d+) -> (\d+)")
+
+
+def _engine_batch(server_log: Path, requested: int) -> int:
+    """The batch the engine actually serves, which may be below what was asked.
+
+    **This guard exists because its absence produced a meaningless number.**
+    `__init__.MULTI_RANK_MAX_NUM_SEQS` clamps concurrent sequences above one
+    rank, and it is currently 1 because multi-sequence decode at 64 ranks hangs.
+    A server asked for 10 therefore serves **one at a time** — while
+    `vllm bench serve --max-concurrency 10` keeps ten requests in flight. The
+    nine that cannot run sit in the engine's queue, and their queue wait lands
+    in their TTFT:
+
+        in512_bs10: ttft p50 234,981 ms, p99 260,168 ms (ratio 1.1x),
+                    output_throughput 4.71 tok/s against batch 1's 4.26
+
+    A p99/p50 ratio of 1.1 is the tell — every request waited, so it is not a
+    slow outlier but queueing. And the throughput is batch 1's, because the
+    engine *is* batch 1. Reported without this check, that row reads as "batch
+    10 has terrible latency" when what it measures is a queue.
+
+    Returns the clamped value, or `requested` when no clamp was logged.
+    """
+    try:
+        text = server_log.read_text(errors="replace")
+    except OSError:
+        return requested
+    matches = _CLAMP_RE.findall(text)
+    return int(matches[-1][1]) if matches else requested
 
 
 #: `DSparkProposer`'s running acceptance line, as it appears in a server log.
@@ -453,7 +494,9 @@ def _print_table(cells: list[dict]) -> None:
               f"{fmt(m['per_stream_tok_s'], '.2f'):>9} "
               f"{fmt(m.get('draft_acceptance_pct'), '.0f'):>7} "
               f"{m['completed'] if m['completed'] is not None else '-':>5}"
-              + ("" if m.get("warmed") else "  COLD"))
+              + ("" if m.get("warmed") else "  COLD")
+              + ("" if not c.get("concurrency_capped")
+                 else f"  CAPPED->{c.get('engine_max_num_seqs')}"))
     print("=" * 94)
 
 
@@ -526,8 +569,21 @@ def main(argv: list[str] | None = None) -> int:
             log = log_dir / f"server_in{input_len}_bs{batch}.log"
             proc = _serve(args.model, tp, context, batch, port, log)
             raw = None
+            served_batch = batch
             try:
                 _wait_healthy(proc, port, args.server_timeout)
+                served_batch = _engine_batch(log, batch)
+                if served_batch < batch:
+                    print(
+                        f"bench: WARNING cell in{input_len}_bs{batch} — the "
+                        f"engine clamped max_num_seqs to {served_batch}, so it "
+                        f"serves {served_batch} sequence(s) at a time while the "
+                        f"client keeps {batch} in flight. TTFT will be mostly "
+                        "queue wait and the throughput will be "
+                        f"{served_batch}-way, not {batch}-way. See "
+                        "deepseek_v41.MULTI_RANK_MAX_NUM_SEQS.",
+                        file=sys.stderr,
+                    )
                 n = args.num_prompts or _num_prompts(batch)
                 raw = _bench_cell(
                     args.model, port, input_len, args.output_len, batch, n,
@@ -547,6 +603,8 @@ def main(argv: list[str] | None = None) -> int:
                 "output_len": args.output_len,
                 "batch": batch,
                 "max_model_len": context,
+                "engine_max_num_seqs": served_batch,
+                "concurrency_capped": served_batch < batch,
                 "num_prompts": args.num_prompts or _num_prompts(batch),
                 "metrics": metrics,
                 "server_log": str(log),

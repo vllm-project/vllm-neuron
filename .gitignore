@@ -8,6 +8,33 @@ __pycache__
 vllm_neuron/model/deepseek_v41/verifier/verifier_report.json
 vllm_neuron/model/deepseek_v41_timeshare/verifier/verifier_report.json
 
+# Written by the bench on every run (bench/run_bench.py DEFAULT_REPORT, and the
+# per-cell `vllm bench serve` results and server logs beside it). The server
+# logs in particular are tens of MB each at 64 ranks, and the AutoHelix loop
+# diffs this worktree to see what an iteration changed.
+vllm_neuron/model/deepseek_v41/bench/bench_report.json
+vllm_neuron/model/deepseek_v41/bench/cells/
+
+# Local working material for the DeepSeek-V4.1-Flash port: kept on disk because
+# it is actively used, kept out of the repository because it is not part of the
+# port.
+#
+#   floorplan/    the placement study — simulator reports, candidate schemes,
+#                 probe output. Hundreds of KB of planning artifacts naming this
+#                 host's paths and this run's measurements.
+#   references/   the map of where the checkpoint, the partition artifact and
+#                 the venvs live *on this machine*. Absolute local paths; useful
+#                 here, meaningless to anyone else.
+vllm_neuron/model/deepseek_v41/floorplan/
+vllm_neuron/model/deepseek_v41/references/
+vllm_neuron/model/deepseek_v41_timeshare/floorplan/
+vllm_neuron/model/deepseek_v41_timeshare/references/
+
+# Logs, anywhere. A 64-rank run writes tens of MB per engine and none of it
+# belongs in version control.
+*.log
+**/logs/
+
 # NKI/neuronx-cc scratch, written into the *current working directory* rather
 # than TMPDIR. A device run launched from the repo root leaves one directory per
 # compiled kernel (`<kernel name>_<hash>/`, holding a `.colz`), an empty

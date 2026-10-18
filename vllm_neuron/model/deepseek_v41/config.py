@@ -36,6 +36,7 @@ under `kernels/`:
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 
 import torch
@@ -192,6 +193,95 @@ TENSOR_PARALLEL_SIZE = 64
 #: vocab-parallel embedding and the logits all-gather — span the real world size
 #: and are untouched.
 ATTENTION_TENSOR_PARALLEL_SIZE = 8
+
+#: Concurrent sequences this port serves above one rank. One, and this is
+#: the setting in this file that most deserves scepticism, so here is the
+#: measurement behind it.
+#:
+#: Each distinct *shape* the scheduler produces keys its own NEFF, and every
+#: loaded NEFF holds host memory for its code, its DMA rings and its scratchpad
+#: — at four ranks, in four separate processes. Running 2-4 sequences at once
+#: multiplies the decode shapes (`1+k` rows per request with speculation, so 6,
+#: 12, 18, 24) and iteration 10 measured where that ends, on the gate's own
+#: phase-2 arguments at four ranks (`/tmp/iter10/v4s.log`): six forwards in, all
+#: 43 layers each, then a graph *load* failed with
+#:
+#:     TDRV:dma_util_expand_tiling_dims   memory allocation failed
+#:     TDRV:kbl_model_add                 create_data_refill_rings() error
+#:     NRT:nrt_load_util                  Failure: NRT_FAILURE
+#:
+#: at `Committed_AS` 90.1 GiB of a 114.8 GiB `CommitLimit` and climbing. The
+#: same three prompts at one sequence peak near 75 GiB and pass
+#: (`/tmp/iter10/v4t.log`, judged).
+#:
+#: So this was a capability declaration — the batch size that port could serve
+#: on *that* host at four ranks — in the same place and for the same kind of
+#: reason as `require_segmented_prefill`'s. What it cost was coverage: every
+#: prompt was still served and judged, but one at a time, so the multi-sequence
+#: paths (per-batch `SharedAttentionState`, the n-gram hash cache shared between
+#: sequences, the indexer's mask under chunked prefill) went unexercised above
+#: one rank.
+#:
+#: ── Why it is 4 here, not 1 ──────────────────────────────────────────────────
+#:
+#: The constraint it answered was `Committed_AS` 90.1 GiB against a **114.8 GiB**
+#: `CommitLimit`. This host's limit is **1700 GiB** and the measured *residency*
+#: of a 64-rank run peaked at 247 GiB of 2000. The clamp is answering a question
+#: nobody is asking any more.
+#:
+#: And it suppresses exactly the thing a throughput target needs. A forward's
+#: cost here is dominated by per-execution and collective overhead that a batch
+#: amortizes: ~100 collectives and several hundred graph executions are paid per
+#: *forward*, not per sequence, so serving one sequence at a time pays the whole
+#: fixed cost for one token's worth of work. Aggregate output throughput — total
+#: output tokens over wall clock, which is what the reference benchmarks report
+#: as the headline figure — is close to linear in this number until the fixed
+#: cost stops dominating.
+#:
+#: ── Still 1 at 64 ranks, and now for a different reason: it hangs ───────────
+#:
+#: The host-memory argument above no longer applies — this host's `CommitLimit`
+#: is 1700 GiB and a 64-rank run peaked at 247 GiB resident — so this was raised
+#: to 16 on 2026-10-17 to get the throughput a batch amortizes. **It deadlocks,
+#: reproducibly, and the clamp is back to 1 until that is fixed.**
+#:
+#: What was observed, at 64 ranks with the verifier's own arguments:
+#:
+#:   phase 1, `max_num_seqs=1`     passed and tore down normally
+#:   phase 2, `max_num_seqs=4`     24+ forwards, completed **1 of 3** prompts,
+#:                                 then stopped making progress entirely:
+#:                                 64 workers spinning at 83% CPU, load 68,
+#:                                 **no neuronx-cc process running**, no NEFF
+#:                                 written for 10 minutes, and EngineCore
+#:                                 repeating `No available shared memory
+#:                                 broadcast block found in 60 seconds`.
+#:
+#: No compiler running plus pegged CPU is a collective spin-wait, not a slow
+#: compile. The suspicious moment is a sequence *finishing*: the decode row
+#: count is `(1 + k) * running_seqs`, so it steps 18 -> 12 -> 6 as the batch
+#: drains, and the stall came after the first of three prompts completed.
+#:
+#: This is the path the note above already warned was never exercised: "the
+#: multi-sequence paths the verifier's phase split exists to exercise (per-batch
+#: `SharedAttentionState`, the n-gram hash cache shared between sequences, the
+#: indexer's mask under chunked prefill) are exercised at one rank and not at
+#: four". Raising this clamp is what finally exercised them above one rank, and
+#: they do not work there yet.
+#:
+#: **It is a real throughput lever and it is worth fixing**, because the
+#: per-forward cost here is almost all fixed — collectives and graph launches
+#: paid per forward, not per sequence — so aggregate throughput is close to
+#: linear in this number. The fix is a debugging task, not a tuning one: find
+#: which collective the ranks disagree about when the running count changes.
+#: Until then, correctness wins and the gate stays green.
+#:
+#: This only ever lowers, so a caller asking for fewer keeps fewer. **At one
+#: rank it is not applied at all.**
+#:
+#: `DEEPSEEK_V41_MAX_NUM_SEQS=<n>` raises it, which is how the hang above is
+#: reproduced and how it will be re-tested once fixed. Env-overridable rather
+#: than edit-to-test so a debugging run leaves no diff behind.
+MAX_NUM_SEQS = int(os.environ.get("DEEPSEEK_V41_MAX_NUM_SEQS", 1))
 
 
 @dataclass

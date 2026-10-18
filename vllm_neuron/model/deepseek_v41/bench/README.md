@@ -49,13 +49,21 @@ minutes to build. At batch 10 the whole first round of ten requests pays it
 concurrently, which is half the sample: an unwarmed cell does not report a slow
 median, it reports a compile.
 
-So each cell runs twice. The first run is discarded, sends `max(batch, 2)`
-requests so every concurrency slot is exercised, and generates only
-`WARMUP_OUTPUT_LEN = 8` tokens — the decode shape this model keys is
+So each cell runs twice. The first run is discarded and generates only
+`WARMUP_OUTPUT_LEN = 8` tokens, which is what makes it cheap — the decode shape
+this model keys is
 `(1 + k) * running_seqs` rows, a function of the batch and not of how many
 tokens have been emitted, and with the compressed read pinned to the context
 and the window fixed at 128 slots a longer generation reaches no shape a short
 one does not. 8 tokens compiles the same graph set as 128.
+
+It sends the **same number of requests** as the measurement, which looks like
+waste and is not. With `--max-concurrency b` and `2b` requests the scheduler
+admits a new request each time one finishes, so a *prefill runs concurrently
+with `b - 1` decodes* — a shape that never occurs if the warm-up submits exactly
+`b` requests, which all start together and drain together. Matching the count
+makes the warm-up traverse the same scheduling trajectory, so every shape the
+measurement will key already exists.
 
 A failed warm-up is a note, not a dropped cell: the measurement is then a cold
 one, it is marked `COLD` in the table, and `warmed: false` lands in the report.
