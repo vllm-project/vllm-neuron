@@ -59,6 +59,24 @@ goal: |
   then verify with `lsof` again and SIGKILL anything left. Do not kill the `autohelix` process
   that is running this loop — that is your own driver.
 
+  WHEN A RUN STOPS PRODUCING, READ THE SERVER'S LOG BEFORE CONCLUDING ANYTHING. The one
+  wedge diagnosed here, 2026-10-18, was not a model bug and not a batching deadlock. The cell
+  was executing *sequentially* — `max_num_seqs 32 -> 1` in force, one sequence at a time, 37
+  requests already answered — when one rank of 64 ran out of device memory for DMA descriptor
+  rings, three seconds after a normal forward:
+
+      TDRV:ddrs_build_ring_from_template  Failed to allocate memory for dma ring for qSPIO0_0
+      TDRV:dmem_buf_copyin                Copy from buffer to memory failed: timeout (ret=-110)
+      RuntimeError: Failed to schedule neff execution. status=1 message=Unknown Failure
+
+  The other 63 ranks then sat in a collective waiting for a rank that was never coming. Two
+  things follow. The ring pool scales with *graph count*, not batch size — each loaded NEFF
+  caches `NEURON_RT_IO_RING_CACHE_SIZE` rings and the worker default is 32, against ~120 graphs
+  on this model — so lowering that variable is the first thing to try. And the wedge lives in
+  driver state, so killing the processes does not clear it: `~/reset_neuron.sh` reloads the
+  `neuron` module, which does, in seconds rather than a ~30 minute reboot. The bench now
+  matches those signatures in the engine log and kills the cell on sight.
+
   DO NOT RAISE `MAX_NUM_SEQS` ABOVE 1 UNTIL BATCHED INFERENCE IS ACTUALLY CORRECT. This model
   keys a decode graph per `(1 + k) * running_seqs` row count, and the per-sequence state is the
   part most likely to be wrong: iteration 4 found three separate bugs here (`SharedAttentionState`

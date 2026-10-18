@@ -74,6 +74,53 @@ DEFAULT_PROSE_OUTPUT_LEN = 96
 #: hence 25 min rather than something tighter.
 DEFAULT_STALL_TIMEOUT = 1500
 
+#: Lines that mean the run is over, whatever the clock says. Matched against the
+#: tail of the server log while a cell runs, because waiting out a timeout after
+#: one of these appears buys nothing and costs the devices.
+#:
+#: Taken from an actual wedge, 2026-10-18 03:42:28. The cell was healthy --
+#: `max_num_seqs 32 -> 1` in force, one sequence at a time, 37 requests already
+#: answered -- and then rank 51 alone failed:
+#:
+#:   TDRV:ddrs_build_ring_from_template  Failed to allocate memory for dma ring
+#:                                       for queue qSPIO0_0
+#:   TDRV:dmem_buf_copyin                Copy from buffer to memory failed:
+#:                                       timeout (ret=-110)
+#:   RuntimeError: Failed to schedule neff execution. status=1 message=Unknown
+#:
+#: The other 63 ranks then sat in a collective waiting for a rank that was never
+#: coming. Nothing about it was a batching deadlock: execution was sequential
+#: throughout. It was one rank running out of device memory for DMA descriptor
+#: rings, three seconds after a normal forward.
+_FATAL_PATTERNS = (
+    "Failed to schedule neff execution",
+    "Failed to allocate memory for dma ring",
+    "Failed to build dma rings for io",
+    "WorkerProc hit an exception",
+    "EngineCore encountered a fatal error",
+)
+
+#: Bytes of the server log tail scanned each poll. The signatures above appear
+#: within a few KB of the failure, and reading the whole file every 5 s would
+#: cost more than the check is worth once a log passes a few hundred MB.
+_FATAL_SCAN_BYTES = 256 * 1024
+
+
+def _fatal_in_log(path: Path) -> str | None:
+    """The first fatal signature in the log's tail, or None."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > _FATAL_SCAN_BYTES:
+                fh.seek(size - _FATAL_SCAN_BYTES)
+            tail = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    for pattern in _FATAL_PATTERNS:
+        if pattern in tail:
+            return pattern
+    return None
+
 #: Shakespeare's sonnets, 2155 verse lines, built from Project Gutenberg #1041.
 #: `sonnet.txt` does not ship with vLLM, so it has to be supplied.
 DEFAULT_SONNET_PATH = "/mnt/nvme/datasets/sonnet.txt"
@@ -635,10 +682,31 @@ def _bench_serve(
         except subprocess.TimeoutExpired:
             pass
 
-        # A wedged engine writes nothing. Catching that here rather than at the
-        # cell timeout is the difference between losing 5 minutes and losing 25
-        # -- and the longer a 64-rank collective sits wedged, the likelier it
-        # is to need a host reboot to clear rather than a kill.
+        # A rank that dies says so. Catching the signature is seconds rather
+        # than the 25 minutes the silence watchdog below would take, and the
+        # devices come back that much sooner.
+        if log_path is not None:
+            fatal = _fatal_in_log(log_path)
+            if fatal:
+                print(f"bench:   FATAL in the engine log: {fatal!r} — killing the cell "
+                      "now rather than waiting out the timeout.", file=sys.stderr)
+                if "dma ring" in fatal or "dma rings" in fatal:
+                    print("bench:   That is device memory for DMA descriptor rings, not "
+                          "HBM for weights. Each loaded NEFF caches "
+                          "`NEURON_RT_IO_RING_CACHE_SIZE` rings (the worker default is "
+                          "32) and this model keys ~120 graphs, so the ring pool scales "
+                          "with graph count. Lowering that variable is the first thing "
+                          "to try.", file=sys.stderr)
+                print("bench:   The surviving ranks are wedged in a collective. "
+                      "`~/reset_neuron.sh` reloads the driver, which clears it without "
+                      "a host reboot.", file=sys.stderr)
+                client.kill(); client.wait()
+                if server is not None:
+                    _stop(server)
+                return None
+
+        # A wedged engine that says nothing at all. The backstop for failures
+        # with no log signature.
         if log_path is not None and stall_timeout > 0:
             size = log_path.stat().st_size if log_path.exists() else 0
             if size != last_size:
