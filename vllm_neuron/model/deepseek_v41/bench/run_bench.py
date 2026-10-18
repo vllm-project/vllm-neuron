@@ -921,6 +921,31 @@ def _vllm_acceptance(server_log: Path) -> dict:
     }
 
 
+#: Figures emitted per cell, in `_emit_metrics`.
+_EMITTED = ("ttft_p50_ms", "tpot_p50_ms", "decode_tok_s", "vllm_acceptance_pct")
+
+
+def _emit_metrics(cell: dict) -> None:
+    """One `##autohelix[...]` line per figure, named `<metric>_<cell>`.
+
+    Called as soon as a cell has figures, not at the end of the matrix. The
+    difference matters: `bench_report.json` is rewritten after every cell, so a
+    run that dies on cell 7 keeps six cells' measurements -- but the emission
+    used to happen only after the last cell, so the same run reported *nothing*
+    to a loop reading these lines. Emitting per cell makes the two records agree.
+
+    Only figures that exist are emitted: a missing metric must not read as a
+    zero.
+    """
+    m = cell.get("metrics")
+    if not m:
+        return
+    for key in _EMITTED:
+        value = m.get(key)
+        if isinstance(value, (int, float)):
+            print(f"##autohelix[{key}_{cell['name']}={value:.6g}]", flush=True)
+
+
 def _metrics(raw: dict) -> dict:
     """The three figures this benchmark reports, out of `vllm bench serve`.
 
@@ -1093,6 +1118,8 @@ def main(argv: list[str] | None = None) -> int:
                 report["prose"]["max_model_len"] = context
                 pr = report["prose"]
                 pct = pr["acceptance_pct"]
+                if isinstance(pct, (int, float)):
+                    print(f"##autohelix[spec_acceptance_pct={pct:.6g}]", flush=True)
                 print(f"bench:   {pr['accepted_tokens']}/{pr['draft_tokens']} drafts "
                       f"accepted = {(f'{pct:.1f}%' if pct is not None else 'unmeasured')} "
                       f"over case(s) {pr['cases']}")
@@ -1125,6 +1152,7 @@ def main(argv: list[str] | None = None) -> int:
             **extra,
         })
         _write()  # after every cell, so a crash keeps what ran
+        _emit_metrics(report["cells"][-1])
 
     # The prose probe needs the widest context the matrix offers, and batch 1 so
     # it is not competing with 31 other sequences for the counters it reads.
@@ -1152,27 +1180,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
     _print_table(report["cells"])
-
-    # ── `##autohelix[...]`, one line per figure per cell ──────────────────
-    #
-    # Named `<metric>_in<input>_bs<batch>` so a loop can gate on a single cell
-    # without parsing a table. Only figures that exist are emitted: a missing
-    # metric must not read as a zero.
-    for c in report["cells"]:
-        m = c["metrics"]
-        if not m:
-            continue
-        suffix = c["name"]
-        keys = ("ttft_p50_ms", "tpot_p50_ms", "decode_tok_s")
-        if c.get("dataset") == "prose":
-            # Its latencies are not comparable to the random cells', so only the
-            # figure it exists for is emitted.
-            keys = ("vllm_acceptance_pct",)
-        for key in keys:
-            value = m.get(key)
-            if isinstance(value, (int, float)):
-                print(f"##autohelix[{key}_{suffix}={value:.6g}]")
-
     ran = [c for c in report["cells"] if c["metrics"]]
     report["completed_cells"] = len(ran)
     report["total_cells"] = len(report["cells"])
