@@ -195,7 +195,7 @@ constraints:
 
   # ── 4. it runs on 64 ranks, and the tokens read sensibly ───────────────────────────────
   - name: verifier
-    command: . /home/ubuntu/ds41-env.sh && export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" && mkdir -p /mnt/nvme/tmp/run && cd /mnt/nvme/tmp/run && exec /home/ubuntu/vllm-neuron/.venv/bin/python -u -m vllm_neuron.model.deepseek_v41.verifier.io_monitor --watch /mnt/nvme/hf -- /home/ubuntu/vllm-neuron/.venv/bin/python -u -m vllm_neuron.model.deepseek_v41.verifier.run_verifier --model /mnt/nvme/hf
+    command: . /home/ubuntu/ds41-env.sh && export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" && mkdir -p /mnt/nvme/tmp/run /home/ubuntu/logs/gate && cd /mnt/nvme/tmp/run && { /home/ubuntu/vllm-neuron/.venv/bin/python -u -m vllm_neuron.model.deepseek_v41.verifier.io_monitor --watch /mnt/nvme/hf -- /home/ubuntu/vllm-neuron/.venv/bin/python -u -m vllm_neuron.model.deepseek_v41.verifier.run_verifier --model /mnt/nvme/hf > /home/ubuntu/logs/gate/verifier.log 2>&1; rc=$?; cat /home/ubuntu/logs/gate/verifier.log; exit $rc; }
     timeout: 7200
     rationale: |
       The gate you described: 4 prompts (TranSonic's `short-prose` and its needle-in-a-haystack
@@ -264,7 +264,7 @@ constraints:
 
   # ── 6. the speed and acceptance evidence. the three constraints after it read its report ─
   - name: bench
-    command: . /home/ubuntu/ds41-env.sh && export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" && mkdir -p /mnt/nvme/tmp/run && cd /mnt/nvme/tmp/run && exec /home/ubuntu/vllm-neuron/.venv/bin/python -u -m vllm_neuron.model.deepseek_v41.bench.run_bench --model /mnt/nvme/hf
+    command: . /home/ubuntu/ds41-env.sh && export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" && mkdir -p /mnt/nvme/tmp/run /home/ubuntu/logs/gate && cd /mnt/nvme/tmp/run && { /home/ubuntu/vllm-neuron/.venv/bin/python -u -m vllm_neuron.model.deepseek_v41.bench.run_bench --model /mnt/nvme/hf > /home/ubuntu/logs/gate/bench.log 2>&1; rc=$?; cat /home/ubuntu/logs/gate/bench.log; exit $rc; }
     timeout: 10800
     rationale: |
       Infrastructure, not a bar of its own: it runs the matrix, probes acceptance, and writes
