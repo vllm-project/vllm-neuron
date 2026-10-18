@@ -148,34 +148,8 @@ goal: |
   - `vllm_neuron/model/deepseek_v41_timeshare/` is the working predecessor: the same model on one
     device, streaming weights from disk. It is a good reference for *what* each module computes.
     Its host facts, its memory budgets and its latencies are from a host with 1/16th the devices
-    and 1/15th the host memory — see the carryover warning below.
-
-  Where this stands:
-  - The first four constraints hold today: the verifier passes at 64 ranks and the forward is
-    resident (`experts N/N from HBM (100%), 0 admitted, ~0.00 GiB fetched`). The last five are
-    the work. This stage's job is to keep what holds holding while the rest comes in.
-  - **Speed is gated here, and every speed bar currently fails.** Measured batch 1, output 128:
-
-        input   ctx    TTFT p50   per 1k    TPOT p50   decode agg
-          512   768     2010 ms   4020 ms     206 ms     4.26 tok/s
-         1024  1280     2584 ms   2584 ms     234 ms     3.98 tok/s
-         2048  2304     4439 ms   2220 ms     234 ms     3.76 tok/s
-         8192  8448    20182 ms   2523 ms     268 ms     2.31 tok/s
-
-    Against TTFT < 1500 ms per 1k that is a 1.5-2.7x prefill improvement. The decode bar
-    (> 50 tok/s aggregate) is not reachable at batch 1 at all — per-stream is ~4.9 tok/s — so it
-    runs through `concurrency-32`: 32 streams at today's per-stream rate is ~155 tok/s. The two
-    are coupled, and `MAX_NUM_SEQS` is the first thing in the way of both.
-  - **The bottleneck is collective count x participants plus per-graph-execution overhead — not
-    FLOPs and not I/O.** Four settings carried from the single-device port cost ~11x forward time
-    here before being fixed (5.9 s -> ~490 ms). When a number in this port's comments looks
-    authoritative, CHECK WHICH HOST IT WAS MEASURED ON before trusting it. The comments say, and
-    several name the premise that has since moved.
-  - **`MAX_NUM_SEQS = 1`**, and it is in `config.py` so you can change it. Above 1 a run has stalled;
-    the evidence is recorded beside the constant and `~/ds41_repro_hang.py` is the minimal
-    reproduction. Fixing it is the single highest-value change available: the per-forward cost
-    (~100 collectives, hundreds of graph launches) is paid per *forward*, not per sequence, so batch
-    1 pays the whole fixed cost for one token's work, and every batch-10 bench cell is blocked on it.
+    and 1/15th the host memory. Check which host a number was measured on before trusting
+    it; references/INDEX.md records the comparison.
 
   Two pieces of work reach outside this port into `vllm_neuron`'s own backend, and each has a
   constraint of its own — `parallelism-schema` and `acceptance-rate`. `scope.editable` names the
@@ -214,35 +188,6 @@ goal: |
     rest at once is padding the decode token axis to a fixed bucket so shapes stop depending on
     the batch. That is a bug to finish fixing, not a trade to accept.
 
-
-# Evaluated in order, cheapest first, so a broken import does not cost a device run before it
-# is reported. The count that hold is the metric.
-#
-# Each command sources `~/ds41-env.sh` rather than relying on the operator's shell: the gate
-# inherits whatever environment `autohelix` was launched with, and a run started from cron or a
-# unit file would otherwise get the root volume as TMPDIR and 32 compile workers.
-#
-# PYTHONPATH is *prepended* with `$PWD` rather than assigned, and `$PWD` is pinned to the worktree
-# by `build_worktree_env`. It is load-bearing, and checked rather than assumed: `vllm_neuron` is
-# installed into this venv as a **modern editable**, which works through a `sys.meta_path` finder
-# (`_EditableFinder`) rather than a `sys.path` entry — so `import vllm_neuron` resolves to
-# /home/ubuntu/vllm-neuron even from an unrelated cwd with no PYTHONPATH at all. If that finder ran
-# first, every iteration would validate the *main* repo's code and the loop would be measuring
-# nothing. It does not: `_EditableFinder` installs itself after `PathFinder`, so a PYTHONPATH entry
-# wins. Verified by pointing PYTHONPATH at a decoy `vllm_neuron/` and confirming the decoy was
-# imported. Do not change this to a bare assignment or drop it.
-#
-# The device commands then `cd /mnt/nvme/tmp/run`, because the NKI toolchain writes a scratch
-# directory per compiled kernel into the *current working directory* — 144 paths and 32 MB after one
-# verifier run — and this loop diffs the worktree to see what an iteration changed. The report the
-# agent constraints read still lands in the worktree, since PYTHONPATH resolves the package there.
-#
-# The absolute paths are the venv, the checkpoint and the env script. The venv is hardcoded because
-# `.venv/` is gitignored and absent from the worktree; the checkpoint is outside the repo, which is
-# why the verifier's `--model` is required and has no default.
-#
-# The `check_*` and `run_verifier` scripts are under `verifier/`, and `bench/` likewise, both
-# outside `scope.editable` — so the agent cannot relax its own bar.
 constraints:
 
   # ── 1. nothing else can be checked until this holds ────────────────────────────────────
@@ -890,24 +835,6 @@ constraints:
     effort: medium
     timeout: 900
 
-# What may the agent modify? (everything else is reverted before the constraints run)
-#
-# A whitelist, in two parts: this port, and the specific shared-backend files that two named
-# pieces of work cannot be done without. Everything else is reverted, which is what makes the
-# measurement credible — it still covers `verifier/`, `bench/`, `registry.py` (so registration
-# cannot be bent to satisfy constraint 1), and the read-only `chat_template.jinja`.
-#
-# The second part is a deliberate widening and it has a cost; the block above it says what, and
-# which of the two pieces of work each file is for. A change there is held to a higher bar than a
-# change inside the port: smallest thing that works, and anything model-specific belongs in
-# `model/deepseek_v41/`.
-#
-# `references/` and `floorplan/` are not listed because they are gitignored and so are not in the
-# worktree at all. Read them from the main checkout — the goal gives the path.
-#
-# Scratch space: out-of-scope *untracked* files are deleted before the constraints run, but
-# gitignored ones are left alone. Anything an iteration writes for its own use must go to
-# /mnt/nvme/tmp or a gitignored path, or it will be gone by the time the verifier runs.
 scope:
   editable:
     - vllm_neuron/model/deepseek_v41/__init__.py
@@ -916,11 +843,6 @@ scope:
     - vllm_neuron/model/deepseek_v41/model.py
     - vllm_neuron/model/deepseek_v41/weight_loader.py
     - vllm_neuron/model/deepseek_v41/kernels
-    # The model's own speculative drafter. Named here, rather than the whole package being
-    # opened up, so `verifier/` and `bench/` stay out: the scope is what makes the measurement
-    # credible. It lives under the model because the drafter registry exists precisely so a
-    # drafter can sit with its model — `NeuronModelRunner` builds whatever a model registers in
-    # `vllm_neuron.vllm.spec_decode.PROPOSERS`.
     - vllm_neuron/model/deepseek_v41/drafter.py
 
     # ── The shared Neuron backend ───────────────────────────────────────────────────────────
@@ -1006,39 +928,9 @@ scope:
     # step, which bounds acceptance from above.
     - vllm_neuron/vllm/core/scheduler.py
 
-# As in the optimization loops (optimization-HCSublayerIn-long8192.yaml and friends): type only,
-# no `model:` and no `timeout_seconds:`. The per-iteration deadline comes from
-# `budget.iteration_time` below, which is the one the agent is shown a countdown against.
-#
-# This block is also what the five `kind: agent` constraints judge with — `AgentConfig.from_dict`
-# reads it and then the judge overrides only model and effort — so a run configured for a
-# different backend judges with that backend too.
 agent:
   type: claude
 
-# Optional, all of it. The loop ends when the constraints hold, so these are safety valves for
-# a run that cannot converge — not a plan. With none of them set, nothing will stop it.
-#
-# ── BUDGET THE WALL CLOCK BEFORE STARTING ───────────────────────────────────────────────────
-#
-# `sum(timeouts) + 300` is **27,300 s = 7.6 h**, so a worst-case iteration is the agent's 4 h
-# plus 7.6 h of gate — around 12 h. Three device runs dominate it, and they are three because
-# each measures something the others cannot:
-#
-#   bench            9000 s   the speed evidence. ~2-3 h in practice: four cells, and a cell
-#                             builds its own engine because `_COMPRESS_READ_CEILING` pins the
-#                             compressed read to `max_model_len`.
-#   verifier         7200 s   correctness, ~15 min warm / ~25 min cold. Generous because an
-#                             iteration that edits `model.py` re-keys every graph, and a
-#                             timeout costs the whole iteration rather than one constraint.
-#   acceptance-rate  3600 s   its own engine, with stat logging on.
-#
-# The five cheap script constraints add 2100 s of timeout and seconds of wall clock; the five
-# judges add 4500 s. If that is too much per iteration, the lever is the bench: moving `bench`,
-# `performance-targets` and `concurrency-32` into `integrate-run.yaml` — where throughput is a
-# metric being improved rather than a bar being met — takes the gate to ~4.3 h. That is a
-# deliberate trade, not a cleanup: the baseline stage would then stop checking speed at all.
-# Consider `--max-iterations 1` for the first run, to see the real cost before committing.
 budget:
   # iterations: 50      # a backstop, not a budget. Omit for unbounded.
   iteration_time: 4h   # per-iteration deadline (agent sees countdown)
