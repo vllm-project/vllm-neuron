@@ -157,10 +157,10 @@ goal: |
   - **Speed is gated here, and every speed bar currently fails.** Measured batch 1, output 128:
 
         input   ctx    TTFT p50   per 1k    TPOT p50   decode agg
-          512   768     2010 ms   4019 ms     206 ms     4.26 tok/s
+          512   768     2010 ms   4020 ms     206 ms     4.26 tok/s
          1024  1280     2584 ms   2584 ms     234 ms     3.98 tok/s
-         2048  2304     4439 ms   2219 ms     234 ms     3.76 tok/s
-         8192  8448    20182 ms   2524 ms     268 ms     2.31 tok/s
+         2048  2304     4439 ms   2220 ms     234 ms     3.76 tok/s
+         8192  8448    20182 ms   2523 ms     268 ms     2.31 tok/s
 
     Against TTFT < 1500 ms per 1k that is a 1.5-2.7x prefill improvement. The decode bar
     (> 50 tok/s aggregate) is not reachable at batch 1 at all — per-stream is ~4.9 tok/s — so it
@@ -446,7 +446,7 @@ constraints:
       cannot be confused. If the intent was per-stream, it is one flag
       (`--min-decode-tok-s`) and one line of the script.
 
-      Where this starts: every cell currently fails the TTFT bar — 4019 / 2584 / 2219 ms per 1k
+      Where this starts: every cell currently fails the TTFT bar — 4020 / 2584 / 2220 ms per 1k
       at 512 / 1024 / 2048 — so this is roughly a 1.5-2.7x prefill improvement, and the decode
       bar is unmeasured until `concurrency-32` holds. Those two are coupled on purpose: 32
       streams at today's per-stream rate is ~155 tokens/s, so the throughput bar is reachable
