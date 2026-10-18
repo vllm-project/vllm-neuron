@@ -440,6 +440,49 @@ def _acceptance(server_log: Path) -> float | None:
     return 100.0 * int(kept) / offered_n if offered_n else None
 
 
+#: vLLM's own per-interval spec-decode line, logged by `SpecDecodingLogging.log`
+#: whenever stat logging is on — which it is for a served engine. The counts are
+#: per logging interval, not cumulative, so every line is summed.
+_VLLM_SPEC_RE = re.compile(
+    r"SpecDecoding metrics:.*?Accepted: (\d+) tokens, Drafted: (\d+) tokens"
+)
+
+
+def _vllm_acceptance(server_log: Path) -> dict:
+    """This cell's acceptance rate as *vLLM* counted it, not as the port did.
+
+    `_acceptance` above reads `drafter.py`'s own running line, which is the
+    useful one to watch and the wrong one to trust: `drafter.py` is inside
+    `scope.editable`, so the loop can change the code that computes the number
+    it is judged on. vLLM's scheduler accumulates the same quantity in
+    `SpecDecodingStats.observe_draft` from the model runner's output, in code
+    this port cannot edit, and logs it as `Accepted: N tokens, Drafted: M`.
+
+    Recorded here beside the port's own figure so the two can be compared. The
+    gate that actually depends on acceptance is `verifier/check_acceptance.py`,
+    which reads these counters directly through `LLM.get_metrics()` rather than
+    scraping a log — and measures on prose, because random token ids are not
+    predictable by an n-gram drafter at any quality.
+
+    Returns zero counts rather than None when the pattern never matched, with
+    `found: False`, so "not measured" stays distinguishable from "accepted
+    nothing".
+    """
+    try:
+        text = server_log.read_text(errors="replace")
+    except OSError:
+        return {"found": False, "accepted": 0, "drafted": 0, "pct": None}
+    pairs = _VLLM_SPEC_RE.findall(text)
+    accepted = sum(int(a) for a, _ in pairs)
+    drafted = sum(int(d) for _, d in pairs)
+    return {
+        "found": bool(pairs),
+        "accepted": accepted,
+        "drafted": drafted,
+        "pct": (100.0 * accepted / drafted) if drafted else None,
+    }
+
+
 def _metrics(raw: dict) -> dict:
     """The three figures this benchmark reports, out of `vllm bench serve`.
 
@@ -598,6 +641,12 @@ def main(argv: list[str] | None = None) -> int:
                 # this server served exactly this cell, so its last line is this
                 # cell's acceptance rate and nothing else's.
                 metrics["draft_acceptance_pct"] = _acceptance(log)
+                # The same quantity from vLLM's own counters, which the port
+                # cannot edit. See `_vllm_acceptance`.
+                vllm_spec = _vllm_acceptance(log)
+                metrics["vllm_acceptance_pct"] = vllm_spec["pct"]
+                metrics["vllm_accepted_tokens"] = vllm_spec["accepted"]
+                metrics["vllm_draft_tokens"] = vllm_spec["drafted"]
             cell = {
                 "input_len": input_len,
                 "output_len": args.output_len,

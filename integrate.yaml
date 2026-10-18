@@ -31,12 +31,25 @@ goal: |
     environment.
   - drafter.py: the DSpark/MTP speculative proposer.
 
-  What's the success constraints (eight; four are scripts, four are judged by an agent):
+  What's the success constraints (fourteen; nine are scripts, five are judged by an agent):
   - The port imports and registers under the arch string vLLM dispatches on.
   - The checkpoint directory being served is complete and full-size.
   - The model configuration matches the official checkpoint: no shrinking the model to make it fit.
   - The verifier should pass: verifier will run a smoke test on the registered model and check if the
     output tokens make sense.
+  - The forward pass reads no weight from disk or host DRAM. Measured from `/proc` while the
+    verifier runs, not from the port's own log lines — see `hbm-resident-forward`.
+  - DSpark speculative acceptance >= 27%, counted by vLLM's own `vllm:spec_decode_*` counters
+    and measured on prose. Read `acceptance-rate`'s rationale before changing the bar: 27%
+    against `--dataset-name random` would be a bar on the dataset rather than on the model.
+  - TTFT < 1.5 s per 1k input tokens on every measured configuration, and aggregate decode
+    throughput > 50 tokens/s on the concurrent ones.
+  - 32 concurrent requests, really concurrent: the engine admits the batch, every request
+    finishes, and aggregate throughput is several times the batch-1 figure. A queue that
+    completes is not support for a batch.
+  - The parallelism scheme is a chosen one. The floorplan is the priority, and TP=4 x PP=16 and
+    TP=16 x PP=4 each need either a measured comparison against today's TP=64 x PP=1 or a named
+    blocker. Keeping the current scheme is a passing outcome when the evidence says so.
   - The heavy modules run as NKI kernels on the Trainium device. Two halves of one requirement: the
     computation happens on device (no reward hacking, no tricking by using the CPU execution) AND the
     modules that have an implementation under `kernels/legacy/` — sparse attention, MoE,
@@ -137,16 +150,22 @@ goal: |
     Its host facts, its memory budgets and its latencies are from a host with 1/16th the devices
     and 1/15th the host memory — see the carryover warning below.
 
-  Where this stands, and what is deliberately not a constraint here:
-  - The verifier passes at 64 ranks today, and the forward is resident: the per-forward counters
-    report `experts N/N from HBM (100%), 0 admitted, ~0.00 GiB fetched`. This stage's job is to keep
-    every constraint holding while the implementation improves — not to reach it from nothing.
-  - **Speed is not gated in this file.** `bench/` is the speed gate (`vllm bench serve
-    --dataset-name random`; input 512/1k/2k/8k, output 128, batch 1 and 10; one engine per cell,
-    every cell warmed) and it belongs to the `integrate run` stage, which has `metrics:`. A bench
-    matrix costs hours, so running it every baseline iteration would buy nothing the readback can
-    gate on. Current batch-1 figures, for context: TTFT p50 2.0 / 2.6 / 4.4 / 20.2 s and TPOT p50
-    206-268 ms, against targets of TTFT <= 8 s and >= 200 tok/s.
+  Where this stands:
+  - The first four constraints hold today: the verifier passes at 64 ranks and the forward is
+    resident (`experts N/N from HBM (100%), 0 admitted, ~0.00 GiB fetched`). The last five are
+    the work. This stage's job is to keep what holds holding while the rest comes in.
+  - **Speed is gated here, and every speed bar currently fails.** Measured batch 1, output 128:
+
+        input   ctx    TTFT p50   per 1k    TPOT p50   decode agg
+          512   768     2010 ms   4019 ms     206 ms     4.26 tok/s
+         1024  1280     2584 ms   2584 ms     234 ms     3.98 tok/s
+         2048  2304     4439 ms   2219 ms     234 ms     3.76 tok/s
+         8192  8448    20182 ms   2524 ms     268 ms     2.31 tok/s
+
+    Against TTFT < 1500 ms per 1k that is a 1.5-2.7x prefill improvement. The decode bar
+    (> 50 tok/s aggregate) is not reachable at batch 1 at all — per-stream is ~4.9 tok/s — so it
+    runs through `concurrency-32`: 32 streams at today's per-stream rate is ~155 tok/s. The two
+    are coupled, and `MAX_NUM_SEQS` is the first thing in the way of both.
   - **The bottleneck is collective count x participants plus per-graph-execution overhead — not
     FLOPs and not I/O.** Four settings carried from the single-device port cost ~11x forward time
     here before being fixed (5.9 s -> ~490 ms). When a number in this port's comments looks
@@ -158,11 +177,11 @@ goal: |
     (~100 collectives, hundreds of graph launches) is paid per *forward*, not per sequence, so batch
     1 pays the whole fixed cost for one token's work, and every batch-10 bench cell is blocked on it.
 
-  Two further pieces of work are in scope, and both reach outside this port into `vllm_neuron`'s
-  own backend. `scope.editable` names the specific files and says which is for which; read the
-  block above it before touching any of them, because that backend is shared with every other
-  model in this repository and **this repository has no test suite**, so nothing here would notice
-  if you broke one.
+  Two pieces of work reach outside this port into `vllm_neuron`'s own backend, and each has a
+  constraint of its own — `parallelism-schema` and `acceptance-rate`. `scope.editable` names the
+  specific files and says which is for which; read the block above it before touching any of
+  them, because that backend is shared with every other model in this repository and **this
+  repository has no test suite**, so nothing here would notice if you broke one.
 
   - **Pipeline parallelism.** It does not exist in the execution path today. The declaration does:
     `initialize_neuron_model_parallel` accepts a `pipeline_parallel_size` and builds vLLM's `_PP`
@@ -182,9 +201,11 @@ goal: |
     microbatch and PP's bubble is paid at `MAX_NUM_SEQS = 1` with nothing to overlap it with. If
     you build it, say what you expected it to win and what it actually won.
 
-  - **Speculative acceptance.** Measured 49% on prose, which is in line with DeepSeek V4.1 Flash
-    itself, so start by establishing there is something wrong rather than assuming it. The live
-    path is almost entirely inside this port and that is where to look first: `model.py`'s
+  - **Speculative acceptance.** The bar is 27% and the last measurement on prose was 49%, in
+    line with DeepSeek V4.1 Flash itself — so this is a constraint that should already hold, and
+    its job is to stop a change elsewhere from quietly costing the drafter its edge. Establish
+    where it actually stands before treating it as broken. The live path is almost entirely
+    inside this port and that is where to look first: `model.py`'s
     `_rejection_sample` is the acceptance rule (compiled into the forward), `_draft` and
     `forward_spec` produce the draft, and `drafter.py`'s `_report_acceptance` computes the rate.
     `drafter.py`'s own docstring records what is known: the acceptance rule is exact, but the two
@@ -277,7 +298,7 @@ constraints:
 
   # ── 4. it runs on 64 ranks, and the tokens read sensibly ───────────────────────────────
   - name: verifier
-    command: . /home/ubuntu/ds41-env.sh && export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" && mkdir -p /mnt/nvme/tmp/run && cd /mnt/nvme/tmp/run && exec /home/ubuntu/vllm-neuron/.venv/bin/python -u -m vllm_neuron.model.deepseek_v41.verifier.run_verifier --model /mnt/nvme/hf
+    command: . /home/ubuntu/ds41-env.sh && export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" && mkdir -p /mnt/nvme/tmp/run && cd /mnt/nvme/tmp/run && exec /home/ubuntu/vllm-neuron/.venv/bin/python -u -m vllm_neuron.model.deepseek_v41.verifier.io_monitor --watch /mnt/nvme/hf -- /home/ubuntu/vllm-neuron/.venv/bin/python -u -m vllm_neuron.model.deepseek_v41.verifier.run_verifier --model /mnt/nvme/hf
     timeout: 7200
     rationale: |
       The gate you described: 4 prompts (TranSonic's `short-prose` and its needle-in-a-haystack
@@ -304,7 +325,158 @@ constraints:
       compile, 64 ranks share one cache so one compiles while the rest wait, and a timeout here
       costs the whole iteration rather than just this constraint.
 
-  # ── 5-8. the four things no script here can express without becoming gameable ──────────
+      It runs under `verifier/io_monitor.py`, which is transparent — it execs the verifier,
+      passes its exit code through, and writes `verifier/io_trace.json` as a side effect. That
+      trace is what `hbm-resident-forward` below reads, so the residency measurement costs no
+      second device run. If that wrapper is ever dropped from this command, the residency
+      constraint fails for want of evidence rather than passing quietly.
+
+  # ── 5. the forward read no weight from disk, measured by the kernel ────────────────────
+  - name: hbm-resident-forward
+    command: PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" /home/ubuntu/vllm-neuron/.venv/bin/python -m vllm_neuron.model.deepseek_v41.verifier.check_hbm_resident
+    timeout: 300
+    rationale: |
+      "The LLM forward pass should not access disk or Host DRAM for weights", made mechanical
+      and measured from outside the process.
+
+      The port already claims this: the loader logs `Weights are RESIDENT: the forward path
+      reads no file.` and the per-forward counters report `0 admitted, ~0.00 GiB fetched`. Both
+      lines come from `weight_loader.py` and `model.py`, which are in `scope.editable` — so a
+      gate that reads them is a gate on a string the loop can write. This reads `/proc`
+      instead: open descriptors on the checkpoint, file-backed mappings, `read_bytes` from the
+      block device, and fault counts, sampled across all 64 worker processes while the verifier
+      runs.
+
+      Two bars, both from the kernel. No checkpoint descriptor may be open after the first 40%
+      of the run (load is ~62 s of a run that is minutes long, so that is a ~4x margin), and
+      block-device reads over the second half must stay under 256 MiB — against ~13 GiB a rank
+      a forward if weights were streamed, a ~50x margin meant to tolerate logging and imports
+      rather than to leave room for a weight.
+
+      Verified against both outcomes before being trusted: a synthetic command that reads a
+      shard late is caught and named (`model-00001-of-00048.safetensors@1048576`), one that
+      reads only at the start passes, and a missing trace fails rather than passing vacuously.
+      That test also showed why the descriptor bar is the primary one — the late read scored
+      0 MiB of `read_bytes`, because the page cache served it.
+
+      What it does not close, and the reason the agent constraint still carries this question:
+      a shard left mmap'd whose pages are already cached would be read by *minor* faults — no
+      descriptor, no block I/O, but host DRAM all the same. Minor faults are far too noisy to
+      gate on, so they are reported, as is the list of checkpoint files still mapped at the
+      end. `check_hbm_resident.py`'s docstring says this plainly instead of overclaiming.
+
+  # ── 6. speculation is worth having, counted by vLLM rather than by the port ────────────
+  - name: acceptance-rate
+    command: . /home/ubuntu/ds41-env.sh && export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" && mkdir -p /mnt/nvme/tmp/run && cd /mnt/nvme/tmp/run && exec /home/ubuntu/vllm-neuron/.venv/bin/python -u -m vllm_neuron.model.deepseek_v41.verifier.check_acceptance --model /mnt/nvme/hf --min-acceptance-pct 27
+    timeout: 3600
+    rationale: |
+      DSpark acceptance >= 27%, where the 27% is a constant on this command line and nowhere
+      else, so moving the bar is a config change rather than a code change.
+
+      **The number comes from vLLM, not from the port.** `drafter.py`'s `_report_acceptance`
+      logs a running rate and the bench reads it; `drafter.py` is editable, so that figure
+      cannot be the gate. This reads `vllm:spec_decode_num_draft_tokens` and
+      `vllm:spec_decode_num_accepted_tokens` through `LLM.get_metrics()`. vLLM's scheduler
+      accumulates them in `update_from_output` from the model runner's output, and
+      `NeuronScheduler` subclasses that scheduler and calls `super()`, which is what makes them
+      available on this backend. Checked against four real server logs: the two sources agree
+      to a few tenths of a point today (13.0 vs 12.9, 13.2 vs 13.5, 16.8 vs 16.8), which is
+      evidence the port's own counter is honest *now* and not a reason to keep depending on it.
+      `num_accepted_tokens_per_pos` is reported too, because a drafter that only ever lands its
+      first token is a different problem from one that lands a short run.
+
+      **Measured on prose, deliberately.** The input is the verifier's own four cases. This is
+      the one judgement call in the constraint and it is worth stating, because it is the
+      difference between a bar that can be met and one that cannot: acceptance is a statement
+      about how predictable the text is, and `vllm bench serve --dataset-name random` feeds
+      random token *ids*, which an n-gram/Markov drafter cannot predict even in principle.
+      Measured on this port: 49% on prose against 16-18% on random. A 27% bar against random
+      data would be a bar on the dataset, unreachable by any change to the model — so the bench
+      keeps recording its per-cell rate (now from vLLM's counters as well as the port's) and
+      that figure is not a pass/fail line. If the intent was 27% on random input too, say so
+      and this splits into two constraints; it is not a thing to leave implicit.
+
+      Its own engine, which is why it is a separate device run rather than folded into the
+      verifier: measuring acceptance needs stat logging on and ~96 tokens a case, and the
+      correctness gate is not to be modified for the convenience of a different measurement.
+
+  # ── 7. the speed evidence. the two constraints after this one read its report ──────────
+  - name: bench
+    command: . /home/ubuntu/ds41-env.sh && export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" && mkdir -p /mnt/nvme/tmp/run && cd /mnt/nvme/tmp/run && exec /home/ubuntu/vllm-neuron/.venv/bin/python -u -m vllm_neuron.model.deepseek_v41.bench.run_bench --model /mnt/nvme/hf --input-lens 1024,2048 --batch-sizes 1,32
+    timeout: 9000
+    rationale: |
+      Infrastructure, not a bar of its own: it runs the matrix and writes
+      `bench/bench_report.json`, and `performance-targets` and `concurrency-32` are the rules
+      applied to it. It passes when every requested cell produced figures, which is a real
+      condition — a cell that dies measures nothing, and the two constraints after it then fail
+      for want of evidence rather than passing vacuously.
+
+      **A reduced matrix, on purpose.** Four cells — input 1024 and 2048, batch 1 and 32 —
+      against the 8-cell matrix `bench/README.md` describes. Each cell builds its own engine
+      (`_COMPRESS_READ_CEILING` pins the compressed-KV read to `max_model_len`, so sharing one
+      context measures the largest input rather than each one), so cells are the expensive unit
+      and this is the smallest set that can answer both questions: two input lengths an octave
+      apart test that the per-1k TTFT bar means the same thing at both, and batch 1 beside batch
+      32 at a shared input length is what distinguishes real batching from a queue. The full
+      matrix, including 8k, belongs to `integrate-run.yaml`, where throughput is a metric being
+      improved rather than a bar being met.
+
+      This is the dominant term in the gate's wall clock. See the note on `budget` below.
+
+  # ── 8. the latency and throughput bars ────────────────────────────────────────────────
+  - name: performance-targets
+    command: PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" /home/ubuntu/vllm-neuron/.venv/bin/python -m vllm_neuron.model.deepseek_v41.verifier.check_targets --check latency
+    timeout: 300
+    rationale: |
+      TTFT < 1.5 s per 1k input tokens, and decode > 50 tokens/s. Reads the bench report, so it
+      costs seconds and fails on its own terms rather than inside the bench run.
+
+      The two bars are read differently and the asymmetry is deliberate. TTFT is applied to
+      **every** measured cell, because latency is a per-sample property and a configuration
+      that misses it is one a user would experience as slow whatever the others do; normalising
+      by input length is what lets one bar mean the same thing at 1024 and 8192 tokens.
+
+      Decode is applied to the **concurrent** cells, aggregate. `decode_tok_s` is
+      `vllm bench serve`'s `output_throughput` — output tokens per second over everything in
+      flight, which is the figure a serving deployment is rated by. Per-stream decode here is
+      ~4.9 tokens/s (TPOT ~206 ms), so 50 tokens/s at batch 1 would need a 10x single-stream
+      win; at batch 32 it needs batching to work at all. Gating batch 1 on it would be gating
+      something arithmetic forbids, so that figure is reported and the bar is applied where
+      throughput is actually won. `per_stream_tok_s` is printed beside it so the two views
+      cannot be confused. If the intent was per-stream, it is one flag
+      (`--min-decode-tok-s`) and one line of the script.
+
+      Where this starts: every cell currently fails the TTFT bar — 4019 / 2584 / 2219 ms per 1k
+      at 512 / 1024 / 2048 — so this is roughly a 1.5-2.7x prefill improvement, and the decode
+      bar is unmeasured until `concurrency-32` holds. Those two are coupled on purpose: 32
+      streams at today's per-stream rate is ~155 tokens/s, so the throughput bar is reachable
+      through concurrency and probably not without it.
+
+  # ── 9. 32 concurrent requests, really concurrent, and the run ends ────────────────────
+  - name: concurrency-32
+    command: PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" /home/ubuntu/vllm-neuron/.venv/bin/python -m vllm_neuron.model.deepseek_v41.verifier.check_targets --check concurrency --target-batch 32
+    timeout: 300
+    rationale: |
+      Three separate things, because the failure this is written against passed two of them. A
+      batch-10 cell measured here reported plausible numbers while the engine had clamped itself
+      to `max_num_seqs 10 -> 1`: the requests completed, the latencies were real, and what was
+      measured was a queue. TTFT p50 was 234 s with a p99/p50 ratio of 1.1 and throughput equal
+      to batch 1 — which reads as "slow" rather than "wrong" unless you know to look.
+
+      So: the engine admitted the batch (`engine_max_num_seqs >= 32`, not clamped), every
+      request finished (`completed == num_prompts` — no hang, no stall, the server exited
+      rather than being killed), and aggregate throughput is at least 4x the batch-1 figure at
+      the same input length. The last is the one that separates batching from serialisation:
+      32 requests served one after another give the *same* aggregate throughput as batch 1, so
+      a serialised cell scores ~1.0x. 4x is far below the ideal 32x on purpose — speculation,
+      the scheduler and the shared prefill all take their cut, and the question here is which
+      of the two regimes this is, not whether it is perfectly parallel.
+
+      `config.MAX_NUM_SEQS` is the knob and it is 1 today, with the stall evidence recorded
+      beside it. This constraint is therefore expected to fail at the start, and it is the one
+      whose fix unblocks `performance-targets`' decode bar as well.
+
+  # ── 10-14. the five things no script here can express without becoming gameable ───────
 
   - name: nki-kernels-on-device
     kind: agent
@@ -621,6 +793,99 @@ constraints:
 
       Weight *loading* at startup reads the checkpoint and is not a failure — that is the one
       exception. The forward is what must fetch nothing.
+
+      Half (b) now has a script behind it: `hbm-resident-forward` measures the same thing from
+      `/proc` while the verifier runs, which a model cannot reach. Read its output and do not
+      duplicate it. Your half of (b) is the part it says it cannot close: a shard left mmap'd
+      whose pages are already in the page cache would be read by minor faults — no descriptor,
+      no block I/O, and host DRAM all the same. The trace lists the checkpoint files still
+      mapped at the end of the run; if any are, follow the code and say whether the forward
+      touches them.
+    model: claude-sonnet-5
+    effort: medium
+    timeout: 900
+
+  - name: parallelism-schema
+    kind: agent
+    rationale: |
+      The floorplan was written for exactly this 16-device target and the bootstrap deliberately
+      ignored it: it took the simplest scheme that fit — flat `TENSOR_PARALLEL_SIZE = 64`, no
+      pipeline stages — on the understanding that the placement study would come back later.
+      This is later. `floorplan/systems/trn2-16device.yaml` is this host, `floorplan/schemes/`
+      holds the candidates and `floorplan/reports/` the simulator's view of them.
+
+      Two specific factorizations are named because they are the ones worth settling, and both
+      keep the whole world: TP=4 x PP=16 and TP=16 x PP=4 against today's TP=64 x PP=1. Note
+      what changes and what does not. Per-rank weight footprint is unchanged in all three —
+      PP divides layers, TP divides within a layer, so 384 experts x 41 layers / 64 ranks is
+      246 expert slots a rank however the 64 is factored. What changes is the collective: this
+      model's bottleneck is collective count x participants plus per-graph-execution overhead,
+      and a 4-way all-reduce has a quarter the participants of a 16-way one. Against that, a
+      stage boundary adds a serialized activation transfer per microbatch, and PP's bubble is
+      unhidden at `MAX_NUM_SEQS = 1` because there is nothing to overlap it with — which is why
+      this and `concurrency-32` are likely to have to move together.
+
+      **PP does not exist in the execution path yet.** There is no `IntermediateTensors`
+      anywhere in `vllm_neuron`, so there is no activation transfer to schedule; the files to
+      build it in are in `scope.editable` and the goal says what is missing. So a FAIL here is
+      expected at the start, and "we could not measure PP because it is not implemented" is a
+      legitimate state to be in — once. It stops being legitimate when it is the same sentence
+      two iterations running with nothing built in between.
+    prompt: |
+      Decide whether this iteration's parallelism scheme is a chosen one or an inherited one.
+
+      Read the floorplan first — it is the stated priority and it is **not in your worktree**
+      (gitignored), so read it at
+      `/home/ubuntu/vllm-neuron/vllm_neuron/model/deepseek_v41/floorplan/`: `README.md`,
+      `MODEL.md`, `PLATFORM.md`, `systems/trn2-16device.yaml`, `schemes/` and `reports/`. Say
+      which scheme the port currently implements, whether the floorplan contains it or
+      something else, and where they differ. An iteration that never opened the floorplan has
+      not followed the priority, whatever else it did.
+
+      Then establish what happened to the two named candidates, TP=4 x PP=16 and TP=16 x PP=4,
+      against the current TP=64 x PP=1. For each, exactly one of these has to be true and
+      cited:
+        - it was **measured** this iteration: say which configuration ran, and give the figures
+          it produced beside the current scheme's — TTFT, TPOT, aggregate decode, and whether
+          the verifier still passed. A scheme that is faster and wrong is not better.
+        - it was **blocked**, by something specific you can name in the code. "Pipeline
+          parallelism has no activation transport: there is no `IntermediateTensors` in
+          `vllm_neuron` and `NeuronDeviceCommunicator` implements no send/recv" is such a
+          reason. "We did not get to it" is not.
+
+      Then decide whether the right scheme is in place. Adopting a candidate requires that it
+      measured better; keeping the current one requires that the candidates measured worse or
+      were blocked. Both are passing outcomes. What is not passing is a scheme that is still
+      flat TP=64 because nobody looked.
+
+      Things that would make this FAIL — look for each specifically:
+        - the floorplan was not read, or was read and contradicted without the contradiction
+          being argued;
+        - a factorization that does not multiply to the world size (TP x PP must be 64, or the
+          world size must change deliberately and be stated);
+        - a candidate declared better on reasoning alone, with no run behind it;
+        - a candidate declared worse on reasoning alone, where a run was possible;
+        - a configuration that was measured but whose verifier run was skipped or failed, so
+          the comparison is between a working scheme and an unverified one;
+        - the same blocker reported as last iteration with no work done on it in between —
+          check the iteration notes and `git log`;
+        - a change to `TENSOR_PARALLEL_SIZE` or `ATTENTION_TENSOR_PARALLEL_SIZE` whose effect on
+          `o_groups` was not thought through: `n_local_groups = o_groups // tp` reaches 0 above
+          8, which is why attention is capped there and replicated.
+    criteria: |
+      PASS if the floorplan was consulted and cited, AND each of TP=4 x PP=16 and TP=16 x PP=4
+      has either a measured comparison or a specific named blocker, AND the scheme now in place
+      is the best of those that could be measured — which may well be the current TP=64 x PP=1.
+      Keeping the current scheme is a pass when the evidence supports it; say so explicitly and
+      give the numbers.
+      FAIL if the floorplan was not read, if a candidate was dismissed or adopted without
+      evidence, if a measured candidate's verifier run did not pass, if the factorization does
+      not account for all 64 ranks, or if the evidence does not let you tell.
+
+      A FAIL is expected while pipeline parallelism is being built — there is nothing to
+      measure until there is a PP implementation. Say plainly which of the two candidates is
+      blocked on what, and what was built toward it this iteration, so the next one continues
+      rather than restating.
     model: claude-sonnet-5
     effort: medium
     timeout: 900
@@ -745,7 +1010,7 @@ scope:
 # no `model:` and no `timeout_seconds:`. The per-iteration deadline comes from
 # `budget.iteration_time` below, which is the one the agent is shown a countdown against.
 #
-# This block is also what the four `kind: agent` constraints judge with — `AgentConfig.from_dict`
+# This block is also what the five `kind: agent` constraints judge with — `AgentConfig.from_dict`
 # reads it and then the judge overrides only model and effort — so a run configured for a
 # different backend judges with that backend too.
 agent:
@@ -754,9 +1019,26 @@ agent:
 # Optional, all of it. The loop ends when the constraints hold, so these are safety valves for
 # a run that cannot converge — not a plan. With none of them set, nothing will stop it.
 #
-# Budget the wall clock before starting: the gate alone can take sum(timeouts) = 3.6 h, almost
-# all of it the verifier, so an iteration here is the agent's 4 h plus up to 3.6 h of gate. That
-# is the cost of a device run on 64 ranks, not overhead to trim.
+# ── BUDGET THE WALL CLOCK BEFORE STARTING ───────────────────────────────────────────────────
+#
+# `sum(timeouts) + 300` is **27,300 s = 7.6 h**, so a worst-case iteration is the agent's 4 h
+# plus 7.6 h of gate — around 12 h. Three device runs dominate it, and they are three because
+# each measures something the others cannot:
+#
+#   bench            9000 s   the speed evidence. ~2-3 h in practice: four cells, and a cell
+#                             builds its own engine because `_COMPRESS_READ_CEILING` pins the
+#                             compressed read to `max_model_len`.
+#   verifier         7200 s   correctness, ~15 min warm / ~25 min cold. Generous because an
+#                             iteration that edits `model.py` re-keys every graph, and a
+#                             timeout costs the whole iteration rather than one constraint.
+#   acceptance-rate  3600 s   its own engine, with stat logging on.
+#
+# The five cheap script constraints add 2100 s of timeout and seconds of wall clock; the five
+# judges add 4500 s. If that is too much per iteration, the lever is the bench: moving `bench`,
+# `performance-targets` and `concurrency-32` into `integrate-run.yaml` — where throughput is a
+# metric being improved rather than a bar being met — takes the gate to ~4.3 h. That is a
+# deliberate trade, not a cleanup: the baseline stage would then stop checking speed at all.
+# Consider `--max-iterations 1` for the first run, to see the real cost before committing.
 budget:
   # iterations: 50      # a backstop, not a budget. Omit for unbounded.
   iteration_time: 4h   # per-iteration deadline (agent sees countdown)
