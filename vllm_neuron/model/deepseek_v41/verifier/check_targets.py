@@ -137,12 +137,18 @@ def _check_latency(report: dict, args) -> list[str]:
             "An unmeasured configuration is not a passing one."
         )
 
-    print("  cell          input    TTFT p50   per 1k      TPOT p50   decode  per-stream")
+    print("  cell          meas-in  TTFT p50   per 1k      TPOT p50   decode  per-stream")
     print("  " + "-" * 74)
     for cell in sorted(cells, key=lambda c: (c["input_len"], c["batch"])):
         m = cell["metrics"]
         ttft = m.get("ttft_p50_ms")
-        per_1k = (ttft / (cell["input_len"] / 1024.0)) if ttft else None
+        # The *measured* input length, not the cell's nominal one. The matrix is
+        # built from sonnet, which reaches a target length by picking whole
+        # verse lines, so a "1024" cell lands near 1024 rather than on it.
+        # Normalising by the name would quietly credit or penalise the port for
+        # the dataset's rounding.
+        n_in = m.get("mean_input_tokens") or cell.get("input_len")
+        per_1k = (ttft / (n_in / 1024.0)) if ttft and n_in else None
         decode = m.get("decode_tok_s")
         stream = m.get("per_stream_tok_s")
         tpot = m.get("tpot_p50_ms")
@@ -152,14 +158,14 @@ def _check_latency(report: dict, args) -> list[str]:
         tpot_s = f"{tpot:.0f} ms" if tpot else "-"
         decode_s = f"{decode:.1f}" if decode else "-"
         stream_s = f"{stream:.1f}" if stream else "-"
-        print(f"  {_label(cell):<13} {cell['input_len']:>5}   {ttft_s:>9}   "
+        print(f"  {_label(cell):<13} {n_in or 0:>5.0f}   {ttft_s:>9}   "
               f"{per_1k_s:>7}{over:<5}   {tpot_s:>9}  {decode_s:>7}  {stream_s:>10}")
         if per_1k is None:
             problems.append(f"cell {_label(cell)} reported no TTFT.")
         elif per_1k > args.ttft_ms_per_1k:
             problems.append(
-                f"cell {_label(cell)}: TTFT {ttft:.0f} ms over {cell['input_len']} input "
-                f"tokens is {per_1k:.0f} ms per 1k, above the "
+                f"cell {_label(cell)}: TTFT {ttft:.0f} ms over {n_in:.0f} measured "
+                f"input tokens is {per_1k:.0f} ms per 1k, above the "
                 f"{args.ttft_ms_per_1k:.0f} ms bar."
             )
         if per_1k is not None:
@@ -191,23 +197,60 @@ def _check_latency(report: dict, args) -> list[str]:
 
 
 def _check_concurrency(report: dict, args) -> list[str]:
+    """That the deployment supports `--target-batch` concurrent requests.
+
+    **Supporting 32 is not the same as benchmarking 32**, and this checks the
+    former. Two separate claims:
+
+      1. the deployment is *configured* to admit that many — `config.MAX_NUM_SEQS
+         >= target`, read from the port rather than from a bench cell;
+      2. concurrency *works at all* — the batch>1 cells the matrix does measure
+         really batch, rather than serialising behind a clamp.
+
+    (2) is the load-bearing half, because a configured ceiling proves nothing on
+    its own: a port that declares 32 and then clamps every engine to 1 would
+    pass (1) and serve a queue. The discriminator is aggregate throughput
+    against the batch-1 cell at the same input length -- serialised requests
+    give the same aggregate as batch 1, so they score ~1.0x.
+
+    This deliberately does not require a batch-32 cell. Each cell builds its own
+    engine, so adding one costs an engine build per iteration to measure a
+    number the batch-10 cell already answers in kind.
+    """
     problems: list[str] = []
     target = args.target_batch
     all_cells = [c for c in (report.get("cells") or [])
                  if c.get("dataset") != "prose"]
-    at_target = [c for c in all_cells if c["batch"] == target]
 
-    if not at_target:
-        return [
-            f"the bench report has no cell at batch {target}, so the concurrency this "
-            f"constraint is about was never exercised. Run the bench with "
-            f"`--batch-sizes 1,{target}`."
+    # (1) is the deployment allowed to admit `target` sequences?
+    try:
+        from ..config import MAX_NUM_SEQS
+    except Exception as exc:  # noqa: BLE001 - reported, not raised
+        problems.append(f"could not read `config.MAX_NUM_SEQS`: {exc!r}")
+        MAX_NUM_SEQS = None
+    if MAX_NUM_SEQS is not None:
+        print(f"  config.MAX_NUM_SEQS = {MAX_NUM_SEQS} (needs >= {target})")
+        print(f"##autohelix[max_num_seqs={MAX_NUM_SEQS}]")
+        if MAX_NUM_SEQS < target:
+            problems.append(
+                f"`config.MAX_NUM_SEQS` is {MAX_NUM_SEQS}, below the {target} this "
+                "deployment has to support. That is the knob, and the evidence for why "
+                "it is where it is sits beside it."
+            )
+
+    # (2) does concurrency work at all, on the batches the matrix measures?
+    concurrent = [c for c in all_cells if c["batch"] > 1]
+    if not concurrent:
+        return problems + [
+            "the bench report has no cell above batch 1, so whether concurrency works at "
+            "all was never measured. The matrix needs a batch>1 cell beside a batch-1 one "
+            "at the same input length."
         ]
 
     baselines = {c["input_len"]: c for c in all_cells
                  if c["batch"] == 1 and c.get("metrics")}
 
-    for cell in sorted(at_target, key=lambda c: c["input_len"]):
+    for cell in sorted(concurrent, key=lambda c: c["input_len"]):
         label = _label(cell)
         metrics = cell.get("metrics")
         served = cell.get("engine_max_num_seqs")
@@ -216,9 +259,9 @@ def _check_concurrency(report: dict, args) -> list[str]:
         if cell.get("concurrency_capped"):
             problems.append(
                 f"cell {label}: the engine clamped itself to max_num_seqs={served} after "
-                f"being asked for {target}. Whatever it measured, it was not {target} "
-                "concurrent sequences — `config.MAX_NUM_SEQS` is the knob, and the stall "
-                "recorded beside it is why it is where it is."
+                f"being asked for {cell['batch']}. Whatever it measured, it was not "
+                f"{cell['batch']} concurrent sequences — so this says nothing about "
+                f"supporting {target}."
             )
             continue
 

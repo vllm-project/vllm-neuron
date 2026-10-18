@@ -68,6 +68,51 @@ DEFAULT_OUTPUT_LEN = 128
 #: at ~1.5 accepted a step is ~250 draft decisions.
 DEFAULT_PROSE_OUTPUT_LEN = 96
 
+#: Seconds of total silence from the engine before it is killed. A healthy
+#: 64-rank forward writes a line every ~380 ms, and the quietest legitimate
+#: stretch is a cold graph compile, measured at up to ~20 min on this port --
+#: hence 25 min rather than something tighter.
+DEFAULT_STALL_TIMEOUT = 1500
+
+#: Shakespeare's sonnets, 2155 verse lines, built from Project Gutenberg #1041.
+#: `sonnet.txt` does not ship with vLLM, so it has to be supplied.
+DEFAULT_SONNET_PATH = "/mnt/nvme/datasets/sonnet.txt"
+
+#: Slack over the time the performance targets imply a cell should take. 3x,
+#: because a cell that is merely 3x slower than target is a failing measurement
+#: worth having, and one that is 10x slower is a wedge worth killing.
+CELL_TIMEOUT_SLACK = 3.0
+
+#: Floor for a derived cell timeout: an engine build plus a cold compile has to
+#: fit under it even for the smallest cell.
+CELL_TIMEOUT_FLOOR = 1800
+
+
+def _cell_timeout(args, batch: int, output_len: int) -> int:
+    """How long one cell gets, derived from the performance targets.
+
+    A flat timeout is wrong in both directions: too tight for an 8k prefill at
+    batch 10, too loose for 512 at batch 1 -- where it means a wedge sits for
+    the full budget. So the budget is what the targets say the work should cost.
+
+    `--bench-timeout` overrides it, for when a cell needs a number rather than
+    a derivation.
+    """
+    if args.bench_timeout:
+        return args.bench_timeout
+    # Requests run `batch` at a time, so `ceil(n / batch)` rounds deep. Each
+    # round costs one TTFT plus `output_len` tokens at the target TPOT.
+    rounds = -(-(args.num_prompts or _num_prompts(batch)) // batch)
+    per_round = TARGET_TTFT_S + output_len * TARGET_TPOT_S
+    return int(max(CELL_TIMEOUT_FLOOR, CELL_TIMEOUT_SLACK * rounds * per_round))
+
+
+#: The bars `verifier/check_targets.py` applies, restated here only to size the
+#: timeouts. TTFT is the 1.5 s-per-1k bar at the longest input in the matrix;
+#: TPOT is 1/50 s, the aggregate decode bar taken per stream as an upper bound.
+TARGET_TTFT_S = 12.0
+TARGET_TPOT_S = 0.25
+
 #: `--served-model-name`, and what every client here asks for.
 SERVED_NAME = "deepseek-v41-flash"
 
@@ -137,8 +182,28 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--bench-timeout",
         type=int,
-        default=7200,
-        help="seconds for one cell",
+        default=0,
+        help="seconds for one cell. 0 (default) derives it from the performance targets "
+             "per cell — see `_cell_timeout`. A flat number is wrong in both directions: "
+             "too tight for an 8k prefill at batch 10, and too loose at 512 x 1, where it "
+             "means a wedged engine sits for the whole budget.",
+    )
+    p.add_argument(
+        "--prose-dataset", default="sharegpt", choices=("sharegpt", "verifier"),
+        help="text for the acceptance probe. sharegpt is real dialogue; verifier falls "
+             "back to the correctness gate's own four cases.",
+    )
+    p.add_argument(
+        "--dataset-path", default=DEFAULT_SONNET_PATH,
+        help="the sonnet text the matrix is built from. Plain lines of English; "
+             "`SonnetDataset` does `readlines()` and samples them.",
+    )
+    p.add_argument(
+        "--stall-timeout", type=int, default=DEFAULT_STALL_TIMEOUT,
+        help="kill the engine when it has written nothing for this many seconds. The "
+             "safeguard against a wedged collective: catching it in minutes beats waiting "
+             "out the cell timeout, because the longer 64 ranks sit wedged the likelier a "
+             "host reboot is needed to clear them. 0 disables.",
     )
     p.add_argument(
         "--prose-output-len", type=int, default=DEFAULT_PROSE_OUTPUT_LEN,
@@ -217,11 +282,30 @@ def _serve(
           f"(max_model_len={max_model_len}, max_num_seqs={max_num_seqs})")
     print(f"bench:   {' '.join(cmd)}")
     handle = log.open("w")
+    def _child_setup() -> None:
+        # Two things, and they pull in opposite directions.
+        #
+        # `setsid` gives the server its own process group so `_stop` can take
+        # the 64 workers down together instead of orphaning them. But it also
+        # puts the server OUTSIDE the bench's group -- so when the harness
+        # times a constraint out and kills the bench's process group, the
+        # server survives holding all 64 cores. That is the orphan that has
+        # forced a host reboot here more than once.
+        #
+        # `PR_SET_PDEATHSIG` closes it: the kernel SIGKILLs this process the
+        # moment its parent dies, however the parent died. So the server is
+        # independently killable AND cannot outlive the bench.
+        import ctypes
+
+        os.setsid()
+        PR_SET_PDEATHSIG = 1
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(
+            PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0
+        )
+
     return subprocess.Popen(
         cmd, stdout=handle, stderr=subprocess.STDOUT,
-        # Its own process group, so tearing it down takes the 64 workers with
-        # it rather than orphaning them on the devices.
-        start_new_session=True,
+        preexec_fn=_child_setup,  # noqa: PLW1509 - deliberate, see above
     )
 
 
@@ -276,19 +360,44 @@ def _stop(proc: subprocess.Popen) -> None:
 WARMUP_OUTPUT_LEN = 8
 
 
-def _random_flags(input_len: int) -> callable:
-    """`vllm bench serve` flags for a random-token cell of a given input length.
+def _sonnet_flags(input_len: int, dataset_path: str) -> callable:
+    """`vllm bench serve` flags for a cell of real English at a target length.
 
     Returns a callable taking the output length, because the warm-up and the
     measurement of one cell differ only in that.
+
+    **Why sonnet rather than random.** `--dataset-name random` feeds random
+    token *ids*, and that is not a neutral choice for this model: a drafter
+    predicts the next token, there is nothing to predict in noise, and DSpark's
+    n-gram/Markov head leans on real language statistics hardest of all.
+    Measured on this port, acceptance is 11-15% on random against 41% on prose
+    -- and since a decode step emits `1 + accepted` tokens, every throughput
+    figure measured on random is a lower bound rather than the real number.
+
+    `sonnet` is the only dataset in `vllm bench` that gives real text *and* a
+    target input length; every other prose option (sharegpt, spec_bench, hf)
+    takes whatever length the source happens to be.
+
+    Two things to know about it:
+
+      - **the length is approximate.** It picks whole verse lines until it
+        reaches the target (`num_input_lines = round((input_len - base_offset) /
+        avg_len)`), so a "1024" cell lands near 1024, not on it. That is why the
+        report records `mean_input_tokens` from the run's own
+        `total_input_tokens`, and why `check_targets` normalises TTFT by the
+        measured length rather than the nominal one.
+      - **`--sonnet-prefix-len 0`, deliberately.** The default is 200, which
+        gives every request in a cell the same 200-token opening -- and a
+        drafter seeing the same text repeatedly would post an acceptance rate
+        that says more about the prefix than the model.
     """
     def build(output_len: int) -> list[str]:
         return [
-            "--dataset-name", "random",
-            "--random-input-len", str(input_len),
-            "--random-output-len", str(output_len),
-            # Exact lengths, not a range: the cell is named for its shape.
-            "--random-range-ratio", "0",
+            "--dataset-name", "sonnet",
+            "--dataset-path", dataset_path,
+            "--sonnet-input-len", str(input_len),
+            "--sonnet-output-len", str(output_len),
+            "--sonnet-prefix-len", "0",
         ]
     return build
 
@@ -330,7 +439,66 @@ def _scrape_spec_counters(port: int) -> dict[str, float]:
     return out
 
 
-def _prose_probe(model: str, port: int, output_len: int, timeout: int) -> dict:
+#: ShareGPT conversations, for the acceptance probe. Real dialogue rather than
+#: Shakespeare: the matrix is sonnet because only sonnet can hit a target input
+#: length, but acceptance has no length constraint, so it can use the most
+#: representative text available.
+DEFAULT_SHAREGPT_PATH = "/mnt/nvme/sharegpt/ShareGPT_V3_unfiltered_cleaned_split.json"
+
+#: Conversations the probe sends. Enough decode steps for the rate to mean
+#: something, few enough that the probe stays a tail on an existing cell.
+PROSE_PROMPTS = 6
+
+
+def _prose_prompts(model: str, dataset: str) -> list[tuple[str, str, int]]:
+    """Prompts for the acceptance probe, as `(id, text, n_tokens)`.
+
+    `sharegpt` takes the first human turn of each conversation -- real dialogue,
+    which is what the drafter will actually see in service. Falls back to the
+    verifier's own cases when the ShareGPT file is absent, so the probe degrades
+    to something rather than nothing; which was used is recorded in the report.
+
+    The prompts are sent raw, with no chat template applied, because they go to
+    `/v1/completions`. Templating here and again at the server would change the
+    tokens the drafter sees.
+    """
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+
+    if dataset == "sharegpt" and Path(DEFAULT_SHAREGPT_PATH).is_file():
+        raw = json.loads(Path(DEFAULT_SHAREGPT_PATH).read_text())
+        out: list[tuple[str, str, int]] = []
+        for conv in raw:
+            turns = conv.get("conversations") or []
+            if not turns or turns[0].get("from") != "human":
+                continue
+            text = (turns[0].get("value") or "").strip()
+            n = len(tok(text).input_ids)
+            # Long enough that the drafter has context, short enough to fit any
+            # cell's engine.
+            if not (64 <= n <= 1024):
+                continue
+            out.append((f"sharegpt-{conv.get('id', len(out))}", text, n))
+            if len(out) >= PROSE_PROMPTS:
+                return out
+        if out:
+            return out
+        print("bench:   no usable ShareGPT conversation found; falling back to the "
+              "verifier's cases", file=sys.stderr)
+
+    from ..verifier import prompts as vp
+    from ..verifier.run_verifier import CHAT_TEMPLATE
+
+    case_set = vp.build_cases()
+    rendered, notes = vp.render(case_set, model, CHAT_TEMPLATE)
+    for note in notes:
+        print(f"bench:   {note}")
+    return [(c.id, text, n) for c, (text, n) in zip(case_set.cases, rendered)]
+
+
+def _prose_probe(model: str, port: int, output_len: int, timeout: int,
+                 dataset: str = "sharegpt") -> dict:
     """Measure speculative acceptance on real prose, on a server already up.
 
     **Why this is a probe and not a cell.** Acceptance is the one figure the
@@ -359,18 +527,11 @@ def _prose_probe(model: str, port: int, output_len: int, timeout: int) -> dict:
     Only prompts that fit the server's context are sent, and which ones is
     recorded: a 2008-token needle has nothing to do with a 768-token engine.
     """
-    from ..verifier import prompts
-    from ..verifier.run_verifier import CHAT_TEMPLATE
-
-    case_set = prompts.build_cases()
-    rendered, notes = prompts.render(case_set, model, CHAT_TEMPLATE)
-    for note in notes:
-        print(f"bench:   {note}")
-
+    pairs = _prose_prompts(model, dataset)
     before = _scrape_spec_counters(port)
     sent: list[str] = []
     generated = 0
-    for case, (text, n_tok) in zip(case_set.cases, rendered):
+    for case_id, text, n_tok in pairs:
         payload = json.dumps({
             "model": SERVED_NAME,
             "prompt": text,
@@ -391,10 +552,10 @@ def _prose_probe(model: str, port: int, output_len: int, timeout: int) -> dict:
                 TimeoutError) as exc:
             # A prompt longer than the engine's context is the expected
             # rejection here, not a bug: say which and carry on.
-            print(f"bench:   prose prompt {case.id} ({n_tok} tok) rejected: {exc}",
+            print(f"bench:   prose prompt {case_id} ({n_tok} tok) rejected: {exc}",
                   file=sys.stderr)
             continue
-        sent.append(case.id)
+        sent.append(case_id)
         generated += (body.get("usage") or {}).get("completion_tokens") or 0
 
     after = _scrape_spec_counters(port)
@@ -403,6 +564,7 @@ def _prose_probe(model: str, port: int, output_len: int, timeout: int) -> dict:
     drafts = int(after["num_drafts"] - before["num_drafts"])
     return {
         "cases": sent,
+        "dataset": dataset,
         "output_len": output_len,
         "tokens_generated": generated,
         "source": "vllm:spec_decode_* /metrics delta around the prose requests",
@@ -417,6 +579,7 @@ def _bench_serve(
     model: str, port: int, dataset_flags: list[str], batch: int,
     num_prompts: int, result_dir: Path, result_file: str, timeout: int,
     server: subprocess.Popen | None = None,
+    server_log: Path | None = None, stall_timeout: int = 0,
 ) -> dict | None:
     """One `vllm bench serve` invocation. Returns its parsed result, or None.
 
@@ -462,12 +625,34 @@ def _bench_serve(
     ]
     started = time.monotonic()
     client = subprocess.Popen(cmd)
+    log_path = server_log if server_log is not None else None
+    last_size, last_grew = (log_path.stat().st_size if log_path and log_path.exists()
+                            else 0), time.monotonic()
     while True:
         try:
             client.wait(timeout=5.0)
             break
         except subprocess.TimeoutExpired:
             pass
+
+        # A wedged engine writes nothing. Catching that here rather than at the
+        # cell timeout is the difference between losing 5 minutes and losing 25
+        # -- and the longer a 64-rank collective sits wedged, the likelier it
+        # is to need a host reboot to clear rather than a kill.
+        if log_path is not None and stall_timeout > 0:
+            size = log_path.stat().st_size if log_path.exists() else 0
+            if size != last_size:
+                last_size, last_grew = size, time.monotonic()
+            elif time.monotonic() - last_grew > stall_timeout:
+                print(f"bench:   the engine has written nothing for "
+                      f"{stall_timeout} s — killing it rather than waiting out the "
+                      f"{timeout} s cell timeout. A wedged 64-rank collective gets "
+                      "harder to clear the longer it sits.", file=sys.stderr)
+                client.kill(); client.wait()
+                if server is not None:
+                    _stop(server)
+                return None
+
         if server is not None and server.poll() is not None:
             print(f"bench:   the engine exited {server.returncode} while the client was "
                   f"still running — killing the client rather than waiting out the "
@@ -496,6 +681,7 @@ def _bench_cell(
     model: str, port: int, name: str, flags: callable, output_len: int, batch: int,
     num_prompts: int, result_dir: Path, timeout: int,
     server: subprocess.Popen | None = None,
+    server_log: Path | None = None, stall_timeout: int = 0,
 ) -> dict | None:
     """One cell: warm it up, then measure it.
 
@@ -530,6 +716,7 @@ def _bench_cell(
     warm = _bench_serve(
         model, port, flags(WARMUP_OUTPUT_LEN), batch, num_prompts,
         result_dir, f"{name}.warmup.json", timeout, server=server,
+        server_log=server_log, stall_timeout=stall_timeout,
     )
     if warm is None:
         print(f"bench:   warm-up for {name} did not complete; the measurement "
@@ -540,6 +727,7 @@ def _bench_cell(
     measured = _bench_serve(
         model, port, flags(output_len), batch, num_prompts,
         result_dir, f"{name}.json", timeout, server=server,
+        server_log=server_log, stall_timeout=stall_timeout,
     )
     if measured is not None:
         # Recorded on the result, so a reader of the report can tell a warmed
@@ -685,6 +873,13 @@ def _metrics(raw: dict) -> dict:
         "total_tok_s": raw.get("total_token_throughput"),
         "completed": raw.get("completed"),
         "duration_s": raw.get("duration"),
+        # Sonnet rounds to whole verse lines, so the nominal input length and
+        # the real one differ. Everything that normalises by input length has to
+        # use this, not the cell's name.
+        "mean_input_tokens": (
+            (raw.get("total_input_tokens") or 0) / raw["completed"]
+            if raw.get("completed") else None
+        ),
         # False means the cell's warm-up did not complete, so these figures
         # include that cell's compile cost. See `_bench_cell`.
         "warmed": raw.get("_warmed", False),
@@ -815,13 +1010,16 @@ def main(argv: list[str] | None = None) -> int:
                 )
             raw = _bench_cell(
                 args.model, port, name, flags, output_len, batch, num_prompts,
-                result_dir, args.bench_timeout, server=proc,
+                result_dir, _cell_timeout(args, batch, output_len), server=proc,
+                server_log=log, stall_timeout=args.stall_timeout,
             )
             if probe_prose:
                 print(f"\nbench: prose acceptance probe on {name}'s server "
                       f"(context {context}, {args.prose_output_len} out)")
                 report["prose"] = _prose_probe(
-                    args.model, port, args.prose_output_len, args.bench_timeout,
+                    args.model, port, args.prose_output_len,
+                    _cell_timeout(args, 1, args.prose_output_len),
+                    dataset=args.prose_dataset,
                 )
                 report["prose"]["host_cell"] = name
                 report["prose"]["max_model_len"] = context
@@ -873,14 +1071,14 @@ def main(argv: list[str] | None = None) -> int:
             name = f"in{input_len}_bs{batch}"
             run_cell(
                 name=name,
-                flags=_random_flags(input_len),
+                flags=_sonnet_flags(input_len, args.dataset_path),
                 context=args.max_model_len or (
                     input_len + args.output_len + CONTEXT_HEADROOM
                 ),
                 batch=batch,
                 num_prompts=args.num_prompts or _num_prompts(batch),
                 output_len=args.output_len,
-                extra={"input_len": input_len, "dataset": "random"},
+                extra={"input_len": input_len, "dataset": "sonnet"},
                 probe_prose=(name == probe_cell),
             )
 

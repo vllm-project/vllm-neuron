@@ -246,7 +246,7 @@ constraints:
 
   # ── 6. the speed and acceptance evidence. the three constraints after it read its report ─
   - name: bench
-    command: . /home/ubuntu/ds41-env.sh && export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" && mkdir -p /mnt/nvme/tmp/run && cd /mnt/nvme/tmp/run && exec /home/ubuntu/vllm-neuron/.venv/bin/python -u -m vllm_neuron.model.deepseek_v41.bench.run_bench --model /mnt/nvme/hf --input-lens 1024,2048 --batch-sizes 1,32 --bench-timeout 1500
+    command: . /home/ubuntu/ds41-env.sh && export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" && mkdir -p /mnt/nvme/tmp/run && cd /mnt/nvme/tmp/run && exec /home/ubuntu/vllm-neuron/.venv/bin/python -u -m vllm_neuron.model.deepseek_v41.bench.run_bench --model /mnt/nvme/hf
     timeout: 10800
     rationale: |
       Infrastructure, not a bar of its own: it runs the matrix, probes acceptance, and writes
