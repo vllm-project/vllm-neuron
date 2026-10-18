@@ -13,6 +13,11 @@ goal: |
   floorplan/. Read them; do not write there. Writing outside your worktree breaks the merge and
   loses your iteration.
 
+  READ /home/ubuntu/vllm-neuron/.autohelix/hints.md FIRST, before you plan anything. It is short
+  and it is the operator correcting a previous iteration's reasoning — each hint exists because an
+  iteration already lost time or shipped a worse design without it. Same rule: read it, do not
+  write to it. When a decision follows a hint, cite its number so the next reader can check it.
+
   What you can modify: under vllm_neuron/model/deepseek_v41
   - __init__.py: setup scripts, the runtime environment the port establishes, and the
     registration hooks.
