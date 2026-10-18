@@ -8,6 +8,11 @@ __pycache__
 vllm_neuron/model/deepseek_v41/verifier/verifier_report.json
 vllm_neuron/model/deepseek_v41_timeshare/verifier/verifier_report.json
 
+# Written by verifier/io_monitor.py on every verifier run, and read by
+# check_hbm_resident.py. A per-run artifact like the reports below.
+vllm_neuron/model/deepseek_v41/verifier/io_trace.json
+vllm_neuron/model/deepseek_v41/verifier/acceptance_report.json
+
 # Written by the bench on every run (bench/run_bench.py DEFAULT_REPORT, and the
 # per-cell `vllm bench serve` results and server logs beside it). The server
 # logs in particular are tens of MB each at 64 ranks, and the AutoHelix loop

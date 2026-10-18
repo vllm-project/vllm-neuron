@@ -416,8 +416,23 @@ def _prose_probe(model: str, port: int, output_len: int, timeout: int) -> dict:
 def _bench_serve(
     model: str, port: int, dataset_flags: list[str], batch: int,
     num_prompts: int, result_dir: Path, result_file: str, timeout: int,
+    server: subprocess.Popen | None = None,
 ) -> dict | None:
-    """One `vllm bench serve` invocation. Returns its parsed result, or None."""
+    """One `vllm bench serve` invocation. Returns its parsed result, or None.
+
+    `server` is the engine this is driving, watched while the client runs.
+    **`vllm bench serve` has no per-request timeout**, so if the engine goes
+    away mid-measurement the client waits for replies that will never come
+    until `timeout` expires. Measured 2026-10-18: an engine was sent SIGTERM
+    while healthy -- 1 running, 9 waiting, generation throughput rising
+    2.7 -> 4.3 tokens/s, a forward every ~375 ms -- and the client then sat for
+    the full 7200 s. Two hours spent learning nothing, and the figure it looked
+    like from outside was a model stall, which it was not.
+
+    So the server is polled alongside the client. If it exits first, the client
+    is killed and this returns None with the engine's exit code named, which is
+    both faster and a different diagnosis from a timeout.
+    """
     # The `vllm` CLI is what the onboarding guide names; fall back to the module
     # it dispatches to if this environment has no console script on PATH.
     vllm_bin = shutil.which("vllm")
@@ -445,13 +460,29 @@ def _bench_serve(
         "--result-dir", str(result_dir),
         "--result-filename", result_file,
     ]
-    try:
-        subprocess.run(cmd, check=True, timeout=timeout)
-    except subprocess.CalledProcessError as exc:
-        print(f"bench:   exit {exc.returncode}", file=sys.stderr)
-        return None
-    except subprocess.TimeoutExpired:
-        print(f"bench:   timed out after {timeout} s", file=sys.stderr)
+    started = time.monotonic()
+    client = subprocess.Popen(cmd)
+    while True:
+        try:
+            client.wait(timeout=5.0)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        if server is not None and server.poll() is not None:
+            print(f"bench:   the engine exited {server.returncode} while the client was "
+                  f"still running — killing the client rather than waiting out the "
+                  f"{timeout} s timeout. This is a lost server, not a slow model; see its "
+                  "log for why it went away.", file=sys.stderr)
+            client.kill()
+            client.wait()
+            return None
+        if time.monotonic() - started > timeout:
+            print(f"bench:   timed out after {timeout} s", file=sys.stderr)
+            client.kill()
+            client.wait()
+            return None
+    if client.returncode:
+        print(f"bench:   exit {client.returncode}", file=sys.stderr)
         return None
 
     path = result_dir / result_file
@@ -464,6 +495,7 @@ def _bench_serve(
 def _bench_cell(
     model: str, port: int, name: str, flags: callable, output_len: int, batch: int,
     num_prompts: int, result_dir: Path, timeout: int,
+    server: subprocess.Popen | None = None,
 ) -> dict | None:
     """One cell: warm it up, then measure it.
 
@@ -497,7 +529,7 @@ def _bench_cell(
           f"{WARMUP_OUTPUT_LEN} out (discarded)")
     warm = _bench_serve(
         model, port, flags(WARMUP_OUTPUT_LEN), batch, num_prompts,
-        result_dir, f"{name}.warmup.json", timeout,
+        result_dir, f"{name}.warmup.json", timeout, server=server,
     )
     if warm is None:
         print(f"bench:   warm-up for {name} did not complete; the measurement "
@@ -507,7 +539,7 @@ def _bench_cell(
           f"concurrency {batch}, {output_len} out")
     measured = _bench_serve(
         model, port, flags(output_len), batch, num_prompts,
-        result_dir, f"{name}.json", timeout,
+        result_dir, f"{name}.json", timeout, server=server,
     )
     if measured is not None:
         # Recorded on the result, so a reader of the report can tell a warmed
@@ -783,7 +815,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             raw = _bench_cell(
                 args.model, port, name, flags, output_len, batch, num_prompts,
-                result_dir, args.bench_timeout,
+                result_dir, args.bench_timeout, server=proc,
             )
             if probe_prose:
                 print(f"\nbench: prose acceptance probe on {name}'s server "
