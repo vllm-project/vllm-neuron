@@ -3658,6 +3658,26 @@ class DeepseekV41ForCausalLM(nn.Module):
         block_table = meta.get("full_block_table_tensor")
         if block_table is None:
             block_table = meta["block_table_tensor"]
+        # vLLM leaves **negative** entries in the rows of `block_table` it has
+        # not allocated, and `PagedSpan.slots` turns one of those into
+        # `-1 * block_size + pos % block_size` — a negative cache row. Every
+        # gather that addresses the paged allocation then reads out of bounds:
+        #
+        #   TDRV:exec_process_custom_notification  nd13:nc4: Received
+        #   notification generated at runtime: scatter/gather (indirect memory
+        #   copy via vector DGE) out-of-bound access
+        #
+        # Measured 2026-10-18 at `max_num_seqs=10`: 142 distinct graphs emitting
+        # that, ~89 a second, and the engine stopped making progress with
+        # `Running: 10 reqs`. `_bucket_rows` below already does exactly this
+        # clamp, but only on the path it takes — which bails out at
+        # `len(spans) != 1`, so one sequence was defended and ten were not.
+        #
+        # A no-op wherever no entry is negative, which is every configuration
+        # that passes today. Via the host rather than `clamp_min(0)` on the
+        # device, for the reason `_bucket_rows` spells the same way: this runs
+        # outside every compiled region, and the payload is a few kB.
+        block_table = block_table.cpu().clamp_min(0).to(block_table.device)
         slot_mapping = meta["slot_mapping"]
         device = slot_mapping.device
         starts = torch.tensor(

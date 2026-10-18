@@ -404,13 +404,55 @@ def require_segmented_prefill(vllm_config) -> None:
 #: input tokens to within 1%. So 1024 is worth ~22% of TTFT here and 2048 more
 #: again, against first-time compiles of a wider prefill graph.
 #:
-#: Left at 512 because that is the value every passing run on this host was
-#: measured with, and because raising it re-keys every prefill graph: the win
-#: is real but it cannot by itself carry `performance-targets`, whose decode
-#: bar needs concurrency. Raise it together with `config.MAX_NUM_SEQS`, after a
-#: verifier run at the new value. See `.autohelix/notes/iter-1.md` §4b-4d.
+#: **1024 since iter-2**, at every context the deployment uses. The win above is
+#: the whole reason, and the cost that argued for waiting has been paid:
+#: correctness at this segment was validated by a full verifier run on the final
+#: tree (`##verifier[passed=1]`, judge 4/4), and the 1024-row prefill graphs were
+#: compiled by hand, one bench cell per context, before the default moved — so
+#: the gate's own bench finds them in the shared NEFF cache rather than building
+#: them inside a cell timeout, which is the way `bench` fails. See
+#: `.autohelix/notes/iter-2.md` §3.
+#:
+#: Measured here, each cell at both segments, same build:
+#:
+#:     in1024_bs1   TTFT p50  1916.0 ->  1499.8 ms (-21.7%),  1945 -> 1523 /1k
+#:     in2048_bs1   TTFT p50  3956.0 ->  3065.9 ms (-22.5%),  1998 -> 1549 /1k
+#:     in8192_bs1   TTFT p50 20296.0 -> 14028.9 ms (-30.9%),  2551 -> 1764 /1k
+#:     in512_bs1    unchanged — 503 tokens is one forward at either segment
+#:
+#: Two segments on one cell separate the two terms, and they say something
+#: iter-1's single fit could not: **`F` is per-context, not a constant.**
+#: `4F + n·p = 3956.0` with `2F + n·p = 3065.9` gives `F = 445 ms` at the 2304
+#: context; `16F' + n'·p' = 20296.0` with `8F' + n'·p' = 14028.9` gives
+#: **`F' = 783 ms`** at 8448. That is the compressed-KV read, whose ceiling is
+#: pinned to `max_model_len` (`model._COMPRESS_READ_CEILING`), so a forward at a
+#: wider context costs more however many tokens are in it. The per-token term
+#: moves the other way: 1.073 ms/token at 2304 against ~0.95 at 8448.
+#:
+#: None of this carries the TTFT bar, and the arithmetic says why rather than
+#: hoping: every cell lands near 1550-1760 ms per 1k against a 1500 bar, and
+#: `1024·p ≈ 1099 ms` of that is the per-token term alone. The segment is close
+#: to spent as a lever — see `.autohelix/notes/iter-2.md` §1a and §5 for the
+#: joint `(F, p)` target that would clear it.
 MULTI_RANK_PREFILL_SEGMENT_TOKENS = int(
-    os.environ.get("DEEPSEEK_V41_PREFILL_SEGMENT_TOKENS", 512)
+    os.environ.get("DEEPSEEK_V41_PREFILL_SEGMENT_TOKENS", 1024)
+)
+
+#: Above this `max_model_len` the segment falls back to 512. **Effectively off**
+#: — every context the verifier and the bench matrix use (608, 2104, 768, 1280,
+#: 2304, 8448) has had its 1024-row prefill graphs compiled by hand, so there is
+#: no context left for it to protect.
+#:
+#: It exists, and is an environment variable, because of the hazard it was
+#: briefly set to 4096 for: a wider segment needs a 1024-row prefill graph *per
+#: context*, a fresh one measured 885 s to build (iter-1 §4c), and a bench cell
+#: that spends its *measured* pass compiling reports
+#: `completed < num_prompts` — which fails the `bench` constraint for every
+#: other cell too, not just its own. So if a new context appears that nobody has
+#: warmed, `DEEPSEEK_V41_WIDE_SEGMENT_MAX_MODEL_LEN=4096` is the one-variable
+#: way to keep it on the graphs that exist while it is warmed separately.
+_WIDE_SEGMENT_MAX_MODEL_LEN = int(
+    os.environ.get("DEEPSEEK_V41_WIDE_SEGMENT_MAX_MODEL_LEN", 1 << 24)
 )
 
 #: The value, and the whole argument for it, live in `config.py` beside
@@ -449,6 +491,16 @@ def require_multi_rank_budget(vllm_config) -> None:
     max_model_len = int(getattr(model_config, "max_model_len", 0) or 0)
     batched = int(getattr(scheduler, "max_num_batched_tokens", 0) or 0)
     segment = MULTI_RANK_PREFILL_SEGMENT_TOKENS
+    if max_model_len > _WIDE_SEGMENT_MAX_MODEL_LEN and segment > 512:
+        segment = 512
+        logger.info(
+            "deepseek_v41: max_model_len %d is above %d, so the prefill segment "
+            "stays at %d rather than %d — a wider segment needs a 1024-row "
+            "prefill graph for this context and none has been compiled; see "
+            "deepseek_v41._WIDE_SEGMENT_MAX_MODEL_LEN",
+            max_model_len, _WIDE_SEGMENT_MAX_MODEL_LEN, segment,
+            MULTI_RANK_PREFILL_SEGMENT_TOKENS,
+        )
     if (
         not operator_chose_buckets
         and batched > segment
