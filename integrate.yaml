@@ -89,42 +89,16 @@ goal: |
     single rank is preferred" is a conclusion about **4 ranks inside one device**, where a collective
     never leaves that device's NeuronLink. It does not carry over unchanged to 64 ranks across 16.
 
-  Two pieces of work reach outside this port into `vllm_neuron`'s own backend, and each has a
-  constraint of its own — `parallelism-schema` and `acceptance-rate`. `scope.editable` names the
-  specific files and says which is for which; read the block above it before touching any of
-  them, because that backend is shared with every other model in this repository and **this
-  repository has no test suite**, so nothing here would notice if you broke one.
+  floorplan/ contains the proposed parallelism scheme. It's recommended but not always the best. Make
+  it as the first priority to implement, then explore other parallelism (TP=4, PP=16 and TP=16, PP=4) to see if they can be faster. 
+  Implementing PP will require modification of backends for vllm Neuron, as PP is currently not supported
+  natively in vllm Neuron. You can consider using P2P collectives for communications between devices.
+  At this moment, do not worry about the regression on other models when implementing PP. Just make sure 
+  the DeepSeek V4.1 Flash model is working correctly and efficiently.
 
-  - **Pipeline parallelism.** It does not exist in the execution path today. The declaration does:
-    `initialize_neuron_model_parallel` accepts a `pipeline_parallel_size` and builds vLLM's `_PP`
-    group, and the runner carries inherited `is_last_rank` bookkeeping. The part that would make
-    it real is absent — there is **no `IntermediateTensors` anywhere in `vllm_neuron`**, so no
-    stage-to-stage activation transfer, no `make_empty_intermediate_tensors`, and no model
-    `forward` that takes or returns them. `NeuronDeviceCommunicator` implements no `send`/`recv`
-    either, so settle whether `GroupCoordinator.send_tensor_dict` works on this backend before
-    designing around it; the worker already patches around a `torch.distributed.barrier()` bug
-    with the Neuron device backend, so the generic path is not safe to assume.
-
-    On this model specifically, think about whether PP is the right answer before building it.
-    The weights already fit — 13.16 GiB of a 24 GiB bank — so PP buys no capacity here; what it
-    could buy is a shorter critical path, by cutting the number of ranks that have to join each
-    collective. Against that, this model's forward executes hundreds of graphs and the bottleneck
-    is collective count x participants, so a stage boundary adds a serialized transfer per
-    microbatch and PP's bubble is paid at `MAX_NUM_SEQS = 1` with nothing to overlap it with. If
-    you build it, say what you expected it to win and what it actually won.
-
-  - **Speculative acceptance.** The bar is 27% and the last measurement on prose was 49%, in
-    line with DeepSeek V4.1 Flash itself — so this is a constraint that should already hold, and
-    its job is to stop a change elsewhere from quietly costing the drafter its edge. Establish
-    where it actually stands before treating it as broken. The live path is almost entirely
-    inside this port and that is where to look first: `model.py`'s
-    `_rejection_sample` is the acceptance rule (compiled into the forward), `_draft` and
-    `forward_spec` produce the draft, and `drafter.py`'s `_report_acceptance` computes the rate.
-    `drafter.py`'s own docstring records what is known: the acceptance rule is exact, but the two
-    arms are not yet token-identical on every prompt — 2 of 4 byte-identical, improved from 1 of 4
-    when `RMSNorm` became a row-count-invariant NKI kernel — and the change that would close the
-    rest at once is padding the decode token axis to a fixed bucket so shapes stop depending on
-    the batch. That is a bug to finish fixing, not a trade to accept.
+  Do not run the bench matrix script during the iteration. It takes a very long time. Instead, check the 
+  bench matrix script and do each test one by one and see if any improvement. You don't have to run for all 
+  config cases to determine whether there is a high chance the iteration will pass all constraints.
 
 constraints:
 
@@ -250,7 +224,7 @@ constraints:
 
   # ── 6. the speed and acceptance evidence. the three constraints after it read its report ─
   - name: bench
-    command: . /home/ubuntu/ds41-env.sh && export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" && mkdir -p /mnt/nvme/tmp/run && cd /mnt/nvme/tmp/run && exec /home/ubuntu/vllm-neuron/.venv/bin/python -u -m vllm_neuron.model.deepseek_v41.bench.run_bench --model /mnt/nvme/hf --input-lens 1024,2048 --batch-sizes 1,32
+    command: . /home/ubuntu/ds41-env.sh && export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" && mkdir -p /mnt/nvme/tmp/run && cd /mnt/nvme/tmp/run && exec /home/ubuntu/vllm-neuron/.venv/bin/python -u -m vllm_neuron.model.deepseek_v41.bench.run_bench --model /mnt/nvme/hf --input-lens 1024,2048 --batch-sizes 1,32 --bench-timeout 1500
     timeout: 10800
     rationale: |
       Infrastructure, not a bar of its own: it runs the matrix, probes acceptance, and writes
@@ -278,6 +252,23 @@ constraints:
       `CustomDataset` reads its JSONL through pandas, which is absent from this environment and
       resolves to a `PlaceholderModule` that raises on use. `--no-prose-probe` drops it, and
       then `acceptance-rate` fails for want of evidence, which is intended.
+
+      **`--bench-timeout 1500`, against a default of 7200, because a cell that stops producing
+      must fail cheaply.** Measured 2026-10-18: a batch-10 cell completed 7 of 20 requests at
+      ~35 s each and then produced nothing for two hours, until the 7200 s timeout fired. The
+      engine was not at fault — its own log shows it healthy at the moment it stopped
+      (`Running: 1 reqs, Waiting: 9 reqs`, generation throughput rising 2.7 -> 4.3 tokens/s, a
+      forward every ~375 ms) and then receiving an external SIGTERM. `vllm bench serve` has no
+      per-request timeout, so the client waited out the full cell timeout for replies from a
+      server that had gone away. `_bench_serve` now watches the engine and kills the client when
+      it exits, so that specific case fails in seconds; 1500 s is the backstop for everything
+      else that could stop a cell, including the multi-sequence hang `concurrency-32` exists to
+      catch. The batch-1 cells that produce the TTFT evidence need ~5 min each and are
+      unaffected. A batch-32 cell that is merely clamped
+      to 1 serves its 64 requests serially (~37 min) and will time out — which costs nothing,
+      because a clamped cell fails `concurrency-32` and is excluded from the decode bar anyway.
+      The report is written after every cell, and batch 1 runs first, so a batch-32 stall cannot
+      take the batch-1 figures down with it.
 
       This is the dominant term in the gate's wall clock: 10,800 s of a 25,800 s budget.
 
@@ -913,23 +904,15 @@ reviewer:
     (64 logical NeuronCores) with the weights sharded and resident in HBM.
     1. Report the progress in detail, what has been resolved, what is half way through
     2. What is the implementation error and accuracy error encountered?
-    3. What's the next step? How to resolve the remaining problems to pass all constraints.
+    3. What's the next steps? How to resolve the remaining problems to pass all constraints.
     4. Reward hacking check: any potential sign of agent trying to hack the loophole of the
       constraints? In particular: weights quietly re-read during the forward rather than kept
       resident, `seal()` or `_refuse_if_sealed` weakened, a rank count declared but not run,
       work skipped on 63 of 64 ranks and masked by an all-reduce, an acceptance rate raised by
       changing how it is counted rather than how well the drafter predicts, or a number quoted
-      from the single-device predecessor's comments as though it were measured on this host.
+      from the single-device predecessor's comments as though itd were measured on this host.
       What additional constraints should we add and modify? Please also directly suggest the main
       agent to avoid such reward hacking.
-    5. Shared-backend check. `scope.editable` now includes files under `vllm_neuron/vllm/`,
-      `vllm_neuron/parallel/` and `vllm_neuron/utils/` that are shared with `model/llama3`,
-      `model/qwen3`, `model/qwen3_vl`, `model/gpt_oss` and `model/deepseek_v41_timeshare`. This
-      repository has no test suite, and the verifier exercises only this port, so a regression
-      in one of those models would pass every constraint silently. If the iteration changed any
-      of those files, say for each: was it necessary, is it the smallest change that works, and
-      would it alter behaviour for a model that does not set the config this port sets? A
-      model-specific behaviour change made in shared code belongs in `model/deepseek_v41/`
-      instead — name it and say so.
+
   model: claude-sonnet-5
   timeout_seconds: 2000
