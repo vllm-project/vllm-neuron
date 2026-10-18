@@ -38,13 +38,20 @@ def _chunk(width):
 
 @nki.jit
 def swiglu(gate, up, weights, limit):
-    """The clamped SwiGLU with its routing weight. See the module docstring."""
+    """The clamped SwiGLU with its routing weight. See the module docstring.
+
+    `weights` is `(rows, 1)` for a routed expert — one routing weight a row —
+    or `(1, 1)` for the shared expert, where every token carries the same
+    weight and there is no per-row vector to materialize.
+    """
     rows, inter = gate.shape
     assert up.shape == (rows, inter), f"up {up.shape} wants ({rows}, {inter})"
-    assert weights.shape == (rows, 1), (
-        f"weights {weights.shape} wants ({rows}, 1) — one routing weight a row"
+    assert weights.shape in ((rows, 1), (1, 1)), (
+        f"weights {weights.shape} wants ({rows}, 1) — one routing weight a row "
+        "— or (1, 1) for a weight shared by every row"
     )
     assert limit.shape == (1, 1), f"limit {limit.shape} wants (1, 1)"
+    uniform = weights.shape[0] == 1
 
     ch = _chunk(inter)
     nchunks = inter // ch
@@ -54,7 +61,12 @@ def swiglu(gate, up, weights, limit):
     def body(r0, nr):
         lim = nl.broadcast_to(nl.load(limit[0:1, 0:1], dtype=nl.float32), (nr, 1))
         nlim = nl.multiply(lim, -1.0)
-        w = nl.load(weights[r0 : r0 + nr, 0:1], dtype=nl.float32)
+        if uniform:
+            w = nl.broadcast_to(
+                nl.load(weights[0:1, 0:1], dtype=nl.float32), (nr, 1)
+            )
+        else:
+            w = nl.load(weights[r0 : r0 + nr, 0:1], dtype=nl.float32)
 
         for j in range(nchunks):
             c0 = j * ch

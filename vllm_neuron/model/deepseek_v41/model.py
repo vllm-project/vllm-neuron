@@ -289,6 +289,7 @@ def _nki_entry(module: str, name: str = "kernel"):
         index_score,
         rmsnorm,
         sparse_attn as sparse_attn_kernel,
+        swiglu as swiglu_kernel,
     )
 
     _raise_dynamo_limits()
@@ -303,6 +304,7 @@ def _nki_entry(module: str, name: str = "kernel"):
         "index_score": index_score,
         "rmsnorm": rmsnorm,
         "sparse_attn": sparse_attn_kernel,
+        "swiglu": swiglu_kernel,
     }
     wrapped = wrap_nki(getattr(modules[module], name))
 
@@ -1576,24 +1578,50 @@ def _compiled(fn):
     return _compile_fn(fn)
 
 
+#: `(limit, ones)` as (1, 1) fp32 device tensors, one pair per (limit, device).
+#: `kernels/swiglu` takes both as tensors, and both are loop-invariant — built
+#: once here rather than once a layer, so the 40 MoE calls of a forward do not
+#: pay 80 tiny host-to-device copies for two constants.
+_SWIGLU_CONSTS: dict = {}
+
+
+def swiglu_consts(limit: float, device) -> tuple[torch.Tensor, torch.Tensor]:
+    """The clamp limit and the shared expert's unit routing weight, on
+    `device`. Call from eager code: this allocates, so it must not be traced.
+    """
+    key = (float(limit), str(device))
+    hit = _SWIGLU_CONSTS.get(key)
+    if hit is None:
+        # Built on the host and copied, which is the one way of putting a
+        # constant on this device that the rest of this file already relies on
+        # (`_route_plan` stages its row lists the same way).
+        hit = (
+            torch.full((1, 1), float(limit), dtype=torch.float32).to(device),
+            torch.ones((1, 1), dtype=torch.float32).to(device),
+        )
+        _SWIGLU_CONSTS[key] = hit
+    return hit
+
+
 def _swiglu_expert(x, weights, w1, s1, w2, s2, w3, s3, storage, limit):
-    """One expert's SwiGLU FFN; all three GEMMs through `kernels/blockquant`.
+    """One expert's SwiGLU FFN; all three GEMMs through `kernels/blockquant`
+    and the clamped activation through `kernels/swiglu`.
 
       * the needle case answered correctly and stopped emitting EOS (19 tokens
         `stop` -> 32 tokens `length`), and
       * speculation on and off stopped producing identical tokens — two of the
         three short cases still matched exactly, `smoke-test` diverged after 80
         characters.
+
+    `weights` is a `(rows, 1)` fp32 tensor for a routed expert and the `(1, 1)`
+    unit tensor for the shared expert, and `limit` a `(1, 1)` fp32 tensor; both
+    come from `swiglu_consts`, because a NKI kernel takes tensors and this
+    function is traced.
     """
     dtype = x.dtype
-    gate = nki_linear(x, w1, s1, storage).float()
-    up = nki_linear(x, w3, s3, storage).float()
-    if limit > 0:
-        up = torch.clamp(up, min=-limit, max=limit)
-        gate = torch.clamp(gate, max=limit)
-    y = F.silu(gate) * up
-    if weights is not None:
-        y = weights * y
+    gate = nki_linear(x, w1, s1, storage)
+    up = nki_linear(x, w3, s3, storage)
+    y = _nki_entry("swiglu", "swiglu")(gate, up, weights, limit)
     return nki_linear(y.to(dtype), w2, s2, storage)
 
 
@@ -1608,10 +1636,10 @@ def _routed_expert_step(
     return carry.index_add(0, rows, y.float())
 
 
-def _shared_expert_step(carry, flat, w1, s1, w2, s2, w3, s3, limit):
+def _shared_expert_step(carry, flat, ones, w1, s1, w2, s2, w3, s3, limit):
     """The shared expert every token goes through, added to the routed sum."""
     contribution = _swiglu_expert(
-        flat, None, w1, s1, w2, s2, w3, s3, "fp8", limit
+        flat, ones, w1, s1, w2, s2, w3, s3, "fp8", limit
     )
     return carry + contribution.float()
 
@@ -1804,14 +1832,15 @@ class Expert(nn.Module):
     def forward(
         self, x: torch.Tensor, weights: torch.Tensor | None = None
     ) -> torch.Tensor:
+        limit, ones = swiglu_consts(self.swiglu_limit, x.device)
         return _swiglu_expert(
             x,
-            weights,
+            ones if weights is None else weights,
             self.w1.weight, self.w1.scale,
             self.w2.weight, self.w2.scale,
             self.w3.weight, self.w3.scale,
             self.w1.storage,
-            self.swiglu_limit,
+            limit,
         )
 
 
@@ -2036,7 +2065,7 @@ class MoE(nn.Module):
         plan = self._route_plan(indices, weights, live_rows, weight_store)
 
         y = _compiled(_moe_carry)(flat)
-        limit = self.expert_slot.swiglu_limit
+        limit, ones = swiglu_consts(self.expert_slot.swiglu_limit, flat.device)
         for expert_id, rows, route_weights in plan:
             mark = time.perf_counter() if _EXPERT_TIMING else 0.0
             slot = self._expert(weight_store, expert_id)
@@ -2058,12 +2087,13 @@ class MoE(nn.Module):
             y = tp_all_reduce(y, tp_group)
 
         shared = self.shared_experts
+        shared_limit, _ = swiglu_consts(shared.swiglu_limit, flat.device)
         y = _compiled(_shared_expert_step)(
-            y, flat,
+            y, flat, ones,
             shared.w1.weight, shared.w1.scale,
             shared.w2.weight, shared.w2.scale,
             shared.w3.weight, shared.w3.scale,
-            shared.swiglu_limit,
+            shared_limit,
         )
         return _compiled(_moe_narrow)(y, x.dtype).reshape(shape)
 

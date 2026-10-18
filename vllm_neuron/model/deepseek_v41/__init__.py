@@ -389,7 +389,29 @@ def require_segmented_prefill(vllm_config) -> None:
 #: The prefill segment a *multi-rank* run uses. `PREFILL_SEGMENT_TOKENS` above
 #: is the ceiling for a single rank; this is a clamp that only applies above one
 #: rank, and it is the balance point between two costs that pull in opposite
-MULTI_RANK_PREFILL_SEGMENT_TOKENS = 512
+#: directions. Larger segments mean fewer forwards for the same prompt, and a
+#: forward is where the cost is: ~43 world-wide all-reduces and ~120 graph
+#: executions, neither of which gets cheaper per token when the segment is
+#: small. Smaller segments mean smaller prefill graphs, so less compile time
+#: and less device memory per graph.
+#:
+#: Which term wins is measurable, and measuring it needs two segment sizes:
+#: at a fixed segment the number of forwards is itself proportional to the
+#: prompt, so TTFT against input length cannot tell a per-forward cost from a
+#: per-token one. Measured on `in1024_bs1`, one cell each at 512 and 1024:
+#: TTFT p50 1924.7 ms -> 1503.3 ms, which fits
+#: `ceil(tokens/segment) * 422 ms + tokens * 1.06 ms` across 503, 1009 and 2027
+#: input tokens to within 1%. So 1024 is worth ~22% of TTFT here and 2048 more
+#: again, against first-time compiles of a wider prefill graph.
+#:
+#: Left at 512 because that is the value every passing run on this host was
+#: measured with, and because raising it re-keys every prefill graph: the win
+#: is real but it cannot by itself carry `performance-targets`, whose decode
+#: bar needs concurrency. Raise it together with `config.MAX_NUM_SEQS`, after a
+#: verifier run at the new value. See `.autohelix/notes/iter-1.md` §4b-4d.
+MULTI_RANK_PREFILL_SEGMENT_TOKENS = int(
+    os.environ.get("DEEPSEEK_V41_PREFILL_SEGMENT_TOKENS", 512)
+)
 
 #: The value, and the whole argument for it, live in `config.py` beside
 #: `TENSOR_PARALLEL_SIZE` and `ATTENTION_TENSOR_PARALLEL_SIZE`: those three
