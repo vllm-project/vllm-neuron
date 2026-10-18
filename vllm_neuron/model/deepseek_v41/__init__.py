@@ -453,7 +453,7 @@ def require_multi_rank_budget(vllm_config) -> None:
             "host memory for its code, DMA rings and scratchpad in every one of the "
             "%d worker processes. A run above 1 has stalled on this host; see "
             "config.MAX_NUM_SEQS. Every request is still served, one at a time.",
-            world_size, seqs, MULTI_RANK_MAX_NUM_SEQS, world_size, seqs, world_size,
+            world_size, seqs, MULTI_RANK_MAX_NUM_SEQS, world_size,
         )
 
 
