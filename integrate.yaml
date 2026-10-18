@@ -67,18 +67,6 @@ goal: |
   mode is not a wrong answer — it is that **the run stops producing and keeps holding the
   devices**, which costs the whole iteration and needs the reclaim above.
 
-  Two honest caveats on that, because the evidence is weaker than it looks. The *mechanism* is
-  not established — divergent graph selection across ranks stalling a collective is a
-  hypothesis, not a finding. And a freeze that looked exactly like this one, on 2026-10-18,
-  turned out on inspection to be a healthy engine receiving an external SIGTERM with a client
-  that has no per-request timeout; see the `bench` constraint. So treat the stall as real but
-  unexplained, and when you see one, read the **server's** log for what the engine was doing
-  before concluding anything. `~/ds41_repro_hang.py` is the minimal reproduction to start from.
-
-  So: prove the batched path on CPU with `nki.simulate(kernel)(...)` and on a single short
-  prompt before you let the verifier or the bench near it, and raise `MAX_NUM_SEQS` one step at
-  a time rather than straight to 32.
-
   Weight Checkpoint: `/mnt/nvme/hf` — 475.3 GiB, 48 shards, revision
   `314113f8a7dadb388215396ba5fbee2c610a04d6`. Do not redownload from huggingface. It is on the
   instance store, which does not survive a stop/start; `~/download_ckpt.sh` re-pulls it in ~3 min
