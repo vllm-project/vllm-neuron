@@ -1,0 +1,128 @@
+[build-system]
+requires = [
+    "setuptools>=77.0.3,<80.0.0",
+    "wheel"
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-neuron"
+version = "0.29.0.1.2.0"
+description = "vLLM Neuron backend plugin"
+license = "Apache-2.0"
+authors = [
+    {name = "AWS Neuron team"}
+]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+requires-python = ">=3.11"
+dynamic = ["dependencies", "optional-dependencies"]
+
+[project.entry-points."vllm.platform_plugins"]
+neuron = "vllm_neuron:register"
+
+[project.entry-points."vllm.general_plugins"]
+neuron = "vllm_neuron.vllm.patches:apply_patches"
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements/core.txt"]}
+optional-dependencies = {test = {file = ["requirements/test.txt"]}}
+
+# Keep non-.py data files in the wheel (synthetic model JSONs loaded via
+# Path(__file__).parent, Llama3 LICENSE, py.typed). Without this they get dropped
+# and the synthetic model breaks at runtime.
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+vllm_neuron = ["py.typed", "**/*.json", "model/llama3/LICENSE"]
+
+# Keep only the plugin package out of all the top-level dirs (test/, ci/, tools/,
+# examples/, ...). The dotted form pins it to vllm_neuron and its subpackages, so
+# a sibling like vllm_neuron_tests can't sneak in (a bare vllm_neuron* would).
+[tool.setuptools.packages.find]
+include = ["vllm_neuron", "vllm_neuron.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["test/unit", "test/vllm_neuron"]
+python_files = ["test_*.py", "*_test.py", "*_tests.py"]
+python_classes = "Test*"
+python_functions = "test_*"
+
+[tool.coverage.run]
+branch = true
+source = ["vllm_neuron"]
+omit = [
+    "test/*",
+    "ci/*",
+    ".github/*",
+    "doc/*",
+    "*.md",
+    "setup.py",
+    "vllm_neuron/patches/*",
+    "test/evaluation/*",
+]
+
+[tool.coverage.paths]
+source = [
+    "vllm_neuron/",
+    "*/site-packages/",
+]
+
+[tool.coverage.report]
+precision = 2
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["vllm_neuron"]
+
+[tool.ruff.lint]
+# G004: Prevent f-strings in logging statements
+extend-select = ["G004"]
+
+[tool.ruff.lint.per-file-ignores]
+# Only enforce G004 (no f-strings in logging) in vllm_neuron folder
+"test/*" = ["G004"]
+"ci/*" = ["G004"]
+"docs/*" = ["G004"]
+"setup.py" = ["G004"]
+# vLLM Neuron-specific ignores - intentional patterns in the codebase
+# E741: Ambiguous variable names (I, l, E, H are standard ML dimension names)
+# F841: Unused variables (often intentional for side effects in tests)
+# E402: Module level import not at top (required for conditional imports)
+# E701: Multiple statements on one line (NKI kernel patterns)
+# E711/E712: Comparison to None/False (NKI kernel patterns)
+# E721/E722: Type comparisons and bare except (legacy patterns)
+"vllm_neuron/*" = ["E741", "F841", "E402", "E701", "E711", "E712", "E721", "E722", "G004"]
+"test/vllm_neuron/*" = ["E741", "F841", "E402", "E701"]
+"examples/vllm_neuron/*" = ["F841"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+check_untyped_defs = true
+show_error_codes = true
+show_column_numbers = true
+show_error_context = true
+pretty = true
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+ignore_errors = true

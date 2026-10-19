@@ -1,0 +1,46 @@
+# Core dependencies with Neuron-compatible constraints
+setuptools-scm>=8
+urllib3>=2.6.0
+
+# Neuron torch compile/runtime framework
+# Left unpinned to resolve based on vLLM's torch requirement
+libtorch-neuronx-lite
+
+# Neuron toolchain (compiler/kernels)
+neuronx-cc
+nki
+
+# vLLM installation
+vllm==0.29.0
+
+# Pin <0.137: 0.137's `_IncludedRouter` breaks prometheus-fastapi-instrumentator
+fastapi[standard]>=0.115.0,<0.137
+
+# Ceiling only: the floor comes transitively from vllm's own requirement.
+# Majors break silently (v4->v5 moved rope config keys -> garbage logits,
+# see #2164), so block the next one from being resolved in unreviewed.
+# vllm 0.29.0 sets no ceiling. transformers 5.19.0 changes the video
+# processor mapping values from strings to dicts, and vllm 0.29.0 cannot
+# read a dict value, so each video request fails. Use the vllm 0.31.0
+# ceiling until the vllm pin includes the fix (vllm PR #60381).
+transformers<5.18.0
+
+# Prometheus metrics
+prometheus_client
+
+# Manifest + encoder-router schema models
+pydantic>=2
+
+# NKI CPU simulator dtype support
+ml_dtypes
+
+# NIXL KV transfer (disaggregated inference). Pinned below 1.4.0: that release
+# reworks the LIBFABRIC write path (stride descriptors, pre-connection
+# handshake, FI_MORE flush) and degrades multi-node KV-transfer accuracy and
+# throughput on EFA. Re-evaluate the pin on the next nixl release.
+nixl<1.4.0
+
+# benchmark dependency
+psutil
+requests
+boto3
