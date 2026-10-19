@@ -98,6 +98,9 @@ class HYV4Config:
     max_position_embeddings: int
     torch_dtype: torch.dtype
     neuron_quantization: dict | None = None
+    # The indexer's rope dims: the LAST qk_rope_head_dim of its 128 (Hy4) or the FIRST
+    # (GLM-5.x, interleaved).
+    indexer_rope_first: bool = False
 
     neuron_config: object | None = field(default=None, repr=False)
 

@@ -344,10 +344,14 @@ class HYV4Indexer(nn.Module):
         # vLLM's HYV4 indexer uses 1e-6 here, not rms_norm_eps.
         self.k_norm_eps = 1e-6
         self.weight_scale = self.head_dim**-0.5 * self.n_heads**-0.5
+        self.rope_first = config.indexer_rope_first
         for param in (self.wq_b_weight, self.wk_weight, self.weights_proj_weight):
             set_weight_loader(param, _replicated_transposed())
 
     def _rope_tail(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+        if self.rope_first:  # GLM-5.x: the rotated dims lead
+            r = self.rope_dim
+            return torch.cat((apply_rope(x[..., :r], cos, sin), x[..., r:]), dim=-1)
         keep = self.head_dim - self.rope_dim
         return torch.cat((x[..., :keep], apply_rope(x[..., keep:], cos, sin)), dim=-1)
 
@@ -445,21 +449,36 @@ class HYV4Attention(nn.Module):
         self.kv_a_layernorm = HYV4RMSNorm(
             self.kv_lora_rank, config.rms_norm_eps, self.dtype
         )
-        # kv_b_proj split per head into its key and value halves, kept in the
-        # checkpoint's [out, latent] orientation: both are used against the latent.
+        # kv_b_proj split per head into its key and value halves. The key half keeps the
+        # checkpoint's [out, latent] orientation (it contracts over out); the value half is
+        # stored [latent, out], the way it contracts. In [out, latent] the value up-projection
+        # transposed the weight every step, and in GLM-5.3's decode graph that
+        # transpose's spill/reload got an out-of-range address (NCC_INLA001 / ISA validation).
         self.w_uk = nn.Parameter(
             torch.empty(nh, self.nope_dim, self.kv_lora_rank, dtype=self.dtype)
         )
         self.w_uv = nn.Parameter(
-            torch.empty(nh, self.v_dim, self.kv_lora_rank, dtype=self.dtype)
+            torch.empty(nh, self.kv_lora_rank, self.v_dim, dtype=self.dtype)
         )
-        self.gate_proj_weight = nn.Parameter(
-            torch.empty(hidden, nh * self.v_dim, dtype=self.dtype)
-        )
+        self.gated = config.gated_mla
+        if self.gated:
+            self.gate_proj_weight = nn.Parameter(
+                torch.empty(hidden, nh * self.v_dim, dtype=self.dtype)
+            )
         self.o_proj_weight = nn.Parameter(
             torch.empty(nh * self.v_dim, hidden, dtype=self.dtype)
         )
-        self.sinks = nn.Parameter(torch.zeros(nh, dtype=torch.float32))
+        self.learnable_sink = config.learnable_sink
+        if self.learnable_sink:
+            self.sinks = nn.Parameter(torch.zeros(nh, dtype=torch.float32))
+        else:
+            # No sinks (GLM-5.x): a -1e30 logit takes exactly zero weight in every softmax
+            # here, dense and key-blocked, so no path changes. device="cpu": the model is
+            # built under the meta device, and a buffer made there has no data to move (as
+            # for HYV4RotaryEmbedding.inv_freq).
+            self.register_buffer(
+                "sinks", torch.full((nh,), -1.0e30, device="cpu"), persistent=False
+            )
 
         self.kv_pages: torch.Tensor | None = None
 
@@ -474,15 +493,16 @@ class HYV4Attention(nn.Module):
                 is_storage_transposed=True,
             ),
         )
-        set_weight_loader(
-            self.gate_proj_weight,
-            sharding_weight_loader(
-                shard_dim=1,
-                shard_size=nh * self.v_dim,
-                num_shards=self.world_size,
-                is_storage_transposed=True,
-            ),
-        )
+        if self.gated:
+            set_weight_loader(
+                self.gate_proj_weight,
+                sharding_weight_loader(
+                    shard_dim=1,
+                    shard_size=nh * self.v_dim,
+                    num_shards=self.world_size,
+                    is_storage_transposed=True,
+                ),
+            )
         set_weight_loader(
             self.o_proj_weight,
             sharding_weight_loader(
@@ -492,12 +512,13 @@ class HYV4Attention(nn.Module):
                 is_storage_transposed=True,
             ),
         )
-        set_weight_loader(
-            self.sinks,
-            sharding_weight_loader(
-                shard_dim=0, shard_size=nh, num_shards=self.world_size
-            ),
-        )
+        if self.learnable_sink:
+            set_weight_loader(
+                self.sinks,
+                sharding_weight_loader(
+                    shard_dim=0, shard_size=nh, num_shards=self.world_size
+                ),
+            )
         per_head = self.nope_dim + self.v_dim
 
         def kv_b(part: str) -> SafetensorsWeightLoader:
@@ -505,11 +526,9 @@ class HYV4Attention(nn.Module):
                 (source,) = slices  # [heads * (nope + v), kv_lora_rank]
                 rows = source[rank * nh * per_head : (rank + 1) * nh * per_head, :]
                 rows = rows.reshape(nh, per_head, self.kv_lora_rank)
-                return (
-                    rows[:, : self.nope_dim]
-                    if part == "k"
-                    else rows[:, self.nope_dim :]
-                )
+                if part == "k":
+                    return rows[:, : self.nope_dim]
+                return rows[:, self.nope_dim :].transpose(1, 2).contiguous()
 
             return SafetensorsWeightLoader(transform=transform)
 
@@ -547,15 +566,16 @@ class HYV4Attention(nn.Module):
             )
         entry = torch.cat((index_key.to(c.dtype), c, k_rope.to(c.dtype)), dim=-1)
 
-        gate = x @ self.gate_proj_weight
+        gate = x @ self.gate_proj_weight if self.gated else None
         return query, entry, gate, q_resid
 
     def _finish(self, o_lat: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """``o_lat [T, nh, 512]`` -> value up-projection, gate, ``o_proj`` partial."""
         tokens = o_lat.shape[0]
-        out = torch.einsum("tnc,nvc->tnv", o_lat.to(self.dtype), self.w_uv)
+        out = torch.einsum("tnc,ncv->tnv", o_lat.to(self.dtype), self.w_uv)
         out = out.reshape(tokens, self.num_heads * self.v_dim)
-        out = out * torch.sigmoid(gate.float()).to(out.dtype)
+        if gate is not None:
+            out = out * torch.sigmoid(gate.float()).to(out.dtype)
         out = out @ self.o_proj_weight
         if self.world_size > 1:
             out = _all_reduce(self.tp_group, out)
@@ -1119,6 +1139,9 @@ class HYV4ForCausalLM(nn.Module):
 
     # Two private pages per buffer (zero page + write sink), as Qwen3.5 uses.
     kv_cache_page_major = True
+    # Overridden by models built on this port (glm_dsa).
+    text_model_cls = HYV4TextModel
+    checkpoint_mappings = staticmethod(checkpoint_mappings)
 
     def __init__(
         self, config: HYV4Config | None = None, *, vllm_config=None, prefix: str = ""
@@ -1137,7 +1160,7 @@ class HYV4ForCausalLM(nn.Module):
 
         nc = config.neuron_config
 
-        self.model = HYV4TextModel(config)
+        self.model = self.text_model_cls(config)
 
         self.on_device_sampling_config = nc.on_device_sampling_config if nc else None
         self._gather_logits = nc is not None and (
@@ -1255,7 +1278,7 @@ class HYV4ForCausalLM(nn.Module):
             self.rank,
             self.world_size,
             self,
-            checkpoint_mappings(self.config),
+            self.checkpoint_mappings(self.config),
             device,
             strict=False,
         ).state_dict
