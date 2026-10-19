@@ -244,6 +244,43 @@ _ALLREDUCE_CHUNK_ELEMS = int(
 )
 
 
+# What this collective costs, measured on device in iteration 3. A forward
+# carries ~43 *world-wide* all-reduces (one per MoE layer, two engram layers,
+# the logits path) on top of the 8-way attention ones, and until iteration 3
+# nobody had priced them — the floorplan says so of itself:
+# "no intra-device collective can be timed on this host" (REPORT.md:742-745).
+#
+# Substituting the 8-rank EP-TP group for the world here, with every shape,
+# graph and launch left alone, moved the `in512_bs1` cell by:
+#
+#     prefill forward, 503 tokens    947.4 ms -> 873.7 ms   (-7.8%)
+#     decode step, 6 rows            402.6 ms -> 320.1 ms   (-20.5%)
+#
+# The saving is the *same ~75 ms at 503 rows and at 6*, so what a 64-rank
+# all-reduce costs here is per-call latency and synchronization — ~1.9 ms,
+# against ~0.1 ms for 8 consecutive ranks — and not bytes (5.2 MB at 503
+# tokens, ~10 µs of wire).
+#
+# Two consequences, both measured rather than argued:
+#
+#   * **The cost tracks how many devices a collective spans, not how many
+#     ranks.** Factoring the world sum as 8 (EP-TP row: 8 consecutive ranks,
+#     two column-adjacent devices, one torus hop) x 8 (EP column: 8 ranks
+#     strided across 8 *different* devices) is exact and measured 2.8% SLOWER
+#     (974.2 ms), because the column leg costs what the 16-device world leg
+#     costs.
+#   * So a total sum cannot be made cheap: every rank needs data from every
+#     device. The way to stop paying for it is to stop needing it, which is
+#     what pipeline parallelism does — and that is now the measured case for
+#     TP=8 x PP=8, with `kernels/pp_permute.py` as the stage transport.
+#
+# The two probes that produced these numbers are
+# `.autohelix/notes/iter-3-probes.patch` (apply, measure, revert): they are not
+# in the tree because a probe-tree verifier run failed its second phase twice
+# while an untouched HEAD passed, and no script constraint is worth that risk
+# for a knob that is off. `.autohelix/notes/iter-3.md` §2 and §4 have the
+# detail, including why a probe's TPOT is not comparable (nonsense logits
+# collapse the drafter's acceptance; convert with `TPOT x (1 + 5 x accept)`).
 def tp_all_reduce(x: torch.Tensor, tp_group) -> torch.Tensor:
     """Sum `x` across the tensor-parallel ranks. Returns the reduced tensor."""
     name = _group_name(tp_group)
