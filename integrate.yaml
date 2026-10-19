@@ -275,7 +275,14 @@ constraints:
   # ── 6. the speed and acceptance evidence. the three constraints after it read its report ─
   - name: bench
     command: . /home/ubuntu/ds41-env.sh && export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" && mkdir -p /mnt/nvme/tmp/run /home/ubuntu/logs/gate && cd /mnt/nvme/tmp/run && { /home/ubuntu/vllm-neuron/.venv/bin/python -u -m vllm_neuron.model.deepseek_v41.bench.run_bench --model /mnt/nvme/hf > /home/ubuntu/logs/gate/bench.log 2>&1; rc=$?; cat /home/ubuntu/logs/gate/bench.log; exit $rc; }
-    timeout: 10800
+    # 5 h, raised from 3 h because an optimised kernel costs more to compile,
+    # not less, and compile is paid inside this constraint. A healthy matrix is
+    # 7056 s measured; the headroom covers four cells each paying a full
+    # `CELL_WARMUP_COMPILE_ALLOWANCE` of 2400 s for shapes a kernel change
+    # re-keyed. Iteration 6 was rejected at 10800 s with its verifier and all
+    # four judges passing, purely because the in8192 cell was still amortising
+    # compile when the budget ran out.
+    timeout: 18000
     rationale: |
       Infrastructure, not a bar of its own: it runs the matrix, probes acceptance, and writes
       `bench/bench_report.json`. `acceptance-rate` and `performance-targets`

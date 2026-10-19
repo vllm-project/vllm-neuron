@@ -130,9 +130,31 @@ DEFAULT_SONNET_PATH = "/mnt/nvme/datasets/sonnet.txt"
 #: worth having, and one that is 10x slower is a wedge worth killing.
 CELL_TIMEOUT_SLACK = 3.0
 
-#: Floor for a derived cell timeout: an engine build plus a cold compile has to
-#: fit under it even for the smallest cell.
+#: Floor for a derived cell timeout, which sizes the *measured* pass. By then
+#: the warm-up has compiled the cell's shapes, so this is steady-state work.
 CELL_TIMEOUT_FLOOR = 1800
+
+#: Added to the warm-up's timeout only, because the warm-up is where compile is
+#: paid and the derivation above sizes steady-state work with no allowance for
+#: it. An optimised kernel costs more to compile, not less, so the budget has to
+#: leave room for one.
+#:
+#: Sized from measurement. A 64-rank compile of a single new shape has been
+#: measured at 1045-1167 s. A cell re-keys more than one: iteration 5's
+#: `BQ_2CORE=fp4,fp8` split re-keyed 125 distinct graph keys for one in512 cell,
+#: because fp8 appears in every graph holding an attention projection. And
+#: iteration 6 lost its whole gate to this: the in8192 warm-up was still
+#: amortising compile -- 253.98 s then 116.22 s a request, ETA falling 29:37 to
+#: 11:37 -- when the flat 1800 s fired, so the measured pass ran cold, paid the
+#: compile again, timed out too, and took the acceptance probe with it. Four
+#: judges and the verifier had passed; the iteration was rejected for a timeout
+#: during compilation.
+#:
+#: 2400 s is ~2x the worst measured single-shape compile, which covers a cell
+#: that re-keys several shapes without letting a genuine wedge sit for hours.
+#: The measured pass keeps the tight budget, so a wedge there is still caught in
+#: CELL_TIMEOUT_FLOOR.
+CELL_WARMUP_COMPILE_ALLOWANCE = 2400
 
 
 def _cell_timeout(args, batch: int, output_len: int) -> int:
@@ -783,7 +805,10 @@ def _bench_cell(
           f"{WARMUP_OUTPUT_LEN} out (discarded)")
     warm = _bench_serve(
         model, port, flags(WARMUP_OUTPUT_LEN), batch, num_prompts,
-        result_dir, f"{name}.warmup.json", timeout, server=server,
+        result_dir, f"{name}.warmup.json",
+        # Compile is paid here, so this pass gets the allowance; see
+        # `CELL_WARMUP_COMPILE_ALLOWANCE` for what it is sized from.
+        timeout + CELL_WARMUP_COMPILE_ALLOWANCE, server=server,
         server_log=server_log, stall_timeout=stall_timeout,
     )
     if warm is None:
