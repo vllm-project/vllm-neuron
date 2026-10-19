@@ -20,11 +20,12 @@ not something an iteration can do.
 
 **`--check latency`** -- two bars, and they are read differently on purpose.
 
-  TTFT < 1.5 s per 1k input tokens, on **every** measured cell. Latency is a
-  per-sample property, so a cell that misses it is a configuration a user would
-  experience as slow, whatever the others do. Normalising by input length is
-  what makes one bar meaningful across 512 and 8192 tokens; `ttft_p50` is
-  already per-request, so no further per-sample reduction is needed.
+  TTFT < 1.5 s per 1k input tokens **per sample**, on every measured cell.
+  Latency is a per-sample property, so a cell that misses it is a configuration
+  a user would experience as slow, whatever the others do. Two normalisations
+  make one bar mean the same thing everywhere: by input length, so 512 and 8192
+  are comparable, and by batch, so a cell that prefills ten samples together is
+  credited for sharing the wait between them.
 
   Decode > 50 tokens/s, on the **concurrent** cells only, aggregate. This is the
   interpretation to check if the number looks generous: `decode_tok_s` is
@@ -159,28 +160,43 @@ def _check_latency(report: dict, args) -> list[str]:
         # Its TPOT and decode figures stay in the table: those are per-token and
         # unaffected by admission delay.
         capped = bool(cell.get("concurrency_capped"))
-        per_1k = (ttft / (n_in / 1024.0)) if ttft and n_in and not capped else None
+        # The bar is per 1k input tokens **per sample**, so a concurrent cell's
+        # TTFT divides by its batch: ten samples prefilled together share the
+        # wait, and what a user experiences is their share of it. At batch 1
+        # this is the plain figure.
+        #
+        # Dividing is what makes the bar mean the same thing at every batch, and
+        # it is why it cannot be dodged either way. A cell that really prefills
+        # ten at once amortises: 2 s of concurrent prefill over 10 samples at
+        # 500 tokens is 410 ms per 1k, comfortably under. A queue cannot
+        # amortise, because its TTFT grows with the queue rather than staying
+        # put: `in512_bs10` clamped to one sequence measured 165 s, which is
+        # 16.5 s a sample and 33,800 ms per 1k -- 22x over the bar even after
+        # dividing, since the median request waits out the *decodes* of the
+        # requests ahead of it, not just their prefills.
+        per_1k = (ttft / cell["batch"] / (n_in / 1024.0)) if ttft and n_in else None
         decode = m.get("decode_tok_s")
         stream = m.get("per_stream_tok_s")
         tpot = m.get("tpot_p50_ms")
         over = "" if per_1k is None or per_1k <= args.ttft_ms_per_1k else " OVER"
         ttft_s = f"{ttft:.0f} ms" if ttft else "-"
-        per_1k_s = f"{per_1k:.0f} ms" if per_1k else ("queued" if capped else "-")
+        per_1k_s = f"{per_1k:.0f} ms" if per_1k else "-"
         tpot_s = f"{tpot:.0f} ms" if tpot else "-"
         decode_s = f"{decode:.1f}" if decode else "-"
         stream_s = f"{stream:.1f}" if stream else "-"
         print(f"  {_label(cell):<13} {n_in or 0:>5.0f}   {ttft_s:>9}   "
               f"{per_1k_s:>7}{over:<5}   {tpot_s:>9}  {decode_s:>7}  {stream_s:>10}")
         if capped:
-            print(f"      ^ TTFT not normalised: engine capped to "
-                  f"{cell.get('engine_max_num_seqs')} of {cell['batch']} requested, so this "
-                  "is queue wait. See `config.MAX_NUM_SEQS` for the cap itself.")
-        elif per_1k is None:
+            print(f"      ^ engine capped to {cell.get('engine_max_num_seqs')} of "
+                  f"{cell['batch']} requested, so this is a queue rather than a batch and the "
+                  "per-sample figure above is what that costs. See `config.MAX_NUM_SEQS`.")
+        if per_1k is None:
             problems.append(f"cell {_label(cell)} reported no TTFT.")
         elif per_1k > args.ttft_ms_per_1k:
+            share = (f" shared by {cell['batch']} samples" if cell["batch"] > 1 else "")
             problems.append(
-                f"cell {_label(cell)}: TTFT {ttft:.0f} ms over {n_in:.0f} measured "
-                f"input tokens is {per_1k:.0f} ms per 1k, above the "
+                f"cell {_label(cell)}: TTFT {ttft:.0f} ms{share} over {n_in:.0f} measured "
+                f"input tokens is {per_1k:.0f} ms per 1k per sample, above the "
                 f"{args.ttft_ms_per_1k:.0f} ms bar."
             )
         if per_1k is not None:
