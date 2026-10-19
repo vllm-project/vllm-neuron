@@ -570,6 +570,77 @@ def fp4_linear(x, w, scale):
     return out
 
 
+@nki.jit
+def fp4_linear_2core(x, w, scale):
+    """`fp4_linear` with the output columns divided across the two physical
+    cores of a logical NeuronCore. Launch it at `grid=(2,)`.
+
+    **Why this exists.** `wrap_nki` hardcodes `grid=[]`
+    (`libtorch_neuronx_lite/nki/nki_hop.py:657`), which `compile_nki` turns
+    into `lnc = 1`, while importing lite sets `NEURON_LOGICAL_NC_CONFIG=2`.
+    Iteration 4 read the lowering off `module.mlir` for `fp4_linear` at both
+    grids, 128x5120x2304 — the exact shape a routed expert step runs:
+
+        grid 1   one function  @blockquant.fp4_linear       360 nc_matmul
+        grid 2   two functions @...fp4_linear_lnc{0,1}      720 nc_matmul
+
+    One function and no `lnc_id` at grid 1, so there is no code for the second
+    physical core; and at grid 2 *every* op count is exactly doubled, because
+    `fp4_linear` divides nothing by `nl.program_id`, so both cores would
+    compute the same GEMM over the same data. Hence this: the same work, cut in
+    two, so the two per-core functions' op counts **sum** to the grid-1 total
+    instead of doubling it.
+
+    The cut is the free axis. `_gemm` writes `dst_hbm[rows, nb*nt:(nb+1)*nt]`
+    and `_dequant_fp4` reads a row range of `w`, so core `p` owns columns
+    `[p*span, (p+1)*span)` of the output and the matching rows of the weight:
+    disjoint reads, disjoint writes, no barrier and no exchange. What it does
+    duplicate is `_stage_rows` — `m x k` bf16 into each core's *private* HBM
+    scratch, 1.3 MB at m=128, k=5120 — because both cores need every row of the
+    stationary operand and a barrier to share one copy would cost more than the
+    copy does.
+
+    Reproduce the lowering check with
+    `/mnt/nvme/tmp/iter4lnc/compile_bq_lnc.py`, which compiles through
+    `TracerFrontend` (what `wrap_nki` defaults to) and opens no device.
+
+    Nothing calls this yet: `model._nki_entry` wraps at `wrap_nki(...)`, i.e.
+    grid 1, and this kernel asserts on a grid of 1 rather than silently running
+    half a GEMM. Wiring it means taking grid 2 **for this entry point only** —
+    `wrap_nki(fp4_linear_2core)[2]` — and leaving every unsplit kernel at
+    grid 1, because a kernel written for one core runs twice over the same data
+    at grid 2.
+    """
+    m, k = x.shape
+    n = w.shape[0]
+    assert w.shape[1] * 2 == k, f"fp4 weight {w.shape} does not pack k={k}"
+    programs = nl.num_programs(0)
+    core = nl.program_id(0)
+    assert programs == 2, (
+        f"launch grid is {programs}; fp4_linear_2core divides its output "
+        "columns between the two physical cores of a logical NeuronCore and "
+        "computes only its own half, so at grid 1 it would return a half-"
+        "empty result. Launch it as `wrap_nki(fp4_linear_2core)[2]`, or call "
+        "`fp4_linear` instead."
+    )
+    assert n % (programs * PT) == 0, (
+        f"n={n} does not divide into {programs} shares of a multiple of {PT}"
+    )
+    span = n // programs
+    lo = core * span
+    _check(k, span)
+    mpad = -(-m // PT) * PT
+
+    out = nl.ndarray((mpad, n), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    xq = nl.ndarray((mpad, k), dtype=nl.bfloat16, buffer=nl.private_hbm)
+    wd = nl.ndarray((span, k), dtype=nl.bfloat16, buffer=nl.private_hbm)
+
+    _stage_rows(x, m, k, xq, True)
+    _dequant_fp4(w[lo : lo + span, 0 : k // 2], scale[lo : lo + span], wd, span, k)
+    _gemm(xq, wd, out[0:mpad, lo : lo + span], mpad, k, span, out_scale=FP4_POST)
+    return out
+
+
 #: The low nibble of each uint16 lane of a uint32, i.e. two nibbles a lane-op.
 FP4_NIB_MASK2 = 0x000F000F
 #: `FP4_FIELD` doubled and signed: NKI takes a 32-bit bitwise operand as int32,

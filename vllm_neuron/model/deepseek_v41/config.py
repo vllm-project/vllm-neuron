@@ -34,7 +34,14 @@ TENSOR_PARALLEL_SIZE = 64
 #: `n_local_groups = o_groups // tp` reaches 0 above it; above the cap attention
 #: is replicated `world_size // this` times and the head-partial all-reduces are
 #: divided back down by `attn_replicas`.
-ATTENTION_TENSOR_PARALLEL_SIZE = 8
+#: 8 is the cap and the default. `DEEPSEEK_V41_ATTENTION_TP` lowers it, which
+#: is needed to reach TP=4 x PP=16: a 4-rank tensor-parallel group cannot
+#: contain an 8-way attention shard. At 4 each rank holds 2 of the 8 `o_groups`
+#: and the head-partial reduction runs over the 4-rank lane group — one device,
+#: the cheapest collective this host has — replicated 16x.
+ATTENTION_TENSOR_PARALLEL_SIZE = int(
+    os.environ.get("DEEPSEEK_V41_ATTENTION_TP", "8") or 8
+)
 
 #: Concurrent sequences this port serves above one rank. One because a run above
 #: 1 has stalled rather than because 1 is right: `~/ds41_repro_hang.py` is the

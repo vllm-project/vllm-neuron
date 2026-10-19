@@ -28,6 +28,7 @@ Why this exists:
 """
 
 import logging
+import os
 from datetime import timedelta
 
 import vllm.distributed.parallel_state as vllm_parallel_state
@@ -468,6 +469,49 @@ def _build_node_group_ranks(world_size: int, nnodes: int) -> list[list[int]]:
     ]
 
 
+#: Consecutive-rank groups by width, created only when asked for. See the
+#: "Lane groups" block in `_create_neuron_groups` for what they are for.
+_NEURON_LANE_GROUPS: dict[int, GroupCoordinator] = {}
+
+
+def _requested_lane_widths(world_size: int) -> list[int]:
+    """The lane-group widths `DEEPSEEK_V41_LANE_WIDTHS` asks for, validated.
+
+    Empty by default. A width must divide the world and be at least 2; the
+    world width itself is skipped because the TP group already is it.
+    """
+    raw = os.environ.get("DEEPSEEK_V41_LANE_WIDTHS", "").strip()
+    if not raw:
+        return []
+    widths: list[int] = []
+    for piece in raw.replace(" ", ",").split(","):
+        if not piece:
+            continue
+        width = int(piece)
+        if width < 2 or world_size % width or width >= world_size:
+            logger.warning(
+                "DEEPSEEK_V41_LANE_WIDTHS: skipping %d — it must be at least 2, "
+                "divide the world size %d, and be narrower than it",
+                width, world_size,
+            )
+            continue
+        if width not in widths:
+            widths.append(width)
+    return widths
+
+
+def get_neuron_lane_group(width: int) -> GroupCoordinator:
+    """The consecutive-rank group of `width` ranks containing this rank."""
+    group = _NEURON_LANE_GROUPS.get(width)
+    if group is None:
+        raise RuntimeError(
+            f"no lane group of width {width} was created; set "
+            f"DEEPSEEK_V41_LANE_WIDTHS={width} before the engine starts "
+            f"(created: {sorted(_NEURON_LANE_GROUPS)})"
+        )
+    return group
+
+
 # ---------------------------------------------------------------------------
 # Core: create Neuron-specific groups (assumes vLLM state exists)
 # ---------------------------------------------------------------------------
@@ -578,6 +622,43 @@ def _create_neuron_groups(
         "Initialized Node GroupCoordinator: ranks=%s",
         _NEURON_NODE_GROUP.ranks,
     )
+
+    # --- Lane groups: the consecutive-rank group a TP x PP factorization
+    #     would reduce over, for every width asked for.
+    #
+    # `parallelism-schema` asks what TP=4 x PP=16 and TP=16 x PP=4 are worth
+    # against today's flat TP=64 x PP=1. TP x PP = 64 in all three, so a
+    # factorization leaves per-rank arithmetic and per-rank weight footprint
+    # alone and changes exactly one thing: how many ranks — and, which
+    # iteration 3 measured to be the term that matters, how many *devices* — a
+    # tensor-parallel all-reduce spans. On this host rank r sits on device
+    # r // 4, so a consecutive-rank group of width w spans ceil(w / 4) devices:
+    # width 4 is one device, 8 is two column-adjacent devices (one torus hop,
+    # which is the floorplan's scheme-c TP group), 16 is four, 64 is all
+    # sixteen.
+    #
+    # These are deliberately *empty by default*: creating a GroupCoordinator is
+    # itself collective and costs device-side collective resources, which this
+    # deployment has been seen to run out of (`.autohelix/notes/iter-3.md` §5).
+    # `DEEPSEEK_V41_LANE_WIDTHS=4,16` asks for them, and nothing creates or
+    # touches them otherwise.
+    lane_widths = _requested_lane_widths(get_world_group().world_size)
+    for width in lane_widths:
+        lane_ranks = [
+            list(range(base, base + width))
+            for base in range(0, get_world_group().world_size, width)
+        ]
+        _NEURON_LANE_GROUPS[width] = init_model_parallel_group(
+            lane_ranks,
+            local_rank,
+            backend,
+            group_name=f"neuron_lane{width}",
+        )
+        logger.info(
+            "Initialized lane GroupCoordinator of width %d: ranks=%s",
+            width,
+            _NEURON_LANE_GROUPS[width].ranks,
+        )
 
     # --- Expert Parallelism ---
     if ep_degree > 1:
