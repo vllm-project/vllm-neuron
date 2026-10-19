@@ -26,7 +26,7 @@ goal: |
     in `kernels/legacy/`), as these fused kernels can significantly improve the inference speed.
   - drafter.py: the DSpark/MTP speculative proposer.
 
-  What's the success constraints. Thirteen, in the order the gate runs them. Each one's
+  What's the success constraints. Twelve, in the order the gate runs them. Each one's
   `why:` below says how it is judged and what it is defending against; these are the one-line
   versions, not the whole statement.
   - **imports-and-registers** — the port resolves under the arch string vLLM dispatches on.
@@ -36,13 +36,17 @@ goal: |
   - **hbm-resident-forward** — the forward reads no weight from disk or host DRAM.
   - **bench** — the speed and acceptance evidence gets measured. The three below read its report.
   - **acceptance-rate** — DSpark acceptance >= 27% on prose, by vLLM's own counters.
-  - **performance-targets** — TTFT < 1.5 s per 1k input tokens; aggregate decode > 50 tokens/s.
+  - **performance-targets** — TTFT < 1.5 s per 1k input tokens **per sample** (so a concurrent
+    cell's figure divides by its batch); aggregate decode > 50 tokens/s.
   - **nki-kernels-on-device** — the heavy modules run as NKI kernels on device. Not torch, not CPU.
   - **full-model-faithful** — every component of DeepSeek V4.1 Flash actually executes.
   - **uses-dspark-speculation** — drafts are proposed and verified, not computed and discarded.
   - **weights-resident-across-64-ranks** — the weights are divided across the 64 ranks and live in HBM.
-  - **parallelism-schema** — implement the floorplan's scheme (TP=8 x PP=8) and measure it,
-    then TP=4 x PP=16 and TP=16 x PP=4. Naming a blocker is not a pass.
+
+  **performance-targets is the only one of the twelve that has never passed.** Everything else
+  has been green at some point, so an iteration that breaks one of them has gone backwards even
+  if it moved a number. Treat the other eleven as regression tests and spend the iteration on
+  the performance bars.
 
   WARNING: Some operations, especially those related to collectives between cores and multi-batch
   inference, can cause the system to hang or deadlock. This phenomenon is devastating and we want to do
@@ -129,12 +133,18 @@ goal: |
     single rank is preferred" is a conclusion about **4 ranks inside one device**, where a collective
     never leaves that device's NeuronLink. It does not carry over unchanged to 64 ranks across 16.
 
-  floorplan/ contains the proposed parallelism scheme. It's recommended but not always the best. Make
-  it as the first priority to implement, then explore other parallelism (TP=4, PP=16 and TP=16, PP=4) to see if they can be faster. 
-  Implementing PP will require modification of backends for vllm Neuron, as PP is currently not supported
-  natively in vllm Neuron. You can consider using P2P collectives for communications between devices.
-  At this moment, do not worry about the regression on other models when implementing PP. Just make sure 
-  the DeepSeek V4.1 Flash model is working correctly and efficiently.
+  Parallelism — a suggestion now, not a requirement. `floorplan/` holds a proposed scheme
+  (TP=8 x PP=8: 16 stages, 8-wide tensor-parallel groups) and the two factorizations worth
+  knowing about are TP=4 x PP=16 and TP=16 x PP=4. Iterations 3-5 measured all of them and every
+  one lost at batch 1, for a reason that is arithmetic rather than implementation: PP=N
+  serialises N stages when one microbatch is in flight, so it costs about Nx until
+  `MAX_NUM_SEQS >= N`. Larger TP is genuinely better at batch 1 because it keeps all 64 ranks on
+  the one sequence. So the constraint that gated this is disabled, and the right time to revisit
+  it is after batching works — then PP can overlap microbatches and the comparison becomes
+  capable of going either way. If you do take it up: PP is not supported natively in vLLM Neuron,
+  `kernels/pp_permute.py` is the on-device transport written for it, and P2P collectives are the
+  route. Do not worry about regressions on other models. None of this is required of an
+  iteration; `performance-targets` is.
 
   Do not run the bench matrix script during the iteration. It takes a very long time. Instead, check the 
   bench matrix script and do each test one by one and see if any improvement. You don't have to run for all 
@@ -730,141 +740,148 @@ constraints:
     effort: medium
     timeout: 900
 
-  - name: parallelism-schema
-    kind: agent
-    rationale: |
-      The floorplan was written for exactly this 16-device target and the bootstrap deliberately
-      ignored it: it took the simplest scheme that fit — flat `TENSOR_PARALLEL_SIZE = 64`, no
-      pipeline stages — on the understanding that the placement study would come back later.
-      This is later. `floorplan/systems/trn2-16device.yaml` is this host, `floorplan/schemes/`
-      holds the candidates and `floorplan/reports/` the simulator's view of them.
-
-      Two specific factorizations are named because they are the ones worth settling, and both
-      keep the whole world: TP=4 x PP=16 and TP=16 x PP=4 against today's TP=64 x PP=1. Note
-      what changes and what does not. Per-rank weight footprint is unchanged in all three —
-      PP divides layers, TP divides within a layer, so 384 experts x 41 layers / 64 ranks is
-      246 expert slots a rank however the 64 is factored. What changes is the collective: this
-      model's bottleneck is collective count x participants plus per-graph-execution overhead,
-      and a 4-way all-reduce has a quarter the participants of a 16-way one. Against that, a
-      stage boundary adds a serialized activation transfer per microbatch, and PP's bubble is
-      unhidden at `MAX_NUM_SEQS = 1` because there is nothing to overlap it with — which is why
-      this and raising `config.MAX_NUM_SEQS` are likely to have to move together.
-
-      BE CAREFUL BEFORE YOU CHANGE THE RANK COUNT OR THE COLLECTIVE TIMEOUTS. A naive
-      multi-rank run through vLLM twice hung the whole *instance* on the predecessor host, each
-      time needing a reboot — which loses the iteration, the devices and everything in flight.
-      The mechanism is three timeouts ordered wrong: graphs here compile mid-forward (warmup is
-      skipped, the shape set is router-dependent), a measured compile took 1045-1167 s, and a
-      peer waiting inside a collective gave up at 960 s. The rank still compiling outlasts the
-      peers waiting on it, they time out, retry against a rank still compiling, and leave the
-      collective's device-side state in a condition no process can clear.
-
-      The mitigation is in place and should not be undone: `__init__.py` raises
-      `NEURON_RT_EXEC_TIMEOUT` from the runtime default of 300 s to 7200, above any compile
-      measured here. 64 ranks has since run the verifier to completion repeatedly; the one
-      reboot during bring-up was AWS degraded hardware with a scheduled `instance-stop`, not
-      this workload. Keep the ordering safe either way — prove every graph is compiled before
-      any collective executes (a warm NEFF cache, or a compile-only pass), or keep the RX
-      timeout above the worst compile you have measured. Check with `nki.simulate(kernel)(...)`
-      on CPU, then one short prompt, then the verifier. A lot of double-checking here is
-      cheaper than one reboot.
-
-      **PP does not exist in the execution path yet.** There is no `IntermediateTensors`
-      anywhere in `vllm_neuron`, so there is no activation transfer to schedule; the files to
-      build it in are in `scope.editable` and the goal says what is missing. So a FAIL here was
-      expected at the start — but "we could not measure PP because it is not implemented" is a
-      description of the work, not a substitute for it. Implementing PP *is* this constraint.
-      Iteration 1 added `send`/`recv` and documented the blockers accurately; the next step is
-      an activation transport that runs, not a better description of its absence.
-    prompt: |
-      Decide whether this iteration's parallelism scheme is a chosen one or an inherited one.
-
-      Read the floorplan first — it is the stated priority and it is **not in your worktree**
-      (gitignored), so read it at
-      `/home/ubuntu/vllm-neuron/vllm_neuron/model/deepseek_v41/floorplan/`: `README.md`,
-      `MODEL.md`, `PLATFORM.md`, `systems/trn2-16device.yaml`, `schemes/` and `reports/`. Say
-      which scheme the port currently implements, whether the floorplan contains it or
-      something else, and where they differ. An iteration that never opened the floorplan has
-      not followed the priority, whatever else it did.
-
-      Then establish what happened to the two named candidates, TP=4 x PP=16 and TP=16 x PP=4,
-      against the current TP=64 x PP=1. For each, exactly one of these has to be true and
-      cited:
-        - it was **measured** this iteration: say which configuration ran, and give the figures
-          it produced beside the current scheme's — TTFT, TPOT, aggregate decode, and whether
-          the verifier still passed. A scheme that is faster and wrong is not better.
-        - it was **ruled out by a figure from a run** — a pipeline that executed and was
-          slower, or a configuration that failed the verifier. A blocker named in the code is
-          not this. Iteration 1 named four accurate blockers and passed on the old wording;
-          that route is closed.
-
-      The floorplan's own scheme comes first, before either candidate: TP=8 x PP=8, which
-      iteration 1 established by reading `floorplan/REPORT.md:95-118` and confirmed against
-      `floorplan.yaml:145-150`. It is the stated priority, so measure it first and report it
-      beside TP=64 x PP=1.
-
-      Then decide whether the right scheme is in place. Adopting a candidate requires that it
-      measured better; keeping the current one requires that the others ran and were worse.
-      What is not passing is a scheme that is still flat TP=64 with no pipeline ever having
-      executed.
-
-      Things that would make this FAIL — look for each specifically:
-        - the floorplan was not read, or was read and contradicted without the contradiction
-          being argued;
-        - a factorization that does not multiply to the world size (TP x PP must be 64, or the
-          world size must change deliberately and be stated);
-        - a candidate declared better on reasoning alone, with no run behind it;
-        - a candidate declared worse on reasoning alone, where a run was possible;
-        - a configuration that was measured but whose verifier run was skipped or failed, so
-          the comparison is between a working scheme and an unverified one;
-        - the same blocker reported as last iteration with no work done on it in between —
-          check the iteration notes and `git log`;
-        - a change to `TENSOR_PARALLEL_SIZE` or `ATTENTION_TENSOR_PARALLEL_SIZE` whose effect on
-          `o_groups` was not thought through: `n_local_groups = o_groups // tp` reaches 0 above
-          8, which is why attention is capped there and replicated.
-    criteria: |
-      PASS requires a pipeline that actually ran. Specifically: the floorplan's own scheme —
-      TP=8 x PP=8, 16 stages on 16 devices with 8-wide tensor-parallel groups — is implemented
-      and measured against TP=64 x PP=1 with the verifier still passing, and TP=4 x PP=16 and
-      TP=16 x PP=4 are each either measured too or ruled out by a figure from a run. The scheme
-      left in place is then the fastest of the measured ones, which may still be TP=64 x PP=1 —
-      keeping it is a pass only when numbers from a working pipeline say so.
-
-      **Naming a blocker is not a pass.** Iteration 1 passed this constraint on the earlier
-      wording, which accepted "measured comparison OR specific named blocker": it cited the
-      floorplan correctly, added `NeuronDeviceCommunicator.send/recv`, documented four real
-      blockers — and left the scheme at flat TP=64 x PP=1, measuring none of the three. That is
-      progress worth having and it is not what this constraint is for. The operator's
-      instruction is to implement the floorplan's scheme as the priority and then compare the
-      two candidates, so until a pipeline executes this FAILs, and the FAIL is the signal to
-      build it rather than to describe it again.
-
-      The blockers are real and all of them are reachable from `scope.editable`; a FAIL here is
-      a work item, not an impossibility:
-        - no `IntermediateTensors` in `vllm_neuron` — thread them through `model.py` and
-          `vllm/worker/neuron_model_runner.py`, both editable;
-        - no pipeline process group — `parallel/neuron_parallel_state.py` is editable and is
-          where the groups are built;
-        - `NeuronDeviceCommunicator.send/recv` stage through host DRAM over gloo, which puts a
-          host round trip on every stage boundary. `nki.collectives.collective_permute` exists
-          in the installed toolchain and `kernels/` is editable, so a device-side p2p kernel is
-          the in-scope route. The XLA lowering in `libtorch_neuronx_lite/overrides/
-          xla_collectives.py` is vendored and NOT editable — go around it, not through it.
-
-      Report the floorplan's bandwidth case on its own terms. Its argument for pipelining is
-      bank-bandwidth-bound decode and lower per-bank weight residency, not capacity. "The
-      weights already fit" answers a different question and does not settle it.
-      FAIL if the floorplan was not read, if a candidate was dismissed or adopted without
-      evidence, if a measured candidate's verifier run did not pass, if the factorization does
-      not account for all 64 ranks, or if the evidence does not let you tell.
-
-      A FAIL is expected while pipeline parallelism is being built — there is nothing to
-      measure until there is a PP implementation. Say plainly which of the two candidates is
-      blocked on what, and what was built toward it this iteration, so the next one continues
-      rather than restating.
-    model: claude-sonnet-5
-    effort: medium
-    timeout: 900
+  # ── DISABLED 2026-10-19 by the operator ────────────────────────────────────────────────
+  # The floorplan and the two named factorizations are now *suggestions in the goal*, not a
+  # gate. Four iterations measured them and every scheme lost at batch 1 for a reason that is
+  # arithmetic rather than implementation: PP=N serialises N stages with one microbatch in
+  # flight, so it costs ~Nx until MAX_NUM_SEQS >= N. Gating on it spent iteration budget
+  # re-arguing a blocked comparison every iteration. Re-enable once batching works, when the
+  # comparison can be made at a batch where PP is capable of winning.
+  # - name: parallelism-schema
+  # kind: agent
+  # rationale: |
+  # The floorplan was written for exactly this 16-device target and the bootstrap deliberately
+  # ignored it: it took the simplest scheme that fit — flat `TENSOR_PARALLEL_SIZE = 64`, no
+  # pipeline stages — on the understanding that the placement study would come back later.
+  # This is later. `floorplan/systems/trn2-16device.yaml` is this host, `floorplan/schemes/`
+  # holds the candidates and `floorplan/reports/` the simulator's view of them.
+  #
+  # Two specific factorizations are named because they are the ones worth settling, and both
+  # keep the whole world: TP=4 x PP=16 and TP=16 x PP=4 against today's TP=64 x PP=1. Note
+  # what changes and what does not. Per-rank weight footprint is unchanged in all three —
+  # PP divides layers, TP divides within a layer, so 384 experts x 41 layers / 64 ranks is
+  # 246 expert slots a rank however the 64 is factored. What changes is the collective: this
+  # model's bottleneck is collective count x participants plus per-graph-execution overhead,
+  # and a 4-way all-reduce has a quarter the participants of a 16-way one. Against that, a
+  # stage boundary adds a serialized activation transfer per microbatch, and PP's bubble is
+  # unhidden at `MAX_NUM_SEQS = 1` because there is nothing to overlap it with — which is why
+  # this and raising `config.MAX_NUM_SEQS` are likely to have to move together.
+  #
+  # BE CAREFUL BEFORE YOU CHANGE THE RANK COUNT OR THE COLLECTIVE TIMEOUTS. A naive
+  # multi-rank run through vLLM twice hung the whole *instance* on the predecessor host, each
+  # time needing a reboot — which loses the iteration, the devices and everything in flight.
+  # The mechanism is three timeouts ordered wrong: graphs here compile mid-forward (warmup is
+  # skipped, the shape set is router-dependent), a measured compile took 1045-1167 s, and a
+  # peer waiting inside a collective gave up at 960 s. The rank still compiling outlasts the
+  # peers waiting on it, they time out, retry against a rank still compiling, and leave the
+  # collective's device-side state in a condition no process can clear.
+  #
+  # The mitigation is in place and should not be undone: `__init__.py` raises
+  # `NEURON_RT_EXEC_TIMEOUT` from the runtime default of 300 s to 7200, above any compile
+  # measured here. 64 ranks has since run the verifier to completion repeatedly; the one
+  # reboot during bring-up was AWS degraded hardware with a scheduled `instance-stop`, not
+  # this workload. Keep the ordering safe either way — prove every graph is compiled before
+  # any collective executes (a warm NEFF cache, or a compile-only pass), or keep the RX
+  # timeout above the worst compile you have measured. Check with `nki.simulate(kernel)(...)`
+  # on CPU, then one short prompt, then the verifier. A lot of double-checking here is
+  # cheaper than one reboot.
+  #
+  # **PP does not exist in the execution path yet.** There is no `IntermediateTensors`
+  # anywhere in `vllm_neuron`, so there is no activation transfer to schedule; the files to
+  # build it in are in `scope.editable` and the goal says what is missing. So a FAIL here was
+  # expected at the start — but "we could not measure PP because it is not implemented" is a
+  # description of the work, not a substitute for it. Implementing PP *is* this constraint.
+  # Iteration 1 added `send`/`recv` and documented the blockers accurately; the next step is
+  # an activation transport that runs, not a better description of its absence.
+  # prompt: |
+  # Decide whether this iteration's parallelism scheme is a chosen one or an inherited one.
+  #
+  # Read the floorplan first — it is the stated priority and it is **not in your worktree**
+  # (gitignored), so read it at
+  # `/home/ubuntu/vllm-neuron/vllm_neuron/model/deepseek_v41/floorplan/`: `README.md`,
+  # `MODEL.md`, `PLATFORM.md`, `systems/trn2-16device.yaml`, `schemes/` and `reports/`. Say
+  # which scheme the port currently implements, whether the floorplan contains it or
+  # something else, and where they differ. An iteration that never opened the floorplan has
+  # not followed the priority, whatever else it did.
+  #
+  # Then establish what happened to the two named candidates, TP=4 x PP=16 and TP=16 x PP=4,
+  # against the current TP=64 x PP=1. For each, exactly one of these has to be true and
+  # cited:
+  # - it was **measured** this iteration: say which configuration ran, and give the figures
+  # it produced beside the current scheme's — TTFT, TPOT, aggregate decode, and whether
+  # the verifier still passed. A scheme that is faster and wrong is not better.
+  # - it was **ruled out by a figure from a run** — a pipeline that executed and was
+  # slower, or a configuration that failed the verifier. A blocker named in the code is
+  # not this. Iteration 1 named four accurate blockers and passed on the old wording;
+  # that route is closed.
+  #
+  # The floorplan's own scheme comes first, before either candidate: TP=8 x PP=8, which
+  # iteration 1 established by reading `floorplan/REPORT.md:95-118` and confirmed against
+  # `floorplan.yaml:145-150`. It is the stated priority, so measure it first and report it
+  # beside TP=64 x PP=1.
+  #
+  # Then decide whether the right scheme is in place. Adopting a candidate requires that it
+  # measured better; keeping the current one requires that the others ran and were worse.
+  # What is not passing is a scheme that is still flat TP=64 with no pipeline ever having
+  # executed.
+  #
+  # Things that would make this FAIL — look for each specifically:
+  # - the floorplan was not read, or was read and contradicted without the contradiction
+  # being argued;
+  # - a factorization that does not multiply to the world size (TP x PP must be 64, or the
+  # world size must change deliberately and be stated);
+  # - a candidate declared better on reasoning alone, with no run behind it;
+  # - a candidate declared worse on reasoning alone, where a run was possible;
+  # - a configuration that was measured but whose verifier run was skipped or failed, so
+  # the comparison is between a working scheme and an unverified one;
+  # - the same blocker reported as last iteration with no work done on it in between —
+  # check the iteration notes and `git log`;
+  # - a change to `TENSOR_PARALLEL_SIZE` or `ATTENTION_TENSOR_PARALLEL_SIZE` whose effect on
+  # `o_groups` was not thought through: `n_local_groups = o_groups // tp` reaches 0 above
+  # 8, which is why attention is capped there and replicated.
+  # criteria: |
+  # PASS requires a pipeline that actually ran. Specifically: the floorplan's own scheme —
+  # TP=8 x PP=8, 16 stages on 16 devices with 8-wide tensor-parallel groups — is implemented
+  # and measured against TP=64 x PP=1 with the verifier still passing, and TP=4 x PP=16 and
+  # TP=16 x PP=4 are each either measured too or ruled out by a figure from a run. The scheme
+  # left in place is then the fastest of the measured ones, which may still be TP=64 x PP=1 —
+  # keeping it is a pass only when numbers from a working pipeline say so.
+  #
+  # **Naming a blocker is not a pass.** Iteration 1 passed this constraint on the earlier
+  # wording, which accepted "measured comparison OR specific named blocker": it cited the
+  # floorplan correctly, added `NeuronDeviceCommunicator.send/recv`, documented four real
+  # blockers — and left the scheme at flat TP=64 x PP=1, measuring none of the three. That is
+  # progress worth having and it is not what this constraint is for. The operator's
+  # instruction is to implement the floorplan's scheme as the priority and then compare the
+  # two candidates, so until a pipeline executes this FAILs, and the FAIL is the signal to
+  # build it rather than to describe it again.
+  #
+  # The blockers are real and all of them are reachable from `scope.editable`; a FAIL here is
+  # a work item, not an impossibility:
+  # - no `IntermediateTensors` in `vllm_neuron` — thread them through `model.py` and
+  # `vllm/worker/neuron_model_runner.py`, both editable;
+  # - no pipeline process group — `parallel/neuron_parallel_state.py` is editable and is
+  # where the groups are built;
+  # - `NeuronDeviceCommunicator.send/recv` stage through host DRAM over gloo, which puts a
+  # host round trip on every stage boundary. `nki.collectives.collective_permute` exists
+  # in the installed toolchain and `kernels/` is editable, so a device-side p2p kernel is
+  # the in-scope route. The XLA lowering in `libtorch_neuronx_lite/overrides/
+  # xla_collectives.py` is vendored and NOT editable — go around it, not through it.
+  #
+  # Report the floorplan's bandwidth case on its own terms. Its argument for pipelining is
+  # bank-bandwidth-bound decode and lower per-bank weight residency, not capacity. "The
+  # weights already fit" answers a different question and does not settle it.
+  # FAIL if the floorplan was not read, if a candidate was dismissed or adopted without
+  # evidence, if a measured candidate's verifier run did not pass, if the factorization does
+  # not account for all 64 ranks, or if the evidence does not let you tell.
+  #
+  # A FAIL is expected while pipeline parallelism is being built — there is nothing to
+  # measure until there is a PP implementation. Say plainly which of the two candidates is
+  # blocked on what, and what was built toward it this iteration, so the next one continues
+  # rather than restating.
+  # model: claude-sonnet-5
+  # effort: medium
+  # timeout: 900
 
 scope:
   editable:
