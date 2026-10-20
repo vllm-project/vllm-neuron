@@ -1368,13 +1368,19 @@ class PagedSpan:
 class SharedAttentionState:
     """What attention layers hand down the stack instead of recomputing."""
 
-    __slots__ = ("compress_kv", "index_k", "topk_idxs", "candidates")
+    __slots__ = (
+        "compress_kv", "index_k", "topk_idxs", "candidates", "compress_read",
+    )
 
     def __init__(self) -> None:
         self.compress_kv: torch.Tensor | None = None
         self.index_k: torch.Tensor | None = None
         self.topk_idxs: torch.Tensor | None = None
         self.candidates: torch.Tensor | None = None
+        #: The rows of `compress_kv` the last `is_kv_source` layer read out,
+        #: for the layers behind it that would read exactly the same ones.
+        #: See `Attention.reads_shared_compress`.
+        self.compress_read: torch.Tensor | None = None
 
 
 class Compressor(nn.Module):
@@ -1614,6 +1620,50 @@ class Attention(nn.Module):
         self.is_kv_source = is_backbone and layer_id in config.kv_source_layer_ids
         self.is_index_source = is_backbone and layer_id in config.index_source_layer_ids
 
+        #: Whether this layer reads the compressed KV that an earlier layer
+        #: already gathered, instead of gathering the same rows again.
+        #:
+        #: Only `is_kv_source` layers own a `compress_kv_cache` (see
+        #: `bind_kv_cache`), and `_compress_kv` hands the owner's buffer down
+        #: the stack as `shared.compress_kv`. The rows it then reads out of that
+        #: buffer are `min(arange(read_len), compress_len - 1) * ratio`, and
+        #: every term is fixed by `(ratio, start_pos, seqlen)` — so **every
+        #: layer behind one `is_kv_source` layer, at that layer's ratio, gathers
+        #: byte-for-byte the same tensor**. With `kv_source_layer_ids
+        #: [2, 8, 14, 20]` and `compress_ratios` 2 on layers 2-19 and 1 on
+        #: 20-39, that is 38 indirect gathers a sequence a forward where 4 are
+        #: needed: layers 3-7, 9-13, 15-19 and 21-39 repeat their source's.
+        #:
+        #: Each repeat is `read_len x head_dim` pulled through the indirect
+        #: scatter/gather path — 9.7 MB a layer at the bench's 8448-token
+        #: context, since `_COMPRESS_READ_CEILING` pins `read_len` to the
+        #: engine's context.
+        #:
+        #: **It is not, however, a latency win, and this comment is deliberately
+        #: not claiming one.** Removing 34 of the 38 gathers — 2.6 GB of
+        #: indirect reads out of an 8-forward `in8192_bs1` cell — measured
+        #: within +-1.3% on all four batch-1 bench cells, two in each direction
+        #: (`.autohelix/notes/iter-9.md` §6 and §8). What it buys is device
+        #: working set: 34 fewer `read_len x 576` tables live per sequence per
+        #: forward, under a 24 GiB per-rank budget. The predecessor of this
+        #: comment, in `__init__.py`, attributed the whole per-forward prefill
+        #: cost to this read; that attribution is false, and iteration 9's §9b
+        #: measures where the time actually is by halving the forward count.
+        #:
+        #: Decided here, from the layer topology, rather than by comparing
+        #: tensors at runtime: the flag is a module constant, so the two arms in
+        #: `_compress_kv` are chosen at trace time and neither adds a guard on
+        #: anything a previous graph wrote. The equality of `ratio` is checked
+        #: rather than assumed, so a config whose ratio changes inside a
+        #: kv-source group gathers again instead of reusing rows at the wrong
+        #: stride.
+        self.reads_shared_compress = False
+        if is_backbone and self.compress_ratio and not self.is_kv_source:
+            sources = [s for s in config.kv_source_layer_ids if s < layer_id]
+            self.reads_shared_compress = bool(sources) and (
+                config.compress_ratios[max(sources)] == self.compress_ratio
+            )
+
         self.register_buffer(
             "attn_sink", torch.empty(self.n_local_heads, dtype=torch.float32)
         )
@@ -1751,16 +1801,31 @@ class Attention(nn.Module):
                 rotated.reshape(rotated.size(1), -1),
             )
 
-        group_pos = (
-            torch.minimum(
-                torch.arange(read_len, device=x.device),
-                (compress_len - 1).clamp_min(0),
+        if self.reads_shared_compress:
+            # The same rows of the same buffer an earlier layer already read.
+            # Handed down the stack like `shared.compress_kv` and
+            # `shared.topk_idxs` beside it, and for the same reason: it is the
+            # one mechanism in this model that is known to carry a computed
+            # tensor between two separately compiled block graphs.
+            #
+            # Correct because nothing writes `shared.compress_kv` between the
+            # gather and this read: the only writer is the `paged.put` above,
+            # which runs exactly where `latent is not None`, i.e. on the
+            # `is_kv_source` layer that also refreshes `shared.compress_read`
+            # two lines down.
+            compress_kv = shared.compress_read
+        else:
+            group_pos = (
+                torch.minimum(
+                    torch.arange(read_len, device=x.device),
+                    (compress_len - 1).clamp_min(0),
+                )
+                * ratio
             )
-            * ratio
-        )
-        compress_kv = paged.gather(shared.compress_kv, group_pos).reshape(
-            1, read_len, -1
-        )
+            compress_kv = paged.gather(shared.compress_kv, group_pos).reshape(
+                1, read_len, -1
+            )
+            shared.compress_read = compress_kv
         return compress_kv, idxs
 
     #: Whether `forward_spans` below may serve this attention. False on

@@ -484,10 +484,24 @@ def require_segmented_prefill(vllm_config) -> None:
 #: iter-1's single fit could not: **`F` is per-context, not a constant.**
 #: `4F + n·p = 3956.0` with `2F + n·p = 3065.9` gives `F = 445 ms` at the 2304
 #: context; `16F' + n'·p' = 20296.0` with `8F' + n'·p' = 14028.9` gives
-#: **`F' = 783 ms`** at 8448. That is the compressed-KV read, whose ceiling is
-#: pinned to `max_model_len` (`model._COMPRESS_READ_CEILING`), so a forward at a
-#: wider context costs more however many tokens are in it. The per-token term
-#: moves the other way: 1.073 ms/token at 2304 against ~0.95 at 8448.
+#: **`F' = 783 ms`** at 8448. The per-token term moves the other way:
+#: 1.073 ms/token at 2304 against ~0.95 at 8448.
+#:
+#: **This paragraph used to attribute `F` to the compressed-KV read, whose
+#: ceiling is pinned to `max_model_len` (`model._COMPRESS_READ_CEILING`). That
+#: attribution is false and has been removed.** Iteration 9 deleted 34 of the
+#: 38 compressed-KV gathers a sequence a forward — 2.6 GB of indirect reads out
+#: of an `in8192_bs1` cell — and all four batch-1 cells came back within ±1.3%,
+#: two in each direction. See `.autohelix/notes/iter-9.md` §6.
+#:
+#: Iteration 9 also re-ran this experiment one octave up (1024 vs 2048) and got
+#: 325 ms at 2304 and 357 ms at 8448 for the same quantity, against the 445 and
+#: 783 above. So **`F` is segment-dependent as well as context-dependent**: the
+#: marginal value of eliminating a forward roughly halves with each doubling of
+#: the segment, which means part of what both fits call `F` is per-token work
+#: that gets cheaper in wider tiles. Quote a number from here only with the
+#: segment pair it was measured from, and do not read either as an operator's
+#: cost — §9c of those notes.
 #:
 #: None of this carries the TTFT bar, and the arithmetic says why rather than
 #: hoping: every cell lands near 1550-1760 ms per 1k against a 1500 bar, and
