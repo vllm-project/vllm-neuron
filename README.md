@@ -1,128 +1,154 @@
 # vLLM Neuron Plugin (Beta)
 
-> **⚠️ Important**: This is beta preview of the vLLM Neuron plugin. For a more stable experience, consider using the [AWS Neuron vllm fork](https://github.com/aws-neuron/upstreaming-to-vllm/releases/tag/2.26.0) as described in the [NxDI vLLM User Guide](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/nxd-inference/developer_guides/vllm-user-guide.html).
+The vLLM Neuron plugin is the recommended serving solution for large language models on AWS Trainium. It extends [vLLM](https://docs.vllm.ai/) with a Neuron backend, providing the same vLLM APIs and configuration you are already familiar with.
 
-The vLLM Neuron plugin (vllm-neuron) is a vLLM extension that integrates AWS Neuron Trainium/Inferentia support with vLLM. Built on [vLLM's Plugin System](https://docs.vllm.ai/en/latest/design/plugin_system.html), it enables the optimization of existing vLLM workflows on AWS Neuron.
+> **If you are using vLLM with NxD Inference (0.5.x plugin version),** see the [release-0.5.3 branch](https://github.com/aws-neuron/private-vllm-neuron/tree/release-0.5.3) and the [NxD Inference + vLLM documentation](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/nxd-inference/index.html). To migrate to the plugin based on 0.21.0+, see the [migration guide](docs/getting-started/migration-nxdi-to-vllm-neuron.md).
 
-* vLLM v0.11.0 is automatically installed as part of this installation. Refer to the Quickstart Guide below.
-
-## Prerequisites
-
-- AWS Neuron SDK 2.26.1 ([Release Notes](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/release-notes/2.26.1.html))
-- Python 3.8+ (compatible with vLLM requirements)
-- Supported AWS instances: Inf2, Trn1/Trn1n, Trn2
-
-## Quickstart Guide
-
-Install the plugin from GitHub sources using the following commands. The plugin will automatically install the correct version of vLLM along with other required dependencies.
+## Installation
 
 ```bash
-git clone https://github.com/vllm-project/vllm-neuron.git
+git clone -b release-0.29.0.1.2.0 https://github.com/vllm-project/vllm-neuron.git
 cd vllm-neuron
 pip install --extra-index-url=https://pip.repos.neuron.amazonaws.com -e .
 ```
-## Basic Usage
-### Offline Inference
 
-```python
-import os
-from vllm import LLM, SamplingParams
+This installs the vLLM Neuron plugin from source along with vLLM and the required Neuron SDK packages. See [Version](#version) for the full compatibility matrix.
 
-# Initialize the model
-llm = LLM(
-    model=f"TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    max_num_seqs=4,
-    max_model_len=2048,
-    tensor_parallel_size=32,
-    num_gpu_blocks_override=4096,
-    block_size=32,
-    enable_prefix_caching=True,
-    additional_config=dict(
-        override_neuron_config=dict(
-            async_mode=False,
-            is_prefix_caching=True,
-            is_block_kv_layout=True,
-            pa_num_blocks=4096,
-            pa_block_size=32,
-            skip_warmup=True,
-            save_sharded_checkpoint=True,
-        )
-    ),
-)
+**For detailed environment setup and instance selection**: See the [Setup guide](docs/getting-started/setup-guide.md).
 
-# Generate text
-prompts = [
-    "Hello, my name is",
-    "The president of the United States is",
-    "The capital of France is",
-]
-sampling_params = SamplingParams(temperature=0.0)
-outputs = llm.generate(prompts, sampling_params)
+## Quick Start
 
-for output in outputs:
-    print(f"Prompt: {output.prompt}")
-    print(f"Generated: {output.outputs[0].text}")
-```
-
-### OpenAI-Compatible API Server
+Run the following command from a shell terminal in the local or instance environment (`vllm` must be in the path) where vLLM is configured:
 
 ```bash
-python3 -m vllm.entrypoints.openai.api_server \
-    --model "TinyLlama/TinyLlama-1.1B-Chat-v1.0" \
-    --tensor-parallel-size 32 \
-    --max-model-len 2048 \
-    --max-num-seqs 4 \
-    --no-enable-prefix-caching \
-    --additional-config '{
-        "override_neuron_config": {
-            "skip_warmup": true,
-            "enable_bucketing": true,
-            "context_encoding_buckets": [256, 512, 1024, 2048],
-            "token_generation_buckets": [256, 512, 1024, 2048]
-        }
-    }' \
-    --port 8000
+vllm serve openai/gpt-oss-20b \
+    --tensor-parallel-size 8 \
+    --max-model-len 8192 \
+    --max-num-batched-tokens 4096 \
+    --max-num-seqs 4
 ```
-## Feature Support
 
-| Feature                 | Status | Notes                         |
-|:------------------------|:------:|-------------------------------|
-| Continuous batching     |   🟢   |                               |
-| Chunked prefill         |   🚧   |                               |
-| Prefix caching          |   🟢   |                               |
-| Speculative decoding    |   🟢   | Only Eagle V1 is supported    |
-| Dynamic sampling        |   🟢   |                               |
-| Tool calling            |   🟢   |                               |
-| CPU Sampling            |   🟢   |                               |
-| Multimodal              |   🚧   | Only Llama 4 is supported     |
-| Quantization            |   🟢   | INT8/FP8 quantization support |
+## Supported Models
 
-* 🟢 Functional: Fully operational, with ongoing optimizations.
-* 🚧 WIP: Under active development.
-  
-## Feature Configuration
+Models listed below are tested end-to-end on Neuron hardware with correctness validation and performance benchmarking.
 
-You configure Neuron-specific features using the [NxD Inference library](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/nxd-inference/nxdi-overview.html). Use the `additional_config` field to provide an `override_neuron_config` dict that specifies your desired NxD Inference configurations. 
+| Family | Model | Type | Instance | Correctness | Perf Test | Perf Tuning |
+|---|---|---|---|---|---|---|
+| Llama 3 | 1B, 8B, 70B | Text | Trn2, Trn3 | ✅ | ✅ | In progress |
+| GPT-OSS | 20B, 120B | Text | Trn2, Trn3 | ✅ | ✅ | In progress |
+| Qwen3 | 32B (Dense) | Text | Trn2, Trn3 | ✅ | ✅ | In progress |
+| Qwen3-VL | 32B (Dense) | Multimodal | Trn2, Trn3 | ✅ | ✅ | In progress |
+| Qwen3-Embedding | 8B | Embedding | Trn2, Trn3 | ✅ | ✅ | In progress |
+| Qwen3-ASR | 1.7B | Audio | Trn2, Trn3 | ✅ | ✅ | In progress |
 
-## Models Supported 
-We support a subset of [models supported on NxDI](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/nxd-inference/developer_guides/model-reference.html#supported-model-architectures), including
-* Llama 2/3.1/3.3
-* Llama 4 Scout, Maverick
-* Qwen 2.5
-* Qwen 3
-  
-## Known Issues
+- **Correctness** — Accuracy validation passing (logit comparison, dataset accuracy validation)
+- **Perf Test** — Performance benchmark tests tracked across releases
+- **Perf Tuning** — Active optimization work being done
 
-1. Chunked prefill is disabled by default on Neuron for optimal performance. To enable chunked prefill, set the environment variable `DISABLE_NEURON_CUSTOM_SCHEDULER="1"`.  
-2. Users are required to provide a `num_gpu_blocks_override` arg calculated as `ceil(max_model_len // block_size) * max_num_seqs` when invoking vLLM to avoid a potential OOB error.
-3. Prefix caching with batch_size=1 generates incorrect outputs. Recommend to use batch_size>1 when prefix caching is enabled.
+> **Note:** This list includes only the models currently supported in the latest plugin version and does not include models under development or on roadmap.
 
-## Support
+For dense Qwen3-32B checkpoints, features, and deployment commands, see the
+[model recipe](docs/model-recipes/qwen3-32b.md).
 
-- **Documentation**: [AWS Neuron Documentation](https://awsdocs-neuron.readthedocs-hosted.com/)
-- **Issues**: [GitHub Issues](https://github.com/vllm-project/vllm-neuron/issues)
-- **Community**: [AWS Neuron Forum](https://forums.aws.amazon.com/forum.jspa?forumID=355)
+Performance improvements are delivered incrementally with each Neuron release.
+
+### Community Contributions
+
+The [`contrib/`](contrib/) folder hosts community-contributed models. These are maintained by the community and may have limited testing compared to the officially-supported models above. To use one, or to contribute your own model, see [contrib/README.md](contrib/README.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Features
+
+Feature support is at the framework level. See the model cards in [`docs/model-recipes/`](docs/model-recipes/) for per-model feature availability and the [features guide](docs/guides/features-guide.md) for configuration details.
+
+| Category | Feature | Status |
+|---|---|---|
+| **Serving** | Continuous batching | ✅ |
+| | OpenAI-compatible APIs | ✅ |
+| | Embedding API (`/v1/embeddings`) | ✅ |
+| | Streaming | ✅ |
+| | Structured outputs (JSON, regex, grammar) | ✅ |
+| | Tool calling | ✅ |
+| | LoRA adapters | ❌ |
+| | Weight reload API | ❌ |
+| | Sleep mode (sleep/wake_up API) | ❌ |
+| **Parallelism** | Tensor parallelism (TP) | ✅ |
+| | Sequence parallelism (SP) | ✅ |
+| | Data parallelism (DP) | ✅ |
+| | Expert parallelism (EP) | ✅ |
+| | Encoder parallelism | ✅ |
+| | Pipeline parallelism (PP) | ❌ |
+| | Context parallelism (CP) | ✅ |
+| **Performance** | Paged KV cache | ✅ |
+| | Prefix caching | ✅ |
+| | Segmented prefill | ✅ |
+| | Chunked prefill (mixed batching) | ❌ |
+| | Disaggregated inference (1P1D, xPyD) | ✅ |
+| | Async scheduling | ✅ |
+| | On-device sampling (top-k, top-p, temperature) | ✅ |
+| | KV cache offloading | ❌ |
+| | Disaggregated encoder (EPD) | ✅ |
+| **Compilation** | torch.compile (native PyTorch) | ✅ |
+| | torch.compile (XLA backend) | ✅ |
+| | Compile cache (local/remote) | ✅ |
+| | CPU compilation | ✅ |
+| **Runtime** | Model Runner V2 (dense models) | ✅ |
+| **Speculative Decoding** | EAGLE3 | ✅ |
+| | MTP | ❌ |
+| **Quantization** | BF16 | ✅ |
+| | FP8 | ✅ |
+| | Quantized KV cache (FP8) | ✅ |
+| | MXFP4 weights (Trn3) | ✅ |
+| | MXFP8 weights (Trn3) | ✅ |
+| **Multimodal Inputs** | Images + text | ✅ |
+| | Videos + text | ✅ |
+| | Audio | ✅ |
+| **Observability** | Production metrics (`/metrics` endpoint) | ✅ |
+| | Profiler API | ✅ |
+
+**Status legend:**
+
+- ✅ Supported — integrated and tested for at least one model
+- ❌ Not supported — may be considered for future releases
+
+## Documentation
+
+Full documentation sources are found in [`docs/`](docs/). These docs are published to [awsdocs-neuron.readthedocs-hosted.com/en/latest/vllm-neuron](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/vllm-neuron/docs/index.html).
+
+**Deploying supported models:**
+
+| Folder | What's inside |
+|---|---|
+| [`docs/getting-started/`](docs/getting-started/) | Setup, quickstarts, migration from NxD Inference |
+| [`docs/guides/`](docs/guides/) | Features guide, configuration reference, metrics, profiling |
+| [`docs/model-recipes/`](docs/model-recipes/) | Per-model deployment recipes |
+| [`docs/tutorials/`](docs/tutorials/) | End-to-end walkthroughs (DI, prefix caching, etc.) |
+
+**Implementing new models & optimizing performance:**
+
+| Folder | What's inside |
+|---|---|
+| [`docs/model-dev/`](docs/model-dev/) | Model onboarding, CPU development, etc. |
+| [`docs/design/`](docs/design/) | Architecture deep dives (parallelism, DI, prefix caching, etc.) |
+
+## Version
+
+Starting with 0.21.0, the vLLM Neuron plugin version follows the format `<vLLM version>.<plugin version>` (e.g., `0.21.0.1.0.0` means vLLM 0.21.0, plugin version 1.0.0). Model implementations live directly in the plugin and NxD Inference is no longer a dependency. Customers on 0.5.x can migrate using the [migration guide](docs/getting-started/migration-nxdi-to-vllm-neuron.md).
+
+| vLLM-Neuron Plugin | vLLM Version | Neuron SDK | NxD Inference | Instance Support | Status | Documentation |
+|---|---|---|---|---|---|---|
+| 0.29.0.1.2.0 (latest) | 0.29.0 | 2.33 | Not required | Trn2, Trn3 | Beta | [vLLM Neuron docs](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/vllm-neuron/docs/index.html) |
+| 0.24.0.1.1.0 | 0.24.0 | 2.32 | Not required | Trn2, Trn3 | Beta | [vLLM Neuron docs](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/vllm-neuron/docs/index.html) |
+| 0.21.0.1.0.0 | 0.21.0 | 2.31 | Not required | Trn2, Trn3 | Beta | [vLLM Neuron docs](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/vllm-neuron/docs/index.html) |
+| 0.5.3 | 0.16.0 | 2.31 | 0.10.x | Trn1, Trn2, Trn3, Inf2 | Maintenance | [NxDI + vLLM on Neuron docs](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/nxd-inference/index.html) |
+
+## Issues
+
+Report bugs or request features: [GitHub Issues](https://github.com/vllm-project/vllm-neuron/issues)
+
+## Code of Conduct
+
+This project follows the [Amazon Open Source Code of Conduct](https://aws.github.io/code-of-conduct). For more information, see the [Code of Conduct FAQ](https://aws.github.io/code-of-conduct-faq) or contact <opensource-codeofconduct@amazon.com>.
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](https://github.com/vllm-project/vllm-neuron/blob/main/LICENSE) file for details.
+Apache-2.0
