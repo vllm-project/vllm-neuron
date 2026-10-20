@@ -431,6 +431,113 @@ def fp8_linear_raw(x, w, scale):
     return out
 
 
+def _fp8_2core_span(w, scale, programs, core):
+    """`(span, lo, w_rows, scale_rows)` for this core's share of an fp8 GEMM.
+
+    The column cut is the same free axis `fp4_linear_2core` divides, with one
+    extra thing to get right: **fp8 carries its scale at one row per `BLK`
+    weight rows**, not one per weight row. `_dequant_fp8` reads
+    `s_u8[nb * nsb + i]` while loading `w_u8[nb * rows ...]` with
+    `nsb = rows // BLK`, so a weight slice starting at row `lo` has to be paired
+    with the scale slice starting at `lo // BLK`, and pairing it with `lo` would
+    dequantise every column of this core's half against the wrong exponent --
+    silently, with plausible-looking magnitudes.
+
+    It divides exactly. The caller asserts `n % (programs * PT) == 0`, so `span`
+    is a multiple of `PT = 128` and `lo = core * span` is a multiple of 128,
+    which is four whole `BLK = 32` scale rows. `_dequant_fp8` then takes
+    `rows = PT` on the slice, exactly as it does on the whole weight, so the
+    per-tile arithmetic inside it is unchanged rather than merely equivalent.
+    """
+    n = w.shape[0]
+    k = w.shape[1]
+    span = n // programs
+    lo = core * span
+    return (
+        span,
+        lo,
+        w[lo : lo + span, 0:k],
+        scale[lo // BLK : (lo + span) // BLK],
+    )
+
+
+def _fp8_2core_check(programs, n, name):
+    assert programs == 2, (
+        f"launch grid is {programs}; {name} divides its output columns between "
+        "the two physical cores of a logical NeuronCore and computes only its "
+        f"own half, so at grid 1 it would return a half-empty result. Launch it "
+        f"as `wrap_nki({name})[2]`, or call the undivided kernel instead."
+    )
+    assert n % (programs * PT) == 0, (
+        f"n={n} does not divide into {programs} shares of a multiple of {PT}"
+    )
+
+
+@nki.jit
+def fp8_linear_2core(x, w, scale):
+    """`fp8_linear` with the output columns divided across both physical cores.
+
+    Launch at `grid=(2,)`. See `fp4_linear_2core` for why the split exists and
+    what it costs (a duplicated `_stage_rows` into each core's private HBM), and
+    `_fp8_2core_span` for the scale-row arithmetic this storage adds.
+
+    Measured by iteration 5 at `in512_bs1` on 64 ranks, as the second half of
+    `DEEPSEEK_V41_BQ_2CORE=fp4,fp8`: TTFT 888.2 -> 841.8 ms against the fp4-only
+    arm, TPOT 111.2 ms against a 143.3 ms baseline, per-stream decode 8.99
+    tok/s. That iteration was rejected for an unrelated verifier failure and the
+    kernel was lost with its worktree; `.autohelix/notes/iter-5.md` §8-§9 is the
+    implementation record it was rewritten from.
+
+    **`nki.simulate` cannot check this kernel.** It raises `OverflowError` on
+    `E4M3_SGN2` inside `_decode_e4m3` in the numpy backend -- in the undivided
+    kernel too, so it is not the split's doing (iter-5.md §9). Validation is a
+    device run against the undivided arm plus the index argument above.
+    """
+    m, k = x.shape
+    n = w.shape[0]
+    programs = nl.num_programs(0)
+    core = nl.program_id(0)
+    _fp8_2core_check(programs, n, "fp8_linear_2core")
+    span, lo, w_share, s_share = _fp8_2core_span(w, scale, programs, core)
+    _check(k, span)
+    mpad = -(-m // PT) * PT
+
+    out = nl.ndarray((mpad, n), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    xq = nl.ndarray((mpad, k), dtype=nl.bfloat16, buffer=nl.private_hbm)
+    wd = nl.ndarray((span, k), dtype=nl.bfloat16, buffer=nl.private_hbm)
+
+    _stage_rows(x, m, k, xq, True)
+    _dequant_fp8(w_share, s_share, wd, span, k)
+    _gemm(xq, wd, out[0:mpad, lo : lo + span], mpad, k, span)
+    return out
+
+
+@nki.jit
+def fp8_linear_raw_2core(x, w, scale):
+    """`fp8_linear_raw` split across both physical cores; see `fp8_linear_2core`.
+
+    The only difference from the quantising form is `_stage_rows(..., False)`,
+    exactly as `fp8_linear_raw` differs from `fp8_linear`.
+    """
+    m, k = x.shape
+    n = w.shape[0]
+    programs = nl.num_programs(0)
+    core = nl.program_id(0)
+    _fp8_2core_check(programs, n, "fp8_linear_raw_2core")
+    span, lo, w_share, s_share = _fp8_2core_span(w, scale, programs, core)
+    _check(k, span)
+    mpad = -(-m // PT) * PT
+
+    out = nl.ndarray((mpad, n), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    xs = nl.ndarray((mpad, k), dtype=nl.bfloat16, buffer=nl.private_hbm)
+    wd = nl.ndarray((span, k), dtype=nl.bfloat16, buffer=nl.private_hbm)
+
+    _stage_rows(x, m, k, xs, False)
+    _dequant_fp8(w_share, s_share, wd, span, k)
+    _gemm(xs, wd, out[0:mpad, lo : lo + span], mpad, k, span)
+    return out
+
+
 #: SBUF bytes a partition may spend on the staged weight in the fused GEMM.
 _WT_BYTES = 96 * 1024
 

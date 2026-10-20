@@ -508,8 +508,36 @@ def require_segmented_prefill(vllm_config) -> None:
 #: `1024·p ≈ 1099 ms` of that is the per-token term alone. The segment is close
 #: to spent as a lever — see `.autohelix/notes/iter-2.md` §1a and §5 for the
 #: joint `(F, p)` target that would clear it.
+#: **2048 since 2026-10-20, measured on the integrated tree** rather than
+#: inferred from the fit above. Iteration 9 ran the 1024-vs-2048 experiment and
+#: left the default at 1024 because the wider segment flipped no cell *on its
+#: own*; composed with the rest of this integration it is simply faster, and a
+#: cell that gains margin is worth having even when it was already passing:
+#:
+#:     in2048_bs1   2924.3 -> 2600.6 ms  (-11.1%),  1477 -> 1314 /1k
+#:     in8192_bs1  13514.6 -> 12420.0 ms  (-8.1%),  1699 -> 1561 /1k
+#:
+#: Both cells reported `warmed: true`, so neither figure carries compile time.
+#: Only these two move: the clamp below applies when `max_model_len > segment`,
+#: so contexts 768 and 1280 are one forward at either setting.
+#:
+#: **4096 after measuring it**, which is one notch past where iteration 9's
+#: extrapolation said the win was. That extrapolation (`in8192_bs1` at
+#: 1448-1497 per 1k) did **not** hold: 4096 measured 12220.8 ms = 1536 per 1k,
+#: only -1.6% against 2048's 12420, where the fit predicted -6.5%. So the
+#: segment is close to spent as a lever after all, and `in8192_bs1` stays over
+#: the bar. It is still the better of the two settings on both cells it
+#: touches, and its graphs are now warm, so it ships:
+#:
+#:     in2048_bs1  2924.3 -> 2600.6 (seg 2048) -> 2544.4 ms  = 1285 /1k
+#:     in8192_bs1 13514.6 -> 12420.0 (seg 2048) -> 12220.8 ms = 1536 /1k
+#:
+#: Contexts 768 and 1280 are one forward at any of these settings. Note 4096
+#: also stops the clamp applying at context 2304 (2304 < 4096), which leaves
+#: `max_num_batched_tokens` to vLLM — measured harmless here, the bucket comes
+#: out `[2048]` either way.
 MULTI_RANK_PREFILL_SEGMENT_TOKENS = int(
-    os.environ.get("DEEPSEEK_V41_PREFILL_SEGMENT_TOKENS", 1024)
+    os.environ.get("DEEPSEEK_V41_PREFILL_SEGMENT_TOKENS", 4096)
 )
 
 #: Above this `max_model_len` the segment falls back to 512. **Effectively off**
@@ -593,6 +621,39 @@ def require_multi_rank_budget(vllm_config) -> None:
         )
 
     seqs = int(getattr(scheduler, "max_num_seqs", 0) or 0)
+    if (
+        MULTI_RANK_MAX_NUM_SEQS > 1
+        and seqs > 1
+        and "num_seqs_buckets" not in neuron_config
+    ):
+        # **One** decode batch size, not the backend's default ladder of
+        # powers of two. A decode graph here is keyed by the span count and is
+        # 40 layers deep, so each bucket is its own full compile of the model;
+        # `get_decode_padded_batch_size` would otherwise hand out 1, 2, 4, 8,
+        # 16 and `max_num_seqs`, and the model would compile all six as the
+        # live count drifted down through them. With one bucket every decode
+        # step presents `max_num_seqs` spans — `model._bucket_spans` keeps the
+        # padding rather than trimming it — so there is exactly one decode
+        # graph per context for the whole run.
+        #
+        # What it costs is the attention on the padded rows when the batch is
+        # not full; what it buys is that a concurrent cell stops compiling.
+        # Measured 2026-10-20 without it: an `in1024_bs32` cell answered 2 of
+        # 32 requests in 23 minutes, spending both the 32-span and the 30-span
+        # step on `neuronx-cc`. The MoE does not pay for the padding at all
+        # (`model._MOE_LIVE_ROWS`), and at `max_num_seqs=1` — every batch-1
+        # bench cell — this does not fire.
+        additional = getattr(vllm_config, "additional_config", None)
+        if additional is not None:
+            buckets = dict(additional.get("neuron_config", {}) or {})
+            buckets["num_seqs_buckets"] = [min(seqs, MULTI_RANK_MAX_NUM_SEQS)]
+            additional["neuron_config"] = buckets
+            logger.info(
+                "deepseek_v41: %d rank(s) — num_seqs_buckets %s, so the "
+                "decode batch always pads to one compiled span count; see "
+                "deepseek_v41.require_multi_rank_budget",
+                world_size, buckets["num_seqs_buckets"],
+            )
     if seqs > MULTI_RANK_MAX_NUM_SEQS:
         scheduler.max_num_seqs = MULTI_RANK_MAX_NUM_SEQS
         logger.info(

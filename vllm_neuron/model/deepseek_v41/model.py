@@ -493,11 +493,32 @@ def nki_topk(tensor: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
 #: The storages a `_2core` kernel exists for. Intersected with the request
 #: below, so asking for one that has no split kernel is inert rather than a
 #: claim in the log that something was split when it was not.
-_BQ_2CORE_AVAILABLE = frozenset({"fp4"})
+#:
+#: `fp8` joined this on 2026-10-20, when `blockquant.fp8_linear_2core` /
+#: `fp8_linear_raw_2core` were written back from `iter-5.md` §8-§9 — the
+#: iteration that measured them (-5.2% TTFT on top of fp4, TPOT 111.2 ms) was
+#: rejected for an unrelated verifier failure and its worktree went with it, so
+#: three later reviews recorded `fp4,fp8` as **inert**: the flag was accepted
+#: and silently did nothing because this set had only `fp4` in it.
+_BQ_2CORE_AVAILABLE = frozenset({"fp4", "fp8"})
 
+#: **`fp4,fp8` since 2026-10-20**, measured on the integrated tree at
+#: `in512_bs1`, 64 ranks, against the fp4-only arm this repo shipped:
+#:
+#:     TTFT   873.2 -> 835.1 ms  (-4.4%)      iteration 5 measured 841.8
+#:     TPOT   129.9 -> 116.9 ms  (-10.0%)     iteration 5 measured 111.2
+#:     decode   7.03 -> 7.68 tok/s (+9.2%)
+#:     acceptance 36.4% -> 36.8%  (unchanged, which is the correctness signal:
+#:                a wrong scale slice would collapse draft agreement)
+#:
+#: Two independent implementations five iterations apart agreeing to within 0.8%
+#: on TTFT is the evidence that the split is real rather than a measurement
+#: artefact. The compile cost is also real and is the reason this was not the
+#: default before: fp8 appears in every graph holding an attention projection
+#: and re-keys ~125 graphs a context, ~12 min at context 768.
 _BQ_2CORE = _BQ_2CORE_AVAILABLE & frozenset(
     part.strip()
-    for part in os.environ.get("DEEPSEEK_V41_BQ_2CORE", "fp4").split(",")
+    for part in os.environ.get("DEEPSEEK_V41_BQ_2CORE", "fp4,fp8").split(",")
     if part.strip() and part.strip() != "none"
 )
 
@@ -613,7 +634,12 @@ def nki_linear(
         out = _nki_entry("blockquant", "fp32w_linear")(flat, weight)
     elif storage == "fp8":
         name = "fp8_linear" if quantize_activation else "fp8_linear_raw"
-        out = _nki_entry("blockquant", name)(flat, weight, scale)
+        if _two_core("fp8", int(weight.shape[0])):
+            out = _nki_entry(
+                "blockquant", f"{name}_2core", _TWO_CORE_PROGRAMS
+            )(flat, weight, scale)
+        else:
+            out = _nki_entry("blockquant", name)(flat, weight, scale)
     elif storage == "fp4":
         if "fp4" in _BQ_FUSED and k % 64 == 0:
             out = _nki_entry("blockquant", "fp4_linear_fused")(flat, weight, scale)
@@ -1963,6 +1989,12 @@ class Attention(nn.Module):
         q, qr = self.project_in(x, freqs_cis)
         kv_rows = self.latent_kv(x, freqs_cis)
 
+        if self._spans_uniform(lengths, paged):
+            o = self._spans_attended(
+                x, q, qr, kv_rows, lengths[0], paged, shared, tp_group, device
+            )
+            return self.project_out(o, freqs_cis, x.dtype, tp_group)
+
         attended: list[torch.Tensor] = []
         begin = 0
         for length, span, span_shared in zip(lengths, paged, shared):
@@ -1985,6 +2017,151 @@ class Attention(nn.Module):
             )
         o = attended[0] if len(attended) == 1 else torch.cat(attended, dim=1)
         return self.project_out(o, freqs_cis, x.dtype, tp_group)
+
+    def _spans_uniform(
+        self, lengths: list[int], paged: list[PagedSpan]
+    ) -> bool:
+        """Whether every span has the same row count *and* the same table
+        widths, which is what lets one `sparse_attn` serve them all.
+
+        True in a pure decode step — every sequence contributes
+        `1 + num_speculative_tokens` rows and `read_lens` is pinned to the
+        engine context by `_COMPRESS_READ_CEILING`, so the window table is
+        `window_size + L - 1` rows and the compressed one `read_len` rows for
+        every sequence alike. False in a mixed prefill/decode step, where a
+        chunk's row count is nothing like a decode row's, and that is the case
+        the loop below still serves.
+        """
+        if len(lengths) < 2 or len(set(lengths)) != 1:
+            return False
+        ratio = self.compress_ratio
+        if ratio and len({span.read_lens[ratio] for span in paged}) != 1:
+            return False
+        return len({span.block_size for span in paged}) == 1
+
+    def _spans_attended(
+        self,
+        x: torch.Tensor,
+        q: torch.Tensor,
+        qr: torch.Tensor,
+        kv_rows: torch.Tensor,
+        length: int,
+        paged: list[PagedSpan],
+        shared: list[SharedAttentionState],
+        tp_group,
+        device,
+    ) -> torch.Tensor:
+        """`sparse_attn` over every span's rows in **one** call.
+
+        The kernel this ends in (`kernels/sparse_attn.gathered_attn_idx`) takes
+        a single `[n, head_dim]` table and a `[tokens, topk]` index map, and its
+        body is `for t in nl.affine_range(tokens)` — a token's output is a
+        function of its own query row, its own gathered slots and its own bias
+        and nothing else. So B sequences can share one launch by concatenating
+        their tables and shifting sequence `i`'s indices by `i * rows_per`, and
+        the result is **bit-identical** to calling it once per sequence: the
+        same q row meets the same slot values in the same order.
+
+        That is where the multi-row decode penalty went after iteration 8
+        hoisted the projections. At batch B the loop above issues, per layer,
+        B window writes, B window gathers, B table concatenations and B kernel
+        launches, each over `1 + k` rows against a 128-row partition. This
+        issues one of each.
+
+        What stays per sequence is `_compress_kv`, because the compressor and
+        the indexer address a different block table per sequence — but on 34 of
+        the 40 layers it is a no-op that hands down `shared.compress_read`
+        (`Attention.reads_shared_compress`), so the loop that remains is a
+        Python loop over cheap state rather than over device work.
+
+        The empty-slot sentinel is **not** shifted: `EMPTY_SLOT` is -1 and
+        `sparse_attn` recognises it by equality to build the `-1e30` bias, so an
+        offset -1 would silently become a real slot of the previous sequence.
+        """
+        bsz = len(paged)
+        win = self.window_size
+        head_dim = self.head_dim
+        block_size = paged[0].block_size
+        span_rows = win + length - 1
+        if self.window_kv_cache is None:
+            raise RuntimeError(
+                f"layer {self.layer_id} attention has no window KV cache; "
+                "bind_kv_cache() must run before forward()."
+            )
+
+        # One write for every sequence's own slots. `slot_mapping` is this
+        # step's own rows, so concatenating them in span order lines up with
+        # `kv_rows`, which `forward_spans` built over the same concatenation.
+        slots = torch.cat([span.slot_mapping for span in paged])
+        self.window_kv_cache.index_put_(
+            (
+                slots // block_size,
+                torch.zeros_like(slots),
+                slots % block_size,
+            ),
+            kv_rows.reshape(bsz * length, head_dim),
+        )
+
+        # One gather for every sequence's window. `PagedSpan.slots` per span is
+        # `block_table[pos // block_size] * block_size + pos % block_size`;
+        # stacking the block tables turns that into a `gather` over the same
+        # integer arithmetic, so the slot list is the same list.
+        starts = torch.cat([span.pos for span in paged]).reshape(bsz, 1)
+        tables = torch.stack([span.block_table for span in paged])
+        window_pos = (
+            starts - (win - 1) + torch.arange(span_rows, device=device)
+        ).clamp_min(0)
+        window_slots = (
+            tables.gather(1, window_pos // block_size) * block_size
+            + window_pos % block_size
+        )
+        window_kv = self.window_kv_cache.view(-1, head_dim).index_select(
+            0, window_slots.reshape(-1)
+        ).reshape(bsz, span_rows, head_dim)
+
+        # One window index map. `window_topk_idxs`' arithmetic with the per-span
+        # `start_pos` broadcast over a leading sequence axis.
+        rows = torch.arange(length, device=device).unsqueeze(1) + torch.arange(
+            win, device=device
+        )
+        window_idxs = torch.where(
+            (starts.reshape(bsz, 1, 1) - (win - 1)) + rows < 0,
+            EMPTY_SLOT,
+            rows,
+        ).int()
+
+        parts: list[torch.Tensor] = []
+        idxs: list[torch.Tensor] = []
+        begin = 0
+        for b, (span, span_shared) in enumerate(zip(paged, shared)):
+            sel = slice(begin, begin + length)
+            begin += length
+            parts.append(window_kv[b : b + 1])
+            if not self.compress_ratio:
+                idxs.append(window_idxs[b : b + 1])
+                continue
+            compress_kv, compress_idxs = self._compress_kv(
+                x[:, sel], qr[:, sel], span.pos, span_rows,
+                span_shared, span, tp_group,
+            )
+            parts.append(compress_kv)
+            idxs.append(
+                torch.cat([window_idxs[b : b + 1], compress_idxs], dim=-1)
+            )
+        kv = torch.cat(parts, dim=1)
+        rows_per = kv.shape[1] // bsz
+        idx = torch.cat(idxs, dim=0)
+        shift = (
+            torch.arange(bsz, device=device, dtype=idx.dtype) * rows_per
+        ).reshape(bsz, 1, 1)
+        idx = torch.where(idx == EMPTY_SLOT, idx, idx + shift)
+        return sparse_attn(
+            q,
+            kv,
+            self.attn_sink,
+            idx.reshape(1, bsz * length, -1),
+            self.softmax_scale,
+        )
 
     def forward(
         self,
@@ -2261,14 +2438,33 @@ class _RejectionView:
     __slots__ = ("draft_token_ids", "cu_num_draft_tokens", "max_spec_len")
 
 
-def _rejection_sample(sampled, draft_token_ids, cu_num_draft_tokens, num_draft_tokens):
-    """Verify this step's drafts against the target's own tokens, on the device."""
+def _rejection_sample(sampled, draft_token_ids, cu_num_draft_tokens, max_spec_len):
+    """Verify this step's drafts against the target's own tokens, on the device.
+
+    `max_spec_len` arrives as an **int**, not as the per-row tuple it used to be
+    derived from. The value is identical -- it was always `max(num_draft_tokens)`
+    and nothing else in this body read the tuple -- but the tuple was a
+    *compile-time constant* to Dynamo, so a graph was keyed on the exact per-row
+    draft pattern. At batch 32 that is one graph per pattern, and the patterns
+    change whenever a sequence finishes or starts: iteration 10 watched a
+    batch-32 cell go quiet for 8 minutes with no completed step the moment
+    `Running` fell 32 -> 29, which is this axis recompiling
+    (`.autohelix/notes/iter-10.md` §0c). An int keys at most `dspark_block_size
+    + 1` = 6 graphs, and a batch losing rows no longer changes it at all.
+
+    Not the constant `dspark_block_size`, which would key exactly one: the
+    sampler's `all_accepted = (matches & valid).all(dim=1)` is False for any
+    column past a row's own count, so widening the window past the true maximum
+    would silently suppress the bonus token of every row that drafted fewer --
+    a correctness change disguised as a compile win. The real maximum is the
+    widest window every row can fill.
+    """
     from vllm_neuron.nn.rejection_sampler import rejection_sampler
 
     view = _RejectionView()
     view.draft_token_ids = draft_token_ids
     view.cu_num_draft_tokens = cu_num_draft_tokens
-    view.max_spec_len = max(num_draft_tokens)
+    view.max_spec_len = max_spec_len
     return rejection_sampler(view, sampled.reshape(-1))
 
 
@@ -4346,13 +4542,24 @@ class DeepseekV41ForCausalLM(nn.Module):
                 "resident."
             )
         meta = self._attn_meta(attn_metadata)
-        live_spans = self._sequence_spans(positions, meta["slot_mapping"])
+        rows_per_seq = self._decode_rows_per_seq(meta, int(input_ids.shape[0]))
+        live_spans = self._sequence_spans(
+            positions, meta["slot_mapping"], rows_per_seq
+        )
         live_rows = sum(length for _, length, _ in live_spans)
         spans, bucket_meta = self._bucket_rows(
-            live_spans, meta, int(input_ids.shape[0])
+            live_spans, meta, int(input_ids.shape[0]), rows_per_seq
         )
-        paged = self._paged_spans(spans, bucket_meta)
+        paged = self._paged_spans(spans, bucket_meta, len(live_spans))
         live_lengths = [length for _, length, _ in live_spans]
+        # `_draft` indexes its per-row tensors by span, so a bucket that added
+        # spans has to extend this too. The drafts those rows produce are
+        # discarded — `NeuronModelRunner._sanitize_sync_drafts` aligns the row
+        # count to the request count — but the lengths have to be in range.
+        if len(live_lengths) < len(spans):
+            live_lengths = live_lengths + [
+                length for _, length, _ in spans[len(live_lengths):]
+            ]
         slices = [(begin, length) for begin, length, _ in spans]
         bucket_rows = sum(length for _, length, _ in spans)
 
@@ -4457,7 +4664,7 @@ class DeepseekV41ForCausalLM(nn.Module):
                 sampled,
                 spec_decode_metadata.draft_token_ids,
                 spec_decode_metadata.cu_num_draft_tokens,
-                tuple(spec_decode_metadata.num_draft_tokens),
+                max(spec_decode_metadata.num_draft_tokens),
             )
 
         self.last_draft = self._draft(
@@ -4520,14 +4727,19 @@ class DeepseekV41ForCausalLM(nn.Module):
 
     @torch._dynamo.disable
     def _paged_spans(
-        self, spans: list[tuple[int, int, int]], meta: dict
+        self,
+        spans: list[tuple[int, int, int]],
+        meta: dict,
+        live_spans: int | None = None,
     ) -> list[PagedSpan]:
-        """One `PagedSpan` per scheduled sequence.
+        """One `PagedSpan` per scheduled sequence, plus any the bucket added.
 
             scatter/gather (indirect memory copy via scalar DGE)
             out-of-bound access ... engine=GPSIMD
             Source location: model.py:2921
         """
+        if live_spans is None:
+            live_spans = len(spans)
         block_size = int(meta["block_size"])
         block_table = meta.get("full_block_table_tensor")
         if block_table is None:
@@ -4557,9 +4769,30 @@ class DeepseekV41ForCausalLM(nn.Module):
         starts = torch.tensor(
             [start_pos for _, _, start_pos in spans], dtype=torch.int64
         ).to(device)
+        # A span the bucket added rather than the scheduler (see
+        # `_bucket_rows`) gets an **all-zero** block table, so every row it
+        # reads and every row it writes resolves into block 0 — the one
+        # `vllm/v1/core/block_pool.py`'s `BlockPool.__init__` pops out of the
+        # free queue before any request can be served, so no sequence owns it.
+        #
+        # This is not belt-and-braces. The block-table rows above the live
+        # request count are not cleared by vLLM — `condense()` moves a row
+        # without clearing its source — so they can hold a *stale duplicate*
+        # of a live request's table. A padded span carrying that table would
+        # send `_compress_kv`'s `paged.put` into a live sequence's compressed
+        # pages, which is a silent corruption of another sequence's KV rather
+        # than an error. Zeros cannot alias anything.
+        #
+        # Built only when the bucket actually added a span, so the path every
+        # batch-1 forward takes does not gain a device op it has no use for.
+        blank = (
+            torch.zeros_like(block_table[0])
+            if live_spans < len(spans)
+            else None
+        )
         return [
             PagedSpan(
-                block_table=block_table[row],
+                block_table=block_table[row] if row < live_spans else blank,
                 block_size=block_size,
                 slot_mapping=slot_mapping[begin : begin + length],
                 start_pos=start_pos,
@@ -4576,6 +4809,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         spans: list[tuple[int, int, int]],
         meta: dict,
         total_rows: int,
+        rows_per_seq: int | None = None,
     ) -> tuple[list[tuple[int, int, int]], dict]:
         """Round a lone sequence's span up to the whole token bucket, above one
         rank, so a short prefill chunk reuses the graphs a full one built.
@@ -4584,7 +4818,11 @@ class DeepseekV41ForCausalLM(nn.Module):
             out-of-bound access ... engine=GPSIMD
             RuntimeError: nrta status=1006
         """
-        if self.world_size <= 1 or len(spans) != 1 or total_rows <= 0:
+        if self.world_size <= 1 or total_rows <= 0:
+            return spans, meta
+        if len(spans) > 1:
+            return self._bucket_spans(spans, meta, total_rows, rows_per_seq)
+        if len(spans) != 1:
             return spans, meta
         begin, length, start_pos = spans[0]
         if begin != 0 or length >= total_rows:
@@ -4603,8 +4841,97 @@ class DeepseekV41ForCausalLM(nn.Module):
         return [(0, total_rows, start_pos)], bucket
 
     @torch._dynamo.disable
+    def _bucket_spans(
+        self,
+        spans: list[tuple[int, int, int]],
+        meta: dict,
+        total_rows: int,
+        rows_per_seq: int | None,
+    ) -> tuple[list[tuple[int, int, int]], dict]:
+        """Keep the padded spans the runner's `num_seqs` bucket already built,
+        instead of letting the live sequence count decide the graph.
+
+        **This is the compile-volume fix, measured 2026-10-20.** A graph here
+        is keyed by the span count, 40 layers deep, so a decode step with 32
+        live sequences, one with 30 after two retire, one with 29 — each is a
+        structurally different graph. One `in1024_bs32` cell spent 12 minutes
+        compiling its first 32-span step and then went back to compiling the
+        moment `Running` fell to 30; it answered 2 of 32 requests in 23
+        minutes, all of it `Compiling...`, with the engine reporting
+        `generation throughput: 0.0 tokens/s` in every 10-second window but
+        two. Iteration 8 measured the same walk from the other side: ~1600
+        compile-cache misses for one batch-10 cell, and 57 distinct new keys
+        still appearing on the third run of the same shape.
+
+        `NeuronModelRunner` already rounds the decode batch up to a compiled
+        `num_seqs` bucket (`get_decode_padded_batch_size`, default powers of
+        two up to `max_num_seqs`) and already writes `NULL_BLOCK_ID` into the
+        padded slots (`_apply_decode_slot_mapping_padding`). `_sequence_spans`
+        then trims exactly that padding back off, which is what lets the live
+        count reach the graph. Keeping it collapses the decode graph set to one
+        per bucket: at `max_num_seqs=32` the counts 17..32 all run the 32-span
+        graph.
+
+        The padded rows cost almost nothing beyond the attention they go
+        through: `_MOE_LIVE_ROWS` already restricts expert selection to the
+        live rows (set in `forward` from `live_rows != bucket_rows`), so the
+        MoE does not route them, and `_paged_spans` points them at block 0.
+        """
+        if not rows_per_seq:
+            return spans, meta
+        live = sum(length for _, length, _ in spans)
+        if live != len(spans) * rows_per_seq or live >= total_rows:
+            return spans, meta
+        if (total_rows - live) % rows_per_seq:
+            return spans, meta
+        # The padded spans borrow the first live span's `start_pos`, so their
+        # `read_lens` and `at_zero` match a real span's exactly — which is what
+        # keeps them on the same graph rather than keying another one, and what
+        # lets `_spans_uniform` see one uniform batch.
+        start_pos = spans[0][2]
+        padded = list(spans)
+        padded.extend(
+            (off, rows_per_seq, start_pos)
+            for off in range(live, total_rows, rows_per_seq)
+        )
+        return padded, meta
+
+    @torch._dynamo.disable
+    def _decode_rows_per_seq(self, meta: dict, total_rows: int) -> int | None:
+        """Rows one sequence contributes to a decode step, or None if this step
+        is not a decode step with several sequences in it.
+
+        `NeuronScheduler` never mixes a prefill chunk with decodes — it holds
+        the decoding requests back and raises if both appear in one batch
+        (`vllm/core/scheduler.py`'s "Neuron constraint violated: Mixed
+        prefill ... and decode") — so a step with more than one request in its
+        block table and a row count divisible by that request count is a decode
+        step, and every request in it contributed the same `1 + k` rows.
+
+        The `1 + dspark_block_size` ceiling is what keeps a *prefill* step out:
+        a prefill chunk is 512 or 1024 rows for the one request the scheduler
+        allows, so an accidental divisibility cannot be mistaken for a decode
+        shape.
+        """
+        table = meta.get("full_block_table_tensor")
+        if table is None:
+            table = meta.get("block_table_tensor")
+        if table is None or table.ndim < 1:
+            return None
+        reqs = int(table.shape[0])
+        if reqs < 2 or total_rows <= 0 or total_rows % reqs:
+            return None
+        rows = total_rows // reqs
+        if rows > 1 + int(self.config.dspark_block_size):
+            return None
+        return rows
+
+    @torch._dynamo.disable
     def _sequence_spans(
-        self, positions: torch.Tensor, slot_mapping: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        rows_per_seq: int | None = None,
     ) -> list[tuple[int, int, int]]:
         """Split the flat token axis into `(start_index, length, start_pos)`.
 
@@ -4626,7 +4953,31 @@ class DeepseekV41ForCausalLM(nn.Module):
             if i == len(values) or values[i] != values[i - 1] + 1:
                 spans.append((begin, i - begin, int(values[begin])))
                 begin = i
-        return spans
+        if not rows_per_seq:
+            return spans
+        # Two sequences whose next positions happen to be adjacent — sequence
+        # j at `[p, p+k]` and sequence j+1 starting at `p+k+1` — have one
+        # unbroken run of positions between them, so the loop above merges
+        # them into a single span. `_paged_spans` then indexes `block_table`
+        # by span ordinal, so the second sequence's rows would be addressed
+        # through the first sequence's block table: its KV write would land in
+        # another sequence's pages and its queries would attend to that
+        # sequence's history. `_draft` would also emit one row fewer than
+        # there are requests, which is the mismatch
+        # `NeuronModelRunner._sanitize_sync_drafts` was built to paper over.
+        #
+        # A decode step gives every request exactly `rows_per_seq` rows, so a
+        # longer span is a merge and nothing else, and splitting it back is
+        # exact: the positions inside it are consecutive by construction, so
+        # the j-th piece starts at `start_pos + j * rows_per_seq`.
+        split: list[tuple[int, int, int]] = []
+        for begin, length, start_pos in spans:
+            if length <= rows_per_seq or length % rows_per_seq:
+                split.append((begin, length, start_pos))
+                continue
+            for off in range(0, length, rows_per_seq):
+                split.append((begin + off, rows_per_seq, start_pos + off))
+        return split
 
     def _engram_hashes(
         self, input_ids: torch.Tensor, paged: list[PagedSpan]

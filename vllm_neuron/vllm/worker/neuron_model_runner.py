@@ -1461,7 +1461,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Note: When eager mode is enabled, torch compile becomes a no op.
         from vllm_neuron.envs import get_compile_backend_name
 
-        if eager_mode or cpu_mode or debug_mode or skip_graph_capture_backend:
+        if eager_mode or cpu_mode or skip_graph_capture_backend:
             logger.debug("Graph capture and parallel compilation is disabled.")
             self.capture_backend_model = None
         else:
@@ -1487,7 +1487,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         ):
             inner_model = getattr(self.model, "_orig_mod", self.model)
 
-            if eager_mode or cpu_mode or debug_mode or skip_graph_capture_backend:
+            if eager_mode or cpu_mode or skip_graph_capture_backend:
                 self.vision_capture_backend = None
             else:
                 self.vision_capture_backend = torch.compile(
