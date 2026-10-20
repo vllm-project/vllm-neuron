@@ -171,7 +171,8 @@ class DFlashProposer:
                 f"serve this target without DFlash speculation."
             )
 
-        target_num_layers = self.vllm_config.model_config.hf_config.num_hidden_layers
+        target_text_config = self.vllm_config.model_config.hf_text_config
+        target_num_layers = target_text_config.num_hidden_layers
         self.model = self.compile_and_load_draft_model(
             start_layer_idx=target_num_layers,
             target_hidden_size=target_hidden_size,
@@ -456,7 +457,8 @@ class DFlashProposer:
             self.draft_model_config.hf_config
         )
         num_aux_layers = len(target_layer_ids)
-        target_num_layers = self.vllm_config.model_config.hf_config.num_hidden_layers
+        target_text_config = self.vllm_config.model_config.hf_text_config
+        target_num_layers = target_text_config.num_hidden_layers
 
         assert target_num_layers >= num_aux_layers, (
             f"DFlash needs >= {num_aux_layers} target layers to source "
