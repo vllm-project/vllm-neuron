@@ -1,0 +1,5 @@
+cmake>=3.26.1
+ninja
+setuptools-scm>=8.0
+wheel
+jinja2
