@@ -1763,6 +1763,164 @@ class Attention(nn.Module):
         )
         return compress_kv, idxs
 
+    #: Whether `forward_spans` below may serve this attention. False on
+    #: `DSparkAttention`, whose `forward` takes the draft block's own KV and a
+    #: separate main-stream tap and is reached from `DSparkBlock.forward`
+    #: rather than from `Block.attn_half`.
+    spans_supported = True
+
+    def project_in(
+        self, x: torch.Tensor, freqs_cis: tuple[torch.Tensor, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The row-wise half of the query path: the roped `q` and the q LoRA.
+
+        Every op here is row-wise, which is what lets `forward_spans` run it
+        once over the concatenated rows of several sequences.
+        """
+        rd = self.rope_head_dim
+        qr = self.q_norm(self.wq_a(x))
+        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+        q = torch.cat([q[..., :-rd], apply_rotary_emb(q[..., -rd:], freqs_cis)], -1)
+        return q, qr
+
+    def latent_kv(
+        self, x: torch.Tensor, freqs_cis: tuple[torch.Tensor, torch.Tensor]
+    ) -> torch.Tensor:
+        """This layer's latent KV for `x`'s own rows — roped and round-tripped
+        through fp8, but not yet written to any page. Row-wise.
+        """
+        rd = self.rope_head_dim
+        kv = self.kv_norm(self.wkv(x))
+        kv = torch.cat([kv[..., :-rd], apply_rotary_emb(kv[..., -rd:], freqs_cis)], -1)
+        return act_quant_dequant(kv, 32)
+
+    def window_slots(
+        self,
+        kv: torch.Tensor,
+        start_pos: torch.Tensor,
+        paged: PagedSpan,
+        device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Page one sequence's latent KV and gather the window it may see.
+
+        The per-sequence half: it addresses `paged`'s own block table, so
+        unlike `project_in`/`latent_kv` it cannot be shared between sequences.
+        """
+        seqlen = kv.shape[1]
+        win = self.window_size
+        if self.window_kv_cache is None:
+            raise RuntimeError(
+                f"layer {self.layer_id} attention has no window KV cache; "
+                "bind_kv_cache() must run before forward()."
+            )
+        paged.write(self.window_kv_cache, kv.reshape(seqlen, self.head_dim))
+
+        span = win + seqlen - 1
+        base = start_pos - (win - 1)
+        positions = (base + torch.arange(span, device=device)).clamp_min(0)
+        window_kv = paged.gather(
+            self.window_kv_cache.view(-1, self.head_dim), positions
+        ).reshape(1, span, self.head_dim)
+        return window_kv, window_topk_idxs(win, seqlen, start_pos, device)
+
+    def project_out(
+        self,
+        o: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        dtype: torch.dtype,
+        tp_group,
+    ) -> torch.Tensor:
+        """The row-wise half of the output path: the inverse rope, the grouped
+        O LoRA, and **one** reduction over the attention group.
+        """
+        rd = self.rope_head_dim
+        bsz, seqlen = o.shape[0], o.shape[1]
+        o = torch.cat(
+            [o[..., :-rd], apply_rotary_emb(o[..., -rd:], freqs_cis, True)], -1
+        )
+        o = o.reshape(bsz * seqlen, self.n_local_groups, -1)
+        o = torch.cat(
+            [
+                self.wo_a.grouped(o[:, g], g, self.o_lora_rank)
+                for g in range(self.n_local_groups)
+            ],
+            dim=-1,
+        ).reshape(bsz, seqlen, -1)
+        out = self.wo_b(o)
+        if self.world_size > 1 and tp_group is not None:
+            out = tp_all_reduce(out.float(), self.attn_group or tp_group)
+            if self.replicas > 1:
+                out = out / self.replicas
+            out = out.to(dtype)
+        return out
+
+    def forward_spans(
+        self,
+        x: torch.Tensor,
+        lengths: list[int],
+        paged: list[PagedSpan],
+        shared: list[SharedAttentionState],
+        tp_group=None,
+    ) -> torch.Tensor:
+        """`forward`, but over several sequences' rows at once.
+
+        `x` is `[1, sum(lengths), hidden]`, the concatenated normalized rows of
+        the sequences `paged` describes, in the same order. The arithmetic is
+        identical to calling `forward` once per sequence — every op hoisted out
+        of the loop is row-wise, so a row's result does not depend on which
+        other rows share the call — but the q/kv/o projections, the two ropes
+        and the output all-reduce happen **once** instead of once per sequence.
+
+        That is the whole of the multi-row decode penalty iteration 7 named:
+        `attn_half` is one compiled graph, so its Python loop is unrolled into
+        it, and at batch B the graph held B copies of this entire method at a
+        row count that pads to the 128-row tensor-engine partition anyway. A
+        decode step gives each sequence `1 + num_speculative_tokens` rows, so B
+        sequences were paying B full tiles for work that fits in one.
+
+        What stays per sequence is what addresses a different block table:
+        `window_slots`, `_compress_kv` (the compressor, the indexer and the
+        compressed gather) and `sparse_attn`.
+        """
+        device = x.device
+        if len(lengths) == 1:
+            freqs_cis = span_freqs(self.freqs_cis, paged[0].pos, lengths[0], device)
+        else:
+            parts = [
+                span_freqs(self.freqs_cis, span.pos, length, device)
+                for length, span in zip(lengths, paged)
+            ]
+            freqs_cis = (
+                torch.cat([cos for cos, _ in parts], dim=0),
+                torch.cat([sin for _, sin in parts], dim=0),
+            )
+
+        q, qr = self.project_in(x, freqs_cis)
+        kv_rows = self.latent_kv(x, freqs_cis)
+
+        attended: list[torch.Tensor] = []
+        begin = 0
+        for length, span, span_shared in zip(lengths, paged, shared):
+            rows = slice(begin, begin + length)
+            begin += length
+            kv, topk_idxs = self.window_slots(
+                kv_rows[:, rows], span.pos, span, device
+            )
+            if self.compress_ratio:
+                compress_kv, compress_idxs = self._compress_kv(
+                    x[:, rows], qr[:, rows], span.pos, kv.size(1),
+                    span_shared, span, tp_group,
+                )
+                kv = torch.cat([kv, compress_kv], dim=1)
+                topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
+            attended.append(
+                sparse_attn(
+                    q[:, rows], kv, self.attn_sink, topk_idxs, self.softmax_scale
+                )
+            )
+        o = attended[0] if len(attended) == 1 else torch.cat(attended, dim=1)
+        return self.project_out(o, freqs_cis, x.dtype, tp_group)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1771,7 +1929,17 @@ class Attention(nn.Module):
         paged: PagedSpan,
         tp_group=None,
     ) -> torch.Tensor:
-        """`x` is the normalized sublayer input `[b, s, hidden]`."""
+        """`x` is the normalized sublayer input `[b, s, hidden]`.
+
+        Kept as its own body rather than delegating to `forward_spans` with one
+        span, deliberately: this is the path every passing verifier run and
+        every passing batch-1 bench cell takes, and a graph is keyed by the ops
+        dynamo traces. Routing it through the new code would re-key ~120 graphs
+        at every context for no arithmetic change, which costs the gate a full
+        compile in each cell's warm-up and risks the eleven constraints that
+        hold today. The duplication is the price of that, and the two have to
+        be kept in step; `forward_spans`' docstring says which ops are shared.
+        """
         bsz, seqlen, _ = x.shape
         freqs_cis = span_freqs(self.freqs_cis, start_pos, seqlen, x.device)
         rd = self.rope_head_dim
@@ -2933,15 +3101,7 @@ class Block(nn.Module):
         attn_pre, attn_post, attn_comb = self.hc_attn.mixes(batched)
         normed = self.attn_norm(HyperConnections.pre(batched, pre_mix.unsqueeze(0)))
 
-        attn_out = torch.zeros_like(normed)
-        for (begin, length), span, span_shared in zip(slices, paged, shared):
-            attn_out[:, begin : begin + length] = self.attn(
-                normed[:, begin : begin + length],
-                span.pos,
-                span_shared,
-                span,
-                tp_group,
-            )
+        attn_out = self._attn_rows(normed, slices, paged, shared, tp_group)
         batched = HyperConnections.post(attn_out, residual, attn_post, attn_comb)
 
         residual = batched
@@ -2952,6 +3112,56 @@ class Block(nn.Module):
         out_residual.copy_(residual)
         out_normed.copy_(normed)
         return out_normed, out_residual, ffn_pre, ffn_post, ffn_comb
+
+    def _attn_rows(self, normed, slices, paged, shared, tp_group):
+        """The attention sublayer's output for every row of `normed`.
+
+        Two arms, and which one runs is decided at trace time because `slices`
+        is a Python list:
+
+          * **one sequence** — `self.attn(...)` exactly as it has always been
+            called. This is the arm the verifier and every batch-1 bench cell
+            take, and it is kept on the unchanged `Attention.forward` so their
+            graphs keep their keys and their NEFFs.
+          * **several** — one `forward_spans` over the concatenated rows, which
+            does the row-wise work once instead of once per sequence. See
+            `Attention.forward_spans`.
+
+        `_sequence_spans` tiles the live token axis with contiguous spans from
+        row 0, so the second arm's rows are `[0, sum(lengths))` and anything
+        above that is padding the old loop left at zero — reproduced here by
+        the explicit zero tail. The contiguity is checked rather than assumed:
+        a non-contiguous plan falls back to the loop, which is slow but right.
+        """
+        lengths = [length for _, length in slices]
+        contiguous = all(
+            begin == sum(lengths[:i]) for i, (begin, _) in enumerate(slices)
+        )
+        if len(slices) > 1 and contiguous and self.attn.spans_supported:
+            covered = sum(lengths)
+            attn_out = self.attn.forward_spans(
+                normed[:, :covered], lengths, paged, shared, tp_group
+            )
+            total = normed.shape[1]
+            if covered < total:
+                attn_out = torch.cat(
+                    [attn_out, normed.new_zeros(
+                        normed.shape[0], total - covered, normed.shape[2]
+                    )],
+                    dim=1,
+                )
+            return attn_out
+
+        attn_out = torch.zeros_like(normed)
+        for (begin, length), span, span_shared in zip(slices, paged, shared):
+            attn_out[:, begin : begin + length] = self.attn(
+                normed[:, begin : begin + length],
+                span.pos,
+                span_shared,
+                span,
+                tp_group,
+            )
+        return attn_out
 
     def ffn_half(self, ffn_out, residual, ffn_post, ffn_comb):
         """The MoE's output mixed back into the residual streams."""
@@ -2987,6 +3197,13 @@ class DSparkAttention(Attention):
     KV appended, and no compressed KV at all (`compress_ratio == 0` for every
     `mtp` stage, since `compress_ratios` ends `[..., 0, 0, 0]`).
     """
+
+    #: `Attention.forward_spans` does not serve this: a draft stage's KV comes
+    #: from the main-stream tap and the draft block together, and
+    #: `DSparkBlock.forward` calls `self.attn` directly rather than through
+    #: `Block.attn_half`. Declared rather than left to inheritance so that a
+    #: future caller of `forward_spans` cannot reach it by accident.
+    spans_supported = False
 
     def forward(
         self,
