@@ -259,6 +259,30 @@ class NeuronScheduler(Scheduler):
             else None
         )
 
+        # Mirror the model runner's choice: with no segmented prefill, a prefill
+        # attends only the tokens of its own step, so the scheduler must never
+        # split a prompt. See _try_schedule_encoder_inputs.
+        cache_dtype = getattr(vllm_config.cache_config, "cache_dtype", "auto")
+        non_packed_fp8_kv = (
+            isinstance(cache_dtype, str)
+            and cache_dtype.startswith("fp8")
+            and not neuron_config.get("fp8_packed_kv", False)
+        )
+        self._single_shot_prefill: bool = not user_set_kv_segment_size_buckets and (
+            default_kv_segment_size_buckets is None or non_packed_fp8_kv
+        )
+        if (
+            self._single_shot_prefill
+            and vllm_config.scheduler_config.long_prefill_token_threshold > 0
+        ):
+            logger.warning(
+                "long_prefill_token_threshold=%d splits prompts into chunks, but "
+                "segmented prefill is off, so a later chunk cannot attend the "
+                "earlier ones and the output is wrong. Set kv_segment_size_buckets "
+                "in neuron_config, or unset long_prefill_token_threshold.",
+                vllm_config.scheduler_config.long_prefill_token_threshold,
+            )
+
         dcp_size = vllm_config.parallel_config.decode_context_parallel_size
         dcp_stride = (
             dcp_size * vllm_config.cache_config.block_size if dcp_size > 1 else 1
@@ -1323,6 +1347,49 @@ class NeuronScheduler(Scheduler):
             self._release_dispatched_producers()
 
         return scheduler_output
+
+    def _try_schedule_encoder_inputs(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        encoder_compute_budget: int,
+        shift_computed_tokens: int = 0,
+    ) -> tuple[list[int], int, int, list[int]]:
+        """Defer a prompt instead of splitting it when prefill is single-shot.
+
+        When the encoder cache or the encoder budget cannot take a multimodal
+        item yet, upstream schedules only the text tokens in front of it, and
+        the rest of the prompt runs as a second chunk. Without segmented
+        prefill (``kv_segment_size_buckets`` unset), that second chunk attends
+        only its own tokens, so the request decodes from a corrupted context.
+        In that configuration, schedule nothing for the request this step; it
+        runs whole once the cache has room.
+        """
+        result = super()._try_schedule_encoder_inputs(
+            request,
+            num_computed_tokens,
+            num_new_tokens,
+            encoder_compute_budget,
+            shift_computed_tokens,
+        )
+        encoder_inputs, scheduled_tokens, new_budget, external_inputs = result
+        if (
+            self._single_shot_prefill
+            and 0 < scheduled_tokens < num_new_tokens
+            and num_computed_tokens + num_new_tokens >= request.num_prompt_tokens
+            and num_computed_tokens < request.num_prompt_tokens
+        ):
+            logger.debug(
+                "Deferring prefill of request %s: the encoder cache cannot take its "
+                "multimodal input yet, and splitting the prompt needs segmented "
+                "prefill (%d of %d tokens would be scheduled).",
+                request.request_id,
+                scheduled_tokens,
+                num_new_tokens,
+            )
+            return [], 0, encoder_compute_budget, []
+        return encoder_inputs, scheduled_tokens, new_budget, external_inputs
 
     def _is_long_prompt(self, request: Request) -> bool:
         """True when the request's prompt exceeds spec_decode_max_prompt_len."""
