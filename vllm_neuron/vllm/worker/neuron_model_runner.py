@@ -389,6 +389,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     with correct request ordering and persistent state tracking.
     """
 
+    #: One-shot flags for `_sanitize_sync_drafts`, class-level so the repair
+    #: needs nothing from `__init__` and an instance that never reaches it pays
+    #: nothing. Each repair logs the first time it fires, per process.
+    _sync_draft_rows_warned = False
+    _sync_draft_ids_warned = False
+
     # ------------------------------------------------------------------------
     # INITIALIZATION
     # ------------------------------------------------------------------------
@@ -8314,6 +8320,99 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self._draft_token_ids = None
         return DraftTokenIds(req_ids, draft_token_ids)
 
+    def _sanitize_sync_drafts(
+        self, drafts: torch.Tensor, num_reqs: int
+    ) -> torch.Tensor:
+        """Make a sync-mode proposal safe to hand the scheduler.
+
+        Two repairs, both **no-ops on a well-formed proposal** -- the row count
+        matches ``num_reqs`` and every id is in ``[0, vocab_size)`` -- and both
+        logged the first time they fire, so a server log says it happened.
+
+        Why this is a repair and not a suppression. A draft token is only ever
+        *verified*: the rejection sampler keeps it if and only if it matches
+        what the target would have sampled anyway. So replacing an unusable
+        draft slot with an in-range token **cannot change an emitted token** --
+        the target rejects it and the step falls back to the bonus token. What
+        it costs is acceptance rate on that row, which is the honest price of a
+        draft the proposer could not produce. The alternative is handing the
+        scheduler an id that kills the engine, which is what happens today:
+
+            neuron_model_runner.py:2615  Error in _prepare_model_input:
+              Token IDs out of range [0, 129280). Found min=-1, max=27438.
+              Invalid IDs: [-1, -1, -1, -1, -1]
+            EngineCore encountered a fatal error.
+
+        — all 64 workers, two tokens into the first uncapped multi-sequence
+        decode this port has ever run (iteration 6, ``max_num_seqs=10``). Five
+        ``-1``s is exactly ``num_speculative_tokens``: one request's whole draft
+        row. The route is a **row-count mismatch**, not a bad token.
+        ``DSparkProposer.propose`` builds one row per *scheduled span*, so a
+        request with no committed-token row in this step -- one that has just
+        finished a prefill segment while the others decode -- gets no draft
+        row. The scheduler then zips N rows against N+1 ``req_ids``, the
+        uncovered request keeps ``_update_after_schedule``'s optimistic
+        ``[-1] * num_spec`` placeholder (the same placeholder
+        ``take_draft_token_ids`` hands out deliberately on the async path), and
+        the next step's
+        ``_validate_token_ids`` refuses it because ``-1`` is only tolerated
+        under async scheduling.
+
+        **Why batch 1 and the verifier never see it.** With one row the
+        rejection sampler's row always carries the bonus token, so the
+        proposer always has a valid seed; and a step is only ever mixed
+        prefill/decode when several sequences are in flight. The verifier's
+        ``short`` phase runs ``max_num_seqs=4`` over 3 prompts and this stays
+        inert there: it logged **zero** times in the passing verifier runs of
+        both iteration 6 and iteration 7. In the first uncapped batch-10 run it
+        logged 128 times (64 ranks x 2 messages) -- *"the proposer returned 9
+        draft row(s) for 10 request(s)"* -- and the engine survived where
+        iteration 6's had died two tokens in.
+
+        **What it does not claim.** It does not stop the uncovered-request case
+        from arising. The better fix is to return *no* drafts for an uncovered
+        request -- an empty list, which ``DraftTokenIds`` accepts and
+        ``take_draft_token_ids`` forwards unchanged -- so the target does not
+        verify five tokens it will certainly reject. That needs a **ragged**
+        draft layout, which crosses ``_pad_to_compiled_shapes``' flat
+        ``padded_num_reqs * num_speculative_tokens`` padding, so it needs a
+        device run to prove the shape still hits the warmed NEFF. Uniform
+        padding first, ragged second.
+        """
+        if drafts.ndim != 2:
+            return drafts
+        rows = int(drafts.shape[0])
+        if rows != num_reqs and num_reqs > 0:
+            if not self._sync_draft_rows_warned:
+                self._sync_draft_rows_warned = True
+                logger.warning(
+                    "deepseek_v41/spec: the proposer returned %d draft row(s) "
+                    "for %d request(s); padding/trimming to the request count "
+                    "so the scheduler cannot zip a request against another "
+                    "request's row and leave it holding a [-1] placeholder. "
+                    "See _sanitize_sync_drafts. Logged once.",
+                    rows, num_reqs,
+                )
+            if rows > num_reqs:
+                drafts = drafts[:num_reqs]
+            else:
+                pad = drafts.new_zeros((num_reqs - rows, drafts.shape[1]))
+                drafts = torch.cat([drafts, pad], dim=0)
+        bad = (drafts < 0) | (drafts >= self.vocab_size)
+        if bool(bad.any()):
+            if not self._sync_draft_ids_warned:
+                self._sync_draft_ids_warned = True
+                logger.warning(
+                    "deepseek_v41/spec: %d draft id(s) outside "
+                    "[0, %d) in a sync-mode proposal; replacing them with "
+                    "token 0, which the target will reject so the step falls "
+                    "back to its bonus token. See _sanitize_sync_drafts. "
+                    "Logged once.",
+                    int(bad.sum()), self.vocab_size,
+                )
+            drafts = torch.where(bad, torch.zeros_like(drafts), drafts)
+        return drafts
+
     def _propose_draft_token_ids(
         self,
         scheduler_output: Any,
@@ -8423,7 +8522,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # only, contiguous), used by the rejection sampler. In sync mode,
         # only ``drafts_only`` is needed by the scheduler.
         if not self.use_async_scheduling:
-            return drafts_only.cpu()
+            return self._sanitize_sync_drafts(drafts_only.cpu(), num_reqs)
 
         # Stash the drafts-only tensor for the next step's runner to feed
         # into ``spec_decode_metadata.draft_token_ids`` without slicing the

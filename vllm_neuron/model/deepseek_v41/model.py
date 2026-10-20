@@ -383,11 +383,20 @@ def tp_all_gather_last(x: torch.Tensor, tp_group) -> torch.Tensor:
 
 
 @functools.lru_cache(maxsize=None)
-def _nki_entry(module: str, name: str = "kernel"):
+def _nki_entry(module: str, name: str = "kernel", grid: int = 0):
     """A compiled entry point for `kernels.<module>.<name>`.
 
         torch._dynamo.exc.FailOnRecompileLimitHit: Hard failure due to
         fullgraph=True
+
+    `grid` is the NKI launch grid. 0 means `wrap_nki`'s own `[]`, which
+    `compile_nki` turns into `lnc = 1`: one function, no `lnc_id`, so only one
+    of the two physical NeuronCores of a logical core at LNC=2 has code to run.
+    A positive `grid` asks for that many program instances —
+    `wrap_nki(kernel)[2]` — which is only correct for a kernel that divides its
+    own work by `nl.program_id(0)`. A kernel written for one core run at grid 2
+    computes the same result twice over the same data, so this is opt-in per
+    entry point and the two-core kernels assert on the grid they get.
     """
     from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
@@ -422,10 +431,16 @@ def _nki_entry(module: str, name: str = "kernel"):
         "swiglu": swiglu_kernel,
     }
     wrapped = wrap_nki(getattr(modules[module], name))
+    if grid:
+        wrapped = wrapped[grid]
 
     def entry(*args):
         return wrapped(*args)
 
+    # No `grid` in the name: the entry is `lru_cache`d on `(module, name, grid)`
+    # so nothing needs it to be distinct, the kernel names already carry
+    # `_2core`, and keeping the string identical to the one-core form is what
+    # lets a graph iteration 6 compiled still be found in /mnt/nvme/neuron-cache.
     entry.__name__ = f"nki_{module}_{name}"
     return torch.compile(
         entry,
@@ -447,6 +462,140 @@ def nki_topk(tensor: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     return _topk(tensor, k, -1, -1)
 
 
+#: Which block-quant storages run their GEMM across **both** physical cores of
+#: every logical NeuronCore. At LNC=2 a logical core is a pair of
+#: NeuronCore-v3, and `wrap_nki` launches at grid 1, so a kernel's code only
+#: exists for one of the pair: half the machine idles. `fp4_linear_2core`
+#: divides its output columns by `nl.program_id(0)` and is launched at grid 2,
+#: so the two per-core functions' op counts *sum* to the grid-1 total instead of
+#: both doing the whole GEMM (`kernels/blockquant.py:574` records the lowering
+#: check that establishes this).
+#:
+#: Measured on device, same prompts, 64 ranks, against the undivided kernel:
+#:
+#:     `fp4` (the routed experts)   in512_bs1 TTFT  947.9 -> 881.2 ms  (-7.0%)
+#:                                             TPOT  142.8 -> 121.4 ms (-15.0%)
+#:                                  in1024_bs1 TTFT 1504.7 -> 1432.1   (-4.8%)
+#:                                  in2048_bs1 TTFT 3067.3 -> 2930.5   (-4.5%)
+#:
+#: and iteration 5 measured 888.2 ms for the same arm at the same settings, a
+#: 0.8% agreement across two independent implementations of the split.
+#:
+#: `fp8` is deliberately **not** in the default. It is worth a further ~-5% and
+#: iteration 5 verified it on device, but fp8 appears in every graph holding an
+#: attention projection and re-keys ~125 distinct graph shapes per context,
+#: measured at >48 min of compile at context 8448 without completing — and it
+#: flips no cell that `fp4` has not already flipped. There is no `fp8_*_2core`
+#: kernel in this tree for the same reason; iter-5.md §9 and iter-6.md §5/§11
+#: hold its implementation notes, including that `nki.simulate` cannot run any
+#: fp8 kernel here (`OverflowError` on `E4M3_SGN2` in the simulator's numpy
+#: backend, in the undivided kernel too).
+#: The storages a `_2core` kernel exists for. Intersected with the request
+#: below, so asking for one that has no split kernel is inert rather than a
+#: claim in the log that something was split when it was not.
+_BQ_2CORE_AVAILABLE = frozenset({"fp4"})
+
+_BQ_2CORE = _BQ_2CORE_AVAILABLE & frozenset(
+    part.strip()
+    for part in os.environ.get("DEEPSEEK_V41_BQ_2CORE", "fp4").split(",")
+    if part.strip() and part.strip() != "none"
+)
+
+#: Programs in the two-core launch grid. Not a knob: the kernels assert on it.
+_TWO_CORE_PROGRAMS = 2
+
+#: Logged once per process, so a server log says which arm ran.
+_BQ_2CORE_LOGGED = [False]
+
+#: `DEEPSEEK_V41_BQ_FUSED=fp4` routes the routed-expert GEMMs to
+#: `blockquant.fp4_linear_fused`, which decodes the weight in SBUF instead of
+#: writing a bf16 copy to private HBM and reading it straight back. The
+#: undivided `fp4_linear` moves ~47 MB of HBM per linear for a 5.9 MB weight at
+#: `n=2304, k=5120`, so the round trip is the obvious thing to remove — and it
+#: is a *fixed* cost per GEMM, which is the term that dominates both the 512-
+#: token cell's TTFT and the decode step.
+#:
+#: **It loses, and by a lot.** Measured at `in512_bs1`, 64 ranks, three cells in
+#: one session, nothing else changed:
+#:
+#:     fp4_linear_2core  (default)   TTFT  876.5 ms   TPOT 131.5 ms   6.93 tok/s
+#:     fp4_linear        (iter-4)    TTFT  947.9 ms   TPOT 142.8 ms   6.25 tok/s
+#:     fp4_linear_fused              TTFT 1313.3 ms   TPOT 163.2 ms   5.71 tok/s
+#:
+#: i.e. +50% TTFT and +24% TPOT against the default, and +39% / +14% against the
+#: undivided kernel it is a drop-in for — so the round trip it removes is not
+#: what the GEMM was spending its time on. `_gemm_fp4_fused` re-decodes the
+#: weight inside the k loop and `_fp4_plan` caps the n-chunk by PSUM capacity,
+#: so it trades ~47 MB of HBM for a much narrower stationary operand and more
+#: decode work per matmul. It is also cheaper to *compile*: this cell's first
+#: warm-up request took 24 s against 155 s for the two-core arm.
+#:
+#: This settles the question iter-6.md §15 named as the first thing to try, and
+#: the inconclusive measurement in the kernel's own docstring. Kept reachable by
+#: one variable so a later iteration can re-measure it against a *changed*
+#: expert step (e.g. one that decodes a weight once for many m-tiles) rather
+#: than rediscovering the kernel — but as written, hoisting the dequantization
+#: out of the GEMM is not where `F` goes.
+#:
+#: Not combinable with the two-core split: there is no `fp4_linear_fused_2core`,
+#: so asking for fused gives up the split, which is part of why it loses.
+_BQ_FUSED = _BQ_2CORE_AVAILABLE & frozenset(
+    part.strip()
+    for part in os.environ.get("DEEPSEEK_V41_BQ_FUSED", "").split(",")
+    if part.strip() and part.strip() != "none"
+)
+
+
+def _log_two_core_plan() -> None:
+    """Say once, on the logging rank, which GEMMs use both physical cores.
+
+    Without this there is no way to tell from a server log which arm produced a
+    measurement, which iteration 4 had to infer from a compile that only a new
+    graph could explain.
+    """
+    if _BQ_2CORE_LOGGED[0] or not _LOG_RANK[0]:
+        return
+    _BQ_2CORE_LOGGED[0] = True
+    if _BQ_FUSED:
+        logger.warning(
+            "deepseek_v41: DEEPSEEK_V41_BQ_FUSED=%s — storage %s runs "
+            "`fp4_linear_fused` (weight decoded in SBUF, no bf16 round trip "
+            "through private HBM) on ONE physical core, which overrides the "
+            "two-core split for that storage. Measured HALF AS FAST AGAIN "
+            "at TTFT and a quarter slower at TPOT; see nki_linear.",
+            os.environ.get("DEEPSEEK_V41_BQ_FUSED", ""),
+            ",".join(sorted(_BQ_FUSED)),
+        )
+    if not _BQ_2CORE:
+        logger.info(
+            "deepseek_v41: block-quant GEMMs run on ONE physical core per "
+            "logical NeuronCore (DEEPSEEK_V41_BQ_2CORE=%r). The measured "
+            "default is 'fp4'; see nki_linear.",
+            os.environ.get("DEEPSEEK_V41_BQ_2CORE", ""),
+        )
+        return
+    split = _BQ_2CORE - _BQ_FUSED
+    if not split:
+        return
+    logger.info(
+        "deepseek_v41: block-quant GEMMs on BOTH physical cores for storage "
+        "%s (grid=%d, DEEPSEEK_V41_BQ_2CORE=%r)",
+        ",".join(sorted(split)), _TWO_CORE_PROGRAMS,
+        os.environ.get("DEEPSEEK_V41_BQ_2CORE", "fp4"),
+    )
+
+
+def _two_core(storage: str, n: int) -> bool:
+    """Does this GEMM run split across both physical cores?
+
+    `n` has to divide into `_TWO_CORE_PROGRAMS` shares that are each a whole
+    number of 128-row tensor-engine tiles, which is what the kernel asserts. A
+    projection width that cannot be halved that way falls back to the undivided
+    kernel, so a new shape is slower rather than wrong.
+    """
+    return storage in _BQ_2CORE and n % (_TWO_CORE_PROGRAMS * 128) == 0
+
+
 def nki_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -466,7 +615,14 @@ def nki_linear(
         name = "fp8_linear" if quantize_activation else "fp8_linear_raw"
         out = _nki_entry("blockquant", name)(flat, weight, scale)
     elif storage == "fp4":
-        out = _nki_entry("blockquant", "fp4_linear")(flat, weight, scale)
+        if "fp4" in _BQ_FUSED and k % 64 == 0:
+            out = _nki_entry("blockquant", "fp4_linear_fused")(flat, weight, scale)
+        elif _two_core("fp4", int(weight.shape[0])):
+            out = _nki_entry(
+                "blockquant", "fp4_linear_2core", _TWO_CORE_PROGRAMS
+            )(flat, weight, scale)
+        else:
+            out = _nki_entry("blockquant", "fp4_linear")(flat, weight, scale)
     else:
         raise ValueError(f"unknown storage {storage!r}")
     return out[:rows].reshape(*x.shape[:-1], out.shape[-1])
@@ -3219,6 +3375,8 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.pp_always: set[int] = set()
         if _PP_EMULATE > 1:
             self._init_pp_emulation(_PP_EMULATE)
+
+        _log_two_core_plan()
 
         if _PROBE_AR_WIDTH:
             from vllm_neuron.parallel.neuron_parallel_state import (

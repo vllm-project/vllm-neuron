@@ -52,15 +52,75 @@ if os.environ.get("NEURON_RT_EXEC_TIMEOUT", "300") == "300":
 _MULTI_RANK_ENV = {
     "NEURON_RT_INSPECT_ENABLE": "0",
     "NEURON_RT_INSPECT_PRECACHE_ENABLE": "0",
+    "NEURON_RT_IO_RING_CACHE_SIZE": "1",
     "MALLOC_ARENA_MAX": "2",
     "MALLOC_TRIM_THRESHOLD_": "131072",
     "MALLOC_TOP_PAD_": "131072",
     "NEURON_HOST_MEM_PER_RANK_GIB": "20.0",
 }
 
-#: `NEURON_RT_IO_RING_CACHE_SIZE` is deliberately absent above: left at the
-#: worker's own default of 32. Set it to 1 to restore the single-device port's
-#: override for an A/B.
+#: `NEURON_RT_IO_RING_CACHE_SIZE` is iteration 7's addition, and the A/B the
+#: previous comment here asked for. `neuron_worker.py:713` raises the runtime's
+#: own default of 1 to **32** so the runtime reuses the per-step DMA ring across
+#: decode steps "instead of rebuilding it every step (kbl_exec_pre), which
+#: otherwise dominates async-decode model-submit time". That is a sound default
+#: for a model whose decode step is milliseconds. This port's decode step is
+#: ~130 ms (TPOT) / ~370 ms (ITL), so the submit-time win is below measurement
+#: noise, while 32 cached DMA rings *per loaded NEFF* are charged against
+#: exactly the pool whose exhaustion is the one wedge diagnosed on this host:
+#:
+#:     TDRV:ddrs_build_ring_from_template  Failed to allocate memory for dma
+#:                                         ring for queue qSPIO0_0
+#:     TDRV:dmem_buf_copyin                Copy from buffer to memory failed:
+#:                                         timeout (ret=-110)
+#:     RuntimeError: Failed to schedule neff execution. status=1
+#:
+#: One rank of 64 ran out of device memory for descriptor rings three seconds
+#: after a normal forward, and the other 63 then sat in a collective waiting for
+#: it. The pool scales with *graph count*, not batch size, and this model loads
+#: ~120 NEFFs.
+#:
+#: Measured here, `in512_bs1`, 64 ranks, same session, nothing else changed:
+#:
+#:     ring 32   TTFT 876.5 ms   TPOT 131.5 ms   decode 6.93 tok/s
+#:     ring  1   TTFT 883.8 ms   TPOT 130.1 ms   decode 6.99 tok/s
+#:
+#: i.e. +0.8% / -1.1% / +0.9% — noise in both directions, so the latency the
+#: upstream default buys is not present on this port.
+#:
+#: **The HBM saving is not there either, and that was measured rather than
+#: assumed.** The ancestor port recorded ~10 GiB above one rank, which is why
+#: this looked worth having. It does not reproduce. `DEEPSEEK_V41_HBM_TRACE=2`
+#: logs the Neuron runtime's own `get_vnc_memory_stats()` per layer, and at
+#: context 768 the two arms are indistinguishable:
+#:
+#:     ring  1    14.267 GiB at layer 0 of forward 0, peak 15.318 GiB of 24
+#:     ring 32    14.257 GiB at layer 0 of forward 0, peak 15.365 GiB of 24
+#:
+#: 10 MiB and 47 MiB apart. Either the descriptor-ring pool is charged somewhere
+#: `get_vnc_memory_stats()` does not report — it is driver-side, and the wedge
+#: signature (`ddrs_build_ring_from_template`) comes from TDRV rather than from
+#: the allocator this reads — or the pool simply is not large here.
+#:
+#: So the case for keeping ring 1 is not "it frees 10 GiB". It is: the latency
+#: the upstream default buys is absent on this port (measured above), it is the
+#: setting the ancestor port runs and the documented first response to the one
+#: wedge diagnosed on this host, and **every measurement that ships was taken
+#: with it** — two passing verifier runs, and the `in8192_bs1` cell that had
+#: stalled for 1527 s in iteration 6's gate run completing 8/8 in both passes.
+#: Whether that last one is *because* of this variable is open:
+#: `.autohelix/notes/iter-7.md` §11 states the confound plainly.
+#:
+#: Above one rank only, as the ancestor had it: at one rank the pool has never
+#: run out. `NEURON_RT_IO_RING_CACHE_SIZE=32` in the environment restores the
+#: worker default, since every key here is applied with `setdefault` semantics.
+#:
+#: Two neighbouring knobs the ancestor port tried with it and recorded as
+#: **must not touch**: `NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS` (the worker
+#: raises it 8 -> 32) and `NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS`. Setting
+#: either to 1 makes the first forward die with `status=7 message=Execution
+#: Queue Full` — that queue is not per in-flight request, it is the submission
+#: queue for the many NEFFs one forward executes.
 
 #: Ranks at or below which `NEURON_RT_DBG_FORCE_2DEV_PROXY` is applied. It was
 #: measured and validated with all ranks on one device; this deployment has 16 in
