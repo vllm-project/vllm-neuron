@@ -4,7 +4,17 @@
 The drafter projects target auxiliary hidden states into its context KV cache,
 then predicts a masked token block with non-causal attention. Its embedding and
 LM head are aliased from the target model.
+
+Two optional checkpoint features use the upstream vLLM DFlash format:
+
+- A reduced draft vocabulary. The config sets ``draft_vocab_size``. The
+  checkpoint ships its own ``lm_head`` and a ``d2t`` tensor, where
+  ``target_id = draft_id + d2t[draft_id]``.
+- A separate mask embedding. The checkpoint directory holds
+  ``mask_embedding.pt``, which replaces the embedding of ``mask_token_id``.
 """
+
+import os
 
 import torch
 import torch.nn as nn
@@ -147,6 +157,20 @@ class DFlashQwen3DecoderLayer(nn.Module):
         return hidden_states
 
 
+def _find_checkpoint_file(checkpoint_path: str, file_name: str) -> str | None:
+    """Return the path of an optional file in a local or HuggingFace checkpoint."""
+    if os.path.isdir(checkpoint_path):
+        path = os.path.join(checkpoint_path, file_name)
+        return path if os.path.isfile(path) else None
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.utils import EntryNotFoundError
+
+    try:
+        return hf_hub_download(checkpoint_path, file_name)
+    except EntryNotFoundError:
+        return None
+
+
 # =============================================================================
 # Model Backbone
 # =============================================================================
@@ -187,10 +211,17 @@ class DFlashQwen3Model(nn.Module):
             dtype=dtype,
             tp_group=get_tp_group().device_group,
         )
+        # Set by DFlashQwen3ForCausalLM.load_weights when the checkpoint ships
+        # mask_embedding.pt. None means mask slots use embed_tokens[mask_token_id].
+        self.register_buffer("mask_embedding", None, persistent=False)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Embed the flattened draft block with the target's embedding table."""
-        return self.embed_tokens(input_ids, scatter_tokens=False)
+        embeds = self.embed_tokens(input_ids, scatter_tokens=False)
+        if getattr(self, "mask_embedding", None) is not None:
+            is_mask = (input_ids == self.config.mask_token_id).unsqueeze(-1)
+            embeds = torch.where(is_mask, self.mask_embedding.to(embeds.dtype), embeds)
+        return embeds
 
     @torch.no_grad()
     def forward(
@@ -329,6 +360,8 @@ class DFlashQwen3ForCausalLM(nn.Module):
     # These checkpoint weights are supplied by the target after loading.
     has_own_embed_tokens = False
     has_own_lm_head = False
+    # Set in __init__ when the config has a reduced draft vocabulary.
+    has_vocab_mapping = False
 
     def __init__(self, config: DFlashConfig, start_layer_idx: int = 0):
         super().__init__()
@@ -348,10 +381,23 @@ class DFlashQwen3ForCausalLM(nn.Module):
             and config.neuron_config.debug_logits_dir is not None
         )
 
+        # A reduced draft vocabulary needs its own lm_head and the d2t id map.
+        self.has_vocab_mapping = config.draft_vocab_size not in (
+            None,
+            config.vocab_size,
+        )
+        if self.has_vocab_mapping:
+            self.has_own_lm_head = True
+            self.register_buffer(
+                "draft_to_target",
+                torch.zeros(config.draft_vocab_size, dtype=torch.int32),
+                persistent=False,
+            )
+
         # Keep logits sharded when the distributed sampler can consume them.
         self.lm_head = neuron_nn.ColumnParallelLinear(
             config.hidden_size,
-            config.vocab_size,
+            config.draft_vocab_size if self.has_vocab_mapping else config.vocab_size,
             bias=False,
             dtype=config.torch_dtype,
             gather_output=self.on_device_sampling_config is None,
@@ -568,11 +614,15 @@ class DFlashQwen3ForCausalLM(nn.Module):
 
     def _sample_draft_tokens(self, logits: torch.Tensor) -> torch.Tensor:
         if self.on_device_sampling_config is not None:
-            return self.sampler(
+            token_ids = self.sampler(
                 logits,
                 tp_rank=self.tp_group.rank_in_group_tensor,
             ).to(torch.int32)
-        return torch.argmax(logits, dim=-1).to(torch.int32)
+        else:
+            token_ids = torch.argmax(logits, dim=-1).to(torch.int32)
+        if self.has_vocab_mapping:
+            token_ids = self.draft_to_target[token_ids.long()]
+        return token_ids
 
     @classmethod
     def from_configs(
@@ -666,6 +716,10 @@ class DFlashQwen3ForCausalLM(nn.Module):
             f"unexpected weights in checkpoint: {sorted(set(unexpected))}"
         )
 
+        if self.has_vocab_mapping:
+            self._load_vocab_map(checkpoint, device)
+        self.model.mask_embedding = self._read_mask_embedding(checkpoint_path, device)
+
         with torch.no_grad():
             if not self.has_own_embed_tokens and self.model.embed_tokens.weight.is_meta:
                 self.model.embed_tokens.weight = nn.Parameter(
@@ -677,6 +731,48 @@ class DFlashQwen3ForCausalLM(nn.Module):
                     torch.empty_like(self.lm_head.weight, device=device),
                     requires_grad=False,
                 )
+
+    def _load_vocab_map(self, checkpoint: SafetensorsCheckpoint, device) -> None:
+        """Build ``draft_to_target`` from the checkpoint ``d2t`` offsets."""
+        d2t = checkpoint.get_tensor("d2t")
+        if d2t is None:
+            raise ValueError(
+                "The DFlash config sets draft_vocab_size, but the checkpoint has no "
+                "d2t tensor. Add d2t, or remove draft_vocab_size from the config."
+            )
+        if d2t.numel() != self.config.draft_vocab_size:
+            raise ValueError(
+                f"The d2t tensor has {d2t.numel()} entries, but draft_vocab_size is "
+                f"{self.config.draft_vocab_size}. Make the two values the same."
+            )
+        draft_ids = torch.arange(d2t.numel(), dtype=torch.long)
+        # Convert the dtype on the CPU, then move. The device copy does not
+        # convert the dtype.
+        draft_to_target = (draft_ids + d2t.long()).to(torch.int32)
+        self.draft_to_target = draft_to_target.to(device)
+
+    def _read_mask_embedding(self, checkpoint_path: str, device) -> torch.Tensor | None:
+        """Read the optional ``mask_embedding.pt`` file of the checkpoint."""
+        path = _find_checkpoint_file(checkpoint_path, "mask_embedding.pt")
+        if path is None:
+            return None
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        if isinstance(state, dict):
+            file_token_id = state.get("mask_token_id", self.config.mask_token_id)
+            if file_token_id != self.config.mask_token_id:
+                raise ValueError(
+                    f"mask_embedding.pt has mask_token_id {file_token_id}, but the "
+                    f"config has {self.config.mask_token_id}. Make the two values "
+                    "the same."
+                )
+            state = state["embedding"]
+        embedding = state.reshape(-1)
+        if embedding.numel() != self.config.hidden_size:
+            raise ValueError(
+                f"mask_embedding.pt has {embedding.numel()} values, but hidden_size "
+                f"is {self.config.hidden_size}. Use a mask embedding for this draft."
+            )
+        return embedding.to(self.config.torch_dtype).to(device)
 
     def alias_target_head(self, target_model: nn.Module) -> None:
         target_embed = target_model.model.embed_tokens

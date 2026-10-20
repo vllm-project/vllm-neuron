@@ -97,6 +97,9 @@ class DFlashConfig(Qwen3Config):
     block_size: int = 10
     mask_token_id: int | None = 128002
     target_layer_ids: list[int] = field(default_factory=lambda: [1, 8, 15, 22, 29])
+    # Reduced draft vocabulary. The checkpoint ships its own lm_head and a d2t
+    # tensor (target id = draft id + d2t), the same format that upstream vLLM uses.
+    draft_vocab_size: int | None = None
 
     @classmethod
     def from_configs(
@@ -120,7 +123,12 @@ class DFlashConfig(Qwen3Config):
                 "or in dflash_config"
             )
 
-        for key in ("block_size", "mask_token_id", "target_layer_ids"):
+        for key in (
+            "block_size",
+            "mask_token_id",
+            "target_layer_ids",
+            "draft_vocab_size",
+        ):
             if key in nested:
                 config_dict[key] = nested[key]
 
