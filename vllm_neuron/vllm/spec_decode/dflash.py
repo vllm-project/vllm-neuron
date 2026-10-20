@@ -61,17 +61,6 @@ class DFlashProposer:
         self.on_device_sampling = on_device_sampling
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
 
-        max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
-        num_verify_tokens = max_num_seqs * (self.num_speculative_tokens + 1)
-        # TODO: Remove this guard once the distributed argmax kernel supports
-        # more than 256 verification rows.
-        assert num_verify_tokens <= 256, (
-            "DFlash currently supports at most 256 verification tokens; "
-            f"max_num_seqs={max_num_seqs} with "
-            f"num_speculative_tokens={self.num_speculative_tokens} would verify "
-            f"{num_verify_tokens} tokens at once"
-        )
-
         draft_hf_config = self.draft_model_config.hf_config
         nested_dflash_config = getattr(draft_hf_config, "dflash_config", {}) or {}
         if "block_size" in nested_dflash_config:
