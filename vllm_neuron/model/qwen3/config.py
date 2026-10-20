@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 import torch
 from transformers import PretrainedConfig
 
+from vllm_neuron.model.config_utils import hoist_rope_parameters
 from vllm_neuron.model.neuron_config import NeuronConfig
 
 
@@ -60,6 +61,7 @@ class Qwen3Config:
         else:
             config_dict = hf_config
 
+        config_dict = hoist_rope_parameters(config_dict)
         field_names = {f.name for f in cls.__dataclass_fields__.values()}
         filtered_dict = {k: v for k, v in config_dict.items() if k in field_names}
 
