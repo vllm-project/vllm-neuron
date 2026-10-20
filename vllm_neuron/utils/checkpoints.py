@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import json
 import logging
 import os
 import threading
@@ -63,6 +64,41 @@ class _CheckpointSource(ABC):
         pass
 
 
+_SAFETENSORS_INDEX = "model.safetensors.index.json"
+
+
+def _filter_by_index(file_names: list[str], index_path: str | None) -> list[str]:
+    """Keep only the files that ``model.safetensors.index.json`` names.
+
+    Some repositories ship one set of weights in two formats, for example
+    ``model-*.safetensors`` and ``consolidated.safetensors``. Upstream vLLM
+    loads only the files in the index. Do the same, so the loader does not
+    open a duplicate copy of the weights.
+
+    Args:
+        file_names: The candidate file names.
+        index_path: The local path of the index file, or None if absent.
+
+    Returns:
+        The file names in the index, or ``file_names`` if no index exists.
+
+    Examples:
+        >>> _filter_by_index(["a.safetensors"], None)
+        ['a.safetensors']
+    """
+    if index_path is None or not os.path.isfile(index_path):
+        return file_names
+    with open(index_path) as f:
+        indexed = set(json.load(f)["weight_map"].values())
+    missing = indexed - set(file_names)
+    if missing:
+        raise FileNotFoundError(
+            f"{_SAFETENSORS_INDEX} names files that are not in the checkpoint: "
+            f"{sorted(missing)}. Download the missing files, or fix the index."
+        )
+    return [f for f in file_names if f in indexed]
+
+
 class _LocalCheckpointSource(_CheckpointSource):
     """
     Checkpoint source for loading files from a local directory.
@@ -77,6 +113,10 @@ class _LocalCheckpointSource(_CheckpointSource):
         self._file_names = sorted(
             f for f in os.listdir(checkpoint_dir) if f.endswith(file_extension)
         )
+        if file_extension == ".safetensors":
+            self._file_names = _filter_by_index(
+                self._file_names, os.path.join(checkpoint_dir, _SAFETENSORS_INDEX)
+            )
 
     def get_file_names(self) -> list[str]:
         """Return sorted list of filenames in the checkpoint directory."""
@@ -106,11 +146,15 @@ class _HFCheckpointSource(_CheckpointSource):
     ):
         self._model_name = model_name
         self._cache_dir = cache_dir
+        repo_files = list_repo_files(model_name)
         self._file_names = sorted(
-            f
-            for f in list_repo_files(model_name)
-            if f.endswith(file_extension) and "/" not in f
+            f for f in repo_files if f.endswith(file_extension) and "/" not in f
         )
+        if file_extension == ".safetensors" and _SAFETENSORS_INDEX in repo_files:
+            index_path = hf_hub_download(
+                model_name, _SAFETENSORS_INDEX, cache_dir=cache_dir
+            )
+            self._file_names = _filter_by_index(self._file_names, index_path)
 
     def get_file_names(self) -> list[str]:
         """Return sorted list of filenames in the HuggingFace repository."""
@@ -706,6 +750,28 @@ class SafetensorsCheckpoint:
         """Return the set of tensor names available in the checkpoint."""
         self._ensure_indexed()
         return set(self._tensor_name_to_file.keys())
+
+    def get_tensor(self, name: str) -> torch.Tensor | None:
+        """Return one full tensor from the checkpoint, or None if it is absent.
+
+        Use this method for a small tensor that the model does not shard, for
+        example a token id map. The tensor stays on the CPU.
+
+        Args:
+            name: The tensor name in the safetensors files.
+
+        Returns:
+            The tensor, or None if no file contains ``name``.
+
+        Examples:
+            >>> checkpoint = SafetensorsCheckpoint("/path/to/checkpoint")
+            >>> d2t = checkpoint.get_tensor("d2t")
+        """
+        self._ensure_indexed()
+        file_path = self._tensor_name_to_file.get(name)
+        if file_path is None:
+            return None
+        return self._open_safetensor_files[file_path].get_tensor(name)
 
     def get_num_files(self) -> int:
         """
