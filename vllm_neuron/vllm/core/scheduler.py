@@ -222,9 +222,13 @@ class NeuronScheduler(Scheduler):
 
         # Get max_jump_forward_tokens from config
         neuron_config = vllm_config.additional_config.get("neuron_config", {})
-        self.max_jump_forward_tokens: int = NeuronConfig.from_dict(
-            neuron_config
-        ).max_jump_forward_tokens
+        parsed_neuron_config = NeuronConfig.from_dict(neuron_config)
+        self.max_jump_forward_tokens: int = parsed_neuron_config.max_jump_forward_tokens
+        # Long-prompt routing: requests with longer prompts decode without
+        # speculation. See _route_long_prompts_off_spec.
+        self.spec_decode_max_prompt_len: int | None = (
+            parsed_neuron_config.spec_decode_max_prompt_len
+        )
 
         #  Roll back so upstream base update_from_output can re-accept [jf.., bonus].
         if self.max_jump_forward_tokens > 0:
@@ -1105,6 +1109,9 @@ class NeuronScheduler(Scheduler):
             len(self.running),
         )
 
+        # Step 0: Long-prompt routing (no-op unless spec_decode_max_prompt_len is set)
+        self._route_long_prompts_off_spec()
+
         # Step 1: Move all waiting to holdback queue (preserving priority)
         while self.waiting:
             self.holdback_queue.append(self.waiting.popleft())
@@ -1316,6 +1323,50 @@ class NeuronScheduler(Scheduler):
             self._release_dispatched_producers()
 
         return scheduler_output
+
+    def _is_long_prompt(self, request: Request) -> bool:
+        """True when the request's prompt exceeds spec_decode_max_prompt_len."""
+        limit = self.spec_decode_max_prompt_len
+        return limit is not None and request.num_prompt_tokens > limit
+
+    def _is_spec_routed_off(self, request: Request) -> bool:
+        """True when long-prompt routing has turned speculation off for the request."""
+        if getattr(request, "_spec_routed_off", False):
+            return True
+        if self._is_long_prompt(request):
+            request._spec_routed_off = True
+            return True
+        return False
+
+    def _route_long_prompts_off_spec(self) -> None:
+        """Run long-prompt requests, and the decodes that share their batch, without drafts.
+
+        A draft model's acceptance usually falls on long contexts, so for a long
+        prompt the verification costs more than the drafts save. A request whose
+        prompt is longer than ``spec_decode_max_prompt_len`` therefore decodes
+        without speculation.
+
+        The compiled decode graphs need the same draft count for every request
+        in a batch, and a batch that mixes requests with and without drafts
+        gives wrong logits. So while a long-prompt request is running, every
+        running request also stops speculating. The flag is sticky: a request
+        never goes back to speculation, which avoids a non-spec to spec
+        transition in the middle of a request, and a request that joins while
+        any routed request runs is routed too, so a decode batch never mixes the
+        two. Requests that arrive after the routed ones finish speculate as usual.
+
+        This runs before the base scheduler reads ``spec_token_ids``, so no
+        draft tokens are scheduled for a routed request. The model runner then
+        takes the existing spec to non-spec transition, the same path it uses
+        near ``max_model_len``.
+        """
+        if self.spec_decode_max_prompt_len is None or self.num_spec_tokens <= 0:
+            return
+        if not any([self._is_spec_routed_off(req) for req in self.running]):
+            return
+        for request in self.running:
+            request._spec_routed_off = True
+            request.spec_token_ids = []
 
     def _call_base_schedule(self, throttle_prefills: bool = False) -> "SchedulerOutput":
         """Delegate to base vllm Scheduler. Override for async behavior."""
@@ -1568,7 +1619,10 @@ class NeuronAsyncScheduler(NeuronScheduler, AsyncScheduler):
             if not disabled and request.num_computed_tokens > safe_num_computed:
                 disabled = True
                 request._async_spec_disabled = True
-            if disabled:
+            if disabled or (
+                self.spec_decode_max_prompt_len is not None
+                and self._is_spec_routed_off(request)
+            ):
                 request.spec_token_ids = []
             else:
                 request.spec_token_ids = self._spec_token_placeholders

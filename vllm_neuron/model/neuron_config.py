@@ -197,6 +197,14 @@ class NeuronConfig:
     gpt_oss_tail_hops: tuple[int, ...] = (8, 16)
     # Decode SP: all-reduce -> reduce-scatter + all-gather on token shards; Qwen3-32B MXFP8, tokens % TP == 0 only.
     enable_decode_sequence_parallel: bool = False
+    # Long-prompt routing for speculative decoding. A request whose prompt has more
+    # tokens than this limit decodes without speculation for its whole lifetime: a
+    # draft model's acceptance usually drops on long contexts, so verifying drafts
+    # costs more than it saves. While such a request shares a decode batch with
+    # speculating requests, the whole step runs the non-speculative decode graph,
+    # because the compiled graphs need the same draft count for every request.
+    # None (the default) turns the routing off.
+    spec_decode_max_prompt_len: int | None = None
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "NeuronConfig":
@@ -283,6 +291,7 @@ class NeuronConfig:
             enable_decode_sequence_parallel=config_dict.get(
                 "enable_decode_sequence_parallel", False
             ),
+            spec_decode_max_prompt_len=config_dict.get("spec_decode_max_prompt_len"),
         )
 
     def __post_init__(self):
@@ -331,6 +340,15 @@ class NeuronConfig:
             raise ValueError(
                 "max_jump_forward_tokens must be a valid int, "
                 f"got {self.max_jump_forward_tokens}"
+            )
+        if self.spec_decode_max_prompt_len is not None and (
+            isinstance(self.spec_decode_max_prompt_len, bool)
+            or not isinstance(self.spec_decode_max_prompt_len, int)
+            or self.spec_decode_max_prompt_len < 1
+        ):
+            raise ValueError(
+                "spec_decode_max_prompt_len must be a positive integer or None, "
+                f"got {self.spec_decode_max_prompt_len}"
             )
         if not self.enable_structured_outputs:
             self.max_jump_forward_tokens = 0
