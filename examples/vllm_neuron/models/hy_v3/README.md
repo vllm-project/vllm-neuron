@@ -14,7 +14,8 @@ cache.
 | MATH-500, no_think (temp 0.9, max 4096 tok) | 96.8% (DCP=8: 96.0%) |
 | MATH-500, high reasoning (temp 0.9, max 15000 tok) | 94.2% (27 of 29 misses are length truncations) |
 | 4-layer real-weight model vs HF fp32 | logits cosine >= 0.9986 |
-| Single-request decode (TPOT) | ~30 ms (DCP=8: ~37 ms) |
+| Single-request decode (TPOT) | ~30 ms; 25.5-26.9 ms after the c=1 optimizations (DCP=8: ~37 ms) |
+| TTFT at c=1, 1k / 16k input | 0.54 s / 4.40 s; 0.20 s / 1.80 s with `serve_latency.sh` (REPORT.md §10) |
 | Prefill throughput | ~3.7k tok/s (DCP=8: ~2.8k tok/s) |
 | KV capacity, KV cap 0.45 | 260k tokens (DCP=8: 2.08M tokens) |
 | Peak decode throughput | ~1.7k tok/s (batch 127) |
@@ -29,13 +30,14 @@ node (see REPORT.md §9).
 | Path | What |
 |---|---|
 | `serve.sh` | `vllm serve` wrapper for the configs used in the report (baseline B/C, DCP=8) |
+| `serve_latency.sh` | Single-request latency config: no prefix caching, prefill buckets 512..16384 (enables the dynamic-block MoE prefill kernel) |
 | `bench_matrix.sh` | `vllm bench serve` matrix (random dataset, per-cell seed so cells never share prefix-cache entries) |
 | `eval_math500.py` | MATH-500 against the OpenAI API, graded with math-verify |
 | `make_mini.py` | Build a reduced real-weight checkpoint (first N layers), both FP8 and dequantized BF16 |
 | `hf_reference.py` | HF transformers CPU reference logits / greedy tokens for the BF16 mini checkpoint |
 | `compare_hf_logits.py` | vLLM Neuron vs HF reference, per-step logits comparison |
 | `validate_features.py` | Segmented prefill, prefix-cache hit and batch-128 consistency checks (optionally with DCP) |
-| `kernel_tests/` | Single-NeuronCore micro-tests of the FP8 kernels with real weight shards |
+| `kernel_tests/` | Single-NeuronCore micro-tests of the FP8 kernels with real weight shards, plus timing micro-benchmarks (`bench_moe_cte.py`, `bench_decode.py`) |
 | `inspect_scales.py` | Checkpoint FP8 scale statistics |
 | `di/` | NIXL probe and `libcuda` stub from the single-node P/D investigation |
 | `results/bench/` | Raw `vllm bench` JSON. `summary.csv` covers the clean runs; `archive_fixed_seed/` holds the early fixed-seed runs, whose concurrency > 1 cells are prefix-cache contaminated |

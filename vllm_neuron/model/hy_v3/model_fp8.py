@@ -23,7 +23,7 @@ Kernel mapping:
     input RMSNorm, pre-RoPE QK-norm, in-kernel KV cache update).
   - Dense MLP / shared expert: ``NF.rmsnorm_quant`` + ``NF.mlp`` (STATIC).
   - Routed experts: torch router (sigmoid + selection-only bias), then
-    ``NF.moe_cte`` (``shard_on_i``, per-channel FP8 weight dequant) for
+    ``NF.moe_cte`` (``shard_on_i_hybrid``, per-channel FP8 weight dequant) for
     prefill and ``NF.moe_tkg`` (STATIC FP8 weights) for decode. Both run
     BF16 activations x FP8 weights.
 
@@ -109,6 +109,9 @@ _MLP_INTERMEDIATE_ALIGN = 128
 
 # Blockwise MoE prefill block size (shard_on_i requires a multiple of 256).
 _MOE_BLOCK_SIZE = 256
+
+# Ranks per group sharing one copy of the shared expert during decode.
+_SHARED_DECODE_SHARDS = 8
 
 
 def _halve_fp8(w: torch.Tensor) -> torch.Tensor:
@@ -739,10 +742,19 @@ class HYV3StaticFP8MLP(nn.Module):
     ``tp_sharded=True``: intermediate dim sharded across TP (dense layer).
     ``tp_sharded=False``: full weights on every rank (shared expert); used on
     SP-local tokens in prefill and on all tokens in decode, so no reduction
-    is needed.
+    is needed. ``num_shards`` / ``shard_rank`` instead shard the intermediate
+    dim over a sub-group whose partials the caller combines (decode copy of
+    the shared expert).
     """
 
-    def __init__(self, config: HYV3Config, intermediate_size: int, tp_sharded: bool):
+    def __init__(
+        self,
+        config: HYV3Config,
+        intermediate_size: int,
+        tp_sharded: bool,
+        num_shards: int | None = None,
+        shard_rank: int | None = None,
+    ):
         super().__init__()
         self.tp_group = get_tp_group()
         self.world_size = self.tp_group.world_size
@@ -750,10 +762,12 @@ class HYV3StaticFP8MLP(nn.Module):
         self.hidden_size = config.hidden_size
         self.act_dtype = config.torch_dtype
 
-        if self.tp_sharded:
-            shard = -(-intermediate_size // self.world_size)
-        else:
-            shard = intermediate_size
+        # ``num_shards`` / ``shard_rank`` shard the intermediate dim over a
+        # sub-group without TP collectives (the caller combines the partials).
+        if num_shards is None:
+            num_shards = self.world_size if self.tp_sharded else 1
+            shard_rank = self.tp_group.rank_in_group if self.tp_sharded else 0
+        shard = -(-intermediate_size // num_shards)
         self.intermediate_shard = shard
         self.intermediate_size_per_rank = (
             -(-shard // _MLP_INTERMEDIATE_ALIGN) * _MLP_INTERMEDIATE_ALIGN
@@ -775,7 +789,7 @@ class HYV3StaticFP8MLP(nn.Module):
         self.gate_up_input_scale = _fp32_param(_PMAX, 1)
         self.down_input_scale = _fp32_param(_PMAX, 1)
 
-        tp_rank = self.tp_group.rank_in_group if self.tp_sharded else 0
+        tp_rank = shard_rank
         set_weight_loader(
             self.gate_proj_weight, _padded_mlp_loader(False, shard, I, tp_rank)
         )
@@ -845,7 +859,7 @@ class HYV3DenseMLP(nn.Module):
         self.tp_group = self.mlp.tp_group
         self.world_size = self.mlp.world_size
 
-    def forward(self, hidden_states, ln_w, eps, is_prefill, rank):
+    def forward(self, hidden_states, ln_w, eps, is_prefill, rank, segmented=False):
         output = self.mlp(hidden_states, ln_w, eps, is_prefill)
         # >>> PARALLELISM: combine TP partial sums <<<
         if self.world_size > 1:
@@ -939,11 +953,29 @@ class HYV3MoE(nn.Module):
         self.down_proj_scale_tkg = _fp32_param(L, 1)
 
         # <-- MODEL-SPECIFIC: shared expert(s), full weights on every rank
-        self.shared_mlp = HYV3StaticFP8MLP(
-            config,
-            config.moe_intermediate_size * config.num_shared_experts,
-            tp_sharded=False,
-        )
+        shared_size = config.moe_intermediate_size * config.num_shared_experts
+        self.shared_mlp = HYV3StaticFP8MLP(config, shared_size, tp_sharded=False)
+
+        # >>> PARALLELISM: decode copy of the shared expert sharded over groups
+        # of `_SHARED_DECODE_SHARDS` ranks. Its partial output (scaled by
+        # shards / world_size, since every group computes a full copy) rides
+        # on the routed experts' all-reduce, so decode reads ~1/8 of the
+        # shared weights per rank with no extra collective.
+        self.shared_decode_shards = _SHARED_DECODE_SHARDS
+        if (
+            self.world_size % self.shared_decode_shards == 0
+            and self.world_size > self.shared_decode_shards
+        ):
+            self.shared_mlp_decode = HYV3StaticFP8MLP(
+                config,
+                shared_size,
+                tp_sharded=False,
+                num_shards=self.shared_decode_shards,
+                shard_rank=self.tp_group.rank_in_group % self.shared_decode_shards,
+            )
+            self.shared_decode_weight = self.shared_decode_shards / self.world_size
+        else:
+            self.shared_mlp_decode = None
 
         self._setup_weight_loaders()
 
@@ -1015,24 +1047,35 @@ class HYV3MoE(nn.Module):
         """
         return rank_to_row(rank, self.tp_degree, self.global_world_size)
 
-    def forward(self, hidden_states, ln_w, eps, is_prefill, rank):
+    def forward(self, hidden_states, ln_w, eps, is_prefill, rank, segmented=False):
         # <-- MODEL-SPECIFIC: post-attention RMSNorm feeds router + routed experts
         x = hidden_states.to(torch.float32)
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
         normed = (x * ln_w.to(torch.float32)).to(hidden_states.dtype)
         affinities, top_k_index = self._route(normed)
 
-        # Shared expert: full weights; SP-local tokens in prefill, all tokens
-        # in decode. Its output is complete on every rank.
-        shared_output = self.shared_mlp(hidden_states, ln_w, eps, is_prefill)
-
         if is_prefill:
-            routed = self._forward_prefill(normed, affinities, rank)
-        else:
-            routed = self._forward_decode(normed, affinities, top_k_index, rank)
-        return routed + shared_output
+            # Shared expert: full weights on SP-local tokens, output complete.
+            shared_output = self.shared_mlp(hidden_states, ln_w, eps, is_prefill)
+            return (
+                self._forward_prefill(normed, affinities, rank, segmented)
+                + shared_output
+            )
 
-    def _forward_prefill(self, normed, affinities, rank):
+        if self.shared_mlp_decode is not None:
+            shared_partial = (
+                self.shared_mlp_decode(hidden_states, ln_w, eps, is_prefill)
+                * self.shared_decode_weight
+            )
+            return self._forward_decode(
+                normed, affinities, top_k_index, rank, shared_partial
+            )
+        shared_output = self.shared_mlp(hidden_states, ln_w, eps, is_prefill)
+        return (
+            self._forward_decode(normed, affinities, top_k_index, rank) + shared_output
+        )
+
+    def _forward_prefill(self, normed, affinities, rank, segmented=False):
         # >>> PARALLELISM: All-gather tokens + affinities from SP <<<
         if self.world_size > 1:
             affinities = self.tp_group.all_gather(affinities, dim=0)
@@ -1062,8 +1105,20 @@ class HYV3MoE(nn.Module):
             )
         )
 
+        # shard_on_i_hybrid always runs `num_static_block` blocks and skips the
+        # remaining (worst-case sized) block slots at runtime when they are
+        # empty. With few local experts most of the static worst case is
+        # padding, so this is ~3x faster than shard_on_i at T=2048. Its
+        # dynamic loop cannot share a graph with segmented attention's
+        # (neuronx-cc NCC_ICFG001), so segmented prefill keeps shard_on_i.
+        if segmented:
+            impl, num_static_block = MoECTEImplementation.shard_on_i, None
+        else:
+            impl = MoECTEImplementation.shard_on_i_hybrid
+            num_static_block = self.num_local_experts
         output = NF.moe_cte(
-            implementation=MoECTEImplementation.shard_on_i,
+            implementation=impl,
+            num_static_block=num_static_block,
             conditions=conditions,
             hidden_states=normed,
             expert_affinities_masked=masked,
@@ -1086,7 +1141,7 @@ class HYV3MoE(nn.Module):
             output = self.tp_group.reduce_scatter(output, dim=0)
         return output
 
-    def _forward_decode(self, normed, affinities, top_k_index, rank):
+    def _forward_decode(self, normed, affinities, top_k_index, rank, extra=None):
         rank_id = self._ep_row(rank).to(torch.int32).view(1, 1)
         # moe_tkg selects STATIC from the presence of input scales; on TRN2 the
         # activations stay BF16 so the values are unused.
@@ -1108,7 +1163,9 @@ class HYV3MoE(nn.Module):
             expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
             activation_fn=ActFnType.SiLU,
         )
-        # >>> PARALLELISM: combine expert partials <<<
+        if extra is not None:
+            output = output + extra
+        # >>> PARALLELISM: combine expert (and sharded shared-expert) partials <<<
         if self.world_size > 1:
             output = self.tp_group.all_reduce(output)
         return output
@@ -1155,12 +1212,16 @@ class HYV3DecoderLayer(nn.Module):
             rank=rank,
         )
         hidden_states = hidden_states + attn_out
+        segmented = bool(
+            attn_metadata[self.self_attn.layer_name].get("kv_segment_size")
+        )
         mlp_out = self.mlp(
             hidden_states,
             ln_w=self.post_attention_layernorm.weight,
             eps=self.rms_norm_eps,
             is_prefill=not is_decode,
             rank=rank,
+            segmented=segmented,
         )
         return hidden_states + mlp_out
 
@@ -1438,6 +1499,8 @@ class HYV3ForCausalLM(nn.Module):
             m[f"{mp}.down_proj_scale"] = experts("down_proj", "weight_scale")
             m[f"{mp}.down_proj_scale_tkg"] = experts("down_proj", "weight_scale")
             gated_mlp(f"{mp}.shared_mlp", f"{mp}.shared_mlp")
+            if layer.mlp.shared_mlp_decode is not None:
+                gated_mlp(f"{mp}.shared_mlp_decode", f"{mp}.shared_mlp")
         return m
 
     def load_weights(

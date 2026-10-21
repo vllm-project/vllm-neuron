@@ -10,6 +10,7 @@
 - **延迟**：单请求 decode ≈ 30 ms/token（≈33 tok/s），与 context 长度（1k–16k）基本无关；prefill ≈ 3.7k tok/s（16k 输入 TTFT 4.4 s）。性能数据都已经用独立 seed 重测，排除了 prefix cache 的污染（见第 4 节）。
 - **吞吐**：decode 峰值 ≈ 1.7k tok/s（batch 127），但端到端平均输出吞吐只有 ≈ 380 tok/s。原因是 prefill 会阻塞 decode（Neuron 后端不支持混合批处理），而且短 prompt 也要补齐到 2048 的 prefill bucket。
 - **容量瓶颈**：TP=64 时 8 个 KV head 每个被复制 8 份，KV 显存的 7/8 是冗余；16k context 下最多只能 15 个并发。
+- **单并发优化（第 10 节）**：MoE prefill 改用动态 block kernel，decode 时共享专家切分，再配合低延迟配置，TTFT 降低 51–63%（1k 输入 0.20 s，16k 输入 1.80 s），TPOT 降低 11–16%（25.5–26.9 ms），MATH-500 精度不变。
 - **DCP=8（第 8 节）**：KV 容量提升到 8 倍（26 万 → 208 万 token），32k context 下的并发上限从 5 提高到 63；MATH-500 精度不变（96.0%，基线 96.8%，在采样噪声范围内）。
   - 代价：单请求 TPOT 从约 30.6 ms 增加到约 37.2 ms，prefill 慢 25–37%。
   - 收益：decode 为主的负载有实际提升（MATH-500 no_think 总耗时少 26%）。prefill 为主的长 context 负载，在合并部署下总吞吐没有提升，因为 prefill 只能串行执行。要发挥 DCP 的作用，需要配合 P/D 分离。
@@ -253,11 +254,60 @@
 
 复现：`di/nixl_probe.py`（两核之间用 NIXL 传一块 HBM）。
 
+## 10. 单并发延迟优化
+
+目标是降低单并发下的 TTFT 和 TPOT。先在单核上做了微基准，定位瓶颈（脚本：`kernel_tests/bench_moe_cte.py`、`kernel_tests/bench_decode.py`）。
+
+### 10.1 瓶颈定位
+
+- **TTFT 主要花在 MoE prefill 上**。`moe_cte shard_on_i` 按最坏情况分配 block：每个 rank 有 3 个本地专家，T=2048、top-8 时静态分配了 26 个 block，但实际只用到约 3 个，所以大部分计算都花在补齐上。2048 token 的一步 prefill，光 MoE 就要约 0.42 s（79 层 × 5.35 ms），而 1k 输入的 TTFT 一共才 0.54 s。
+- **TPOT（batch 1）主要是每层 kernel 本身的执行时间**，每层约 0.36 ms，× 80 层 ≈ 29 ms。集合通信只占很小一部分。各组成部分的耗时：
+
+  | 组成部分 | 耗时 | 占比 |
+  |---|---|---|
+  | 路由专家（moe_tkg，3 个本地专家全部加载） | ~0.19 ms | ~50% |
+  | attention megakernel | ~0.10 ms | ~28% |
+  | 共享专家（全量 I=1536） | ~0.08 ms | ~22% |
+
+- batch 1 时，每个 rank 上平均不到 1 个专家被选中。但 moe_tkg 的 selective 模式和 dynamic 模式在 EP 下都不能跳过没被选中的专家：selective 要固定循环 K=8 次，dynamic 要求每个 rank 只有 1 个本地专家。要做到这一点需要写新 kernel，这一轮没做。
+
+### 10.2 改动（`hy_v3/model_fp8.py`）
+
+1. **MoE prefill 改用 `shard_on_i_hybrid`**（`num_static_block` = 本地专家数），运行时跳过空 block。单核测试：T=2048 时从 5.35 ms 降到 1.92 ms，T=8192 时从 18.68 ms 降到 5.14 ms，数值误差和原来一样。
+   - **限制**：它的动态循环和 segmented attention 的 `nl.dynamic_range` 放在同一个计算图里时，neuronx-cc 报 `NCC_ICFG001`（控制流图出现多个出口节点），编译失败。所以只有 prefill 走 flash attention 时才用 hybrid；segmented prefill（开 prefix caching 时）仍然用 `shard_on_i`。两者在语义上互不影响，这是编译器层面的问题，还没有做最小复现去确认。
+2. **decode 时共享专家另存一份 8 路切分的权重**（I=192，补齐到 256）。部分结果乘 1/8 后，合并进原有的 MoE all-reduce，不增加通信；prefill 仍然用全量权重。这样每个 rank 每层读取的共享专家权重从约 19 MB 降到约 2.4 MB。
+3. **低延迟服务配置**（`serve_latency.sh`）：关闭 prefix caching；prefill bucket 设为 512 到 16384；`max_num_batched_tokens` 为 16384。这样 1k 输入不用补齐到 2048，16k 输入一步就能完成 prefill。
+
+### 10.3 结果（完整模型，单并发，每组 8 个请求，独立 seed）
+
+| 输入 | TTFT：基线 → 优化 | TPOT：基线 → 优化 | ITL：基线 → 优化 |
+|---|---|---|---|
+| 1024 | 0.54 s → **0.20 s（−63%）** | 28.8 → **25.5 ms（−11%）** | 28.3 → 25.3 ms |
+| 4096 | 1.07 s → **0.53 s（−51%）** | 30.3 → **25.5 ms（−16%）** | 30.3 → 25.5 ms |
+| 8192 | 2.14 s → **0.97 s（−55%）** | 30.6 → **26.9 ms（−12%）** | 30.7 → 26.9 ms |
+| 16000 | 4.40 s → **1.80 s（−59%）** | 30.6 → **26.9 ms（−12%）** | 30.7 → 26.9 ms |
+
+- TTFT 的下降是 hybrid MoE 和更细的 bucket 共同带来的，两者各自的贡献没有拆开测。
+- 8k 和 16k 输入时，基线和优化版本用的是同一个 16384 的 decode context bucket，所以这两行 TPOT 降低的约 3.7 ms 可以归功于共享专家切分。1k 和 4k 输入时，低延迟配置的 decode bucket 更小，attention 少读了一些 KV，所以降幅更大。
+- 原始数据：`results/bench/opt_latency/`。
+
+### 10.4 精度
+
+- **4 层模型 vs HF fp32**：flash 路径（长 prompt 一步 prefill）greedy 8/8，cos ≥ 0.9995；segmented 路径（含 prefix cache 命中）cos ≥ 0.9988；batch 128 vs batch 4 greedy 一致。新增的几处短 prompt greedy 分歧，参考 top-2 的差距都在 0.007–0.18 nats 之间（4 层模型的输出分布很平）。
+- **MATH-500 no_think，完整模型，前 200 题**：**96.5%**（193/200）。同样这 200 题，基线答对 191 题（95.5%）。数据在 `results/math500/math500_no_think_opt_latency_200.jsonl.gz`。
+
+### 10.5 尚未覆盖
+
+- 优化版本只测了单并发。高并发下、以及 decode token 数 > 96 时共享专家走 CTE 路径的情况，只在 4 层模型上验证了数值，完整模型没有测性能。
+- 开 prefix caching 时只能拿到 TPOT 的优化。要解决这个问题，可以把 attention 换成静态的"flash attention + 历史 KV（`k_prior` / `v_prior`）"，或者等编译器修复。
+- 下一步可以做：QK-norm 和 RoPE 融合进 QKV kernel（降 TTFT）；MTP 投机解码（降 TPOT，收益最大）；为 batch 1 写一个只加载被选中专家的 MoE kernel（降 TPOT）。
+
 ## 附：复现
 
 所有路径相对于 `examples/vllm_neuron/models/hy_v3/`。
 
 - 环境：vLLM 0.24 + 本仓库（`pip install -e .`），另外装 neuronx-cc / nki；这台机器没有 EFA，需要设置 `NEURON_SKIP_EFA_AFFINITY=1`（`serve.sh` 已经设好）。
+- 低延迟服务（单并发优化后的配置）：`MODEL=<ckpt> ./serve_latency.sh`。
 - 服务：`MODEL=<ckpt> [DCP=8] [KV_CAP=0.45] ./serve.sh <max_model_len> <max_num_seqs> '<num_seqs_buckets>' '<decode_ctx_buckets>'`（文件开头注释里有配置 B / C / DCP 对应的参数）。
 - 性能：`OUT_DIR=results/bench/<name> MODEL=<ckpt> ./bench_matrix.sh "<输入长度列表>" "<并发列表>" 256`（每组用独立 seed）。
 - MATH-500：`python eval_math500.py {no_think|high} out.jsonl --concurrency N --max-tokens M`（需要 `openai`、`math-verify[antlr4_13_2]`、`datasets`）。
@@ -269,6 +319,6 @@
 - kernel 微测试：`cd kernel_tests && HY3_CKPT=<ckpt> python test_*.py ...`（单个 NeuronCore，使用真实权重分片）。
 - checkpoint 的 scale 统计：`inspect_scales.py <ckpt>`。
 - 结果数据：
-  - `results/bench/{baseline_B,baseline_C,dcp8}/`（干净数据），汇总在 `results/bench/summary.csv`；
+  - `results/bench/{baseline_B,baseline_C,dcp8}/`（干净数据），汇总在 `results/bench/summary.csv`；`results/bench/opt_latency/`（第 10 节的单并发优化结果）；
   - `results/bench/archive_fixed_seed/`（固定 seed 的旧数据，仅作存档）；
   - `results/math500/*.jsonl.gz`（每道题的回答、判分结果和 token 数）。
