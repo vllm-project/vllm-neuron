@@ -1,0 +1,22 @@
+# Installs the Hy3 contrib model as a vLLM general plugin so that every vLLM
+# process (API server, engine core, Neuron workers) registers it at startup:
+#   pip install -e contrib/models/hy_v3
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-neuron-contrib-hy-v3"
+version = "0.1.0"
+description = "Hy3 (tencent/Hy3-FP8) contrib model for vllm-neuron"
+requires-python = ">=3.10"
+
+[project.entry-points."vllm.general_plugins"]
+hy_v3_neuron = "hy_v3_neuron:register"
+
+[tool.setuptools]
+packages = ["hy_v3_neuron"]
+package-dir = { "hy_v3_neuron" = "src" }
+
+[tool.setuptools.package-data]
+hy_v3_neuron = ["README.md"]
