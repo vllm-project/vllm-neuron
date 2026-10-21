@@ -157,8 +157,11 @@ curl http://localhost:8000/v1/completions \
 - **397B-A17B only:** `enable_expert_parallel=True` with
   `neuron_config.ep_degree=8` at TP=64, the head-count relaxation in
   `scripts/run.py` (`relax_head_divisibility`, because vLLM rejects 64 ranks
-  for 32 query heads), and an `nkilib` with top-k > 8 support in
-  `router_topk` (the stock kernel caps top-k at 8; 397B-A17B routes top-10).
+  for 32 query heads). Its top-10 routing is above the fused decode kernel's
+  limit (`moe_block_tkg` calls `nkilib`'s `router_topk`, which asserts K <= 8),
+  so decode routes in torch and runs the experts through `moe_tkg`
+  (`_forward_decode_unfused` in `src/moe.py`); prefill's `NF.router` already
+  falls back to torch above 8. No patched `nkilib` is needed.
 
 ## Compatibility Matrix
 
@@ -170,7 +173,8 @@ curl http://localhost:8000/v1/completions \
 On SDK 2.33 (trn2.48xlarge, TP=4, with the core branch): Qwen3.5-2B passes the
 logit-validation integration test (`test/integration/test_model.py`, batch 1 and 4,
 `max_model_len` 1024, every token within tolerance); Qwen3.5-27B and 35B-A3B give
-coherent greedy output from `scripts/run.py`. 397B-A17B was not re-run. No
+coherent greedy output from `scripts/run.py`; Qwen3.5-397B-A17B (TP=64, EP=8,
+stock `nkilib`) gives coherent greedy output from `scripts/run.py`. No
 throughput was measured on 2.33. The results below are from the
 earlier in-tree port on vllm-neuron 0.24.0.1.1.0, measured on trn2.3xlarge at
 TP=4, bf16, greedy, 1024-token input and 128-token output, `max_model_len`
@@ -190,8 +194,8 @@ TP=4, bf16, greedy, 1024-token input and 128-token output, `max_model_len`
 - 35B-A3B accuracy: 137/160 greedy tokens equal to HF bf16 (85.6%), no
   first-token mismatch.
 - 397B-A17B: functional validation only (correct greedy output) on a
-  trn2.48xlarge at `world_size=64, ep_degree=8`, 11.93 GiB used per rank. It
-  needed a patched `nkilib` for top-k > 8.
+  trn2.48xlarge at `world_size=64, ep_degree=8`, 11.93 GiB used per rank, with a
+  patched `nkilib` for top-k > 8 (no longer needed, see above).
 
 ## Example Checkpoints
 
