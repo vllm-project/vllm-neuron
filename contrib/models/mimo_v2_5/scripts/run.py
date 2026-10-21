@@ -1,5 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Offline inference example for MiMo-V2.5 (mimo_v2_5).
+"""Offline inference example for MiMo-V2.5 and MiMo-V2.5-Pro (mimo_v2_5).
+
+MiMo-V2.5-Pro uses the same script and architecture; point
+``--model-checkpoint`` at it::
+
+      python contrib/models/mimo_v2_5/scripts/run.py \
+          --model-checkpoint XiaomiMiMo/MiMo-V2.5-Pro
+
+Pro (70 layers, hidden 6144, 384 experts, ~1.02T params) keeps its routed
+experts fp8 on device: ``--expert-dtype auto`` (the default) resolves to fp8
+for Pro and bf16 for V2.5. The numbers below are V2.5's.
 
 48 layers / hidden 4096 / 256 experts top-8, hybrid attention: 9 full-attention
 layers (0, 5, 11, 17, 23, 29, 35, 41, 47) and 39 sliding-window layers
@@ -132,6 +142,16 @@ def main():
     )
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument(
+        "--expert-dtype",
+        choices=("auto", "bf16", "fp8"),
+        default=None,
+        help=(
+            "Routed-expert runtime dtype; sets MIMO_V2_5_EXPERT_DTYPE for the "
+            "workers. 'auto' (the default when neither is set) picks fp8 when "
+            "the per-rank BF16 experts would exceed 12 GiB, i.e. for Pro."
+        ),
+    )
+    parser.add_argument(
         "--chat",
         action="store_true",
         help=(
@@ -152,6 +172,10 @@ def main():
         ),
     )
     args = parser.parse_args()
+
+    if args.expert_dtype is not None:
+        # Read in the worker processes, which inherit this environment.
+        os.environ["MIMO_V2_5_EXPERT_DTYPE"] = args.expert_dtype
 
     register_mimo_v2_5()
 

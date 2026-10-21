@@ -5,15 +5,31 @@ MiMo-V2.5 Config
 
 Text-only decoder config for MiMoV2ForCausalLM (``model_type="mimo_v2"``).
 
-The released checkpoint is multimodal (it carries ``vision_config`` /
-``audio_config`` / ``processor_config`` plus a ``model.mtp.*`` MTP head), but
-this port covers the TEXT decoder only. The extra sub-configs are dropped by
+Serves both released checkpoints of this architecture. Every geometry field
+below is read from ``config.json``; the defaults are MiMo-V2.5's, which is the
+only reason they look specific:
+
+  field                                 V2.5        V2.5-Pro
+  hidden_size                           4096        6144
+  num_hidden_layers (full + SWA)        48 (9+39)   70 (10+60)
+  num_attention_heads (full and SWA)    64          128
+  num_key_value_heads (full / SWA)      4 / 8       8 / 8
+  n_routed_experts (top-8, I=2048)      256         384
+  attention_value_scale                 0.707       0.612
+
+Pro is ~1.02T parameters; its routed experts do not fit a trn2.48xlarge in
+BF16, so the experts' runtime dtype is a mode (:meth:`resolve_expert_dtype`).
+
+The V2.5 checkpoint is multimodal (it carries ``vision_config`` /
+``audio_config`` / ``processor_config``; Pro carries none of them), and both
+carry a 3-layer ``model.mtp.layers.*`` MTP head, but this port covers the TEXT
+decoder only. The extra sub-configs are dropped by
 the ``field_names`` filter in :meth:`MiMoV2Config.from_configs`, and the
 corresponding checkpoint tensors are simply never referenced by
 ``load_weights`` (``load_sharded_pipelined`` only pulls the keys the model's
 parameters map to).
 
-Architecture (48 layers, 256 experts, hidden 4096):
+Architecture (V2.5 numbers; 48 layers, 256 experts, hidden 4096):
   - HYBRID attention: ``hybrid_layer_pattern[i] == 0`` -> FULL attention,
     ``== 1`` -> SWA (window 128). Note the polarity: 0 is full, and the full
     layers are 0, 5, 11, 17, 23, 29, 35, 41, 47 (9 of 48).
@@ -33,12 +49,21 @@ Architecture (48 layers, 256 experts, hidden 4096):
 """
 
 import json
+import os
 from dataclasses import dataclass, field
 
 import torch
 from transformers import PretrainedConfig
 
 from vllm_neuron.model.neuron_config import NeuronConfig
+
+# Runtime dtype of the routed experts: "auto" (default), "bf16" or "fp8".
+EXPERT_DTYPE_ENV = "MIMO_V2_5_EXPERT_DTYPE"
+EXPERT_DTYPES = ("auto", "bf16", "fp8")
+# "auto" picks fp8 when this rank's routed experts would exceed this many GiB
+# in BF16. A trn2 logical core has 24 GiB of HBM. V2.5 at TP=64/EP=64 is
+# 8.81 GiB (stays BF16); Pro is 29.11 GiB (cannot fit, goes fp8).
+BF16_EXPERT_BUDGET_GIB = 12.0
 
 
 @dataclass
@@ -114,6 +139,11 @@ class MiMoV2Config:
     # checkpoint whose every layer has a ceil-padded grid.
     qkv_disk_tp: int | None = None
 
+    # Routed-expert runtime dtype, one of EXPERT_DTYPES. The env var
+    # MIMO_V2_5_EXPERT_DTYPE overrides it; see resolve_expert_dtype. Not an HF
+    # key, so it only reaches here through hf_overrides or that env var.
+    expert_dtype: str = "auto"
+
     def __post_init__(self):
         if not self.hybrid_layer_pattern:
             # No pattern -> treat every layer as full attention.
@@ -166,8 +196,61 @@ class MiMoV2Config:
 
     @property
     def is_fp8_checkpoint(self) -> bool:
+        # V2.5 spells ``store_dtype: "fp8"``; Pro omits the key (same scheme).
+        # V2.6 says ``"mxfp4"``: its routed experts are MXFP4, everything else
+        # quantized is still 128x128 FP8, so it is an FP8 checkpoint too.
         qc = self.quantization_config or {}
-        return qc.get("quant_method") == "fp8" and qc.get("store_dtype") == "fp8"
+        return qc.get("quant_method") == "fp8" and qc.get("store_dtype", "fp8") in (
+            "fp8",
+            "mxfp4",
+        )
+
+    @property
+    def num_moe_layers(self) -> int:
+        return sum(1 for i in range(self.num_hidden_layers) if self.is_moe_layer(i))
+
+    def expert_bytes_per_rank(
+        self, num_local_experts: int, intermediate_per_rank: int, bytes_per_elem: int
+    ) -> int:
+        """Weight bytes of this rank's routed experts over every MoE layer.
+
+        ``gate_up [E_local, H, 2I]`` plus ``down [E_local, I, H]``, at
+        ``bytes_per_elem`` (2 for bf16, 1 for fp8; fp8's per-channel scales are
+        counted separately by :meth:`expert_scale_bytes_per_rank`).
+        """
+        per_expert = 3 * self.hidden_size * intermediate_per_rank
+        return self.num_moe_layers * num_local_experts * per_expert * bytes_per_elem
+
+    def expert_scale_bytes_per_rank(
+        self, num_local_experts: int, intermediate_per_rank: int
+    ) -> int:
+        """fp32 scales of the fp8 layout: ``[E_local, 1, 2I]`` + ``[E_local, 1, H]``."""
+        per_expert = 2 * intermediate_per_rank + self.hidden_size
+        return self.num_moe_layers * num_local_experts * per_expert * 4
+
+    def resolve_expert_dtype(
+        self, num_local_experts: int, intermediate_per_rank: int
+    ) -> str:
+        """``"bf16"`` or ``"fp8"`` for the routed experts on this layout.
+
+        Precedence: ``MIMO_V2_5_EXPERT_DTYPE`` env, then ``self.expert_dtype``,
+        then the auto rule: fp8 iff the BF16 experts of one rank exceed
+        ``BF16_EXPERT_BUDGET_GIB``. Pure (no logging), so every MoE layer and
+        the backbone can call it and get the same answer.
+        """
+        mode = os.environ.get(EXPERT_DTYPE_ENV) or self.expert_dtype or "auto"
+        mode = mode.strip().lower()
+        if mode not in EXPERT_DTYPES:
+            raise ValueError(
+                f"{EXPERT_DTYPE_ENV}/expert_dtype must be one of {EXPERT_DTYPES}, "
+                f"got {mode!r}"
+            )
+        if mode != "auto":
+            return mode
+        bf16_bytes = self.expert_bytes_per_rank(
+            num_local_experts, intermediate_per_rank, 2
+        )
+        return "fp8" if bf16_bytes > BF16_EXPERT_BUDGET_GIB * 2**30 else "bf16"
 
     @property
     def fp8_ignored_layers(self) -> set[str]:

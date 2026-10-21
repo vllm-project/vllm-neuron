@@ -16,15 +16,20 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 class MiMoV2ForCausalLM(nn.Module):
     """Validates the config and selects a MiMo-V2.5 implementation.
 
-    Extends ``nn.Module`` so vLLM's ``ModelRegistry`` accepts the entry. Only a
-    BF16 runtime exists today: the released checkpoint stores its matmul weights
-    as 128x128-blockwise FP8-e4m3 and the weight loaders dequantize to BF16
-    host-side at load time (see ``weight_loaders_bf16``), so both
-    ``quantization=None|"bf16"`` and ``quantization="fp8"`` land on the same
-    implementation. There is no on-device FP8 path: Neuron has no 128x128
-    blockwise-FP8 MoE kernel. Prefer ``"bf16"``: on Trn2 the 0.29 runner adds
+    Serves MiMo-V2.5 and MiMo-V2.5-Pro (same architecture string, different
+    config). Extends ``nn.Module`` so vLLM's ``ModelRegistry`` accepts the
+    entry. Both checkpoints store their matmul weights as 128x128-blockwise
+    FP8-e4m3; the weight loaders dequantize attention, the dense MLP, the
+    embedding and the LM head to BF16 host-side at load time (see
+    ``weight_loaders_bf16``). The routed experts are BF16 too unless the
+    expert-dtype mode resolves to fp8 (``MIMO_V2_5_EXPERT_DTYPE``; ``auto``
+    picks fp8 for Pro), in which case they are requantized to per-channel
+    Trn2-range fp8 and run in torch. ``neuron_config.quantization`` does not
+    select any of this: ``None``/``"bf16"`` and ``"fp8"`` build the same model.
+    Prefer ``"bf16"``: on Trn2 the 0.29 runner adds
     ``--experimental-unsafe-fp8e4m3fn-as-fp8e4m3`` to the compiler flags when
-    ``quantization == "fp8"``, which this BF16 graph does not need.
+    ``quantization == "fp8"``; the fp8 experts are stored inside the 240 range
+    where e4m3fn and Trn2's e4m3 share bit patterns, so they do not need it.
     """
 
     # vLLM inspects the REGISTERED class for its text-generation protocol
@@ -117,7 +122,8 @@ class MiMoV2ForCausalLM(nn.Module):
         if quantization not in (None, "bf16", "fp8"):
             raise ValueError(
                 f"MiMo-V2.5 supports quantization=None/'bf16'/'fp8' (the FP8 "
-                f"checkpoint is dequantized to BF16 at load time), got "
+                f"checkpoint is converted by the weight loaders; the expert "
+                f"dtype is MIMO_V2_5_EXPERT_DTYPE), got "
                 f"{quantization!r}."
             )
 
@@ -144,7 +150,8 @@ class MiMoV2ForCausalLM(nn.Module):
             platform = None
         if platform in ("trn1", "trn1n", "inf2"):
             raise ValueError(
-                f"MiMo-V2.5 needs 24 GB+ per device for its 256 BF16 experts; "
+                f"MiMo-V2.5 needs 24 GB+ per device for its "
+                f"{getattr(hf_config, 'n_routed_experts', '?')} routed experts; "
                 f"{platform} has 16 GB. Use trn2 or trn3."
             )
 

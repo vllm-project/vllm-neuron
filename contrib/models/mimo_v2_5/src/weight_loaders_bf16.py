@@ -37,6 +37,13 @@ Two distinct on-disk scale-grid layouts exist and they are NOT interchangeable:
    from the scale row count (the weight shape alone is invariant to it), so a
    re-sharded or unsharded re-export loads correctly too.
 
+The one exception to "returns BF16" is the routed experts in fp8 mode
+(``MIMO_V2_5_EXPERT_DTYPE``, auto-selected for V2.5-Pro, whose BF16 experts do
+not fit): :func:`expert_gate_up_requant_loader` / :func:`expert_down_requant_loader`
+dequantize the 128x128 blocks to fp32 and requantize them to one scale per
+OUTPUT channel inside Trn2's e4m3 range (max 240, not e4m3fn's 448), so the
+published checkpoint loads as is with no offline conversion.
+
 All loaders read only the tiles they need: the fused-QKV loader touches just
 the 128-row blocks covering this rank's heads (~2 blocks of Q instead of the
 whole 3072-row Q section), and the TP-sharded MLP loaders slice before
@@ -44,12 +51,20 @@ dequantizing.
 """
 
 import math
+import threading
 
 import torch
 
 from vllm_neuron.utils.weight_loader import SafetensorsWeightLoader
 
 FP8_BLOCK = 128
+
+# Largest magnitude Trn2's fp8 e4m3 represents. Values at or below it have the
+# same bit pattern in torch's float8_e4m3fn (whose max is 448), so bytes
+# requantized into this range are stored as float8_e4m3fn and read by Trn2 as
+# its own e4m3 unchanged.
+TRN2_FP8_MAX = 240.0
+FP8_DTYPE = torch.float8_e4m3fn
 
 
 # =============================================================================
@@ -403,6 +418,67 @@ def dense_down_fp8_loader(
 # MoE experts — per-expert keys, flat scale grid
 # =============================================================================
 # MiMo stores experts as SEPARATE keys per expert
+# MXFP4 (MiMo-V2.6, ``store_dtype: mxfp4``): OCP microscaling FP4. Each byte
+# packs two e2m1 values, the even column in the low nibble; one e8m0 scale
+# (``2 ** (s - 127)``) covers 32 consecutive columns of a row. Weight
+# ``[R, C // 2]`` uint8, scale ``[R, C // 32]`` uint8 -- vLLM's Mxfp4MoEMethod
+# layout.
+MXFP4_BLOCK = 32
+# The e2m1 values by nibble. Kept as a list and turned into a tensor per call:
+# this module can be imported while the default device is ``meta``, and a
+# module-level tensor would then be a meta tensor.
+_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+
+
+def dequant_mxfp4(
+    w_slice,
+    s_slice,
+    row_range: tuple[int, int] | None = None,
+    col_range: tuple[int, int] | None = None,
+) -> torch.Tensor:
+    """Dequantize an MXFP4 ``[R, C]`` weight (packed ``[R, C/2]``) to fp32."""
+    R, half_c = tuple(w_slice.get_shape())
+    C = half_c * 2
+    r0, r1 = row_range if row_range is not None else (0, R)
+    c0, c1 = col_range if col_range is not None else (0, C)
+    if c0 % MXFP4_BLOCK or c1 % MXFP4_BLOCK:
+        raise ValueError(f"MXFP4 column window [{c0}, {c1}) must be {MXFP4_BLOCK}-aligned")
+    # Explicitly on the host: the loaders run while the model's default device
+    # is ``meta``, and any tensor a factory makes here would land there.
+    with torch.device("cpu"):
+        packed = w_slice[r0:r1, c0 // 2 : c1 // 2].to("cpu", torch.uint8)
+        table = torch.tensor(_E2M1, dtype=torch.float32, device="cpu")
+        lo = table[(packed & 0x0F).long()]
+        hi = table[(packed >> 4).long()]
+        vals = torch.stack((lo, hi), dim=-1).reshape(r1 - r0, c1 - c0)
+        exp = s_slice[r0:r1, c0 // MXFP4_BLOCK : c1 // MXFP4_BLOCK].to("cpu", torch.int32)
+        scale = torch.exp2((exp - 127).to(torch.float32))
+        return vals * scale.repeat_interleave(MXFP4_BLOCK, dim=1)
+
+
+def _slice_dtype(w_slice) -> str:
+    get = getattr(w_slice, "get_dtype", None)
+    if callable(get):
+        return str(get())
+    return str(w_slice[0:1, 0:1].dtype)
+
+
+def dequant_expert_weight(
+    w_slice,
+    s_slice,
+    row_range: tuple[int, int] | None = None,
+    col_range: tuple[int, int] | None = None,
+) -> torch.Tensor:
+    """One routed-expert matrix to fp32, from either on-disk format.
+
+    MXFP4 (packed ``uint8``, V2.6) or 128x128 blockwise FP8 (V2.5, V2.5-Pro);
+    the weight's dtype tells them apart.
+    """
+    if _slice_dtype(w_slice) in ("U8", "torch.uint8", "uint8"):
+        return dequant_mxfp4(w_slice, s_slice, row_range=row_range, col_range=col_range)
+    return dequant_fp8_blockwise(w_slice, s_slice, row_range=row_range, col_range=col_range)
+
+
 # (``mlp.experts.{e}.{gate,up,down}_proj.weight`` + ``.weight_scale_inv``), so
 # the parameter's checkpoint mapping is a flat INTERLEAVED list and the EP
 # wrapper is :func:`expert_parallel_interleaved_loader`. That wrapper slices the
@@ -453,10 +529,10 @@ def expert_gate_up_fp8_loader(
         for e in range(n_experts):
             base = e * items
             if quantized:
-                gate = dequant_fp8_blockwise(
+                gate = dequant_expert_weight(
                     slices[base], slices[base + 1], row_range=rows
                 )
-                up = dequant_fp8_blockwise(
+                up = dequant_expert_weight(
                     slices[base + 2], slices[base + 3], row_range=rows
                 )
             else:
@@ -497,7 +573,7 @@ def expert_down_fp8_loader(
         for e in range(n_experts):
             base = e * items
             if quantized:
-                w = dequant_fp8_blockwise(
+                w = dequant_expert_weight(
                     slices[base], slices[base + 1], col_range=cols
                 )  # [H, I/TP]
             else:
@@ -505,5 +581,172 @@ def expert_down_fp8_loader(
             per_expert.append(w.T.contiguous())  # [I/TP, H]
 
         return torch.stack(per_expert, dim=0).to(dtype)  # [E_L, I/TP, H]
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+# =============================================================================
+# MoE experts, fp8-resident mode — per-output-channel requantization
+# =============================================================================
+# The 128x128 block scales cannot be used as they are: a block scale varies
+# along BOTH matmul dims, so it cannot be applied after the matmul, and the
+# checkpoint's e4m3fn bytes go up to 448, past Trn2's 240. One fp32 scale per
+# output channel CAN be pulled out of the contraction
+# (``x @ (q * s[None, :]) == (x @ q) * s``), so the forward converts q to bf16,
+# runs the matmul, and multiplies by ``s`` afterwards.
+#
+# Each expert is dequantized and requantized on its own, so the fp32 peak is
+# one expert's gate+up (~100 MB for Pro), not the layer's.
+
+
+def requant_rows_fp8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """fp32 ``[out, in]`` -> (fp8 ``[out, in]``, fp32 scale ``[out]``).
+
+    ``scale = rowmax|w| / 240`` per output row, then ``w / scale`` is clamped to
+    ``[-240, 240]`` and cast to ``float8_e4m3fn``. An all-zero row gets a tiny
+    floor scale (and zero bytes) instead of a division by zero.
+    """
+    w = w.to(torch.float32)
+    amax = w.abs().amax(dim=-1).clamp(min=1e-12)
+    scale = amax / TRN2_FP8_MAX
+    q = (w / scale.unsqueeze(-1)).clamp(-TRN2_FP8_MAX, TRN2_FP8_MAX)
+    return q.to(FP8_DTYPE), scale
+
+
+def _fp8_transpose(q: torch.Tensor) -> torch.Tensor:
+    """Transpose an fp8 matrix through a uint8 view (no fp8 CPU kernels)."""
+    return q.view(torch.uint8).T.contiguous()
+
+
+class ExpertRequantMemo:
+    """Compute-once cache shared by an fp8 expert weight and its scale.
+
+    ``gate_up_proj_weight`` and ``gate_up_proj_scale`` map to the same
+    checkpoint keys and both come out of one requantization. Their loaders run
+    on the checkpoint loader's thread pool, possibly at the same time, so the
+    first ``take`` for a key computes both parts under that key's lock and each
+    part is handed out once (the slot is dropped when both are taken, so a
+    second ``load_weights`` recomputes rather than reusing stale tensors).
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._slots: dict = {}
+
+    def take(self, key, part: str, compute):
+        with self._lock:
+            slot = self._slots.setdefault(key, {"lock": threading.Lock(), "parts": {}})
+        with slot["lock"]:
+            if part not in slot["parts"]:
+                slot["parts"] = compute()
+            value = slot["parts"].pop(part)
+            if not slot["parts"]:
+                with self._lock:
+                    self._slots.pop(key, None)
+        return value
+
+
+def _requant_gate_up(
+    slices: list, rank: int, shard_size: int, num_shards: int, quantized: bool
+) -> dict:
+    items = 4 if quantized else 2
+    n_experts = _local_expert_count(len(slices), items, "expert_gate_up_requant")
+    tp_rank = rank % num_shards
+    half = shard_size // 2
+    rows = (tp_rank * half, tp_rank * half + half)
+
+    weights, scales = [], []
+    for e in range(n_experts):
+        base = e * items
+        if quantized:
+            gate = dequant_expert_weight(slices[base], slices[base + 1], row_range=rows)
+            up = dequant_expert_weight(
+                slices[base + 2], slices[base + 3], row_range=rows
+            )
+        else:
+            gate = slices[base][rows[0] : rows[1], :].to(torch.float32)
+            up = slices[base + 1][rows[0] : rows[1], :].to(torch.float32)
+        # Same order as the bf16 loader: gate is the first half of the 2I dim.
+        q, s = requant_rows_fp8(torch.cat([gate, up], dim=0))  # [2I/TP, H]
+        del gate, up
+        weights.append(_fp8_transpose(q))  # [H, 2I/TP] uint8
+        scales.append(s)
+    return {
+        "weight": torch.stack(weights, dim=0).view(FP8_DTYPE),  # [E_L, H, 2I/TP]
+        "scale": torch.stack(scales, dim=0).unsqueeze(1),  # [E_L, 1, 2I/TP]
+    }
+
+
+def _requant_down(
+    slices: list, rank: int, shard_size: int, num_shards: int, quantized: bool
+) -> dict:
+    items = 2 if quantized else 1
+    n_experts = _local_expert_count(len(slices), items, "expert_down_requant")
+    tp_rank = rank % num_shards
+    cols = (tp_rank * shard_size, tp_rank * shard_size + shard_size)
+
+    weights, scales = [], []
+    for e in range(n_experts):
+        base = e * items
+        if quantized:
+            w = dequant_expert_weight(slices[base], slices[base + 1], col_range=cols)
+        else:
+            w = slices[base][:, cols[0] : cols[1]].to(torch.float32)
+        # [H, I/TP]: output channel = H. Under moe TP the scale is this shard's
+        # rowmax, which is exact: every rank scales its own partial sum.
+        q, s = requant_rows_fp8(w)
+        del w
+        weights.append(_fp8_transpose(q))  # [I/TP, H] uint8
+        scales.append(s)
+    return {
+        "weight": torch.stack(weights, dim=0).view(FP8_DTYPE),  # [E_L, I/TP, H]
+        "scale": torch.stack(scales, dim=0).unsqueeze(1),  # [E_L, 1, H]
+    }
+
+
+def expert_gate_up_requant_loader(
+    shard_size: int,
+    num_shards: int,
+    part: str,
+    memo: ExpertRequantMemo,
+    quantized: bool = True,
+) -> SafetensorsWeightLoader:
+    """Per-expert gate/up -> fp8 ``[E_L, H, 2I/TP]`` or fp32 scale ``[E_L, 1, 2I/TP]``.
+
+    ``part`` is ``"weight"`` or ``"scale"``; the two loaders of one layer share
+    ``memo``, so the requantization runs once. Slice conventions (interleaved
+    per-expert list, ``quantized`` stride) are those of
+    :func:`expert_gate_up_fp8_loader`; a BF16 re-export is requantized too.
+    """
+    if part not in ("weight", "scale"):
+        raise ValueError(f"part must be 'weight' or 'scale', got {part!r}")
+
+    def transform(slices: list, rank: int) -> torch.Tensor:
+        return memo.take(
+            ("gate_up", rank),
+            part,
+            lambda: _requant_gate_up(slices, rank, shard_size, num_shards, quantized),
+        )
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+def expert_down_requant_loader(
+    shard_size: int,
+    num_shards: int,
+    part: str,
+    memo: ExpertRequantMemo,
+    quantized: bool = True,
+) -> SafetensorsWeightLoader:
+    """Per-expert down -> fp8 ``[E_L, I/TP, H]`` or fp32 scale ``[E_L, 1, H]``."""
+    if part not in ("weight", "scale"):
+        raise ValueError(f"part must be 'weight' or 'scale', got {part!r}")
+
+    def transform(slices: list, rank: int) -> torch.Tensor:
+        return memo.take(
+            ("down", rank),
+            part,
+            lambda: _requant_down(slices, rank, shard_size, num_shards, quantized),
+        )
 
     return SafetensorsWeightLoader(transform=transform)

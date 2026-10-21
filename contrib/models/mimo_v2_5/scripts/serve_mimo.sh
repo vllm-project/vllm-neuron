@@ -1,8 +1,13 @@
 #!/bin/bash
-# MiMo-V2.5 single-instance server — TP64 with expert parallelism, BF16.
+# MiMo-V2.5 / MiMo-V2.5-Pro single-instance server — TP64 with expert parallelism.
 #
-# 48 layers / 256 routed experts / top-8 / hidden 4096. At TP=64 with EP=64 each
-# rank owns 4 experts, which is what the MoE kernels are sized against below.
+# V2.5: 48 layers / 256 routed experts / top-8 / hidden 4096. At TP=64 with EP=64
+# each rank owns 4 experts, which is what the MoE kernels are sized against below.
+# Pro:  70 layers / 384 routed experts / hidden 6144, 6 experts per rank. Its
+# experts stay fp8 on device (MIMO_V2_5_EXPERT_DTYPE=auto resolves to fp8 for Pro
+# and bf16 for V2.5; set EXPERT_DTYPE to force one):
+#
+#   MODEL=XiaomiMiMo/MiMo-V2.5-Pro SERVED_NAME=MiMo-V2.5-Pro bash serve_mimo.sh
 #
 # Prerequisite (once): install this folder as a package so its
 # vllm.general_plugins entry point registers MiMoV2ForCausalLM in every process
@@ -55,6 +60,9 @@
 set -x
 
 MODEL="${MODEL:-XiaomiMiMo/MiMo-V2.5}"
+SERVED_NAME="${SERVED_NAME:-MiMo-V2.5}"
+# auto | bf16 | fp8 (routed experts); read by the workers.
+export MIMO_V2_5_EXPERT_DTYPE="${EXPERT_DTYPE:-${MIMO_V2_5_EXPERT_DTYPE:-auto}}"
 BS="${BS:-32}"
 SEQ="${SEQ:-1024}"
 PORT="${PORT:-8000}"
@@ -64,10 +72,10 @@ PORT="${PORT:-8000}"
 # /sys/bus/pci/devices/.../infiniband".
 export NEURON_SKIP_EFA_AFFINITY=1
 
-echo "Starting MiMo-V2.5 server: $MODEL (BS=$BS, SEQ=$SEQ, TP=64, EP=64)"
+echo "Starting $SERVED_NAME server: $MODEL (BS=$BS, SEQ=$SEQ, TP=64, EP=64, experts=$MIMO_V2_5_EXPERT_DTYPE)"
 
 vllm serve "$MODEL" \
-    --served-model-name MiMo-V2.5 \
+    --served-model-name "$SERVED_NAME" \
     --max-model-len "$SEQ" \
     --max-num-seqs "$BS" \
     --max-num-batched-tokens "$SEQ" \

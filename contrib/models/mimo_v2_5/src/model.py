@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-MiMo-V2.5 BF16 Implementation
-=============================
+MiMo-V2.5 / MiMo-V2.5-Pro Implementation
+========================================
 
 Text decoder for ``MiMoV2ForCausalLM`` (``model_type="mimo_v2"``) on the
 PyTorch-native Neuron backend. Ported from the reference GPT-OSS
@@ -11,7 +11,14 @@ PyTorch-native Neuron backend. Ported from the reference GPT-OSS
 Contrib port of vllm-neuron PR #40 (written against 0.21 / SDK 2.31) to the
 0.29 / SDK 2.33 plugin. See ``../README.md`` for what changed in the port.
 
-Architecture (48 layers, hidden 4096, 256 experts, top-8):
+One implementation serves both checkpoints of ``MiMoV2ForCausalLM``; all
+geometry is read from the config (see ``config.py`` for the V2.5 / Pro table).
+The numbers below are V2.5's. Pro (70 layers, hidden 6144, 128 Q heads, 8 KV
+heads on every layer, 384 experts) differs only in those numbers, plus one
+mode: its routed experts stay fp8 on device (see ``MiMoV2SparseMoeBlock``),
+because in BF16 they would be ~29 GiB per rank at TP=64/EP=64.
+
+Architecture (V2.5: 48 layers, hidden 4096, 256 experts, top-8):
 
   * **Hybrid attention.** ``hybrid_layer_pattern[i] == 0`` -> FULL attention,
     ``== 1`` -> SWA (window 128). Note the polarity; the 9 full layers are
@@ -85,13 +92,18 @@ from vllm_neuron.utils.weight_loader import (
     sharding_weight_loader,
 )
 
-from .config import MiMoV2Config
+from .config import BF16_EXPERT_BUDGET_GIB, EXPERT_DTYPE_ENV, MiMoV2Config
 from .kernels.kv_cache_write import write_paged_kv_cache
+from .moe_fp8 import experts_dense_fp8
 from .weight_loaders_bf16 import (
+    FP8_DTYPE,
+    ExpertRequantMemo,
     dense_down_fp8_loader,
     dense_gate_up_fp8_loader,
     expert_down_fp8_loader,
+    expert_down_requant_loader,
     expert_gate_up_fp8_loader,
+    expert_gate_up_requant_loader,
     fused_qkv_fp8_loader,
     infer_qkv_disk_tp,
 )
@@ -116,6 +128,12 @@ _MOE_BLOCK_SIZE_ENV = "MIMO_V2_5_MOE_BLOCK_SIZE"
 # Optional per-graph neuronx-cc -O level for the plain decode graph; see
 # MiMoV2ForCausalLM.compiler_args_for. Unset keeps the runner's level.
 _DECODE_OPT_LEVEL_ENV = "MIMO_V2_5_DECODE_OPT_LEVEL"
+
+
+def _centred(bias: torch.Tensor) -> torch.Tensor:
+    """``bias - mean(bias)`` in float64, returned as fp32 (see ``e_score_correction_bias``)."""
+    b = bias.double()
+    return (b - b.mean()).float()
 
 
 def _topk_last_dim(tensor: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -346,6 +364,14 @@ class MiMoV2Attention(nn.Module):
         # head (consecutive groups of num_kv_replicas ranks share it) instead of
         # a zero-width slice from an integer division.
         if self.world_size >= self.num_key_value_heads:
+            # Pro: 8 KV heads at TP=64 -> 8 consecutive ranks per KV head, and
+            # those ranks' 2 Q heads each are exactly that KV head's group of 16.
+            if self.world_size % self.num_key_value_heads != 0:
+                raise ValueError(
+                    f"tp_degree ({self.world_size}) must be a multiple of "
+                    f"num_key_value_heads ({self.num_key_value_heads}) to "
+                    f"replicate KV heads"
+                )
             self.num_key_value_heads_per_rank = 1
             self.num_kv_replicas = self.world_size // self.num_key_value_heads
         else:
@@ -557,7 +583,8 @@ class MiMoV2Attention(nn.Module):
 
         The 4-D ``[B, N, D, S]`` layout is used (rather than the 3-D one) so the
         NKI output-projection kernel is eligible: it needs ``D <= 128`` (V is
-        exactly 128), ``N <= 17`` (1 head per rank at TP=64), and ``H % 2 == 0``.
+        exactly 128), ``N <= 17`` (1 head per rank at TP=64 for V2.5, 2 for
+        Pro), and ``H % 2 == 0``.
         """
         B, nqh, S, vhd = attn_out.shape
         active = attn_out.permute(0, 1, 3, 2).contiguous()  # [B, N, D, S]
@@ -835,8 +862,9 @@ class MiMoV2Attention(nn.Module):
 class MiMoV2DenseMLP(nn.Module):
     """SwiGLU MLP for the layers where ``moe_layer_freq[i]`` is 0.
 
-    Only layer 0 in the released config. ``NF.mlp`` is used because it has a
-    PyTorch fallback (CPU compile mode works) and fuses gate/up/down.
+    Only layer 0 in both released configs (intermediate 16384). ``NF.mlp`` is
+    used because it has a PyTorch fallback (CPU compile mode works) and fuses
+    gate/up/down.
     """
 
     def __init__(self, config: MiMoV2Config):
@@ -953,8 +981,31 @@ def _plain_transposed_shard_loader(
 # =============================================================================
 
 
+def _moe_parallel_layout(tp_world_size: int) -> tuple[bool, int, int]:
+    """``(ep_enabled, ep_degree, moe_tp_degree)`` for the current vLLM config."""
+    from vllm.config import get_current_vllm_config
+    from vllm_neuron.parallel.neuron_parallel_state import get_neuron_ep_degree
+
+    ep_enabled = get_current_vllm_config().parallel_config.enable_expert_parallel
+    ep_degree = get_neuron_ep_degree() if ep_enabled else 1
+    return ep_enabled, ep_degree, tp_world_size // ep_degree
+
+
 class MiMoV2SparseMoeBlock(nn.Module):
-    """256-expert top-8 MoE with EP, and a hand-written ``noaux_tc`` router.
+    """Routed top-8 MoE with EP, and a hand-written ``noaux_tc`` router.
+
+    256 experts for V2.5, 384 for Pro; no shared expert in either.
+
+    **Expert dtype mode** (``MiMoV2Config.resolve_expert_dtype``):
+
+    * ``bf16`` (V2.5 at TP=64/EP=64): the experts are dequantized to BF16 at
+      load and run through ``moe_cte`` (prefill) / ``moe_tkg`` (decode).
+    * ``fp8`` (Pro): ``gate_up [E_L, H, 2I]`` and ``down [E_L, I, H]`` stay
+      ``float8_e4m3fn`` with one fp32 scale per output channel
+      (``[E_L, 1, 2I]`` / ``[E_L, 1, H]``), requantized at load from the
+      checkpoint's 128x128 block scales into Trn2's 240 range. Both prefill and
+      decode run the dense masked torch path (``moe_fp8.experts_dense_fp8``);
+      ``moe_tkg`` rejects fp8 weights.
 
     The router CANNOT use ``NF.router`` or the fused ``moe_block_tkg`` router:
     neither can express MiMo's group-limited selection
@@ -972,9 +1023,7 @@ class MiMoV2SparseMoeBlock(nn.Module):
 
     def __init__(self, config: MiMoV2Config):
         super().__init__()
-        from vllm.config import get_current_vllm_config
         from vllm_neuron.parallel.neuron_parallel_state import (
-            get_neuron_ep_degree,
             get_neuron_ep_rank,
             get_neuron_ep_tp_group,
         )
@@ -983,16 +1032,15 @@ class MiMoV2SparseMoeBlock(nn.Module):
         self.hidden_size = config.hidden_size
         self.tp_group = get_tp_group()
 
-        self.ep_enabled = (
-            get_current_vllm_config().parallel_config.enable_expert_parallel
+        # tp_degree: intermediate-dim sharding within an EP partition (1 for
+        # pure EP).
+        self.ep_enabled, self.ep_degree, self.tp_degree = _moe_parallel_layout(
+            self.tp_group.world_size
         )
-        self.ep_degree = get_neuron_ep_degree() if self.ep_enabled else 1
         self.ep_rank = get_neuron_ep_rank() if self.ep_enabled else 0
         self.ep_tp_group = (
             get_neuron_ep_tp_group() if self.ep_enabled else self.tp_group
         )
-        # Intermediate-dim sharding degree within an EP partition (1 for pure EP).
-        self.tp_degree = self.tp_group.world_size // self.ep_degree
         # Outer collective group: the full TP world in both TP-only and EP modes.
         self.moe_group = self.tp_group
 
@@ -1031,23 +1079,66 @@ class MiMoV2SparseMoeBlock(nn.Module):
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros(self.total_num_experts, dtype=torch.float32)
         )
+        # Loaded with its mean removed. The bias only ranks experts (the weights
+        # are gathered from the unbiased scores), and a shift shared by every
+        # expert leaves that ranking unchanged. It matters on Pro: its biases sit
+        # at 70-90 with a spread of ~1e-4 in layers 1-12, so ``score + bias`` is
+        # ~80 everywhere and the top-k kernel sees 384 values that round to one
+        # (all 384 tie in bf16). Its index search then misses and the router's
+        # gather/scatter fault on device ("scatter/gather ... out-of-bound
+        # access", nrta 1006). Centred, the selection keys keep their resolution.
+        set_weight_loader(
+            self.e_score_correction_bias,
+            SafetensorsWeightLoader(
+                transform=lambda slices, rank: _centred(slices[0][:].float())
+            ),
+        )
 
-        self.gate_up_proj_weight = nn.Parameter(
-            torch.empty(
-                self.num_local_experts,
-                self.hidden_size,
-                self.intermediate_size_per_rank * 2,
-                dtype=self.dtype,
+        self.expert_fp8 = (
+            config.resolve_expert_dtype(
+                self.num_local_experts, self.intermediate_size_per_rank
             )
+            == "fp8"
         )
-        self.down_proj_weight = nn.Parameter(
-            torch.empty(
-                self.num_local_experts,
-                self.intermediate_size_per_rank,
-                self.hidden_size,
-                dtype=self.dtype,
+        if not self.expert_fp8:
+            self.gate_up_proj_weight = nn.Parameter(
+                torch.empty(
+                    self.num_local_experts,
+                    self.hidden_size,
+                    self.intermediate_size_per_rank * 2,
+                    dtype=self.dtype,
+                )
             )
-        )
+            self.down_proj_weight = nn.Parameter(
+                torch.empty(
+                    self.num_local_experts,
+                    self.intermediate_size_per_rank,
+                    self.hidden_size,
+                    dtype=self.dtype,
+                )
+            )
+        else:
+            # fp8-resident experts plus per-output-channel fp32 scales. Each
+            # weight is declared before its scale; the pair shares one
+            # requantization through the memo.
+            e_l, i_r = self.num_local_experts, self.intermediate_size_per_rank
+            self.gate_up_proj_weight = nn.Parameter(
+                torch.empty(e_l, self.hidden_size, i_r * 2, dtype=FP8_DTYPE),
+                requires_grad=False,
+            )
+            self.gate_up_proj_scale = nn.Parameter(
+                torch.ones(e_l, 1, i_r * 2, dtype=torch.float32),
+                requires_grad=False,
+            )
+            self.down_proj_weight = nn.Parameter(
+                torch.empty(e_l, i_r, self.hidden_size, dtype=FP8_DTYPE),
+                requires_grad=False,
+            )
+            self.down_proj_scale = nn.Parameter(
+                torch.ones(e_l, 1, self.hidden_size, dtype=torch.float32),
+                requires_grad=False,
+            )
+            self._requant_memo = ExpertRequantMemo()
 
         self.quantized = config.is_fp8_checkpoint
         self._setup_weight_loaders()
@@ -1078,6 +1169,34 @@ class MiMoV2SparseMoeBlock(nn.Module):
                     local_expert_indices, loader, self.total_num_experts
                 )
             return loader
+
+        if self.expert_fp8:
+            for part in ("weight", "scale"):
+                set_weight_loader(
+                    getattr(self, f"gate_up_proj_{part}"),
+                    _maybe_ep_wrap(
+                        expert_gate_up_requant_loader(
+                            shard_size=self.intermediate_size_per_rank * 2,
+                            num_shards=self.tp_degree,
+                            part=part,
+                            memo=self._requant_memo,
+                            quantized=quantized,
+                        )
+                    ),
+                )
+                set_weight_loader(
+                    getattr(self, f"down_proj_{part}"),
+                    _maybe_ep_wrap(
+                        expert_down_requant_loader(
+                            shard_size=self.intermediate_size_per_rank,
+                            num_shards=self.tp_degree,
+                            part=part,
+                            memo=self._requant_memo,
+                            quantized=quantized,
+                        )
+                    ),
+                )
+            return
 
         set_weight_loader(
             self.gate_up_proj_weight,
@@ -1278,6 +1397,15 @@ class MiMoV2SparseMoeBlock(nn.Module):
 
         affinities = self._local_expert_slice(affinities, rank)
 
+        if self.expert_fp8:
+            # fp8-resident experts: dense masked torch compute, no blockwise
+            # dispatch. Padding rows are computed too; their outputs are
+            # discarded downstream.
+            output = self._experts_torch(hidden_states, affinities, already_local=True)
+            if self.moe_group.world_size > 1:
+                output = self.moe_group.reduce_scatter(output, dim=0)
+            return output.to(self.dtype)
+
         # Sized from the (static, post-all-gather) token count so the dispatch
         # kernel's block count stays inside the range it can address; see
         # _prefill_block_size.
@@ -1355,7 +1483,15 @@ class MiMoV2SparseMoeBlock(nn.Module):
         hidden_states = hidden_states.to(self.dtype)
         affinities, expert_index = self._route(hidden_states)
 
-        if can_run_kernel(hidden_states):
+        if self.expert_fp8:
+            # Same dense torch path as prefill; the slice uses the traced EP
+            # rank, so every rank shares one graph.
+            output = self._experts_torch(
+                hidden_states,
+                self._local_expert_slice(affinities, rank),
+                already_local=True,
+            )
+        elif can_run_kernel(hidden_states):
             rank_id = self._ep_rank_tensor(rank, hidden_states.device).reshape(1, 1)
             # Static all-expert dispatch, deliberately. The two alternatives were
             # both measured on device and both lose:
@@ -1413,6 +1549,10 @@ class MiMoV2SparseMoeBlock(nn.Module):
         local expert over every token and accumulate weighted by that token's
         affinity for the expert (zero for unselected experts, so they drop out).
 
+        In fp8 mode this is the SERVING path for prefill and decode, delegated
+        to :func:`moe_fp8.experts_dense_fp8` (batched over local experts, scale
+        applied after each matmul); the BF16 loop below is unchanged.
+
         Args:
             hidden_states: ``[T, H]``.
             affinities: ``[T, E]`` global affinities, or ``[T, E_local]`` when
@@ -1428,6 +1568,16 @@ class MiMoV2SparseMoeBlock(nn.Module):
             lo = self.ep_rank * self.num_local_experts
             local_aff = affinities[:, lo : lo + self.num_local_experts].to(
                 torch.float32
+            )
+        if self.expert_fp8:
+            return experts_dense_fp8(
+                hidden_states,
+                local_aff,
+                self.gate_up_proj_weight,
+                self.gate_up_proj_scale,
+                self.down_proj_weight,
+                self.down_proj_scale,
+                compute_dtype=self.dtype,
             )
         gate_up = self._gate_up_kernel_view()  # [E_L, H, 2, I]
         out = torch.zeros(
@@ -1508,6 +1658,46 @@ class MiMoV2DecoderLayer(nn.Module):
 # =============================================================================
 
 
+def _log_expert_dtype(config: MiMoV2Config, tp_world_size: int, rank: int) -> None:
+    """Log the routed-expert dtype choice and its per-rank weight bytes once.
+
+    Every MoE block resolves the same mode from the same inputs
+    (``MiMoV2Config.resolve_expert_dtype``); this only reports it. Logged on
+    rank 0, plus a warning when bf16 is forced past the budget.
+    """
+    _, ep_degree, moe_tp = _moe_parallel_layout(tp_world_size)
+    e_local = config.n_routed_experts // ep_degree
+    i_r = config.moe_intermediate_size // moe_tp
+    mode = config.resolve_expert_dtype(e_local, i_r)
+    bf16_bytes = config.expert_bytes_per_rank(e_local, i_r, 2)
+    fp8_bytes = config.expert_bytes_per_rank(
+        e_local, i_r, 1
+    ) + config.expert_scale_bytes_per_rank(e_local, i_r)
+    over_budget = bf16_bytes > BF16_EXPERT_BUDGET_GIB * 2**30
+    if rank == 0:
+        logger.info(
+            "MiMo-V2.5: routed experts = %s (%s=%r, %d MoE layers x %d local "
+            "experts, I/rank=%d): %.2f GiB/rank in bf16, %.2f GiB/rank in fp8 "
+            "+ scales; auto picks fp8 above %.1f GiB.",
+            mode,
+            EXPERT_DTYPE_ENV,
+            os.environ.get(EXPERT_DTYPE_ENV, config.expert_dtype),
+            config.num_moe_layers,
+            e_local,
+            i_r,
+            bf16_bytes / 2**30,
+            fp8_bytes / 2**30,
+            BF16_EXPERT_BUDGET_GIB,
+        )
+    if mode == "bf16" and over_budget and rank == 0:
+        logger.warning(
+            "MiMo-V2.5: bf16 experts forced at %.2f GiB/rank, above the %.1f "
+            "GiB budget; a trn2 logical core has 24 GiB of HBM in total.",
+            bf16_bytes / 2**30,
+            BF16_EXPERT_BUDGET_GIB,
+        )
+
+
 class MiMoV2Model(nn.Module):
     """Embedding + hybrid decoder stack + final norm.
 
@@ -1524,6 +1714,9 @@ class MiMoV2Model(nn.Module):
         self.tp_group = get_tp_group()
         self.world_size = self.tp_group.world_size
         self.rank = self.tp_group.rank_in_group
+
+        if config.num_moe_layers:
+            _log_expert_dtype(config, self.world_size, self.rank)
 
         self.embed_tokens = VocabDimShardedEmbedding(
             vocab_size=config.vocab_size,
@@ -1791,7 +1984,13 @@ class MiMoV2ForCausalLM(nn.Module):
         to 1-element lists and the same loaders take their bf16 branch.
         MoE experts are separate keys per expert, listed INTERLEAVED
         (``e0`` items, then ``e1`` items, ...) to match
-        ``expert_parallel_interleaved_loader``.
+        ``expert_parallel_interleaved_loader``, which hands each rank's
+        transform only its own experts' slices, so a rank reads (and holds in
+        process RAM) only its ``E_local`` experts.
+
+        Only ``model.layers.{0..num_hidden_layers-1}``, the embedding, the final
+        norm and ``lm_head`` are referenced, so the 3-layer MTP head both
+        checkpoints carry under ``model.mtp.layers.*`` is never loaded.
 
         Args:
             quantized: whether the checkpoint carries ``*_scale_inv`` companions.
@@ -1802,6 +2001,10 @@ class MiMoV2ForCausalLM(nn.Module):
         cfg = self.config
         if quantized is None:
             quantized = cfg.is_fp8_checkpoint
+        # Routed-expert scale companion: ``_scale_inv`` next to 128x128 FP8
+        # (V2.5, V2.5-Pro), ``_scale`` next to MXFP4 (V2.6: ``store_dtype:
+        # mxfp4``, e8m0 per 32). Probed from the checkpoint in _detect_quantized.
+        expert_scale = getattr(self, "_expert_scale_suffix", "_scale_inv")
 
         def q(key: str) -> str | list[str]:
             """Checkpoint entry for a possibly-quantized weight."""
@@ -1848,13 +2051,18 @@ class MiMoV2ForCausalLM(nn.Module):
                         key = f"{ep}.{proj}.weight"
                         gate_up.append(key)
                         if quantized:
-                            gate_up.append(f"{key}_scale_inv")
+                            gate_up.append(f"{key}{expert_scale}")
                     key = f"{ep}.down_proj.weight"
                     down.append(key)
                     if quantized:
-                        down.append(f"{key}_scale_inv")
+                        down.append(f"{key}{expert_scale}")
                 mappings[f"{ours}.mlp.gate_up_proj_weight"] = gate_up
                 mappings[f"{ours}.mlp.down_proj_weight"] = down
+                if self.model.layers[i].mlp.expert_fp8:
+                    # The scales come out of the same requantization, so they
+                    # read the same keys (see ExpertRequantMemo).
+                    mappings[f"{ours}.mlp.gate_up_proj_scale"] = gate_up
+                    mappings[f"{ours}.mlp.down_proj_scale"] = down
             else:
                 mappings[f"{ours}.mlp.gate_proj_weight"] = q(
                     f"{hf}.mlp.gate_proj.weight"
@@ -1889,6 +2097,11 @@ class MiMoV2ForCausalLM(nn.Module):
             ".self_attn.qkv_proj.weight_scale_inv"
         )
         quantized = probe in names
+        moe0 = next(i for i in range(self.config.num_hidden_layers) if self.config.is_moe_layer(i))
+        mx_probe = f"model.layers.{moe0}.mlp.experts.0.gate_proj.weight_scale"
+        self._expert_scale_suffix = "_scale" if mx_probe in names else "_scale_inv"
+        if self._expert_scale_suffix == "_scale":
+            logger.info("MiMo-V2: routed experts are MXFP4 on disk (%s)", mx_probe)
         if quantized != self.config.is_fp8_checkpoint:
             logger.info(
                 "MiMo-V2.5: checkpoint fp8=%s (probed %s), config said %s; "
