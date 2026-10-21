@@ -108,6 +108,8 @@ if TYPE_CHECKING:
     VLLM_NEURON_MEGA_DMA_ORDER_DERIVE: bool = False
     VLLM_NEURON_MEGA_DMA_ORDER_CONSTRAINTS_FILE: Optional[str] = None
     VLLM_NEURON_MEGA_SBUF_ALLOC: bool = True
+    # Hybrid (recurrent-state) models: keep the state in vLLM's shared KV pool
+    VLLM_NEURON_SHARED_STATE_POOL: bool = False
 
 
 def maybe_convert_bool(value: str | None) -> bool | None:
@@ -542,6 +544,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # file's own ``sbuf_alloc_limit``. ON by default; set the variable to 0 to turn it off.
     "VLLM_NEURON_MEGA_SBUF_ALLOC": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_MEGA_SBUF_ALLOC")) is not False
+    ),
+    # Hybrid models keep their recurrent state in a dedicated pool by default (the shared
+    # pool is bound as both KV and state, which the compiler's graph I/O check counts twice).
+    # 1 keeps it in vLLM's shared KV pool, as prefix caching does.
+    "VLLM_NEURON_SHARED_STATE_POOL": lambda: bool(
+        maybe_convert_bool(os.getenv("VLLM_NEURON_SHARED_STATE_POOL"))
     ),
 }
 
