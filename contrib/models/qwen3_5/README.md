@@ -168,7 +168,7 @@ curl http://localhost:8000/v1/completions \
 | Instance / SDK version | 2.33 (vllm-neuron 0.29) | 2.32 and earlier (vllm-neuron 0.24) |
 | ---------------------- | ----------------------- | ----------------------------------- |
 | Trn3                   | Not tested              | Not tested                          |
-| Trn2                   | Working (2B, 27B, 35B-A3B; see below) | Working (see below)        |
+| Trn2                   | Working (2B, 27B, 35B-A3B, 397B-A17B; see below) | Working (see below) |
 
 On SDK 2.33 (trn2.48xlarge, TP=4, with the core branch): Qwen3.5-2B passes the
 logit-validation integration test (`test/integration/test_model.py`, batch 1 and 4,
