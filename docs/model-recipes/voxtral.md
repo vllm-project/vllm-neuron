@@ -5,7 +5,7 @@ including supported checkpoints, feature support, accuracy results, and
 deployment guidance for Voxtral-Mini-3B on Trn2. -->
 <!-- meta: keywords: vLLM, Neuron, Voxtral, Voxtral-Mini-3B, audio, speech
 recognition, ASR, transcription, multimodal, DFlash, model recipe, Trn2, Trainium -->
-<!-- meta: date_updated: 2026-10-20 -->
+<!-- meta: date_updated: 2026-10-21 -->
 <!-- Content type: model-card -->
 
 ## Introduction
@@ -109,17 +109,40 @@ plugin also reads the two optional features of that format: a reduced draft
 vocabulary (`draft_vocab_size` and a `d2t` tensor) and a separate mask
 embedding (`mask_embedding.pt`).
 
-Measured on `trn2.3xlarge` (TP=4, encoder TP=4, LNC=2, greedy, one request at a
-time, `/v1/audio/transcriptions`, 3 passes):
+Measured on `trn2.3xlarge` with Neuron SDK 2.33 (the DLAMI vLLM environment; TP=4,
+encoder TP=4, LNC=2, greedy, one request at a time, `/v1/audio/transcriptions`,
+3 passes):
 
 | Set | Without draft p50 | With draft p50 | Speedup | Acceptance length | WER without / with |
 |---|--:|--:|--:|--:|---|
-| LibriSpeech test-clean (24 clips) | 199.7 ms | 81.0 ms | 2.47x | 8.69 | 2.09% / 2.09% |
-| LibriSpeech test-other (64 clips) | 177.4 ms | 86.1 ms | 2.06x | 6.66 | 4.32% / 4.41% |
+| LibriSpeech test-clean (24 clips) | 202.7 ms | 85.8 ms | 2.36x | 8.69 | 2.09% / 2.09% |
+| LibriSpeech test-other (64 clips) | 180.4 ms | 89.1 ms | 2.02x | 6.63 | 4.32% / 4.41% |
 
 The acceptance length counts the bonus token (1 + accepted draft tokens per
 step). The test-other WER difference is one clip of 64 whose transcript differs
 by bf16 rounding in the verify graph.
+
+With several requests in flight the draft also raises throughput. On LibriSpeech
+test-other (`--max-num-seqs 32`, `decode_context_length_buckets` `[512, 1024]`,
+128 requests), the real-time factor at 32 concurrent requests is 96x without the
+draft and 121x with it.
+
+#### Long audio: skip the draft for long prompts
+
+A draft trained on short clips accepts fewer tokens on long contexts, and for
+long audio the verification can cost more than the draft saves. Set
+`neuron_config.spec_decode_max_prompt_len` to decode longer prompts without
+speculation. One 30 s window is 375 audio tokens, so `2500` turns the draft off
+above about two minutes of audio:
+
+```json
+"neuron_config": {"spec_decode_max_prompt_len": 2500}
+```
+
+While a request above the limit is running, the other requests in the batch also
+decode without speculation, because a decode batch must give every request the
+same number of draft tokens. Requests that arrive after the long ones finish
+speculate as usual. The option is off by default.
 
 ## Accuracy Evaluation
 
@@ -128,10 +151,11 @@ scored with the Open ASR Leaderboard normalizer through the
 `/v1/audio/transcriptions` endpoint. The reference is the Open ASR Leaderboard
 result for Voxtral-Mini-3B-2507: 10.69%.
 
-Measured on `trn2.3xlarge` (TP=4, encoder TP=4, greedy): **7.80%** over 341 chunks.
+Measured on `trn2.3xlarge` with Neuron SDK 2.33 (TP=4, encoder TP=4, greedy):
+**7.80%** over 341 chunks.
 
-With the public DFlash draft the WER is **7.76%** on the same 341 chunks, with an
-acceptance length of 5.19. Check the acceptance length, not only the WER, after a
+With the public DFlash draft the WER is **7.77%** on the same 341 chunks, with an
+acceptance length of 5.17. Check the acceptance length, not only the WER, after a
 change to the draft path: a broken draft path keeps the target's transcripts but
 drops the acceptance length to about 1.
 
@@ -144,3 +168,8 @@ drops the acceptance length to about 1.
   larger bucket.
 - **The server fails with `encoder_cache_num_blocks=... is too small`.** Set
   `encoder_cache_num_blocks` as the configuration table shows.
+- **Long audio needs more device memory headroom.** A clip of several minutes
+  needs a larger `--max-model-len` (each 30 s window adds 375 tokens) and a
+  larger largest encoder bucket. If warmup fails with `nrt_tensor_allocate
+  status=4`, raise `VLLM_NEURON_RESERVED_HEADROOM_GIB` (8 worked for 5-minute
+  clips with `--max-model-len 8192`).
