@@ -6,6 +6,7 @@ from typing import Optional
 from torch import Tensor
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from vllm_neuron.parallel.neuron_parallel_state import all_contiguous_replica_groups
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 from vllm_neuron.utils.bucket_utils import SUPPORTED_KV_SEGMENT_SIZES
 import inspect as _inspect
@@ -52,8 +53,8 @@ def _attention_kv_parallel_segmented_cte_wrapper(
     apc_mode: bool = False,
     valid_num_prior_tokens=None,
 ) -> nl.ndarray:
-    """Thin wrapper that converts tuple ranks to ReplicaGroup."""
-    rg = _ReplicaGroup([list(replica_groups)])
+    """Thin wrapper that converts the tuple-of-tuples partition to ReplicaGroup."""
+    rg = _ReplicaGroup([list(g) for g in replica_groups])
     return _attention_kv_parallel_segmented_cte_impl(
         q=q,
         k_cache=k_cache,
@@ -624,9 +625,10 @@ def _nki_segmented_attention_cp_impl(
     # Pre-scale Q (kernel uses scale=1.0 internally when we pre-scale).
     q_scaled = q * scale
 
-    # The kernel's replica_groups arg is a tuple of rank indices (converted to
-    # ReplicaGroup inside the NKI kernel). Use cp_group.ranks.
-    group_ranks = tuple(cp_group.ranks)
+    # The kernel's replica_groups arg is the full partition the CP group belongs
+    # to (converted to ReplicaGroup inside the NKI kernel). Passing every
+    # sub-group instead of only cp_group.ranks keeps the graph rank-agnostic.
+    group_ranks = tuple(tuple(g) for g in all_contiguous_replica_groups(cp_group.ranks))
 
     # Pass the full k/v cache. The kernel uses k_cache.shape[0] to compute
     # max_prior_tokens and iterates accordingly. The runtime kvp_q_offset

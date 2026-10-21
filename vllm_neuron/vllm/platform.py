@@ -129,6 +129,9 @@ class NeuronPlatform(Platform):
         "neuron_quant",
         "compressed-tensors",
         "modelopt",
+        # Static per-tensor FP8 checkpoints (e.g. tencent/Hy3-FP8); the Neuron
+        # model implementation consumes the weights/scales directly.
+        "fp8",
     ]
     # Neuron quantization paths that CPU-dequant compressed-tensors weights to
     # BF16 on the loader thread. On these paths the device only ever sees BF16

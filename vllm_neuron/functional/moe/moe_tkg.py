@@ -46,7 +46,8 @@ def moe_tkg(
 ) -> Tensor:
     """MoE expert MLP token generation kernel API.
 
-    Supports MXFP4 (uint16) and STATIC_MX FP8 (uint32) weights on Trn3, and BF16.
+    Supports MXFP4 (uint16) and STATIC_MX FP8 (uint32) weights on Trn3, plain FP8
+    (float8_e4m3fn, STATIC or ROW weight scales), and BF16.
 
     This functional API should be used instead of the moe_block_tkg functional API when different
     sharding schemes are used in the norm/router region of the MoE block and in the expert MLPs region.
@@ -191,8 +192,8 @@ def moe_tkg(
         )
     else:
         raise NotImplementedError(
-            "moe_tkg only supports uint16 (MXFP4), uint32 (STATIC_MX FP8), or "
-            f"bfloat16 weights, but got {expert_down_weights.dtype=}"
+            "moe_tkg only supports uint16 (MXFP4), uint32 (STATIC_MX FP8), "
+            f"float8_e4m3fn or bfloat16 weights, but got {expert_down_weights.dtype=}"
         )
 
 
@@ -208,9 +209,15 @@ def _can_use_kernel(
 
     Kernel constraints checked:
         - Must be running on Neuron device or CPU with NKI simulator
-        - Must use MXFP4 (uint16), STATIC_MX FP8 (uint32), or BF16 weights
+        - Must use MXFP4 (uint16), STATIC_MX FP8 (uint32), FP8 (float8_e4m3fn),
+          or BF16 weights
     """
     if not can_run_kernel(hidden_input):
         return False
 
-    return expert_down_weights.dtype in (torch.uint16, torch.uint32, torch.bfloat16)
+    return expert_down_weights.dtype in (
+        torch.uint16,
+        torch.uint32,
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+    )
