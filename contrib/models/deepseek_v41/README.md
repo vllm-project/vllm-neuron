@@ -39,6 +39,24 @@ Two of these are hard rather than advisory:
 compiling forks `neuronx-cc` out of each of 64 workers, and a fork under strict
 mode re-commits the parent's address space.
 
+### Speculative decoding needs one plugin change
+
+The DSpark MTP stages draft **inside** the target model, and the runner's
+speculative path is wired to proposers that ship with the plugin — so the model
+cannot register its draft proposer from inside its own folder. That change is a
+separate pull request, and `plugin-core/` in this folder carries a copy as a
+fallback:
+
+```bash
+contrib/models/deepseek_v41/plugin-core/apply_plugin_core.sh --check
+```
+
+It reports "already in this tree" and does nothing if the upstream change has
+merged. **Without it the model still serves correctly** — both imports are
+guarded — but it logs that speculation is unavailable and decodes one token per
+step, losing the ~49% draft acceptance the benchmark numbers below were measured
+with. See [`plugin-core/README.md`](plugin-core/README.md).
+
 ## Registering the model
 
 Contrib models are deliberately not in `get_models()`, so you register this one
