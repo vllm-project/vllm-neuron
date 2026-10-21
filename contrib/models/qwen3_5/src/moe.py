@@ -103,6 +103,9 @@ BLOCK_SIZE = 128
 # local expert count is ``num_experts / ep_degree``, so the DMA per rank shrinks
 # anyway.
 SELECTIVE_LOADING_THRESHOLD = 1.0
+# ``nkilib``'s ``router_topk`` (inside the fused ``moe_block_tkg``) asserts K <= 8;
+# above it, decode routes in torch (``_forward_decode_unfused``).
+MAX_KERNEL_TOP_K = 8
 
 
 def _expert_gate_up_loader(
@@ -632,6 +635,9 @@ class Qwen3_5SparseMoeBlock(nn.Module):
                 [[self.ep_rank]], dtype=torch.int32, device=hidden_states.device
             )
 
+        if self.top_k > MAX_KERNEL_TOP_K:
+            return self._forward_decode_unfused(hidden_states, norm, rank_id)
+
         out = NF.moe_block_tkg(
             inp=hidden_states.unsqueeze(0),
             gamma=gamma,
@@ -657,6 +663,51 @@ class Qwen3_5SparseMoeBlock(nn.Module):
             out = out[0]
 
         out = out + self._shared_expert(norm(hidden_states))
+        return self._combine(out, is_prefill=False)
+
+    def _forward_decode_unfused(
+        self,
+        hidden_states: torch.Tensor,
+        norm: nn.Module,
+        rank_id: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Decode for top-k > 8 (397B-A17B routes top-10): router in torch, experts in ``moe_tkg``.
+
+        ``moe_block_tkg`` fuses the router through ``nkilib``'s ``router_topk``,
+        which asserts ``K <= 8`` (its top-k is built from 8-wide DVE passes). The
+        router is a ``[T, H] x [H, E]`` matmul at decode sizes, so it runs in
+        torch here -- softmax over every expert, top-k, renormalise, as
+        ``Qwen3_5MoeTopKRouter`` does -- and the experts still go through the
+        ``moe_tkg`` kernel, on the full ``[T, E]`` affinities with the unselected
+        experts masked, the same call ``NF.router``'s torch fallback feeds in
+        prefill.
+        """
+        normed = norm(hidden_states)
+        logits = normed.float() @ self.router_weight.float().T  # [T, E]
+        probs = torch.softmax(logits, dim=-1)
+        top_values, top_index = torch.topk(probs, self.top_k, dim=-1)
+        top_values = top_values / top_values.sum(dim=-1, keepdim=True)
+        affinities = torch.zeros_like(probs).scatter(1, top_index, top_values)
+
+        out = NF.moe_tkg(
+            hidden_input=normed,
+            expert_gate_up_weights=self.experts_gate_up_weight,
+            expert_down_weights=self.experts_down_weight,
+            expert_affinities=affinities.to(self.dtype),
+            expert_index=top_index.to(torch.int32),
+            # The kernel only takes rank_id on the all-expert path, and under EP
+            # (the only way 397B-A17B fits) that path is mandatory.
+            is_all_expert=True,
+            rank_id=(
+                rank_id
+                if rank_id is not None
+                else torch.zeros((1, 1), dtype=torch.int32, device=normed.device)
+            ),
+            mask_unselected_experts=True,
+            expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+            activation_fn=ActFnType.SiLU,
+        )
+        out = out + self._shared_expert(normed)
         return self._combine(out, is_prefill=False)
 
 
