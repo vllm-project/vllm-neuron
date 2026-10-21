@@ -1,8 +1,10 @@
 """Run Hy3 on vLLM Neuron and compare greedy tokens / raw logits to an HF reference.
 
 Usage: python run_vllm.py <ckpt> <ref.pt|-> [tp=64] [max_model_len=1024] [max_num_seqs=4]
+EP_DEGREE=<n> sets neuron_config.ep_degree (default: full EP).
 """
 
+import os
 import sys
 import time
 
@@ -13,6 +15,7 @@ ckpt, ref_path = sys.argv[1], sys.argv[2]
 tp = int(sys.argv[3]) if len(sys.argv) > 3 else 64
 max_len = int(sys.argv[4]) if len(sys.argv) > 4 else 1024
 max_seqs = int(sys.argv[5]) if len(sys.argv) > 5 else 4
+ep_degree = os.environ.get("EP_DEGREE")
 
 if __name__ == "__main__":
     ref = torch.load(ref_path) if ref_path != "-" else None
@@ -29,6 +32,9 @@ if __name__ == "__main__":
         async_scheduling=False,
         max_logprobs=-1 if ref is not None else 0,
         logprobs_mode="raw_logits",
+        additional_config=(
+            {"neuron_config": {"ep_degree": int(ep_degree)}} if ep_degree else None
+        ),
     )
     print(f"### engine ready in {time.time() - t0:.0f}s", flush=True)
 

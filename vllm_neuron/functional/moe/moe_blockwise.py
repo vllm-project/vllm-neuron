@@ -315,6 +315,16 @@ def _build_blockwise_mapping_kernel(
     return token_position_to_id, block_to_expert, num_blocks
 
 
+def _shard_cols(rank: Tensor, tp_degree: int, world_size: int, E_shard: int) -> Tensor:
+    """Column indices of this rank's expert shard, derived from the rank tensor.
+
+    ``torch.narrow`` with a tensor start creates an unbacked symbol that dynamo
+    cannot bind, so the shard is selected with ``index_select`` instead.
+    """
+    col_start = rank_to_col(rank, tp_degree, world_size).reshape(1).long() * E_shard
+    return col_start + torch.arange(E_shard, device=rank.device, dtype=torch.long)
+
+
 def _build_blockwise_mapping_torch(
     expert_mask: Tensor,
     num_local_experts: int,
@@ -355,8 +365,8 @@ def _build_blockwise_mapping_torch(
         E_shard = E_local // tp_degree
         if rank is not None:
             world_size = get_world_group().world_size
-            col_start = rank_to_col(rank, tp_degree, world_size) * E_shard
-            expert_mask_shard = torch.narrow(expert_mask, 1, col_start, E_shard)
+            cols = _shard_cols(rank, tp_degree, world_size, E_shard)
+            expert_mask_shard = expert_mask.index_select(1, cols)
         else:
             col_start_int = moe_group.rank_in_group * E_shard
             expert_mask_shard = expert_mask[:, col_start_int : col_start_int + E_shard]
@@ -400,11 +410,9 @@ def _build_blockwise_mapping_torch(
         E_shard = E_local // tp_degree
         if rank is not None:
             world_size = get_world_group().world_size
-            col_start = rank_to_col(rank, tp_degree, world_size) * E_shard
-            local_positions = torch.narrow(
-                token_position_by_id_and_expert, 1, col_start, E_shard
-            )
-            local_mask = torch.narrow(expert_mask, 1, col_start, E_shard)
+            cols = _shard_cols(rank, tp_degree, world_size, E_shard)
+            local_positions = token_position_by_id_and_expert.index_select(1, cols)
+            local_mask = expert_mask.index_select(1, cols)
         else:
             col_start_int = moe_group.rank_in_group * E_shard
             local_positions = token_position_by_id_and_expert[

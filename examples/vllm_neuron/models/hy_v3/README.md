@@ -30,14 +30,14 @@ node (see REPORT.md §9).
 | Path | What |
 |---|---|
 | `serve.sh` | `vllm serve` wrapper for the configs used in the report (baseline B/C, DCP=8) |
-| `serve_latency.sh` | Single-request latency config: no prefix caching, prefill buckets 512..16384 (enables the dynamic-block MoE prefill kernel) |
+| `serve_latency.sh` | Single-request latency config: no prefix caching, prefill buckets 512..16384 (enables the dynamic-block MoE prefill kernel). `EP=32` runs the EP x expert-TP experiment (REPORT.md §11; slower, not adopted) |
 | `bench_matrix.sh` | `vllm bench serve` matrix (random dataset, per-cell seed so cells never share prefix-cache entries) |
 | `eval_math500.py` | MATH-500 against the OpenAI API, graded with math-verify |
 | `make_mini.py` | Build a reduced real-weight checkpoint (first N layers), both FP8 and dequantized BF16 |
 | `hf_reference.py` | HF transformers CPU reference logits / greedy tokens for the BF16 mini checkpoint |
 | `compare_hf_logits.py` | vLLM Neuron vs HF reference, per-step logits comparison |
 | `validate_features.py` | Segmented prefill, prefix-cache hit and batch-128 consistency checks (optionally with DCP) |
-| `kernel_tests/` | Single-NeuronCore micro-tests of the FP8 kernels with real weight shards, plus timing micro-benchmarks (`bench_moe_cte.py`, `bench_decode.py`) |
+| `kernel_tests/` | Single-NeuronCore micro-tests of the FP8 kernels with real weight shards, timing micro-benchmarks (`bench_moe_cte.py`, `bench_decode.py`, `bench_moe_ep.py`), and the minimal repro of the segmented-attention compile failure (`repro_icfg_segmented_hybrid.py`, REPORT.md §11.3) |
 | `inspect_scales.py` | Checkpoint FP8 scale statistics |
 | `di/` | NIXL probe and `libcuda` stub from the single-node P/D investigation |
 | `results/bench/` | Raw `vllm bench` JSON. `summary.csv` covers the clean runs; `archive_fixed_seed/` holds the early fixed-seed runs, whose concurrency > 1 cells are prefix-cache contaminated |

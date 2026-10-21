@@ -134,6 +134,10 @@
 3. MLP TKG 路径收到 fp8 输入时编译失败 → 按 token 数选择融合 norm 路径还是 rmsnorm_quant 路径。
 4. Neuron 编译缓存在模型代码改动后**不会失效**，需要手动清理 `compile_cache`。
 5. 调度器按 `max_model_len` 的最坏情况硬性限制并发；warmup 不会把所有 NEFF 都加载到设备上，所以 KV 预算要预留余量。
+6. `build_blockwise_mapping` 在 EP-TP 组大于 1 时用 `torch.narrow` 按 rank tensor 切专家列，dynamo trace 失败（`PendingUnbackedSymbolNotFound`）→ **已在框架里修复**，改成 `index_select`（见第 11.2 节）。
+7. 同一情况下，EP-TP 组内 all_gather 的 ReplicaGroup 只写了本组的 rank，每个 EP 组各编译一份 prefill NEFF（EP=32 时 200 个图，EP=64 时 14 个）。这只影响编译时间，未修复。
+8. nkilib `shard_on_I`（含 hybrid）带 FP8 scale 时，要求 I_TP / 2 是 128 的倍数，否则编译时报访问越界（`NCC_IBIR243`）。
+9. segmented attention 后面接带寄存器循环的 kernel 时，编译失败（`NCC_ICFG001` / `NCC_IBIR735`），最小复现见第 11.3 节。
 
 ## 7. 后续优化（按收益排序）
 
@@ -274,7 +278,7 @@
 ### 10.2 改动（`hy_v3/model_fp8.py`）
 
 1. **MoE prefill 改用 `shard_on_i_hybrid`**（`num_static_block` = 本地专家数），运行时跳过空 block。单核测试：T=2048 时从 5.35 ms 降到 1.92 ms，T=8192 时从 18.68 ms 降到 5.14 ms，数值误差和原来一样。
-   - **限制**：它的动态循环和 segmented attention 的 `nl.dynamic_range` 放在同一个计算图里时，neuronx-cc 报 `NCC_ICFG001`（控制流图出现多个出口节点），编译失败。所以只有 prefill 走 flash attention 时才用 hybrid；segmented prefill（开 prefix caching 时）仍然用 `shard_on_i`。两者在语义上互不影响，这是编译器层面的问题，还没有做最小复现去确认。
+   - **限制**：它的动态循环和 segmented attention 的 `nl.dynamic_range` 放在同一个计算图里时，neuronx-cc 报 `NCC_ICFG001`（控制流图出现多个出口节点），编译失败。所以只有 prefill 走 flash attention 时才用 hybrid；segmented prefill（开 prefix caching 时）仍然用 `shard_on_i`。两者在语义上互不影响，是编译器问题；最小复现见第 11.3 节（问题出在 segmented attention 之后再接任何带寄存器循环的 kernel，和 hybrid 本身无关）。
 2. **decode 时共享专家另存一份 8 路切分的权重**（I=192，补齐到 256）。部分结果乘 1/8 后，合并进原有的 MoE all-reduce，不增加通信；prefill 仍然用全量权重。这样每个 rank 每层读取的共享专家权重从约 19 MB 降到约 2.4 MB。
 3. **低延迟服务配置**（`serve_latency.sh`）：关闭 prefix caching；prefill bucket 设为 512 到 16384；`max_num_batched_tokens` 为 16384。这样 1k 输入不用补齐到 2048，16k 输入一步就能完成 prefill。
 
@@ -302,12 +306,61 @@
 - 开 prefix caching 时只能拿到 TPOT 的优化。要解决这个问题，可以把 attention 换成静态的"flash attention + 历史 KV（`k_prior` / `v_prior`）"，或者等编译器修复。
 - 下一步可以做：QK-norm 和 RoPE 融合进 QKV kernel（降 TTFT）；MTP 投机解码（降 TPOT，收益最大）；为 batch 1 写一个只加载被选中专家的 MoE kernel（降 TPOT）。
 
+## 11. EP×TP 混合切分实验（未采用）与编译器问题复现
+
+### 11.1 动机
+
+16k prefill 的 profile（rank 0）里，每层 MoE 输出的 ReduceScatter 中位数 8.07 ms，而同样大小的 attention ReduceScatter 只要 0.52 ms。推测 rank 0 先算完 MoE，在 ReduceScatter 里等最慢的 rank，原因是专家负载不均衡。
+
+用第 79 层 router（随机输入，16k token）统计每个 rank 分到的 token 数：
+
+| 切法 | 每 rank 专家 × I | 最热 rank token 数（平均） | 最热 rank MoE 单核耗时 |
+|---|---|---|---|
+| EP=64（当前） | 3 × 1536 | 5081（2048） | 10.91 ms/层 |
+| EP=32 × 专家内 TP=2 | 6 × 768 | 7361（4096） | 5.27 ms/层 |
+| EP=16 × 4 | 12 × 384 | 12627（8192） | 编译失败（第 6 节第 8 条） |
+| EP=8 × 8 | 24 × 192 | 23221（16384） | 编译失败（同上） |
+
+脚本：`kernel_tests/bench_moe_ep.py <ep_degree>`。两种切法下每个 rank 存的专家权重总量相同。
+
+### 11.2 完整模型结果（EP=32，单并发，每组 8 个请求）
+
+先修复了 `vllm_neuron/functional/moe/moe_blockwise.py` 里 `torch.narrow` 的 trace 问题，4 层模型精度和 EP=64 相当（短 prompt 最差 cos 0.99921 vs 0.99929，长 prompt 0.99943 vs 0.99949）。完整模型（`EP=32 ./serve_latency.sh`）：
+
+| 输入 | TTFT：EP=64 → EP=32 | TPOT：EP=64 → EP=32 |
+|---|---|---|
+| 1024 | 199 → 215 ms | 25.5 → 26.9 ms |
+| 4096 | 530 → 552 ms | 25.5 → 28.2 ms |
+| 8192 | 971 → 1005 ms | 26.9 → 28.6 ms |
+| 16000 | 1798 → 1852 ms | 26.9 → 28.6 ms |
+
+- **TTFT 和 TPOT 都略差，不采用，默认保持 EP=64。**
+- TPOT 变差：decode 每个 rank 要处理 6 个专家，权重字节数不变，但每个专家有固定的 kernel 开销。
+- TTFT 没有改善，说明 ReduceScatter 那 8 ms 的等待不能用单层随机输入下的负载不均衡来解释。原因在用多个 rank 同时 profile 查（进行中）。
+- 原始数据：`results/bench/ep32_c1/`。
+
+### 11.3 segmented attention + 带寄存器循环 kernel 的编译失败：最小复现
+
+`kernel_tests/repro_icfg_segmented_hybrid.py`：单个 NeuronCore，BF16 小形状，没有集合通信，只用 3 个框架 kernel。这 3 个 kernel 都用 `register_load` + `nl.fori_loop` 实现运行时循环次数。
+
+| 同一个图里的 kernel（按执行顺序） | 结果 |
+|---|---|
+| attn / moe / pack 单独 | ✅ |
+| pack→pack、pack→moe、attn→attn | ✅ |
+| moe→attn、pack→attn | ✅ |
+| **attn→moe（hybrid）、attn→pack** | ❌ `NCC_IBIR735: use of register reg_N with no definition in function sg0000` |
+
+- attn = `NF.segmented_attention`，moe = `NF.moe_cte(shard_on_i_hybrid)`，pack = `NF.pack_tokens`。
+- 只有 segmented attention **后面**接另一个带寄存器循环的 kernel 时才失败，换成和 MoE 无关的 `pack_tokens` 也一样。所以问题出在编译器的寄存器/控制流处理上，和 hybrid MoE kernel 本身无关。
+- 完整模型里每层都是 attention 在前、MoE 在后，所以必然触发。那里报的是更早阶段的 `NCC_ICFG001`（控制流图有多个出口节点），判断是同一个问题。
+- 版本：neuronx-cc 2.27.5334，nki 0.6.0。用法：`python repro_icfg_segmented_hybrid.py attn+moe`。
+
 ## 附：复现
 
 所有路径相对于 `examples/vllm_neuron/models/hy_v3/`。
 
 - 环境：vLLM 0.24 + 本仓库（`pip install -e .`），另外装 neuronx-cc / nki；这台机器没有 EFA，需要设置 `NEURON_SKIP_EFA_AFFINITY=1`（`serve.sh` 已经设好）。
-- 低延迟服务（单并发优化后的配置）：`MODEL=<ckpt> ./serve_latency.sh`。
+- 低延迟服务（单并发优化后的配置）：`MODEL=<ckpt> [EP=32] ./serve_latency.sh`。
 - 服务：`MODEL=<ckpt> [DCP=8] [KV_CAP=0.45] ./serve.sh <max_model_len> <max_num_seqs> '<num_seqs_buckets>' '<decode_ctx_buckets>'`（文件开头注释里有配置 B / C / DCP 对应的参数）。
 - 性能：`OUT_DIR=results/bench/<name> MODEL=<ckpt> ./bench_matrix.sh "<输入长度列表>" "<并发列表>" 256`（每组用独立 seed）。
 - MATH-500：`python eval_math500.py {no_think|high} out.jsonl --concurrency N --max-tokens M`（需要 `openai`、`math-verify[antlr4_13_2]`、`datasets`）。

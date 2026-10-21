@@ -44,7 +44,7 @@ tencent/Hy3-FP8: ~295B-parameter MoE decoder with a static per-tensor FP8 checkp
 | ------------------ | ------ | ----- |
 | TP (head sharding) | ✅ | validated at TP=64 |
 | SP (seq parallel)  | ✅ | |
-| EP                 | ✅ | required at TP=64 (`--enable-expert-parallel`); validated full EP=64 |
+| EP                 | ✅ | required at TP=64 (`--enable-expert-parallel`); default full EP=64. `ep_degree=32` (expert TP=2) is also validated but slower; `ep_degree` 16 / 8 fail to compile in `moe_cte` |
 | DCP (decode context parallel) | ✅ | `--decode-context-parallel-size 8 --cp-kv-cache-interleave-size <block_size>`; 8x KV capacity at TP=64 |
 | DP / attention DP / MLP DP | ❌ | rejected at startup |
 | MTP / Eagle3 spec decode | ❌ | |
