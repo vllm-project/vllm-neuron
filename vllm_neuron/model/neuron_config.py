@@ -184,6 +184,10 @@ class NeuronConfig:
     # (disabled) so existing SO servers do not silently opt into JF decoding on upgrade;
     # set max_jump_forward_tokens > 0 to enable.
     max_jump_forward_tokens: int = 0
+    # Decode-only steps the scheduler runs for the other requests after each chunk of a
+    # segmented (multi-chunk) prefill. Prefill and decode are separate graphs, so with 0 the
+    # decoding requests pause until the prefill's last chunk. Read by the scheduler.
+    decode_steps_between_prefill_chunks: int = 0
     # GPT-OSS decode giga-kernel. Derived by the factory heuristic
     # (should_use_gk_decode) in platform check_and_update_config, not customer-set.
     gk_decode: bool = False
@@ -276,6 +280,9 @@ class NeuronConfig:
             ),
             fp8_packed_kv=config_dict.get("fp8_packed_kv", False),
             max_jump_forward_tokens=config_dict.get("max_jump_forward_tokens", 0),
+            decode_steps_between_prefill_chunks=config_dict.get(
+                "decode_steps_between_prefill_chunks", 0
+            ),
             gk_decode=config_dict.get("gk_decode", False),
             decode_only_weights=config_dict.get("decode_only_weights", False),
             # JSON and YAML give a list, and the kernel wants a tuple.
@@ -334,6 +341,9 @@ class NeuronConfig:
             )
         if not self.enable_structured_outputs:
             self.max_jump_forward_tokens = 0
+        validate_decode_steps_between_prefill_chunks(
+            self.decode_steps_between_prefill_chunks
+        )
         self.gpt_oss_tail_hops = tuple(self.gpt_oss_tail_hops)
         if not self.gpt_oss_tail_hops or any(
             not isinstance(h, int) or h < 1 for h in self.gpt_oss_tail_hops
@@ -567,3 +577,16 @@ class EncoderNeuronConfig:
         if self.encoder_cache_min_hold_time_ms is None:
             is_epd = self.mm_encoder_only or self.mm_language_model_only
             self.encoder_cache_min_hold_time_ms = 100.0 if is_epd else 0.0
+
+
+def validate_decode_steps_between_prefill_chunks(value) -> int:
+    """Return ``decode_steps_between_prefill_chunks`` if it is a non-negative int.
+
+    Raises:
+        ValueError: For any other value.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"decode_steps_between_prefill_chunks must be a non-negative int, got {value!r}"
+        )
+    return value
