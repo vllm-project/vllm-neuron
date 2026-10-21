@@ -35,6 +35,8 @@ model uses (the zero page at ``pages - 2`` and the write sink at ``pages - 1``).
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1015,7 +1017,10 @@ class Qwen3_5ForCausalLM(nn.Module, SupportsMRoPE):
                     continue
                 arg = self._HLO2TENSORIZER_PREFIX + " ".join(opts)
             args.append(arg)
-        return with_optimization_level(args, 3)
+        # QWEN3_5_DENSE_DECODE_OPT_LEVEL overrides the level for measurement:
+        # 27B needs >= 2 (it fails ISA validation at -O1); 2B compiles at any.
+        level = int(os.environ.get("QWEN3_5_DENSE_DECODE_OPT_LEVEL", "3"))
+        return with_optimization_level(args, level)
 
     def load_weights(
         self, checkpoint_path: str, device: torch.device, cache_dir: str | None

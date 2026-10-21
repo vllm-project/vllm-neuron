@@ -174,8 +174,49 @@ On SDK 2.33 (trn2.48xlarge, TP=4, with the core branch): Qwen3.5-2B passes the
 logit-validation integration test (`test/integration/test_model.py`, batch 1 and 4,
 `max_model_len` 1024, every token within tolerance); Qwen3.5-27B and 35B-A3B give
 coherent greedy output from `scripts/run.py`; Qwen3.5-397B-A17B (TP=64, EP=8,
-stock `nkilib`) gives coherent greedy output from `scripts/run.py`. No
-throughput was measured on 2.33. The results below are from the
+stock `nkilib`) gives coherent greedy output from `scripts/run.py`.
+
+### Measured on SDK 2.33
+
+Setup:
+
+- trn2.48xlarge, bf16, greedy.
+- 1024-token input, 128-token output, `max_model_len` 2048.
+- `scripts/benchmark_latency.py`: streamed TTFT, then TPOT over the remaining
+  tokens; 3 rounds after a warmup round.
+- Batch = `--max-num-seqs` = the number of concurrent requests.
+- Each run had the instance to itself. The TP=4 checkpoints used one Neuron
+  device (`NEURON_VISIBLE_DEVICES=0-3`); running three of them side by side
+  added ~20% to 2B's batch-1 TPOT.
+
+| Checkpoint | Parallelism | Batch | TTFT mean | TPOT mean | Output tok/s (aggregate) |
+| --- | --- | --- | --- | --- | --- |
+| Qwen3.5-2B | TP=4 | 1 | 49.3 ms | 7.01 ms | 136.3 |
+| Qwen3.5-2B | TP=4 | 4 | 125.6 ms | 14.53 ms | 259.2 |
+| Qwen3.5-2B | TP=4 | 8 | 201.2 ms | 25.60 ms | 296.3 |
+| Qwen3.5-27B | TP=4 | 1 | 298.0 ms | 53.60 ms | 18.0 |
+| Qwen3.5-27B | TP=4 | 4 | 821.0 ms | 173.32 ms | 22.4 |
+| Qwen3.5-27B | TP=4 | 8 | 1348.1 ms | 161.67 ms | 46.8 |
+| Qwen3.5-35B-A3B | TP=4 | 1 | 232.9 ms | 34.54 ms | 27.7 |
+| Qwen3.5-35B-A3B | TP=4 | 4 | 599.2 ms | 77.40 ms | 49.0 |
+| Qwen3.5-35B-A3B | TP=4 | 8 | 1058.3 ms | 143.79 ms | 53.0 |
+| Qwen3.5-397B-A17B | TP=64, EP=8 | 1 | 225.8 ms | 51.77 ms | 18.8 |
+| Qwen3.5-397B-A17B | TP=64, EP=8 | 4 | 563.0 ms | 59.50 ms | 63.0 |
+| Qwen3.5-397B-A17B | TP=64, EP=8 | 8 | 959.8 ms | 69.07 ms | 105.2 |
+
+397B used `--prefill-buckets 1024,2048`; the others used the plugin's default
+prefill buckets.
+
+Against the 0.24 port (below):
+
+- TTFT is 2.6-3x lower on 2B and ~30% lower on 35B-A3B.
+- 35B-A3B decode is unchanged.
+- 2B decode is ~1.8x slower (7.0 vs 3.9 ms at batch 1). The decode graph's
+  optimization level is not the cause: `QWEN3_5_DENSE_DECODE_OPT_LEVEL=1`
+  measures the same 7.0 ms as the default 3. Not yet explained.
+- 27B's batch-4 TPOT is above its batch-8 TPOT; reproduced in isolation.
+
+The results below are from the
 earlier in-tree port on vllm-neuron 0.24.0.1.1.0, measured on trn2.3xlarge at
 TP=4, bf16, greedy, 1024-token input and 128-token output, `max_model_len`
 2048:
