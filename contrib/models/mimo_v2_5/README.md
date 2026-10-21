@@ -363,6 +363,16 @@ have cosine similarity 0.965-0.993 to V2.5's (about 0 with the nibbles swapped).
 
 The checkpoints are half the size: 166 GB (Flash-RL) and 535 GB (Pro-RL).
 
+Performance is that of the matching V2.5 checkpoint, since the device runs the
+same graphs. The table below is `scripts/bench.sh` at 900 in / 90 out:
+
+| Checkpoint (server BS) | c=1: out tok/s, TTFT, TPOT | c=16 | c=32 / c=48 |
+|---|---|---|---|
+| V2.5 (BS=32) | 18.6, 213 ms, 52.0 ms | 177.1, 544 ms, 83.4 ms | c=32: 254.3, 1027 ms, 111.5 ms |
+| V2.6-Flash-RL (BS=32) | 18.6, 212 ms, 52.0 ms | 177.2, 543 ms, 83.5 ms | c=32: 254.6, 1024 ms, 111.6 ms |
+| V2.5-Pro (BS=48) | 8.8, 577 ms, 108.7 ms | 74.9, 1377 ms, 195.5 ms | c=48: 112.6, 5801 ms, 312.7 ms |
+| V2.6-Pro-RL (BS=48) | 8.8, 577 ms, 108.7 ms | 75.0, 1377 ms, 196.7 ms | c=48: 112.6, 5783 ms, 308.0 ms |
+
 `moe_tkg` takes MXFP4 weights natively, so keeping Pro-RL's experts in MXFP4 on
 device, rather than requantizing them to fp8, would halve their HBM and DMA. Not
 done yet.
@@ -380,8 +390,8 @@ MIMO_V2_5_PRO_CHECKPOINT=XiaomiMiMo/MiMo-V2.6-Pro-RL \
 | Trn3                   | Not tested  | Not tested       |
 | Trn2                   | Working (greedy smoke + `vllm serve` bench; logit test not run) | Working (PR #40) |
 | Trn2, MiMo-V2.5-Pro (fp8 experts) | Working (greedy smoke + `vllm serve` bench) | Not tested |
-| Trn2, MiMo-V2.6-Flash-RL (MXFP4 -> bf16 experts) | Working (greedy smoke) | Not tested |
-| Trn2, MiMo-V2.6-Pro-RL (MXFP4 -> fp8 experts) | Working (greedy smoke) | Not tested |
+| Trn2, MiMo-V2.6-Flash-RL (MXFP4 -> bf16 experts) | Working (greedy smoke + `vllm serve` bench) | Not tested |
+| Trn2, MiMo-V2.6-Pro-RL (MXFP4 -> fp8 experts) | Working (greedy smoke + `vllm serve` bench) | Not tested |
 
 Measured on this port (trn2.48xlarge, SDK 2.33, TP=64/EP=64, BF16, XLA compile
 route), `scripts/serve_mimo.sh` at BS=32 / SEQ=1024 and `scripts/bench.sh`: 900
