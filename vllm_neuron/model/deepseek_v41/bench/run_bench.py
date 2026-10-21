@@ -189,7 +189,26 @@ SERVED_NAME = "deepseek-v41-flash"
 #: 8k x 10 cell does not dominate the run: at batch `b` this is `max(8, 2 * b)`,
 #: so batch 1 sends 8 sequentially and batch 10 sends 20 as two full rounds.
 def _num_prompts(batch: int) -> int:
-    return max(8, 2 * batch)
+    """How many requests a cell sends.
+
+    **One wave, not two.** This was `2 * batch`, which the warm-up wants (a
+    prefill running alongside `batch - 1` decodes is a shape a simultaneous
+    batch never produces) and which the *measurement* cannot afford: with
+    `--max-concurrency b` and `2b` requests, round two cannot start until round
+    one finishes decoding, so half the TTFT sample is queue wait and
+    `output_throughput` -- tokens over the run's whole wall clock -- is divided
+    by a serial structure rather than a concurrent one.
+
+    Measured 2026-10-21 at in512_bs10, same engine, same session: 20 prompts
+    gave 5.01 tok/s with mean TTFT 4207 ms and P90 7070 ms, while 10 prompts
+    gave 10.74 tok/s. The second round also **keyed 104 extra compiled graphs**
+    inside the measured pass, because the mixed prefill/decode states only a
+    second round reaches had never been warmed.
+
+    The mixed shapes are still traversed, by `--num-warmups` in `_bench_serve`,
+    which is where warming belongs.
+    """
+    return max(8, batch)
 
 
 #: Context the engine is built with: the largest input plus the output plus
@@ -273,6 +292,27 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "safeguard against a wedged collective: catching it in minutes beats waiting "
              "out the cell timeout, because the longer 64 ranks sit wedged the likelier a "
              "host reboot is needed to clear them. 0 disables.",
+    )
+    p.add_argument(
+        "--skip-warmup-pass", action="store_true",
+        help="run only the measured pass, relying on `--num-warmups` to warm "
+             "the cell. **Measured as a regression, so not the default.** "
+             "`--num-warmups` sends N copies of the *first* dataset request, "
+             "so it warms one prompt length; the discarded pass sends N "
+             "distinct sonnet prompts, whose lengths vary around the target "
+             "and key different prefill shapes. At in512_bs1 on 2026-10-21, "
+             "skipping it moved TTFT 826 -> 1825 ms (+121%) and decode "
+             "9.59 -> 8.01 tok/s, with **zero** NEFF misses either way -- so "
+             "the cost it leaves in the measured window is dynamo re-tracing, "
+             "not compilation. TPOT moved only +8%, which is the tell: prefill "
+             "shapes are length-dependent and decode shapes are not.",
+    )
+    p.add_argument(
+        "--temperature", default="0",
+        help="sampling temperature sent with every request; '0' is greedy and "
+             "is the default because acceptance is a first-order term in every "
+             "throughput figure here. Pass 'none' to send no temperature and "
+             "let the server choose, which is what upstream does by default.",
     )
     p.add_argument(
         "--prose-output-len", type=int, default=DEFAULT_PROSE_OUTPUT_LEN,
@@ -404,28 +444,118 @@ def _wait_healthy(proc: subprocess.Popen, port: int, timeout: int) -> None:
     raise SystemExit(f"bench: server was not healthy within {timeout} s")
 
 
-def _stop(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
-    print("bench: stopping server")
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGINT)
-        proc.wait(timeout=180)
-    except (subprocess.TimeoutExpired, ProcessLookupError, PermissionError):
+#: Processes that may be holding a Neuron device on this host, by cmdline. Only
+#: these are force-killed when a teardown leaves devices busy, so a concurrent
+#: verifier run is never caught by it.
+_ENGINE_MARKERS = ("_serve_main", "EngineCore", "Worker_TP", "multiproc_executor")
+
+#: How long to wait for 64 ranks to drop their device handles after the engine
+#: is signalled. Measured: they take 30-40 s, so this is generous but finite.
+_DEVICE_RELEASE_WAIT = 120
+
+
+def _device_holders() -> list[int]:
+    """PIDs holding a `/dev/neuron*` handle that look like an engine.
+
+    Read from `/proc`, not from `lsof`: the bench runs unprivileged and these
+    are its own descendants, so their fds are readable without sudo.
+    """
+    held: list[int] = []
+    me = os.getpid()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == me:
+            continue
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            proc.wait(timeout=60)
-        except Exception:  # noqa: BLE001 - best effort teardown
+            cmd = Path(f"/proc/{pid}/cmdline").read_bytes().decode(
+                "utf-8", "replace"
+            ).replace("\x00", " ")
+            comm = Path(f"/proc/{pid}/comm").read_text(errors="replace")
+        except OSError:
+            continue
+        if not any(mark in cmd or mark in comm for mark in _ENGINE_MARKERS):
+            continue
+        fd_dir = Path(f"/proc/{pid}/fd")
+        try:
+            for fd in fd_dir.iterdir():
+                try:
+                    if "/dev/neuron" in os.readlink(fd):
+                        held.append(pid)
+                        break
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return held
+
+
+def _stop(proc: subprocess.Popen) -> None:
+    """Stop an engine **and wait for its devices to come back.**
+
+    Killing the parent is not enough and its absence caused a cascade: vLLM's
+    `multiproc_executor` workers are not reliably in the parent's process
+    group, so `EngineCore` and all 64 `Worker_TP*` survived a `_stop` and kept
+    `/dev/neuron*` open. The next engine then failed `nrt_init` on all 64 ranks
+    (`NRT_FAILURE`, "The PyTorch Neuron Runtime could not be initialized") and
+    the cell reported `server exited with 1 before becoming healthy` --
+    measured 2026-10-21, and the same orphaning has been cleaned up by hand
+    repeatedly through this project. One leaked engine poisons every cell after
+    it, so teardown waits for the devices rather than for the parent.
+    """
+    if proc.poll() is None:
+        print("bench: stopping server")
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+            proc.wait(timeout=180)
+        except (subprocess.TimeoutExpired, ProcessLookupError, PermissionError):
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                proc.wait(timeout=60)
+            except Exception:  # noqa: BLE001 - best effort teardown
+                pass
+
+    deadline = time.monotonic() + _DEVICE_RELEASE_WAIT
+    while time.monotonic() < deadline:
+        holders = _device_holders()
+        if not holders:
+            return
+        time.sleep(5)
+    holders = _device_holders()
+    if not holders:
+        return
+    print(f"bench:   {len(holders)} process(es) still hold a Neuron device "
+          f"{_DEVICE_RELEASE_WAIT}s after teardown; killing them so the next "
+          f"cell can start", file=sys.stderr)
+    for pid in holders:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
             pass
+    for _ in range(12):
+        time.sleep(5)
+        if not _device_holders():
+            return
+    print("bench:   devices are still held; the next cell will probably fail "
+          "to initialise the runtime", file=sys.stderr)
 
 
-#: Output tokens a warm-up request generates. Short on purpose: the warm-up
-#: exists to *compile*, not to measure, and the decode shape this model keys is
-#: `(1 + k) * running_seqs` rows — a function of the batch, not of how many
-#: tokens have been emitted. The compressed-group read is pinned to the context
-#: (`model._COMPRESS_READ_CEILING`) and the window is a fixed 128 slots, so a
-#: longer generation reaches no shape a short one does not. 8 tokens compiles
-#: the same graph set as 128 and costs a fifteenth of the time.
+#: **Retired 2026-10-21.** The warm-up now generates the measurement's own
+#: output length; this constant is kept only so the reasoning that replaced it
+#: is on the record.
+#:
+#: It used to be 8, on the argument that the warm-up exists to compile and that
+#: "the decode shape this model keys is `(1 + k) * running_seqs` rows — a
+#: function of the batch, not of how many tokens have been emitted", so a
+#: longer generation reaches no shape a short one does not.
+#:
+#: **That argument is false, and two independent measurements say so.**
+#: Iteration 10 found a cell with a fully warm NEFF cache still keying 48 new
+#: graph signatures, appearing *late in the drain* at `Running: 4 reqs` — states
+#: an 8-token run never reaches. And on 2026-10-21 an 18-minute full-length
+#: warm-up at 10 prompts left 104 further graphs to be keyed inside a 20-prompt
+#: measured pass. Emitted tokens do reach shapes, through the drain.
 WARMUP_OUTPUT_LEN = 8
 
 
@@ -649,6 +779,7 @@ def _bench_serve(
     num_prompts: int, result_dir: Path, result_file: str, timeout: int,
     server: subprocess.Popen | None = None,
     server_log: Path | None = None, stall_timeout: int = 0,
+    num_warmups: int = 0, temperature: float | None = 0.0,
 ) -> dict | None:
     """One `vllm bench serve` invocation. Returns its parsed result, or None.
 
@@ -665,13 +796,20 @@ def _bench_serve(
     is killed and this returns None with the engine's exit code named, which is
     both faster and a different diagnosis from a timeout.
     """
-    # The `vllm` CLI is what the onboarding guide names; fall back to the module
-    # it dispatches to if this environment has no console script on PATH.
+    # The `vllm` CLI is what the onboarding guide names. There is deliberately
+    # **no module fallback**: `python -m vllm.benchmarks.serve` has no
+    # `__main__` block, so it imports its dependencies, exits 0, and writes no
+    # result file. Measured 2026-10-21: six client arms "completed" in 6 s each
+    # with rc=0 and no JSON. A fallback that silently measures nothing is worse
+    # than no fallback, so this raises instead.
     vllm_bin = shutil.which("vllm")
-    cmd = (
-        [vllm_bin, "bench", "serve"] if vllm_bin
-        else [sys.executable, "-m", "vllm.benchmarks.serve"]
-    )
+    if not vllm_bin:
+        raise RuntimeError(
+            "`vllm` is not on PATH. `python -m vllm.benchmarks.serve` is not a "
+            "usable substitute: the module has no __main__ block and exits 0 "
+            "without benchmarking anything."
+        )
+    cmd = [vllm_bin, "bench", "serve"]
     cmd += [
         # `openai`, not `openai-chat`: the completions endpoint takes the random
         # dataset's token ids as given, where the chat endpoint would wrap them
@@ -686,12 +824,36 @@ def _bench_serve(
         # Every request emits exactly `output_len` tokens, so TPOT and the
         # token count are not at the mercy of an early stop.
         "--ignore-eos",
+        # Greedy. Without this the client sends no temperature and the server
+        # samples at its own default, which upstream warns about on every run
+        # ("no longer sets temperature==0 (greedy) in requests by default").
+        # It matters here because acceptance is a first-order term in every
+        # throughput figure: measured 2026-10-21 at in512_bs10, greedy raised
+        # acceptance 37.6% -> 43.7% and acceptance length 2.88 -> 3.19, worth
+        # ~10% of aggregate decode. Declared as this deployment's sampling
+        # policy rather than discovered per run.
+        *(("--temperature", str(temperature)) if temperature is not None else ()),
         "--percentile-metrics", "ttft,tpot,itl,e2el",
         "--metric-percentiles", "50,90,99",
         "--save-result",
+        # Per-request ttfts/tpots/itls land in the result JSON. The aggregate
+        # alone cannot distinguish "the engine is slow" from "one request
+        # stalled for 60 s", and that distinction has cost this project
+        # several wrong conclusions.
+        "--save-detailed",
         "--result-dir", str(result_dir),
         "--result-filename", result_file,
     ]
+    # Upstream's own warm-up: `num_warmups` copies of the first dataset request
+    # at its real output length, under the same `--max-concurrency` semaphore,
+    # awaited before the timer starts (`vllm/benchmarks/serve.py:870`). This is
+    # what the two-pass structure below could not do, because the passes are
+    # separate client processes and the cost being absorbed is **dynamo
+    # re-tracing**, not NEFF compilation. Measured 2026-10-21 at in512_bs10,
+    # both arms with zero NEFF cache misses: without it 10.74 tok/s, with it
+    # 24.82 tok/s.
+    if num_warmups > 0:
+        cmd += ["--num-warmups", str(num_warmups)]
     started = time.monotonic()
     client = subprocess.Popen(cmd)
     log_path = server_log if server_log is not None else None
@@ -767,11 +929,22 @@ def _bench_serve(
     return json.loads(path.read_text())
 
 
+def _parse_temperature(raw) -> float | None:
+    """`--temperature` as a float, or None for "send none and let the server
+    choose" (upstream's default, and what every run before 2026-10-21 did)."""
+    if raw is None:
+        return None
+    if isinstance(raw, str) and raw.strip().lower() in ("none", "", "server"):
+        return None
+    return float(raw)
+
+
 def _bench_cell(
     model: str, port: int, name: str, flags: callable, output_len: int, batch: int,
     num_prompts: int, result_dir: Path, timeout: int,
     server: subprocess.Popen | None = None,
     server_log: Path | None = None, stall_timeout: int = 0,
+    temperature: float | None = 0.0, skip_warmup_pass: bool = False,
 ) -> dict | None:
     """One cell: warm it up, then measure it.
 
@@ -783,9 +956,9 @@ def _bench_cell(
     default prompt count, so an unwarmed cell does not report a slow median: it
     reports a compile.
 
-    So each cell runs twice. The first run is discarded and generates
-    `WARMUP_OUTPUT_LEN` tokens instead of the full output, which is what makes
-    it cheap.
+    So each cell runs twice, and the discarded pass generates the **same output
+    length** as the measurement. It used to generate 8 tokens to stay cheap;
+    see `WARMUP_OUTPUT_LEN` for the measurements that retired that.
 
     **It sends the same number of requests as the measurement, not fewer.** That
     looks like waste and is not: with `--max-concurrency b` and `2b` requests,
@@ -801,31 +974,58 @@ def _bench_cell(
     then simply a cold one, and it is better to report a number with that
     caveat than to drop the cell.
     """
-    print(f"\nbench: cell {name} — warm-up: {num_prompts} prompts, "
-          f"{WARMUP_OUTPUT_LEN} out (discarded)")
-    warm = _bench_serve(
-        model, port, flags(WARMUP_OUTPUT_LEN), batch, num_prompts,
-        result_dir, f"{name}.warmup.json",
-        # Compile is paid here, so this pass gets the allowance; see
-        # `CELL_WARMUP_COMPILE_ALLOWANCE` for what it is sized from.
-        timeout + CELL_WARMUP_COMPILE_ALLOWANCE, server=server,
-        server_log=server_log, stall_timeout=stall_timeout,
-    )
-    if warm is None:
+    warm = None
+    if skip_warmup_pass:
+        print(f"\nbench: cell {name} — warm-up pass skipped; "
+              f"`--num-warmups {num_prompts}` carries the warming")
+    else:
+        print(f"\nbench: cell {name} — warm-up: {num_prompts} prompts, "
+              f"{output_len} out (discarded)")
+        warm = _bench_serve(
+            model, port, flags(output_len), batch, num_prompts,
+            result_dir, f"{name}.warmup.json",
+            # Compile is paid here, so this pass gets the allowance; see
+            # `CELL_WARMUP_COMPILE_ALLOWANCE` for what it is sized from.
+            timeout + CELL_WARMUP_COMPILE_ALLOWANCE, server=server,
+            server_log=server_log, stall_timeout=stall_timeout,
+            temperature=temperature,
+        )
+    if warm is None and not skip_warmup_pass:
         print(f"bench:   warm-up for {name} did not complete; the measurement "
               "below is a cold one", file=sys.stderr)
 
     print(f"bench: cell {name} — measuring: {num_prompts} prompts, "
           f"concurrency {batch}, {output_len} out")
+    # Where this cell's measured window starts in the server log. With one
+    # engine serving several cells the acceptance counters are no longer "this
+    # cell's and nothing else's", so they are read from here rather than from
+    # the top of the file. It also excludes the warm-up, which is correct: the
+    # reported rate should be the measured pass's.
+    log_offset = 0
+    if server_log is not None:
+        try:
+            log_offset = server_log.stat().st_size
+        except OSError:
+            log_offset = 0
     measured = _bench_serve(
         model, port, flags(output_len), batch, num_prompts,
         result_dir, f"{name}.json", timeout, server=server,
         server_log=server_log, stall_timeout=stall_timeout,
+        # A full wave re-traced in-process immediately before the timer starts,
+        # on top of the discarded pass above. Belt and braces: the pass above
+        # warms the engine's graphs, this one warms whatever the client's own
+        # process re-traces per invocation.
+        num_warmups=num_prompts,
+        temperature=temperature,
     )
     if measured is not None:
         # Recorded on the result, so a reader of the report can tell a warmed
         # measurement from a cold one without going back to the console.
-        measured["_warmed"] = warm is not None
+        # With the discarded pass skipped there is no separate warm-up to have
+        # completed, and `--num-warmups` is awaited by the client before the
+        # timer starts -- so a measurement that exists at all was warmed.
+        measured["_warmed"] = True if skip_warmup_pass else warm is not None
+        measured["_log_offset"] = log_offset
     return measured
 
 
@@ -868,7 +1068,7 @@ _ACCEPT_RE = re.compile(
 )
 
 
-def _acceptance(server_log: Path) -> float | None:
+def _acceptance(server_log: Path, offset: int = 0) -> float | None:
     """This cell's speculative acceptance rate, from its own server's log.
 
     **Why the benchmark reports this at all.** Speculation decides how many
@@ -892,7 +1092,9 @@ def _acceptance(server_log: Path) -> float | None:
     measured" and "speculation accepted nothing" are different claims.
     """
     try:
-        text = server_log.read_text(errors="replace")
+        with server_log.open(errors="replace") as fh:
+            fh.seek(offset)
+            text = fh.read()
     except OSError:
         return None
     matches = _ACCEPT_RE.findall(text)
@@ -911,7 +1113,7 @@ _VLLM_SPEC_RE = re.compile(
 )
 
 
-def _vllm_acceptance(server_log: Path) -> dict:
+def _vllm_acceptance(server_log: Path, offset: int = 0) -> dict:
     """This cell's acceptance rate as *vLLM* counted it, not as the port did.
 
     `_acceptance` above reads `drafter.py`'s own running line, which is the
@@ -932,7 +1134,9 @@ def _vllm_acceptance(server_log: Path) -> dict:
     nothing".
     """
     try:
-        text = server_log.read_text(errors="replace")
+        with server_log.open(errors="replace") as fh:
+            fh.seek(offset)
+            text = fh.read()
     except OSError:
         return {"found": False, "accepted": 0, "drafted": 0, "pct": None}
     pairs = _VLLM_SPEC_RE.findall(text)
@@ -1099,6 +1303,9 @@ def main(argv: list[str] | None = None) -> int:
     # which is the right thing when the question is "what does serving an 8k
     # context cost a short request" rather than "how fast is a 512-token
     # request".
+    #: context -> (proc, port, log) for engines left running between cells.
+    _servers: dict[int, tuple] = {}
+
     def run_cell(name: str, flags: callable, context: int, batch: int,
                  num_prompts: int, output_len: int, extra: dict,
                  probe_prose: bool = False) -> None:
@@ -1108,13 +1315,60 @@ def main(argv: list[str] | None = None) -> int:
         server before teardown -- see `_prose_probe` for why it rides along on
         an engine that is already up instead of building one of its own.
         """
-        port = _free_port(args.port)
-        log = log_dir / f"server_{name}.log"
-        proc = _serve(args.model, tp, context, batch, port, log)
+        # One engine per *context*, shared by every batch size at that
+        # context. At `MAX_NUM_SEQS = 1` the port clamps every engine to one
+        # sequence whatever the server was started with, so the bs1 and bs10
+        # cells of one input length are running byte-identical engines today
+        # and differ only in client concurrency -- there was never a reason to
+        # build two. Sharing also means the second cell inherits the first's
+        # warm graphs, which matters now that the warm-up runs at full output
+        # length. The cache key is the context because
+        # `model._COMPRESS_READ_CEILING` pins the indexer's `read_len` to the
+        # engine's context: one engine for *all* cells would make `in512` do
+        # 8448-sized indexer reads and stop measuring what it is named for.
+        #
+        # **Revisit this if `MAX_NUM_SEQS` ever rises above 1.** The engine is
+        # started at `max(batch_sizes)`, and above the clamp a shared engine
+        # pins `num_seqs_buckets` to that maximum, so `_bucket_spans` would pad
+        # a batch-1 decode step out to the full span count -- paying for ten
+        # sequences to serve one. At that point the cache key has to become
+        # `(context, batch)` again, which is what it effectively was before.
+        # The key is `(context, the batch this engine will actually serve)`.
+        # Below the clamp every cell maps to the same key -- `MAX_NUM_SEQS = 1`
+        # makes a bs1 and a bs10 cell byte-identical engines -- so one engine
+        # serves both. Above it they separate again, and they must: a shared
+        # `max_num_seqs = 10` engine pins `num_seqs_buckets` to 10, and
+        # `_bucket_spans` would then pad a one-sequence decode step out to ten
+        # spans, paying for ten sequences to serve one.
+        from ..config import MAX_NUM_SEQS as _CLAMP
+        serve_batch = min(batch, _CLAMP) if _CLAMP else batch
+        key = (context, serve_batch)
+        cached = _servers.get(key)
+        if cached is not None:
+            proc, port, log = cached
+            print(f"\nbench: cell {name} — reusing the context-{context} "
+                  f"max_num_seqs-{serve_batch} engine on port {port}")
+        else:
+            # **At most one engine at a time.** Every engine here takes all 64
+            # ranks, so a second one cannot start while the first lives: it
+            # fails `nrt_init` on all 64 workers with NRT_FAILURE and the cell
+            # reports "server exited with 1 before becoming healthy". Measured
+            # 2026-10-21, when lifting the clamp first made two keys per
+            # context possible. So anything still held is dropped here.
+            for stale_key in list(_servers):
+                stale = _servers.pop(stale_key)
+                print(f"bench:   dropping the context-{stale_key[0]} "
+                      f"max_num_seqs-{stale_key[1]} engine first "
+                      f"(one engine owns all {tp} ranks)")
+                _stop(stale[0])
+            port = _free_port(args.port)
+            log = log_dir / f"server_ctx{context}_ms{serve_batch}.log"
+            proc = _serve(args.model, tp, context, serve_batch, port, log)
         raw = None
         served_batch = batch
         try:
-            _wait_healthy(proc, port, args.server_timeout)
+            if cached is None:
+                _wait_healthy(proc, port, args.server_timeout)
             served_batch = _engine_batch(log, batch)
             if served_batch < batch:
                 print(
@@ -1130,6 +1384,21 @@ def main(argv: list[str] | None = None) -> int:
                 args.model, port, name, flags, output_len, batch, num_prompts,
                 result_dir, _cell_timeout(args, batch, output_len), server=proc,
                 server_log=log, stall_timeout=args.stall_timeout,
+                # Greedy is withheld from multi-sequence cells. It is worth
+                # ~10% of aggregate decode (acceptance 37.6% -> 43.7%) and is
+                # safe at one sequence and on a clamped engine, but measured
+                # 2026-10-21 it **hangs a cold uncapped multi-sequence
+                # engine**: identical config, 10 concurrent requests, the
+                # warm-up froze at 3 of 10 with every worker blocked in
+                # `_engram_rows` (`state=S`, `wchan=do_wait_intr_irq`) and no
+                # NEFF activity, while the same run with no temperature
+                # completed and measured 25.24 tok/s. A 10% figure is not
+                # worth a known hang in the default path.
+                temperature=(
+                    _parse_temperature(args.temperature)
+                    if min(batch, _CLAMP or batch) <= 1 else None
+                ),
+                skip_warmup_pass=args.skip_warmup_pass,
             )
             if probe_prose:
                 print(f"\nbench: prose acceptance probe on {name}'s server "
@@ -1150,17 +1419,19 @@ def main(argv: list[str] | None = None) -> int:
                       f"over case(s) {pr['cases']}")
                 _write()
         finally:
-            if not args.keep_server:
-                _stop(proc)
+            # Left running for the next cell at this context; torn down by the
+            # caller when the context changes or the matrix ends.
+            _servers[key] = (proc, port, log)
         metrics = _metrics(raw) if raw else None
         if metrics is not None:
             # Read after teardown: the counters are cumulative and this server
             # served exactly this cell, so they are this cell's and nothing
             # else's.
-            metrics["draft_acceptance_pct"] = _acceptance(log)
+            off = int(raw.get("_log_offset") or 0)
+            metrics["draft_acceptance_pct"] = _acceptance(log, off)
             # The same quantity from vLLM's own counters, which the port cannot
             # edit. See `_vllm_acceptance`.
-            vllm_spec = _vllm_acceptance(log)
+            vllm_spec = _vllm_acceptance(log, off)
             metrics["vllm_acceptance_pct"] = vllm_spec["pct"]
             metrics["vllm_accepted_tokens"] = vllm_spec["accepted"]
             metrics["vllm_draft_tokens"] = vllm_spec["drafted"]
@@ -1187,21 +1458,34 @@ def main(argv: list[str] | None = None) -> int:
         probe_batch = min(batch_sizes)
         probe_cell = f"in{widest}_bs{probe_batch}"
 
-    for batch in batch_sizes:
-        for input_len in input_lens:
+    # Grouped by context, not by batch: every cell sharing an engine runs
+    # consecutively so the engine can be built once and dropped as soon as its
+    # last cell is done, instead of being held for the whole matrix.
+    for input_len in input_lens:
+        context = args.max_model_len or (
+            input_len + args.output_len + CONTEXT_HEADROOM
+        )
+        for batch in batch_sizes:
             name = f"in{input_len}_bs{batch}"
             run_cell(
                 name=name,
                 flags=_sonnet_flags(input_len, args.dataset_path),
-                context=args.max_model_len or (
-                    input_len + args.output_len + CONTEXT_HEADROOM
-                ),
+                context=context,
                 batch=batch,
                 num_prompts=args.num_prompts or _num_prompts(batch),
                 output_len=args.output_len,
                 extra={"input_len": input_len, "dataset": "sonnet"},
                 probe_prose=(name == probe_cell),
             )
+        if not args.keep_server:
+            for k in [k for k in _servers if k[0] == context]:
+                held = _servers.pop(k, None)
+                if held is not None:
+                    _stop(held[0])
+    for held in list(_servers.values()):
+        if not args.keep_server:
+            _stop(held[0])
+    _servers.clear()
 
 
     _print_table(report["cells"])
