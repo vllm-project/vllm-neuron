@@ -15,8 +15,8 @@ requires-python = ">=3.10"
 hy_v3_neuron = "hy_v3_neuron:register"
 
 [tool.setuptools]
-packages = ["hy_v3_neuron"]
-package-dir = { "hy_v3_neuron" = "src" }
+packages = ["hy_v3_neuron", "hy_v3_neuron.kernels"]
+package-dir = { "hy_v3_neuron" = "src", "hy_v3_neuron.kernels" = "src/kernels" }
 
 [tool.setuptools.package-data]
 hy_v3_neuron = ["README.md"]
