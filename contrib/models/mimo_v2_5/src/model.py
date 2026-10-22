@@ -128,6 +128,9 @@ _MOE_BLOCK_SIZE_ENV = "MIMO_V2_5_MOE_BLOCK_SIZE"
 # Optional per-graph neuronx-cc -O level for the plain decode graph; see
 # MiMoV2ForCausalLM.compiler_args_for. Unset keeps the runner's level.
 _DECODE_OPT_LEVEL_ENV = "MIMO_V2_5_DECODE_OPT_LEVEL"
+# Force (=1) or forbid (=0) moe_tkg's selective decode; unset picks it by batch
+# size (see MiMoV2SparseMoeBlock._use_selective_decode).
+_DECODE_SELECTIVE_ENV = "MIMO_V2_5_DECODE_SELECTIVE"
 
 
 def _centred(bias: torch.Tensor) -> torch.Tensor:
@@ -1322,6 +1325,81 @@ class MiMoV2SparseMoeBlock(nn.Module):
         )
         return NF.get_local_expert_affinities(affinities, local_expert_indices)
 
+    def _use_selective_decode(self, num_tokens: int) -> bool:
+        """Decode through moe_tkg's selective mode rather than all-expert?
+
+        All-expert reads every local expert's weights each step: all experts /
+        world per rank, the same bytes whatever the EP x TP split. Selective
+        reads ``top_k`` experts' ``I / tp`` slices per token, so it wins while
+        ``tokens x top_k`` is below the local expert count -- the rule
+        ``gpt_oss/model_bf16.py`` uses. At the default ep_degree 64 (4 local
+        experts, top-8) that never holds, so the default decode is unchanged;
+        at ep_degree 4 (64 local experts, moe TP 16) it holds up to 7 tokens.
+        ``MIMO_V2_5_DECODE_SELECTIVE=1`` / ``=0`` forces either mode.
+        """
+        forced = os.environ.get(_DECODE_SELECTIVE_ENV)
+        if forced in ("0", "1"):
+            return forced == "1"
+        return num_tokens * self.top_k < self.num_local_experts
+
+    def _moe_tkg_selective(
+        self,
+        hidden_states: torch.Tensor,
+        affinities: torch.Tensor,
+        expert_index: torch.Tensor,
+        rank: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Decode through ``moe_tkg``'s selective mode: only the routed experts' weights.
+
+        All-expert mode reads every local expert's weights each step, which is the
+        same bytes per rank (all experts / world) whatever the EP x TP split.
+        Selective mode reads ``top_k`` experts' ``I / tp`` slices per token, so it
+        shrinks with the moe TP degree (``ep_degree`` 4 -> moe TP 16: 8 x 3 x H x
+        128 x 2 B = 25 MB per layer, against 200 MB all-expert at ep_degree 64).
+
+        The kernel indexes the LOCAL ``[E_L, ...]`` weights and ``[T, E_L]``
+        affinities with ``expert_index``, so the global ids are mapped to local
+        ones. A slot whose expert lives in another EP group is pointed at a
+        local expert this token did not select (affinity 0), so it adds exactly
+        nothing and nothing is counted twice.
+        """
+        e_l = self.num_local_experts
+        local_aff = self._local_expert_slice(affinities, rank)  # [T, E_L]
+        if self.ep_degree > 1:
+            base = self._ep_rank_tensor(rank, hidden_states.device).to(torch.long) * e_l
+            local_idx = expert_index.to(torch.long) - base
+            valid = (local_idx >= 0) & (local_idx < e_l)
+            # First local expert with zero affinity for this token: never selected.
+            spare = torch.argmin((local_aff > 0).to(torch.int32), dim=1, keepdim=True)
+            local_idx = torch.where(valid, local_idx, spare)
+        else:
+            local_idx = expert_index.to(torch.long)
+        kwargs = dict(
+            hidden_input=hidden_states,
+            expert_gate_up_weights=self._gate_up_kernel_view(),
+            expert_down_weights=self.down_proj_weight,
+            # fp32: the selective kernel's affinity arithmetic rejects bf16
+            # ("nisa.tensor_scalar_arith ... must be float32, got bf16").
+            expert_affinities=local_aff.to(torch.float32),
+            expert_index=local_idx.to(torch.int32),
+            is_all_expert=False,
+            expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+            activation_fn=ActFnType.SiLU,
+        )
+        if not self.expert_fp8:
+            return NF.moe_tkg(**kwargs)
+        # fp8 experts: the kernel's ROW quantization (per-output-channel fp32
+        # scales, bf16 activations x fp8 weights). NF.moe_tkg only admits bf16 /
+        # MX weights, so call its kernel wrapper directly, as the Hy3 contrib
+        # port does for its static-fp8 experts.
+        from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+        from vllm_neuron.functional.moe.moe_tkg_wrapper import moe_tkg_wrapper
+
+        e, i_r = self.num_local_experts, self.intermediate_size_per_rank
+        kwargs["expert_gate_up_weights_scale"] = self.gate_up_proj_scale.reshape(e, 2, i_r)
+        kwargs["expert_down_weights_scale"] = self.down_proj_scale.reshape(e, self.hidden_size)
+        return wrap_nki(moe_tkg_wrapper)[2](**kwargs)
+
     def _gate_up_kernel_view(self) -> torch.Tensor:
         return self.gate_up_proj_weight.reshape(
             self.num_local_experts,
@@ -1483,7 +1561,9 @@ class MiMoV2SparseMoeBlock(nn.Module):
         hidden_states = hidden_states.to(self.dtype)
         affinities, expert_index = self._route(hidden_states)
 
-        if self.expert_fp8:
+        if can_run_kernel(hidden_states) and self._use_selective_decode(hidden_states.shape[0]):
+            output = self._moe_tkg_selective(hidden_states, affinities, expert_index, rank)
+        elif self.expert_fp8:
             # Same dense torch path as prefill; the slice uses the traced EP
             # rank, so every rank shares one graph.
             output = self._experts_torch(
@@ -1493,24 +1573,15 @@ class MiMoV2SparseMoeBlock(nn.Module):
             )
         elif can_run_kernel(hidden_states):
             rank_id = self._ep_rank_tensor(rank, hidden_states.device).reshape(1, 1)
-            # Static all-expert dispatch, deliberately. The two alternatives were
-            # both measured on device and both lose:
-            #
-            #   - ``is_all_expert=False`` (routed/selective) indexes the LOCAL
-            #     [E_L, H, 2, I] weights with the GLOBAL expert id and takes no
-            #     rank_id, so it is EP-incompatible by construction (which is why
-            #     gpt_oss/model_bf16.py force-enables all-expert when ep_degree>1).
-            #     It also does K=8 experts of work per token against all-expert's
-            #     E_local=4, and does not compile at these dims.
-            #   - ``is_all_expert_dynamic=True`` skips token blocks with no routed
-            #     tokens, and in an isolated single-kernel microbenchmark that
-            #     looked like a 1.2-1.55x win at T>=16 (bit-exact). END TO END IT
-            #     IS SLOWER: median ITL 160.6/152.9/148.1 ms at concurrency
-            #     1/16/32 versus 147.2/147.2/147.1 static, same host, same
-            #     recompile. The microbenchmark measured one kernel per host round
-            #     trip; in the real graph these are 47 back-to-back invocations
-            #     and the data-dependent control flow (nl.dynamic_range +
-            #     _find_routed_tokens) costs more than the skipping saves.
+            # All-expert dispatch: every local expert's weights, every step. It
+            # is the right mode once tokens x top_k reaches the local expert
+            # count (see _use_selective_decode). ``is_all_expert_dynamic=True``
+            # (skip token blocks with no routed tokens) was measured and loses
+            # end to end: median ITL 160.6/152.9/148.1 ms at concurrency
+            # 1/16/32 versus 147.2/147.2/147.1 static on the 0.21 port; the
+            # data-dependent control flow (nl.dynamic_range +
+            # _find_routed_tokens) over 47 back-to-back invocations costs more
+            # than the skipping saves.
             output = NF.moe_tkg(
                 hidden_input=hidden_states,
                 expert_gate_up_weights=self._gate_up_kernel_view(),

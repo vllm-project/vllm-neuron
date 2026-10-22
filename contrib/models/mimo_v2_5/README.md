@@ -204,7 +204,9 @@ narrow a device fault down to one kernel.
 | `MIMO_V2_5_DECODE_OPT_LEVEL=<n>` | `-O<n>` for the plain decode graph only, via `compiler_args_for` (ignored when you pass `--optimization-level`) |
 
 `MIMO_V2_5_EXPERT_DTYPE=auto|bf16|fp8` is not a diagnostic: it selects the
-routed experts' runtime dtype. See [MiMo-V2.5-Pro](#mimo-v25-pro).
+routed experts' runtime dtype. See [MiMo-V2.5-Pro](#mimo-v25-pro). `MIMO_V2_5_DECODE_SELECTIVE=1|0`
+forces or forbids the selective MoE decode that is otherwise chosen by batch size;
+see [Low-latency decode](#low-latency-decode-ep4-selective-moe).
 
 ## MiMo-V2.5-Pro
 
@@ -381,6 +383,79 @@ done yet.
 python contrib/models/mimo_v2_5/scripts/run.py --model-checkpoint XiaomiMiMo/MiMo-V2.6-Flash-RL
 MIMO_V2_5_PRO_CHECKPOINT=XiaomiMiMo/MiMo-V2.6-Pro-RL \
     pytest contrib/models/mimo_v2_5/test/integration/test_model_pro.py -v -s
+```
+
+## Low-latency decode (EP=4, selective MoE)
+
+The default layout (TP=64, EP=64) suits batched serving. For single-stream latency,
+two settings change the decode step:
+
+1. A batch-1 decode graph: `--max-num-seqs 1` and `"num_seqs_buckets": [1]`. The
+   default BS=32 graph pads every step to 32 rows.
+2. `"ep_degree": 4`. Experts are sharded EP=4 x moe-TP=16, i.e. 64 local experts
+   with `I / 16 = 128` columns each, and decode then takes `moe_tkg`'s **selective**
+   mode.
+
+Why the second setting matters:
+
+- **All-expert** reads every local expert's weights each step. That is
+  `all experts / world` bytes per rank (9.47 GB for V2.6-Flash in BF16), whatever
+  the EP x TP split.
+- **Selective** reads only the `top_k` routed experts' `I / tp` slices, about 25 MB
+  per layer here.
+- The model switches automatically while `tokens x top_k` is below the local expert
+  count (`_use_selective_decode`). That never holds at the default ep_degree 64, so
+  the default decode is unchanged. `MIMO_V2_5_DECODE_SELECTIVE=1` / `0` forces
+  either mode.
+
+Two details the selective path depends on:
+
+- **Affinities must be fp32.** With bf16, the kernel fails to trace
+  (`nisa.tensor_scalar_arith ... must be float32, got bf16`).
+- **Global ids are remapped to local ones.** The kernel indexes the local
+  `[E_L, ...]` weights with `expert_index`. A slot whose expert lives in another EP
+  group points at a local expert the token did not select (affinity 0), so it adds
+  exactly nothing.
+
+MiMo-V2.6-Flash-RL on trn2.48xlarge, SDK 2.33, `scripts/bench.sh` 900 in / 90 out,
+concurrency 1:
+
+| Decode configuration | TPOT median | TTFT median | Output tok/s |
+|---|---|---|---|
+| default: BS=32 graph, EP=64 all-expert | 52.0 ms | 212 ms | 18.6 |
+| BS=1 graph, EP=64 all-expert | 33.7 ms | 212 ms | 28.0 |
+| BS=1 graph, EP=4 all-expert | 41.2 ms | 205 ms | 23.3 |
+| **BS=1 graph, EP=4 selective** | **18.7 ms** | **206 ms** | **48.2** |
+
+Greedy output is unchanged ("The capital of France is" -> " a city that has been a
+center of art, culture, and history for centuries...").
+
+What bounds the remaining step:
+
+- A device profile of the selective step has HBM reads 5x lower than all-expert.
+- The device is busy only ~48% of the step. The rest is spent in the ~2 all-reduces
+  per layer (88 a step) across 64 ranks, which are latency-bound, plus the
+  software-DGE gathers of the selective kernel.
+- Host/device overlap does not move it: `VLLM_NEURON_BATCH_QUEUE_DEPTH=4` and
+  `NEURON_RT_XU_WORKER_ENABLE_LOW_LATENCY_COMPLETION=0` both measure the same
+  17.8 ms with fp8 experts.
+
+fp8 experts (`MIMO_V2_5_EXPERT_DTYPE=fp8`) through `moe_tkg`'s ROW quantization (the
+kernel wrapper called directly, as in the Hy3 contrib port):
+
+- Decode: 17.8 ms.
+- TTFT rises to 254 ms, because fp8 prefill uses the dense torch path.
+- So BF16 experts are the recommended low-latency setting.
+
+```bash
+# low-latency serving of V2.6-Flash-RL / V2.5
+vllm serve <ckpt> --max-model-len 1024 --max-num-seqs 1 --max-num-batched-tokens 1024 \
+  --tensor-parallel-size 64 --enable-expert-parallel --no-enable-prefix-caching --trust-remote-code \
+  --hf-overrides '{"quantization_config": null, "vision_config": null}' \
+  --additional-config '{"neuron_config": {"quantization": "bf16", "ep_degree": 4,
+      "num_batched_tokens_buckets": [1024], "num_seqs_buckets": [1],
+      "on_device_sampling_config": {"all_greedy": true}},
+    "encoder_neuron_config": {"num_encoder_input_buckets": [2048]}}'
 ```
 
 ## Compatibility Matrix
