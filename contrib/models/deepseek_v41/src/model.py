@@ -229,8 +229,18 @@ def _fc_sum(x: torch.Tensor, group_name: str) -> torch.Tensor:
 
 
 def _fc_gather_last(x: torch.Tensor, group_name: str) -> torch.Tensor:
-    """Every rank's `x` concatenated along the last axis."""
-    return _fc_all_gather_tensor(x, -1, group_name)
+    """Every rank's `x` concatenated along the last axis.
+
+    The axis is passed as a non-negative index on purpose. torch 2.13's
+    `all_gather_tensor` rearranges the gathered `[world, ...]` result with
+    `torch._utils._maybe_view_chunk_cat`, whose view fast path slices
+    `shape[1:gather_dim]` and `shape[gather_dim + 1:]` without normalising the
+    dim first, so `-1` builds a shape of twice the rank:
+
+        view(FakeTensor(size=(64, 2048)), [1, 131072, 64, 2048]):
+        shape '[1, 131072, 64, 2048]' is invalid for input of size 131072
+    """
+    return _fc_all_gather_tensor(x, x.dim() - 1, group_name)
 
 
 def _group_name(tp_group) -> str:
@@ -355,6 +365,14 @@ _NARROW_AR_GROUP: list = [None]
 #: across 64 ranks is the one failure this deployment must not have.
 _PP_EMULATE = int(os.environ.get("DEEPSEEK_V41_PP_EMULATE", "0") or 0)
 
+#: `DEEPSEEK_V41_TRACE_INPUTS=1` logs each forward's inputs on rank 0; see `_trace_inputs`.
+_TRACE_INPUTS = os.environ.get("DEEPSEEK_V41_TRACE_INPUTS", "") not in ("", "0")
+_TRACE_STEP = [0]
+#: `DEEPSEEK_V41_DUMP_DIR=<dir>` saves rank 0's per-layer live rows; see `_dump`.
+_DUMP_DIR = os.environ.get("DEEPSEEK_V41_DUMP_DIR", "")
+_DUMP_STEP = [0]
+_DUMP_LIVE = [0]
+
 
 def tp_all_reduce(x: torch.Tensor, tp_group) -> torch.Tensor:
     """Sum `x` across the tensor-parallel ranks. Returns the reduced tensor."""
@@ -382,6 +400,35 @@ def tp_all_gather_last(x: torch.Tensor, tp_group) -> torch.Tensor:
     return _compiled(_fc_gather_last)(x, _group_name(tp_group))
 
 
+#: The plugin's `torch.compile` backend name, resolved once by `_compile_backend`.
+_COMPILE_BACKEND: str | None = None
+
+
+def _compile_backend() -> str:
+    """The backend name every `_nki_entry` compiles against, resolved outside a trace.
+
+    `_nki_entry` is `lru_cache`d, so its first call for a kernel happens wherever
+    that kernel is first used — inside the target's own `torch.compile`d forward,
+    with dynamo inlining this helper. Resolving the name there through
+    `vllm_neuron.envs.get_compile_backend_name` reaches lite's `register()`,
+    which on `libtorch-neuronx-lite` 2.13 probes `torch._dynamo.lookup_backend`,
+    a function dynamo refuses to trace:
+
+        torch._dynamo.exc.Unsupported: Attempted to call function marked as
+        skipped ... `lookup_backend` ... file matches MOD_SKIPLIST
+
+    So the name is resolved once, eagerly, from `DeepseekV41ForCausalLM.__init__`
+    (plain Python, before any compile) and read back as a module constant from
+    then on, which dynamo handles as a string literal.
+    """
+    global _COMPILE_BACKEND
+    if _COMPILE_BACKEND is None:
+        from vllm_neuron.envs import get_compile_backend_name
+
+        _COMPILE_BACKEND = get_compile_backend_name()
+    return _COMPILE_BACKEND
+
+
 @functools.lru_cache(maxsize=None)
 def _nki_entry(module: str, name: str = "kernel", grid: int = 0):
     """A compiled entry point for `kernels.<module>.<name>`.
@@ -399,8 +446,6 @@ def _nki_entry(module: str, name: str = "kernel", grid: int = 0):
     entry point and the two-core kernels assert on the grid they get.
     """
     from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
-
-    from vllm_neuron.envs import get_compile_backend_name
 
     from .kernels import (
         blockquant,
@@ -444,7 +489,7 @@ def _nki_entry(module: str, name: str = "kernel", grid: int = 0):
     entry.__name__ = f"nki_{module}_{name}"
     return torch.compile(
         entry,
-        backend=get_compile_backend_name(),
+        backend=_compile_backend(),
         fullgraph=True,
         options=_COMPILE_OPTIONS,
     )
@@ -623,11 +668,21 @@ def nki_linear(
     scale: torch.Tensor | None,
     storage: str,
     quantize_activation: bool = True,
+    out_fp32: bool = False,
 ) -> torch.Tensor:
-    """`x @ weight.T` on the device, through the matching NKI kernel."""
+    """`x @ weight.T` on the device, through the matching NKI kernel.
+
+    `out_fp32` (fp8 storage only) returns the fp32 accumulator instead of a
+    bf16 rounding of it, for partial sums that are reduced across ranks.
+    """
     k = x.shape[-1]
     flat = x.reshape(-1, k)
     rows = flat.shape[0]
+    if out_fp32:
+        if storage != "fp8" or not quantize_activation:
+            raise ValueError("out_fp32 is implemented for the quantizing fp8 path only")
+        out = _nki_entry("blockquant", "fp8_linear_f32")(flat, weight, scale)
+        return out[:rows].reshape(*x.shape[:-1], out.shape[-1])
     if storage == "bf16":
         out = _nki_entry("blockquant", "bf16_linear")(flat, weight)
     elif storage == "fp32w":
@@ -800,10 +855,21 @@ def fp4_quant_dequant(
     if scale_e4m3:
         amax = amax.clamp_min(6 * 2.0**-9)
         scale = _round_to_bits(amax / _FP4_MAX, _FP8_MANTISSA_BITS, _FP8_MIN_EXP)
+        # An e4m3 scale is not a power of two, and this host's compiled fp32
+        # division is a multiply by an approximate reciprocal: one ulp off on
+        # ~28% of elements (measured 2026-10-22, trn3.48xlarge). The reference
+        # divides exactly, then rounds to e2m1 half-to-even; a bf16 latent over
+        # an e4m3 scale lands on an exact tie (x/s = 5.0, 2.5, ...) often, and
+        # the ulp decides which way it goes, so the compressed KV came out 1.2%
+        # off the reference with 50% errors on tie elements. One Newton step on
+        # the quotient restores the exact value and the reference's rounding.
+        normalized = grouped / scale
+        normalized = normalized - (normalized * scale - grouped) / scale
+        normalized = normalized.clamp(-_FP4_MAX, _FP4_MAX)
     else:
         amax = amax.clamp_min(6 * 2.0**-126)
         scale = _pow2(torch.ceil(torch.log2(amax / _FP4_MAX)))
-    normalized = (grouped / scale).clamp(-_FP4_MAX, _FP4_MAX)
+        normalized = (grouped / scale).clamp(-_FP4_MAX, _FP4_MAX)
     rounded = _round_to_bits(normalized, _FP4_MANTISSA_BITS, _FP4_MIN_EXP)
     return (rounded * scale).reshape(*lead, width).to(x.dtype)
 
@@ -1429,13 +1495,19 @@ class Compressor(nn.Module):
         self.register_buffer("pool_score", None, persistent=False)
 
     def allocate_state(self, device, num_slots: int) -> None:
-        """Allocate the per-slot pooling inputs."""
+        """Allocate the per-slot pooling inputs.
+
+        fp32, as the reference keeps its `kv_state` / `score_state`: the
+        pooling inputs are the fp32 projections `forward` writes, and rounding
+        them to bf16 before the softmax pooling moved the fp4-quantized latent
+        ~1.5% off the reference (isolated at layers 2 and 8, 2026-10-22).
+        """
         if self.compress_ratio > 1:
             self.pool_kv = torch.zeros(
-                num_slots, self.head_dim, dtype=torch.bfloat16, device=device
+                num_slots, self.head_dim, dtype=torch.float32, device=device
             )
             self.pool_score = torch.zeros(
-                num_slots, self.head_dim, dtype=torch.bfloat16, device=device
+                num_slots, self.head_dim, dtype=torch.float32, device=device
             )
 
     def forward(
@@ -1449,9 +1521,18 @@ class Compressor(nn.Module):
             positions = start_pos + torch.arange(seqlen, device=device)
             return self.norm(self.wkv(x)), positions
 
+        # The reference promotes `wkv` / `wgate` to fp32 above ratio 1 and pools
+        # in fp32 ("the softmax pooling above ratio 1 runs in fp32, so those
+        # weights are promoted to fp32 to match", vendor/model.py Compressor).
+        # The bf16 NKI GEMM rounded both projections to bf16 first, and the fp4
+        # round trip after the pooling turns that 0.4% into flipped e2m1
+        # roundings. Plain fp32 matmuls here: [T, 5120] x [5120, 512], small
+        # enough for the tensor engine's fp32 path.
         xf = x.float()
-        paged.write_flat(self.pool_kv, self.wkv(xf).reshape(seqlen, -1))
-        paged.write_flat(self.pool_score, self.wgate(xf).reshape(seqlen, -1))
+        kv_proj = torch.matmul(xf, self.wkv.weight.float().t())
+        score_proj = torch.matmul(xf, self.wgate.weight.float().t())
+        paged.write_flat(self.pool_kv, kv_proj.reshape(seqlen, -1))
+        paged.write_flat(self.pool_score, score_proj.reshape(seqlen, -1))
 
         count = paged.group_counts[ratio]
         if count <= 0:
@@ -1464,7 +1545,7 @@ class Compressor(nn.Module):
         score = self.pool_score.index_select(0, slots).reshape(
             count, ratio, self.head_dim
         )
-        pooled = _nki_entry("compress_pool", "softmax_pool")(kv, score).unsqueeze(0)
+        pooled = (kv * torch.softmax(score, dim=1)).sum(dim=1).unsqueeze(0)
         return self.norm(pooled.to(dtype)), firsts
 
 
@@ -1929,6 +2010,12 @@ class Attention(nn.Module):
         o = torch.cat(
             [o[..., :-rd], apply_rotary_emb(o[..., -rd:], freqs_cis, True)], -1
         )
+        # The reference rounds `o` through fp8 (`act_quant(o, 32, ..., inplace=True)`)
+        # before the grouped `wo_a` einsum; `grouped()` runs the GEMM raw, so do it here.
+        # Measured 2026-10-22: without it layer 0's attention is 3.1% off the reference
+        # and the drift compounds to ~30% by the last layer; with it the port's own
+        # math replicated on CPU matched the device to 0.5%.
+        o = act_quant_dequant(o, 32)
         o = o.reshape(bsz * seqlen, self.n_local_groups, -1)
         o = torch.cat(
             [
@@ -1937,12 +2024,15 @@ class Attention(nn.Module):
             ],
             dim=-1,
         ).reshape(bsz, seqlen, -1)
-        out = self.wo_b(o)
         if self.world_size > 1 and tp_group is not None:
-            out = tp_all_reduce(out.float(), self.attn_group or tp_group)
+            # fp32 partials into the all-reduce: see `fp8_linear_f32`.
+            out = nki_linear(o, self.wo_b.weight, self.wo_b.scale, "fp8", out_fp32=True)
+            out = tp_all_reduce(out, self.attn_group or tp_group)
             if self.replicas > 1:
                 out = out / self.replicas
             out = out.to(dtype)
+        else:
+            out = self.wo_b(o)
         return out
 
     def forward_spans(
@@ -2203,6 +2293,12 @@ class Attention(nn.Module):
             [o[..., :-rd], apply_rotary_emb(o[..., -rd:], freqs_cis, True)], -1
         )
 
+        # The reference rounds `o` through fp8 (`act_quant(o, 32, ..., inplace=True)`)
+        # before the grouped `wo_a` einsum; `grouped()` runs the GEMM raw, so do it here.
+        # Measured 2026-10-22: without it layer 0's attention is 3.1% off the reference
+        # and the drift compounds to ~30% by the last layer; with it the port's own
+        # math replicated on CPU matched the device to 0.5%.
+        o = act_quant_dequant(o, 32)
         o = o.reshape(bsz * seqlen, self.n_local_groups, -1)
         o = torch.cat(
             [
@@ -2211,12 +2307,15 @@ class Attention(nn.Module):
             ],
             dim=-1,
         ).reshape(bsz, seqlen, -1)
-        out = self.wo_b(o)
         if self.world_size > 1 and tp_group is not None:
-            out = tp_all_reduce(out.float(), self.attn_group or tp_group)
+            # fp32 partials into the all-reduce: see `fp8_linear_f32`.
+            out = nki_linear(o, self.wo_b.weight, self.wo_b.scale, "fp8", out_fp32=True)
+            out = tp_all_reduce(out, self.attn_group or tp_group)
             if self.replicas > 1:
                 out = out / self.replicas
             out = out.to(x.dtype)
+        else:
+            out = self.wo_b(o)
         return out
 
 
@@ -2228,12 +2327,10 @@ def _compile_fn(fn):
         skipped ... Dynamo does not know how to trace the builtin
         `time.perf_counter`
     """
-    from vllm_neuron.envs import get_compile_backend_name
-
     _raise_dynamo_limits()
     return torch.compile(
         fn,
-        backend=get_compile_backend_name(),
+        backend=_compile_backend(),
         fullgraph=True,
         options=_COMPILE_OPTIONS,
     )
@@ -2475,6 +2572,28 @@ def _accepted_tail(accepted):
     return seeds, valid.to(torch.int64)
 
 
+_GREEDY_TEMPERATURE_EPS = 1e-5
+
+
+def _greedy_override(sampled: torch.Tensor, greedy_ids: torch.Tensor, sampling_params: torch.Tensor) -> torch.Tensor:
+    """`sampled` with its greedy rows replaced by the gathered-logits argmax.
+
+    `sampled` holds one token per scheduled row (`1 + draft` rows a request
+    under speculation); the greedy flag (temperature column of
+    `sampling_params`, one row per request) is repeated over a request's rows.
+    """
+    greedy = sampling_params[:, 2] < _GREEDY_TEMPERATURE_EPS
+    flat = sampled.reshape(-1)
+    g = greedy_ids.reshape(-1).to(flat.dtype)
+    n = min(int(flat.shape[0]), int(g.shape[0]))
+    reqs = int(greedy.shape[0])
+    reps = n // reqs if reqs and n % reqs == 0 else 1
+    mask = greedy.reshape(-1).repeat_interleave(reps)[:n]
+    head = torch.where(mask, g[:n], flat[:n])
+    out = torch.cat([head, flat[n:]]) if n < flat.shape[0] else head
+    return out.reshape(sampled.shape)
+
+
 def _greedy_rows(logits):
     """`argmax` over the vocabulary, as a compiled step."""
     return logits.argmax(dim=-1)
@@ -2508,7 +2627,10 @@ def _gate_step(
     route_scale,
 ):
     """MoE routing: `sqrtsoftplus` scores, `noaux_tc` selection."""
-    scores = nki_linear(x, weight, None, "bf16").float()
+    # fp32, as the reference's `linear(x.float(), self.weight.float())`: the
+    # bf16 NKI GEMM rounds the scores to bf16, which moves every routing
+    # weight by ~0.4% in every layer. [T, 5120] x [5120, 384] is small.
+    scores = torch.matmul(x.float(), weight.float().t())
     if scoring_func == "softmax":
         scores = scores.softmax(dim=-1)
     elif scoring_func == "sigmoid":
@@ -3065,11 +3187,28 @@ class NgramHashState(nn.Module):
         self.register_buffer("cache", None, persistent=False)
 
     def allocate_state(self, device, num_slots: int) -> None:
-        """The per-slot compressed-id history."""
-        self.cache = torch.full(
-            (num_slots,), self.DEAD, dtype=torch.int64, device=device
-        )
+        """The per-slot compressed-id history, **on the host**.
 
+        The hash is 64-bit integer arithmetic: a compressed id (< 99,092) times
+        a multiplier (~1e13) is ~1e18, and the xor-rolled product is reduced
+        modulo a 16M prime. Compiled for this host's NeuronCores, int64
+        multiply, xor and modulo are evaluated at 32-bit width and wrap, so
+        the device returns a residue that is in range but wrong, and every
+        engram lookup reads the wrong row. Measured 2026-10-22 on
+        trn3.48xlarge (neuronx-cc 2.28): `id * multiplier` came back as the
+        int32-wrapped product on 100% of elements, and the layer-1 engram
+        output was 79% off the reference while its input was 3% off. So the
+        history and the hash stay on the host, where the arithmetic is exact
+        and matches the reference bit for bit; the row indices go to the
+        device as plain int64 that never exceed 2**29.
+        """
+        self.cache = torch.full((num_slots,), self.DEAD, dtype=torch.int64)
+        self._host = {
+            name: getattr(self, name).detach().cpu()
+            for name in ("primes", "offsets", "multipliers", "token_map")
+        }
+
+    @torch._dynamo.disable
     @torch.no_grad()
     def forward(
         self,
@@ -3077,36 +3216,46 @@ class NgramHashState(nn.Module):
         paged: PagedSpan,
         token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Returns `[B, L, n_engram_layers, n_hash_cols]` row indices."""
+        """Returns `[B, L, n_engram_layers, n_hash_cols]` row indices, computed on
+        the host (see `allocate_state`) and moved to `input_ids.device`."""
         if self.cache is None:
             raise RuntimeError(
                 "the n-gram hash state has no slot cache; "
                 "allocate_state() must run before forward()"
             )
+        host = self._host
+        device = input_ids.device
         batch, seqlen = input_ids.shape
-        compressed = self.token_map[input_ids]
+        ids = input_ids.detach().cpu()
+        compressed = host["token_map"][ids]
         if token_mask is not None:
-            compressed = torch.where(token_mask, compressed, self.DEAD)
+            compressed = torch.where(token_mask.detach().cpu(), compressed, self.DEAD)
 
-        positions = paged.pos + torch.arange(seqlen, device=input_ids.device)
-        paged.write_flat(self.cache, compressed.reshape(seqlen))
+        block_size = paged.block_size
+        block_table = paged.block_table.detach().cpu()
+        slot_mapping = paged.slot_mapping.detach().cpu()
+        positions = paged.start_pos + torch.arange(seqlen)
+        self.cache.index_copy_(0, slot_mapping[:seqlen], compressed.reshape(seqlen))
+
+        def slots(pos: torch.Tensor) -> torch.Tensor:
+            return block_table[pos // block_size] * block_size + pos % block_size
 
         positions = positions.unsqueeze(0).expand(batch, seqlen)
         tokens, blocked = [], torch.zeros_like(positions, dtype=torch.bool)
         for shift in range(self.max_ngram_size):
             source = self.cache.index_select(
-                0, paged.slots((positions - shift).clamp_min(0).reshape(-1))
+                0, slots((positions - shift).clamp_min(0).reshape(-1))
             ).reshape(batch, seqlen)
             blocked = blocked | (positions < shift) | (source == self.DEAD)
             tokens.append(torch.where(blocked, self.pad_id, source))
         stacked = torch.stack(tokens, dim=-1)
 
-        products = stacked.unsqueeze(2) * self.multipliers
+        products = stacked.unsqueeze(2) * host["multipliers"]
         rolling, hashes = products[..., 0], []
         for i in range(1, self.max_ngram_size):
             rolling = torch.bitwise_xor(rolling, products[..., i])
-            hashes.append(rolling.unsqueeze(-1) % self.primes[:, i - 1])
-        return torch.cat(hashes, dim=-1) + self.offsets
+            hashes.append(rolling.unsqueeze(-1) % host["primes"][:, i - 1])
+        return (torch.cat(hashes, dim=-1) + host["offsets"]).to(device)
 
 
 def _engram_gather(
@@ -3242,7 +3391,10 @@ class HyperConnections(nn.Module):
         hc = self.hc_mult
         lead = x.shape[:2]
         rows = x.flatten(2).reshape(-1, hc * self.hidden_size)
-        raw = nki_linear(rows, self.fn, None, "fp32w")
+        # fp32, as the reference's `F.linear(x.float(), hc_fn)`: the `fp32w`
+        # kernel narrows both operands and its output to bf16, and the three
+        # coefficient sets (sigmoids and a Sinkhorn) come straight out of it.
+        raw = torch.matmul(rows.float(), self.fn.t())
         pre, post, comb = _nki_entry("hc_mixes")(
             raw, rows, self.base.reshape(1, -1), self.scale.reshape(1, 3)
         )
@@ -3529,6 +3681,12 @@ class DSparkAttention(Attention):
         o = torch.cat(
             [o[..., :-rd], apply_rotary_emb(o[..., -rd:], freqs, True)], dim=-1
         )
+        # The reference rounds `o` through fp8 (`act_quant(o, 32, ..., inplace=True)`)
+        # before the grouped `wo_a` einsum; `grouped()` runs the GEMM raw, so do it here.
+        # Measured 2026-10-22: without it layer 0's attention is 3.1% off the reference
+        # and the drift compounds to ~30% by the last layer; with it the port's own
+        # math replicated on CPU matched the device to 0.5%.
+        o = act_quant_dequant(o, 32)
         o = o.reshape(bsz * block_size, self.n_local_groups, -1)
         o = torch.cat(
             [
@@ -3537,12 +3695,15 @@ class DSparkAttention(Attention):
             ],
             dim=-1,
         ).reshape(bsz, block_size, -1)
-        out = self.wo_b(o)
         if self.world_size > 1 and tp_group is not None:
-            out = tp_all_reduce(out.float(), self.attn_group or tp_group)
+            # fp32 partials into the all-reduce: see `fp8_linear_f32`.
+            out = nki_linear(o, self.wo_b.weight, self.wo_b.scale, "fp8", out_fp32=True)
+            out = tp_all_reduce(out, self.attn_group or tp_group)
             if self.replicas > 1:
                 out = out / self.replicas
             out = out.to(x.dtype)
+        else:
+            out = self.wo_b(o)
         return out
 
 
@@ -3751,6 +3912,10 @@ class DeepseekV41ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.neuron_config = config.neuron_config
+
+        # Resolve the NKI entries' compile backend here, in plain Python, so no
+        # traced forward has to; see `_compile_backend`.
+        _compile_backend()
 
         tp_group = get_tp_group()
         self.tp_group = tp_group
@@ -4374,6 +4539,39 @@ class DeepseekV41ForCausalLM(nn.Module):
             len(kv_caches),
             own_bytes / 2**30,
         )
+        if os.environ.get("DEEPSEEK_V41_CHECK_COLLECTIVES", "") not in ("", "0"):
+            self._check_collectives(device)
+
+    @torch._dynamo.disable
+    def _check_collectives(self, device) -> None:
+        """`DEEPSEEK_V41_CHECK_COLLECTIVES=1`: sum/gather known values over every
+        group this port reduces over, and log whether the runtime got them right.
+        """
+        r = self.rank
+        x = torch.full((1024,), float(r), dtype=torch.float32, device=device)
+        world_sum = tp_all_reduce(x, self.tp_group).cpu()
+        attn_sum = tp_all_reduce(x, self.attn_tp_group).cpu()
+        gathered = tp_all_gather_last(x[:4].contiguous(), self.tp_group).cpu()
+        world_ranks = list(range(self.world_size))
+        attn_ranks = list(getattr(self.attn_tp_group, "ranks", world_ranks))
+        exp_world = float(sum(world_ranks))
+        exp_attn = float(sum(attn_ranks))
+        exp_gather = torch.tensor(
+            [float(i) for i in world_ranks for _ in range(4)]
+        )
+        ok_world = bool((world_sum == exp_world).all())
+        ok_attn = bool((attn_sum == exp_attn).all())
+        ok_gather = bool((gathered == exp_gather).all())
+        logger.warning(
+            "deepseek_v41 COLLECTIVES rank=%d attn_group=%s | world all-reduce %s "
+            "(got %s expected %s) | attn all-reduce %s (got %s expected %s) | "
+            "all-gather %s (got %s)",
+            r, attn_ranks, "OK" if ok_world else "WRONG",
+            world_sum.unique().tolist(), exp_world,
+            "OK" if ok_attn else "WRONG", attn_sum.unique().tolist(), exp_attn,
+            "OK" if ok_gather else "WRONG",
+            gathered.reshape(-1, 4)[:, 0].tolist() if not ok_gather else "expected",
+        )
 
 
     def allocate_staging_buffers(self, device: torch.device) -> None:
@@ -4551,6 +4749,8 @@ class DeepseekV41ForCausalLM(nn.Module):
             live_spans, meta, int(input_ids.shape[0]), rows_per_seq
         )
         paged = self._paged_spans(spans, bucket_meta, len(live_spans))
+        if _TRACE_INPUTS:
+            self._trace_inputs(input_ids, positions, meta, live_spans, spans)
         live_lengths = [length for _, length, _ in live_spans]
         # `_draft` indexes its per-row tensors by span, so a bucket that added
         # spans has to extend this too. The drafts those rows produce are
@@ -4565,6 +4765,9 @@ class DeepseekV41ForCausalLM(nn.Module):
 
         hidden = self.embed_input_ids(input_ids)
         hidden = NF.merge_prompt_embeds(hidden, inputs_embeds, is_token_ids)
+        if _DUMP_DIR:
+            _DUMP_LIVE[0] = live_rows
+            self._dump("embed", hidden, live_rows)
         stream, pre_mix = _nki_entry("hc_expand")(hidden.unsqueeze(0))
         stream, pre_mix = stream.squeeze(0), pre_mix.squeeze(0)
 
@@ -4593,6 +4796,9 @@ class DeepseekV41ForCausalLM(nn.Module):
             if block.engram is not None:
                 index = list(self.config.engram_layer_ids).index(layer_id)
                 rows = self._engram_rows(layer_id, hashes, index, stream.device)
+                if _DUMP_DIR:
+                    self._dump(f"engram{layer_id}_rows", rows.reshape(rows.shape[1], *rows.shape[2:]), live_rows)
+                    self._dump(f"engram{layer_id}_hashes", hashes.reshape(hashes.shape[1], *hashes.shape[2:]), live_rows)
                 if owns:
                     updated = block.engram(
                         stream[:bucket_rows].unsqueeze(0), rows, None
@@ -4613,9 +4819,14 @@ class DeepseekV41ForCausalLM(nn.Module):
             if layer_id in target_layers:
                 main_hiddens.append(_compiled(_dspark_tap)(stream))
             if owns:
+                if _DUMP_DIR and block.engram is not None:
+                    self._dump(f"engram{layer_id}", stream, live_rows)
                 stream, pre_mix = self._run_block(
                     block, stream, pre_mix, slices, paged, shared, bucket_rows
                 )
+                if _DUMP_DIR:
+                    self._dump(f"layer{layer_id}", stream, live_rows)
+                    self._dump(f"premix{layer_id}", pre_mix, live_rows)
             if self.pp_size > 1 and (
                 layer_id + 1 == len(self.layers)
                 or self.block_stage[layer_id + 1] != self.block_stage[layer_id]
@@ -4627,6 +4838,9 @@ class DeepseekV41ForCausalLM(nn.Module):
 
         collapsed = HyperConnections.pre(stream.unsqueeze(0), pre_mix.unsqueeze(0))
         collapsed = self.norm(collapsed).squeeze(0)
+        if _DUMP_DIR:
+            self._dump("final_normed", collapsed, live_rows)
+            self._dump("input_ids", input_ids, live_rows)
 
         selected = collapsed
         if sampling_positions is not None:
@@ -4654,10 +4868,9 @@ class DeepseekV41ForCausalLM(nn.Module):
                 logit_mask = torch.cat(
                     [logit_mask, logit_mask.new_zeros(pad_shape)], dim=-1
                 )
-        sampled = _block_entry(self.sampler, "forward")(
-            logits_shard, sampling_params, logit_mask, rank
-        )
-
+        sampled = self._sampler_entry()(logits_shard, sampling_params, logit_mask, rank)
+        if _TRACE_INPUTS:
+            self._trace_sampler(logits_shard, logits, sampled, rank, sampling_params)
         accepted = None
         if spec_decode_metadata is not None:
             accepted = _compiled(_rejection_sample)(
@@ -4927,6 +5140,110 @@ class DeepseekV41ForCausalLM(nn.Module):
         return rows
 
     @torch._dynamo.disable
+    def _dump(self, name: str, tensor: torch.Tensor, live_rows: int) -> None:
+        """`DEEPSEEK_V41_DUMP_DIR`: save the live rows of `tensor` from rank 0, one
+        file per forward and name, for comparison against a reference."""
+        if self.rank != 0:
+            return
+        step = _DUMP_STEP[0]
+        if name == "embed":
+            _DUMP_STEP[0] = step = step + 1
+        os.makedirs(_DUMP_DIR, exist_ok=True)
+        torch.save(tensor[:live_rows].detach().cpu(), os.path.join(_DUMP_DIR, f"step{step}_{name}.pt"))
+
+    def _sampler_entry(self):
+        """The plugin sampler plus the greedy override, as **one** compiled graph
+        with exactly the sampler's inputs.
+
+        The plugin's distributed sampler returned rank 0's local argmax instead
+        of the global one on this host (measured 2026-10-22: the gathered top
+        was token 2581 at 33.75, the sampler chose 671 at 24.0 on every rank),
+        so greedy rows take the argmax of the gathered logits instead, from the
+        shard, inside the same graph: anything handed across a graph boundary
+        here (a narrowed `logits`, a parameter column) tripped the native
+        backend's `Expected self.is_contiguous()` input check.
+        """
+        fn = self.__dict__.get("_sampler_entry_fn")
+        if fn is None:
+            sampler, group_name = self.sampler, _group_name(self.tp_group)
+
+            def sample(logits_shard, sampling_params, logit_mask, rank):
+                sampled = sampler.forward(logits_shard, sampling_params, logit_mask, rank)
+                if sampling_params is None:
+                    return sampled
+                greedy_ids = _fc_gather_last(logits_shard, group_name).argmax(dim=-1)
+                return _greedy_override(sampled, greedy_ids, sampling_params)
+
+            fn = self.__dict__["_sampler_entry_fn"] = _compile_fn(sample)
+        return fn
+
+    @torch._dynamo.disable
+    def _trace_sampler(self, logits_shard, logits, sampled, rank, sampling_params) -> None:
+        """`DEEPSEEK_V41_TRACE_INPUTS=1`: what the sampler saw and chose, per rank."""
+        ls = logits_shard.detach().float().cpu()
+        lv, li = ls[-1].topk(3)
+        msg = (f"deepseek_v41 SAMPLER rank={self.rank} part_vocab={self.part_vocab_size} pad={self.vocab_pad} "
+               f"rank_arg={None if rank is None else rank.detach().cpu().reshape(-1).tolist()} "
+               f"local_top3={[(int(i) + self.rank * self.part_vocab_size, round(float(v), 2)) for v, i in zip(lv, li)]} "
+               f"sampled={sampled.detach().cpu().reshape(-1).tolist()[:8]}")
+        if self.rank == 0:
+            lg = logits.detach().float().cpu()
+            gv, gi = lg[-1].topk(5)
+            msg += (f" | gathered_top5={[(int(i), round(float(v), 2)) for v, i in zip(gv, gi)]} "
+                    f"gathered_shape={tuple(lg.shape)} params={None if sampling_params is None else sampling_params.detach().cpu().reshape(-1).tolist()[:3]}")
+        # eager probes of the plugin's distributed top-k (collective: every rank runs them)
+        try:
+            from vllm_neuron.functional.topk import topk as plugin_topk
+            from torch.distributed._functional_collectives import all_gather_tensor
+            grp = self.tp_group.device_group
+            # Compiled probes (collectives only run inside compiled graphs here):
+            # the same all-gather with the ProcessGroup object the plugin's
+            # sampler passes, and with the group *name* this port passes.
+            row = logits_shard.detach()[-1:].contiguous()           # fp32 already
+            lv, li = row.topk(256, dim=-1)
+            lv, li = lv.contiguous(), (li + self.rank * self.part_vocab_size).contiguous()
+            name = _group_name(self.tp_group)
+            g_obj = _compiled(lambda v: all_gather_tensor(v, 1, group=grp))(lv)
+            g_name = _compiled(lambda v: all_gather_tensor(v, 1, group=name))(lv)
+            gi_name = _compiled(lambda v: all_gather_tensor(v.to(torch.float32), 1, group=name))(li)
+            v_e, i_e = _compiled(lambda r: plugin_topk(r, 256, -1, -1, process_group=grp, rank=rank))(row)
+            h_obj, h_name, h_gi = g_obj.cpu().reshape(-1), g_name.cpu().reshape(-1), gi_name.cpu().reshape(-1)
+            v_h, i_h = v_e.cpu().reshape(-1), i_e.cpu().reshape(-1)
+            if self.rank == 0:
+                chunks_obj = int((h_obj.reshape(-1, 256).abs().sum(-1) > 0).sum()); chunks_name = int((h_name.reshape(-1, 256).abs().sum(-1) > 0).sum())
+                j = int(h_name.argmax())
+                msg += (f" | compiled all_gather(group=object): width {h_obj.numel()} nonzero_chunks {chunks_obj} max {float(h_obj.max()):.2f}"
+                        f" | all_gather(group=name): width {h_name.numel()} nonzero_chunks {chunks_name} max {float(h_name.max()):.2f} at idx {int(h_gi[j])}"
+                        f" | compiled plugin_topk top3={[(int(i), round(float(v), 2)) for v, i in zip(v_h[:3], i_h[:3])]}")
+        except Exception as e:  # noqa: BLE001 - diagnostics only
+            msg += f" | eager probe failed: {type(e).__name__}: {str(e)[:160]}"
+        logger.warning(msg)
+
+    @torch._dynamo.disable
+    def _trace_inputs(self, input_ids, positions, meta, live_spans, spans) -> None:
+        """`DEEPSEEK_V41_TRACE_INPUTS=1`: log what one forward was handed, on rank 0."""
+        if self.rank != 0:
+            return
+        ids = input_ids.reshape(-1).tolist()
+        pos = positions.reshape(-1).tolist()
+        slots = meta["slot_mapping"].reshape(-1).tolist()
+        table = meta.get("full_block_table_tensor")
+        if table is None:
+            table = meta.get("block_table_tensor")
+        row0 = table[0].tolist()[:12] if table is not None and table.ndim == 2 else None
+        _TRACE_STEP[0] += 1
+        logger.warning(
+            "deepseek_v41 TRACE step=%d rows=%d live_spans=%s spans=%s "
+            "ids[:8]=%s ids[-8:]=%s pos[:4]=%s pos[-6:]=%s slots[:4]=%s slots[-6:]=%s "
+            "block_size=%s table[0][:12]=%s cached_seq_len=%s kv_segment_size=%s",
+            _TRACE_STEP[0], len(ids), live_spans, spans, ids[:8], ids[-8:],
+            pos[:4], pos[-6:], slots[:4], slots[-6:], meta.get("block_size"), row0,
+            (meta.get("cached_seq_len").reshape(-1).tolist()
+             if meta.get("cached_seq_len") is not None else None),
+            meta.get("kv_segment_size"),
+        )
+
+    @torch._dynamo.disable
     def _sequence_spans(
         self,
         positions: torch.Tensor,
@@ -5045,6 +5362,9 @@ class DeepseekV41ForCausalLM(nn.Module):
             block, "attn_half"
         )(stream, pre_mix, slices, paged, shared, tp_group, io_residual, io_normed)
         ffn_out = block.ffn(normed, None, self.weight_store, tp_group, row_count)
+        if _DUMP_DIR:
+            self._dump(f"normed{block.attn.layer_id}", normed.reshape(-1, normed.shape[-1]), _DUMP_LIVE[0])
+            self._dump(f"ffn_out{block.attn.layer_id}", ffn_out.reshape(-1, ffn_out.shape[-1]), _DUMP_LIVE[0])
         return _compiled(_post_into)(
             io_stream, ffn_out, residual, ffn_post, ffn_comb
         ), ffn_pre.squeeze(0)

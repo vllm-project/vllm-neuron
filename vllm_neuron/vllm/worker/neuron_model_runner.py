@@ -1836,10 +1836,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             if encoder_capture is not None:
                 encoder_capture.register_clear_hook(fresh_encoder)
         drafter = getattr(self, "drafter", None)
-        if drafter is not None:
+        # An in-model proposer (one registered through `spec_decode.register_proposer`)
+        # drafts inside the target's own forward, so it owns no separately compiled
+        # model and sets no `compile_kwargs`. The target's fresh wrapper above already
+        # covers its draft stages; there is nothing of its own to wrap again.
+        compile_kwargs = getattr(drafter, "compile_kwargs", None)
+        if drafter is not None and compile_kwargs is not None:
             drafter.model = torch.compile(
                 getattr(drafter.model, "_orig_mod", drafter.model),
-                **drafter.compile_kwargs,
+                **compile_kwargs,
             )
             draft_capture = getattr(self, "_draft_tensor_capture", None)
             if draft_capture is not None:

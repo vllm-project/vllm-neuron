@@ -79,7 +79,7 @@ Pass `quantization="fp8"` or leave it unset. Anything else is rejected by
 | Concurrency (`max_num_seqs > 1`) | **Not supported** | Kept at 1. Uncapped runs stalled mid-decode in the measured pass; the span and `num_seqs` graph axes are bucketed, but the ragged-draft axis is not yet bounded. |
 | Vision tower | **Not supported** | The checkpoint carries one; it is off the tokens-to-logits path and not placed by the floorplan. `factory.py` rejects `mm_encoder_only`. |
 | `--runner generate` | **Not supported** | Rejected by the factory. |
-| Trn3 | **Not tested** | Kernels target Trainium2. |
+| Trn3 | **Working** | SDK 2.33 on `trn3.48xlarge`, the integration test passing; see the model README's Trn3 section for what changed. |
 
 ## A note on the comments
 

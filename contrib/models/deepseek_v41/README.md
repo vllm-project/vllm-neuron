@@ -151,7 +151,7 @@ Neuron SDK versions and instance types this model was tested with.
 
 | Instance / SDK version | 2.33       | 2.32       | 2.31 and earlier |
 | ---------------------- | ---------- | ---------- | ---------------- |
-| Trn3                   | Not tested | Not tested | Not tested       |
+| Trn3                   | Working    | Not tested | Not tested       |
 | Trn2                   | Working    | Working    | Not tested       |
 
 Trn1 is not applicable: the checkpoint does not fit, and the port's kernels
@@ -172,6 +172,46 @@ The exact stack behind the "Working" cells:
 | Runtime (`aws-neuronx-runtime-lib`) | 2.35.30.0 | — |
 | Collectives (`aws-neuronx-collectives`) | 2.35.43.0 | — |
 | Tools (`aws-neuronx-tools`) | 2.33.38.0 | — |
+
+### Trn3 on SDK 2.33 (vllm-neuron 0.29.0.1.2.0)
+
+Validated 2026-10-22 on a `trn3.48xlarge` (16 devices, 64 logical cores at
+LNC=2, 144 GB each) with the integration test below: both expected substrings
+matched, the needle included. The stack was the stock DLAMI venv
+`aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0`: vLLM 0.29.0, torch and
+torch-xla 2.13.0, `libtorch-neuronx-lite` 2.13.0.1.0.3112, `neuronx-cc`
+2.28.7631.0, `nki` 0.7.0, runtime 2.35.30.0, driver 2.31.7.0.
+
+Bringing the port up there needed changes in both the plugin and the model;
+each is commented at its site with the measurement that motivated it:
+
+- **Plugin** (`vllm_neuron/`): the 0.29 runner's `redecorate_compiled_model`
+  skips drafters without `compile_kwargs` (an in-model proposer has none); the
+  Trn2 8x8 expert mesh in `neuron_parallel_state._build_2d_mesh` applies to the
+  `trn2` family only, since its device pairs are not linked on Trn3's switch
+  topology and the runtime refuses the group; a new
+  `patches/dynamo_recompile_reason_patch.py` makes torch 2.13's
+  recompilation-reason report best-effort.
+- **Device numerics** (`src/model.py`): int64 multiply, xor and modulo in
+  compiled graphs are evaluated at 32-bit width on this host, so the engram
+  n-gram hash runs on the host (`NgramHashState`); compiled fp32 division is
+  one ulp off, which flips e2m1 ties, so the e4m3-scaled fp4 path refines its
+  quotient (`fp4_quant_dequant`); the compile backend name is resolved outside
+  any trace; the logits gather passes a non-negative dim.
+- **Reference fidelity** (`src/model.py`, found by per-layer comparison against
+  the checkpoint's own `inference/` code on CPU): the attention output is
+  rounded through fp8 before the grouped `wo_a` as the reference does; the
+  compressor projects and pools in fp32; `hc_mixes`' projection, the router
+  scores and the sharded `wo_b` partials stay fp32 (`fp8_linear_f32`).
+- **Sampling**: the plugin's distributed top-k sampler returned rank 0's local
+  argmax instead of the global one here, so greedy rows take the argmax of the
+  gathered logits inside the sampler's graph (`_sampler_entry`). Non-greedy
+  rows still go through the plugin sampler.
+
+`DEEPSEEK_V41_TRACE_INPUTS=1`, `DEEPSEEK_V41_DUMP_DIR=<dir>` and
+`DEEPSEEK_V41_CHECK_COLLECTIVES=1` are the diagnostics that found these; all
+are off by default. Throughput on Trn3 has not been measured, and the n-gram
+hash now costs one small device-to-host copy of the step's token ids.
 
 > **Read this before you deploy.** Every number in this contribution was
 > measured on `vllm-neuron` **0.24.0.1.1.0**, which is the branch the model was

@@ -293,7 +293,7 @@ def _dequant_fp4(w_u8, s_u8, dst_hbm, n, k):
         )
 
 
-def _gemm(x_hbm, w_hbm, dst_hbm, m, k, n, out_scale=1.0, qdq=False, w_kmajor=False):
+def _gemm(x_hbm, w_hbm, dst_hbm, m, k, n, out_scale=1.0, qdq=False, w_kmajor=False, out_dtype=nl.bfloat16):
     """`dst[m, n] = x[m, k] @ w[n, k].T`, both operands bf16 in HBM."""
     ktiles = k // PT
     nt = _ntile(n)
@@ -344,9 +344,9 @@ def _gemm(x_hbm, w_hbm, dst_hbm, m, k, n, out_scale=1.0, qdq=False, w_kmajor=Fal
                         accumulate=(kb > 0),
                     )
                 if out_scale == 1.0:
-                    row = nl.copy(acc, dtype=nl.bfloat16)
+                    row = nl.copy(acc, dtype=out_dtype)
                 else:
-                    row = nl.ndarray((PT, nt), dtype=nl.bfloat16, buffer=nl.sbuf)
+                    row = nl.ndarray((PT, nt), dtype=out_dtype, buffer=nl.sbuf)
                     nisa.tensor_scalar(
                         dst=row, data=acc, op0=nl.multiply, operand0=out_scale
                     )
@@ -410,6 +410,30 @@ def fp8_linear(x, w, scale):
     _stage_rows(x, m, k, xq, True)
     _dequant_fp8(w, scale, wd, n, k)
     _gemm(xq, wd, out, mpad, k, n)
+    return out
+
+
+@nki.jit
+def fp8_linear_f32(x, w, scale):
+    """`fp8_linear` with the fp32 accumulator stored as **fp32**.
+
+    For a row-parallel projection whose partial sums are all-reduced across
+    ranks: the reference runs one K=8192 GEMM and rounds once, while rounding
+    each of 8 K-shards to bf16 before the sum costs ~0.25% on the attention
+    output (measured 2026-10-22 on the layer-0 `wo_b`, real weights).
+    """
+    m, k = x.shape
+    n = w.shape[0]
+    _check(k, n)
+    mpad = -(-m // PT) * PT
+
+    out = nl.ndarray((mpad, n), dtype=nl.float32, buffer=nl.shared_hbm)
+    xq = nl.ndarray((mpad, k), dtype=nl.bfloat16, buffer=nl.private_hbm)
+    wd = nl.ndarray((n, k), dtype=nl.bfloat16, buffer=nl.private_hbm)
+
+    _stage_rows(x, m, k, xq, True)
+    _dequant_fp8(w, scale, wd, n, k)
+    _gemm(xq, wd, out, mpad, k, n, out_dtype=nl.float32)
     return out
 
 

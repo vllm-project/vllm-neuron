@@ -275,6 +275,16 @@ from vllm_neuron.vllm.patches.accelerator_empty_cache_patch import (
 
 apply_accelerator_empty_cache_patch()
 
+# dynamo's recompilation-reason report evaluates the old entry's tensor-aliasing
+# sources against the new frame's locals with no error handling; a frame
+# re-entered with a module lacking a submodule the earlier entry had raises
+# KeyError out of the diagnostic and kills the forward. See the patch module.
+from vllm_neuron.vllm.patches.dynamo_recompile_reason_patch import (
+    apply_dynamo_recompile_reason_patch,
+)
+
+apply_dynamo_recompile_reason_patch()
+
 # Replica-mesh patches are installed by NeuronWorker.init_device() right before
 # it calls _init_neuron_distributed_environment_and_runtime(). That location
 # runs *after* vLLM has finished importing (avoiding the vllm.utils.torch_utils
