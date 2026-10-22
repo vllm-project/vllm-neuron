@@ -74,6 +74,7 @@ from vllm_neuron.functional.attention.attention_decode_mask import (
     _resize_block_len as _mask_resize_block_len,
     P_MAX as _MASK_P_MAX,
     maybe_transpose_mask_for_qk_swap,
+    relayout_block_kv_mask,
 )
 
 _PMAX = 128
@@ -1290,6 +1291,48 @@ def _torch_attention_decode_impl(
     return output, K_out, V_out
 
 
+def _fold_gqa_block_kv_mask(
+    attention_mask: Optional[Tensor],
+    X: Tensor,
+    W_qkv: Tensor,
+    V_cache: Optional[Tensor],
+    active_blocks_table: Optional[Tensor],
+) -> Optional[Tensor]:
+    """Give a GQA block-KV mask the layout of the kernel's folded batch.
+
+    The caller builds the mask for ``(B, q_heads)``. With ``kv_heads > 1`` the
+    kernel folds KV heads into the batch (``B * kv_heads`` batches of
+    ``q_heads // kv_heads`` heads) and resizes block_len for that folded shape.
+    The resize can differ from the one the mask was built with, for example at
+    an odd batch with ``B * q_heads * S >= 128``. The kernel then reads prior
+    and active rows from the wrong positions. The output is wrong, and nothing
+    fails. Move the mask to the folded layout here, so every caller gets it.
+    """
+    if (
+        attention_mask is None
+        or attention_mask.dim() != 4
+        or V_cache is None
+        or V_cache.dim() != 4
+        or active_blocks_table is None
+    ):
+        return attention_mask
+    kv_heads = V_cache.shape[1]
+    if kv_heads <= 1:
+        return attention_mask
+    block_len = V_cache.shape[2]
+    B, S_tkg, _ = X.shape
+    d_head = V_cache.shape[-1]
+    q_heads = W_qkv.shape[1] // d_head - 2 * kv_heads
+    s_ctx = active_blocks_table.shape[-1] * block_len
+    if attention_mask.shape != (s_ctx, B, q_heads, S_tkg):
+        return attention_mask
+    from_bl = _mask_resize_block_len(block_len, B, q_heads, S_tkg, s_ctx)
+    to_bl = _mask_resize_block_len(
+        block_len, B * kv_heads, q_heads // kv_heads, S_tkg, s_ctx
+    )
+    return relayout_block_kv_mask(attention_mask, from_bl, to_bl)
+
+
 # ---------------------------------------------------------------------------
 # Kernel eligibility check
 # ---------------------------------------------------------------------------
@@ -1708,6 +1751,10 @@ def attention_decode(
     # _can_use_attention_block_kernel.
 
     if can_use_kernel:
+        if pos_ids is None and dcp_size == 1:
+            attention_mask = _fold_gqa_block_kv_mask(
+                attention_mask, X, W_qkv, V_cache, active_blocks_table
+            )
         # Bumped nkilib may select the QK-swap path for this shape and then
         # expect the transposed mask layout. Only the full pre-generated mask
         # (pos_ids is None) is transposed; the fused mask-gen mask is not.
