@@ -11,8 +11,8 @@ That is the same fused-draft contract as EAGLE3 (KV update pass plus an
 unrolled recurrent loop in one NEFF, on-device accepted-token extraction), so
 this proposer reuses :class:`EagleProposer` and changes only what differs:
 
-* the target hands over one hidden state per token (its final, post-norm
-  output) instead of three concatenated auxiliary layers;
+* the target hands over one hidden state per token (its last layer's output,
+  before the final norm) instead of three concatenated auxiliary layers;
 * the draft layer count comes from ``n_predict`` (vLLM keeps the target's
   ``num_hidden_layers`` in the draft config);
 * the draft has no embedding or lm_head of its own and aliases the target's.
@@ -29,11 +29,14 @@ req_indices_per_token) -> (tokens [bs, 1+k], drafts [bs, k], logits)``,
 ``get_kv_spec``, ``bind_kv_cache``, ``load_weights``):
 
 * ``alias_target_weights(target_model)``: share the target's embedding /
-  lm_head instead of loading copies.
+  lm_head (and final norm, which the draft applies to the hidden state it
+  receives) instead of loading copies.
 
-Target model contract: ``set_aux_hidden_state_layers(layers)`` where a layer
-index equal to ``num_hidden_layers`` selects the final post-norm hidden state;
-the target then returns it as the auxiliary hidden states.
+Target model contract: ``set_aux_hidden_state_layers(layers)`` with the usual
+Neuron capture convention (index i = input of layer i), so index
+``num_hidden_layers`` is the last layer's output before the final norm. Return
+pre-norm states: returning the post-norm states that also feed the lm_head as
+a second graph output corrupted the lm_head rows for batch > 1 on Neuron.
 """
 
 import logging
@@ -72,10 +75,10 @@ class MTPProposer(EagleProposer):
         return hidden_size
 
     def get_target_aux_hidden_state_layers(self) -> tuple[int, ...]:
-        """Ask the target for its final post-norm hidden state.
+        """Ask the target for its last layer's output (before the final norm).
 
-        Index ``num_hidden_layers`` (one past the last decoder layer) means the
-        output of the final norm.
+        Index ``num_hidden_layers`` is the input of the (non-existent) next
+        layer, i.e. the last decoder layer's output.
         """
         return (self.vllm_config.model_config.hf_config.num_hidden_layers,)
 
