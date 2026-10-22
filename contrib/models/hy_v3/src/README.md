@@ -43,6 +43,11 @@ tencent/Hy3-FP8: ~295B-parameter MoE decoder with a static per-tensor FP8 checkp
     busiest rank, where `moe_tkg` computes all 3 (all-expert) or 8 slots
     (selective, the non-local ones on a dummy expert). `HY3_DECODE_HITS=0`
     restores `moe_tkg`.
+  - decode, 2 to 4 tokens per 3 local experts (EP=64: 4, EP=32: 8):
+    `kernels/moe_tkg_hits_batch.py`, from nkilib's `all_expert_impl`. The
+    model packs this rank's experts that any token routed to first, with
+    their affinity columns; the kernel loops over them at runtime and reads
+    each once for the whole batch. `HY3_DECODE_HITS_MAX_T` sets the limit.
   - decode, more tokens: the `moe_tkg` kernel (STATIC, all-expert; selective
     when tokens x top_k < local experts, or `HY3_DECODE_SELECTIVE=1`).
     `NF.moe_tkg` only admits MX / BF16 weights, so the model calls the kernel

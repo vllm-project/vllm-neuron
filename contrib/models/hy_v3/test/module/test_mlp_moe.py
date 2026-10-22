@@ -321,3 +321,49 @@ def test_routed_experts_tkg_hits(ckpt, hits):
     err = rel_err(out, _experts_reference(ckpt, layer, x, aff))
     print(f"moe_tkg_hits hits={hits}: rel_err={err:.3e}")
     assert err < REL_TOL
+
+
+@pytest.mark.parametrize("tokens", [2, 4])
+def test_routed_experts_tkg_hits_batch(ckpt, tokens):
+    """A few-token decode over only the local experts the batch routed to."""
+    torch.manual_seed(0)
+    layer = 1
+    w = _expert_tensors(ckpt, layer)
+    ln_w = ckpt.get(f"model.layers.{layer}.post_attention_layernorm.weight").float()
+    x = (torch.randn(tokens, H) * ln_w).to(torch.bfloat16)
+    aff, idx = _route(ckpt, layer, x)
+    # Route token 0 to local expert 0 and token 1 to local experts 0 and 2;
+    # every other slot (and expert 1) stays off rank 0. The batch path reads
+    # the hits from idx, so idx and aff must agree.
+    aff[:, :L] = 0
+    for t in range(tokens):
+        for j in range(K):
+            if idx[t, j] < L:
+                idx[t, j] = L + j
+    idx[0, 0], aff[0, 0] = 0, 0.5
+    idx[1, 0], aff[1, 0] = 0, 0.3
+    idx[1, 1], aff[1, 2] = 2, 0.25
+
+    class M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            for k, v in w.items():
+                self.register_buffer(k, v)
+
+        def forward(self, x, aff, idx):
+            rank_id = torch.zeros((1, 1), dtype=torch.int32, device=x.device)
+            return hy_model.routed_experts_tkg_hits_batch(
+                x,
+                aff,
+                idx,
+                rank_id,
+                self.gate_up,
+                self.down,
+                self.gate_up_scale_tkg,
+                self.down_scale_tkg,
+            )
+
+    out = compile_and_run(M(), x, aff, idx.to(torch.int32))
+    err = rel_err(out, _experts_reference(ckpt, layer, x, aff))
+    print(f"moe_tkg_hits_batch T={tokens}: rel_err={err:.3e}")
+    assert err < REL_TOL

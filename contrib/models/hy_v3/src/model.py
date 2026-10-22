@@ -73,6 +73,7 @@ from vllm_neuron.utils.weight_loader import (
 
 from .config import HYV3Config
 from .kernels.moe_tkg_hits import moe_tkg_hits
+from .kernels.moe_tkg_hits_batch import moe_tkg_hits_batch
 from .weight_loaders import (
     FP8_DTYPE as _FP8_DTYPE,
 )
@@ -902,6 +903,51 @@ def routed_experts_tkg_hits(
     )
 
 
+
+def routed_experts_tkg_hits_batch(
+    normed: torch.Tensor,
+    affinities: torch.Tensor,
+    top_k_index: torch.Tensor,
+    rank_id: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Routed experts for a few-token decode (``moe_tkg_hits_batch``): partial output.
+
+    Same contract as ``routed_experts_tkg``, but only this rank's experts that
+    at least one token routed to are computed, each once for the whole batch:
+    they are packed first (with their affinity columns) and the kernel loops
+    over their count at runtime.
+    """
+    e_l = gate_up_weight.shape[0]
+    base = rank_id.long().reshape(1, 1) * e_l
+    expert = torch.arange(e_l, device=normed.device, dtype=torch.long)
+    local_aff = NF.get_local_expert_affinities(affinities, base.reshape(1) + expert)  # [T, L]
+    local_idx = top_k_index.long() - base  # [T, K], local if in [0, L)
+    hit = (local_idx.unsqueeze(-1) == expert.view(1, 1, e_l)).any(dim=1).any(dim=0)  # [L]
+    # Hit experts first, in expert order: the kernel runs the first num_hits.
+    key = torch.where(hit, expert, expert + e_l).to(torch.float32).view(1, e_l)
+    order = torch.topk(key, e_l, dim=1, largest=False).indices.view(e_l)
+    packed_aff = torch.index_select(local_aff.to(torch.float32), 1, order)
+    # int32 explicitly: sum() of a bool tensor is int64.
+    num_hits = hit.sum(dtype=torch.int32).view(1, 1)
+    dummy_in_scale = torch.ones((e_l, 1), dtype=torch.float32, device=normed.device)
+    return wrap_nki(moe_tkg_hits_batch)[2](
+        hidden_input=normed,
+        expert_gate_up_weights=gate_up_weight,
+        expert_down_weights=down_weight,
+        expert_affinities=packed_aff,
+        expert_index=order.view(1, e_l).to(torch.int32),
+        num_hits=num_hits,
+        expert_gate_up_weights_scale=gate_up_scale,
+        expert_down_weights_scale=down_scale,
+        expert_gate_up_input_scale=dummy_in_scale,
+        expert_down_input_scale=dummy_in_scale,
+        activation_fn=ActFnType.SiLU,
+    )
+
 class HYV3MoE(nn.Module):
     """Hy3 sparse MoE block.
 
@@ -1195,7 +1241,38 @@ class HYV3MoE(nn.Module):
             self.down_proj_scale_tkg,
         )
 
+    def _use_hit_batch_decode(self, num_tokens: int) -> bool:
+        """moe_tkg_hits_batch: a few tokens, only the local experts any of them routed to.
+
+        Each hit expert is read once for the batch. The busiest rank's hits
+        grow with the batch, and once it hits all its experts the runtime loop
+        is slower than moe_tkg's unrolled all-expert path, so the batch limit
+        is 4 tokens per 3 local experts (EP64: 4, EP32: 8).
+        HY3_DECODE_HITS_MAX_T overrides it; HY3_DECODE_HITS=0 turns it off.
+        """
+        if os.environ.get("HY3_DECODE_HITS", "1") == "0":
+            return False
+        max_t = os.environ.get("HY3_DECODE_HITS_MAX_T")
+        limit = int(max_t) if max_t else (4 * self.num_local_experts) // 3
+        return 1 < num_tokens <= limit
+
     def _forward_decode(self, normed, affinities, top_k_index, rank, extra=None):
+        if self._use_hit_batch_decode(normed.shape[0]):
+            output = routed_experts_tkg_hits_batch(
+                normed,
+                affinities,
+                top_k_index,
+                self._ep_row(normed.device).view(1, 1),
+                self.gate_up_proj_weight,
+                self.down_proj_weight,
+                self.gate_up_proj_scale_tkg,
+                self.down_proj_scale_tkg,
+            )
+            if extra is not None:
+                output = output + extra
+            if self.world_size > 1:
+                output = self.tp_group.all_reduce(output)
+            return output
         if self._use_hit_decode(normed.shape[0]):
             output = self._forward_decode_hits(normed, affinities, top_k_index)
             if extra is not None:
