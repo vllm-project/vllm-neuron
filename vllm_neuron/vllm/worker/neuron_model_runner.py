@@ -59,6 +59,7 @@ from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     DraftTokenIds,
+    LogprobsTensors,
     ModelRunnerOutput,
     SamplerOutput,
     make_empty_encoder_model_runner_output,
@@ -427,10 +428,14 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
         model_runner_output: ModelRunnerOutput,
         model_runner: "NeuronModelRunner",
         partial_prefill_req_ids: set[str] | None = None,
+        logprobs_inputs: tuple[torch.Tensor, int] | None = None,
     ):
         self.model_runner_output = model_runner_output
         self._model_runner = model_runner
         self._partial_prefill_req_ids = partial_prefill_req_ids or set()
+        # (gathered logits, max_num_logprobs) when this step's requests asked for logprobs:
+        # computed in get_output(), once the sampled tokens are on the host.
+        self._logprobs_inputs = logprobs_inputs
         # Per-object lock: prevents double-materialization when both the async
         # output thread and the main thread call get_output() on the same object.
         self._lock = threading.Lock()
@@ -494,6 +499,7 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                     return self.model_runner_output
 
                 # First call: materialize device future to CPU.
+                raw_sampled = sampled_token_ids
                 if sampled_token_ids.ndim == 2 and sampled_token_ids.shape[1] > 1:
                     # Spec decode: rejection sampler output [bs, num_spec+1]
                     # with -1 padding for rejected positions. Strip -1s to
@@ -542,6 +548,12 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                 if empty_tokens is not None:
                     sampled_token_ids = empty_tokens
                 self.model_runner_output.sampled_token_ids = sampled_token_ids
+                if self._logprobs_inputs is not None:
+                    logits, max_num_logprobs = self._logprobs_inputs
+                    logprobs = self._model_runner._sampled_token_logprobs(
+                        raw_sampled, logits, max_num_logprobs, sampled_token_ids
+                    )
+                    self.model_runner_output.logprobs = logprobs.tolists()
                 logger.debug(
                     "sampled_token_ids on cpu after moving: sampled_token_ids=%s",
                     sampled_token_ids,
@@ -552,7 +564,7 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                     "Skip updating batch state."
                 )
 
-        # Logprobs are computed in _sample() when on-device logits are available
+        # Logprobs: computed above for this step's samples (sync scheduling: in _sample())
         return self.model_runner_output
 
 
@@ -973,6 +985,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self.neuron_config.on_device_sampling_config is not None
         )
         self._on_device_logits: torch.Tensor | None = None
+        # Logprobs inputs of the step whose async output is being built (see _sample()).
+        self._async_logprobs_inputs: tuple[torch.Tensor, int] | None = None
         self._debug_logits_dir: str | None = self.neuron_config.debug_logits_dir
         self._debug_logits_step_counter: int = 0
         self._tensor_replacer = None
@@ -8321,7 +8335,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             partial_prefill_req_ids=getattr(
                 self, "_async_partial_prefill_req_ids", set()
             ),
+            logprobs_inputs=self._async_logprobs_inputs,
         )
+        self._async_logprobs_inputs = None
         self.async_execution_buffer["async_output"] = async_output
         return async_output
 
@@ -10743,12 +10759,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         sampling_metadata = self.input_batch.sampling_metadata
 
         if self.use_async_scheduling:
-            if spec_decode_metadata is not None:
-                # Async spec decode: keep the raw rejection-sampler output
-                # (device tensor [bs, num_spec+1]) as-is. Materialization is
-                # deferred to the async output thread in
-                # AsyncNeuronModelRunnerOutput.get_output().
-                return SamplerOutput(model_output_tensor, None)
+            # Keep the sampled tokens (device tensor [bs], or [bs, num_spec+1] from the
+            # rejection sampler) as-is: AsyncNeuronModelRunnerOutput.get_output()
+            # materializes them on the async output thread, and computes the logprobs
+            # from the gathered logits kept here.
+            self._async_logprobs_inputs = self._logprobs_inputs(sampling_metadata)
             return SamplerOutput(model_output_tensor, None)
 
         if spec_decode_metadata is None:
@@ -10821,7 +10836,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     model_output_tensor,
                     self.input_batch.vocab_size,
                 )
-                sampler_output = SamplerOutput(output_token_ids, None)
+                logprobs = None
+                logprobs_inputs = self._logprobs_inputs(sampling_metadata)
+                if logprobs_inputs is not None:
+                    num_reqs = self.input_batch.num_reqs
+                    logprobs = self._sampled_token_logprobs(
+                        model_output_tensor,
+                        *logprobs_inputs,
+                        output_token_ids[:num_reqs],
+                    )
+                sampler_output = SamplerOutput(output_token_ids, logprobs)
                 return sampler_output
 
             # CPU rejection sampling
@@ -10856,6 +10880,58 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             sampler_output.sampled_token_ids = output_token_ids
 
         return sampler_output
+
+    def _logprobs_inputs(self, sampling_metadata) -> tuple[torch.Tensor, int] | None:
+        """(gathered logits, max_num_logprobs) when this step's requests asked for logprobs
+        and the model returned its logits (on-device sampling), else None."""
+        max_num_logprobs = sampling_metadata.max_num_logprobs
+        if max_num_logprobs is None or self._on_device_logits is None:
+            return None
+        return self._on_device_logits, max_num_logprobs
+
+    def _sampled_token_logprobs(
+        self,
+        sampled: torch.Tensor,
+        logits: torch.Tensor,
+        max_num_logprobs: int,
+        emitted: list[list[int]],
+    ) -> LogprobsTensors:
+        """Logprobs of the tokens a step emits, from the model's gathered logits.
+
+        Mirrors vLLM's RejectionSampler (_get_logprobs_tensors + parse_output), and
+        covers plain decode too.
+
+        Args:
+            sampled: Sampled tokens, [bs], or the rejection-sampler output [bs, k + 1]
+                with -1 for rejected positions.
+            logits: Gathered logits of the sampled rows, [bs * width, vocab],
+                request-major (a verify step samples all of its k + 1 rows).
+            max_num_logprobs: Top logprobs per token (-1: the whole vocabulary).
+            emitted: Tokens the step emits per request, without padding rows. A
+                discarded row (partial prefill, skip-emit) is empty and gets none.
+
+        Returns:
+            LogprobsTensors of the emitted tokens, with cu_num_generated_tokens.
+        """
+        sampled = sampled.to("cpu")
+        if sampled.dim() == 1:
+            sampled = sampled.unsqueeze(1)
+        num_reqs, width = len(emitted), sampled.shape[1]
+        sampled = sampled[:num_reqs].to(torch.int64)
+        logits = logits.to("cpu")[: num_reqs * width].to(torch.float32)
+        valid = (sampled != -1) & (sampled < self.input_batch.vocab_size)
+        valid &= torch.tensor([len(t) > 0 for t in emitted]).unsqueeze(1)
+        if self.sampler.logprobs_mode in ("raw_logits", "processed_logits"):
+            logprobs = logits
+        else:
+            logprobs = self.sampler.compute_logprobs(logits)
+        if max_num_logprobs < 0:
+            max_num_logprobs = logprobs.shape[-1]
+        tensors = self.sampler.gather_logprobs(
+            logprobs, max_num_logprobs, torch.where(valid, sampled, 0).reshape(-1)
+        ).filter(valid.reshape(-1))
+        cu = [0, *valid.sum(dim=1).cumsum(dim=0).tolist()]
+        return tensors._replace(cu_num_generated_tokens=cu)
 
     def _parse_rejection_sampling_output(
         self,
