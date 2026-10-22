@@ -857,6 +857,51 @@ def routed_experts_tkg(
     )
 
 
+def routed_experts_tkg_hits(
+    normed: torch.Tensor,
+    affinities: torch.Tensor,
+    top_k_index: torch.Tensor,
+    rank_id: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Routed experts for a one-token decode (``moe_tkg_hits``): partial output.
+
+    Same contract as ``routed_experts_tkg``, but only the top-k slots whose
+    expert is one of this rank's ``L`` experts are computed: they are packed
+    first and the kernel loops over their count at runtime.
+    """
+    e_l = gate_up_weight.shape[0]
+    k = top_k_index.shape[1]
+    base = rank_id.long().reshape(1, 1) * e_l
+    local_ids = base.reshape(1) + torch.arange(e_l, device=normed.device, dtype=torch.long)
+    local_aff = NF.get_local_expert_affinities(affinities, local_ids)  # [1, L]
+    local_idx = top_k_index.long() - base
+    valid = (local_idx >= 0) & (local_idx < e_l)
+    # Local hits first, in slot order: the kernel runs the first num_hits.
+    slot = torch.arange(k, device=normed.device, dtype=torch.float32).reshape(1, k)
+    order = torch.topk(torch.where(valid, slot, slot + k), k, dim=1, largest=False).indices
+    packed = torch.gather(torch.where(valid, local_idx, 0), 1, order)
+    # int32 explicitly: sum() of an int32 tensor is int64.
+    num_hits = valid.sum(dim=1, keepdim=True, dtype=torch.int32)
+    dummy_in_scale = torch.ones((e_l, 1), dtype=torch.float32, device=normed.device)
+    return wrap_nki(moe_tkg_hits)[2](
+        hidden_input=normed,
+        expert_gate_up_weights=gate_up_weight,
+        expert_down_weights=down_weight,
+        expert_affinities=local_aff.to(torch.float32),
+        expert_index=packed.to(torch.int32),
+        num_hits=num_hits,
+        expert_gate_up_weights_scale=gate_up_scale,
+        expert_down_weights_scale=down_scale,
+        expert_gate_up_input_scale=dummy_in_scale,
+        expert_down_input_scale=dummy_in_scale,
+        activation_fn=ActFnType.SiLU,
+    )
+
+
 class HYV3MoE(nn.Module):
     """Hy3 sparse MoE block.
 
@@ -1139,33 +1184,15 @@ class HYV3MoE(nn.Module):
         return num_tokens == 1 and os.environ.get("HY3_DECODE_HITS", "1") != "0"
 
     def _forward_decode_hits(self, normed, affinities, top_k_index):
-        e_l = self.num_local_experts
-        k = self.num_experts_per_token
-        base = self._ep_row(normed.device).long().reshape(1, 1) * e_l
-        local_ids = base.reshape(1) + torch.arange(e_l, device=normed.device, dtype=torch.long)
-        local_aff = NF.get_local_expert_affinities(affinities, local_ids)  # [1, E_L]
-        local_idx = top_k_index.long() - base
-        valid = (local_idx >= 0) & (local_idx < e_l)
-        # Local hits first, in slot order: the kernel runs the first num_hits.
-        slot = torch.arange(k, device=normed.device, dtype=torch.float32).reshape(1, k)
-        key = torch.where(valid, slot, slot + k)
-        order = torch.topk(key, k, dim=1, largest=False).indices
-        packed = torch.gather(torch.where(valid, local_idx, 0), 1, order)
-        # int32 explicitly: sum() of an int32 tensor is int64.
-        num_hits = valid.sum(dim=1, keepdim=True, dtype=torch.int32)
-        dummy_in_scale = torch.ones((e_l, 1), dtype=torch.float32, device=normed.device)
-        return wrap_nki(moe_tkg_hits)[2](
-            hidden_input=normed,
-            expert_gate_up_weights=self.gate_up_proj_weight,
-            expert_down_weights=self.down_proj_weight,
-            expert_affinities=local_aff.to(torch.float32),
-            expert_index=packed.to(torch.int32),
-            num_hits=num_hits,
-            expert_gate_up_weights_scale=self.gate_up_proj_scale_tkg,
-            expert_down_weights_scale=self.down_proj_scale_tkg,
-            expert_gate_up_input_scale=dummy_in_scale,
-            expert_down_input_scale=dummy_in_scale,
-            activation_fn=ActFnType.SiLU,
+        return routed_experts_tkg_hits(
+            normed,
+            affinities,
+            top_k_index,
+            self._ep_row(normed.device).view(1, 1),
+            self.gate_up_proj_weight,
+            self.down_proj_weight,
+            self.gate_up_proj_scale_tkg,
+            self.down_proj_scale_tkg,
         )
 
     def _forward_decode(self, normed, affinities, top_k_index, rank, extra=None):

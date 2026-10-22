@@ -273,3 +273,51 @@ def test_routed_experts_tkg(ckpt, tokens):
     err = rel_err(out, _experts_reference(ckpt, layer, x, aff))
     print(f"moe_tkg T={tokens}: rel_err={err:.3e}")
     assert err < REL_TOL
+
+
+@pytest.mark.parametrize("hits", [0, 1, 2, 3])
+def test_routed_experts_tkg_hits(ckpt, hits):
+    """One-token decode over only this rank's routed experts (``moe_tkg_hits``)."""
+    torch.manual_seed(0)
+    layer = 1
+    w = _expert_tensors(ckpt, layer)
+    ln_w = ckpt.get(f"model.layers.{layer}.post_attention_layernorm.weight").float()
+    x = (torch.randn(1, H) * ln_w).to(torch.bfloat16)
+    aff, idx = _route(ckpt, layer, x)
+    # Rank 0 holds experts 0..L-1: route exactly `hits` slots to them and the
+    # rest elsewhere.
+    aff[:, :L] = 0
+    for j in range(hits):
+        idx[0, j] = j
+        aff[0, j] = 0.5 - 0.1 * j
+    for j in range(hits, K):
+        if idx[0, j] < L:
+            idx[0, j] = L + j
+
+    class M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            for k, v in w.items():
+                self.register_buffer(k, v)
+
+        def forward(self, x, aff, idx):
+            rank_id = torch.zeros((1, 1), dtype=torch.int32, device=x.device)
+            return hy_model.routed_experts_tkg_hits(
+                x,
+                aff,
+                idx,
+                rank_id,
+                self.gate_up,
+                self.down,
+                self.gate_up_scale_tkg,
+                self.down_scale_tkg,
+            )
+
+    # Reverse the slots so the local hits are last: the packing must find them.
+    out = compile_and_run(M(), x, aff, idx.flip(1).to(torch.int32))
+    if hits == 0:
+        assert out.abs().max().item() == 0
+        return
+    err = rel_err(out, _experts_reference(ckpt, layer, x, aff))
+    print(f"moe_tkg_hits hits={hits}: rel_err={err:.3e}")
+    assert err < REL_TOL

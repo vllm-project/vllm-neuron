@@ -102,6 +102,22 @@ print(outputs[0].outputs[0].text)
   segmented prefill and prefix-cache hits); its full-model performance was
   measured only on 0.24, where it cost ~22% TPOT and ~30% prefill speed at
   equal concurrency. See [src/README.md](src/README.md).
+- One-token decode steps compute only the routed experts that live on each
+  rank (`src/kernels/moe_tkg_hits.py`, on by default). `HY3_DECODE_HITS=0`
+  restores the all-expert `moe_tkg`. Steps with more tokens are unchanged.
+  See "Decode: only the routed experts" under Results.
+- For the lowest single-request TPOT, use `"ep_degree": 32` (`EP=32` for
+  `scripts/serve.sh` and `scripts/serve_latency.sh`): about 1-1.5 ms lower
+  TPOT than EP=64, for 3-20% higher TTFT. With several concurrent requests
+  keep EP=64: in config B at concurrency 4 / 15, EP=32 is 3-10% slower in
+  TPOT and 10-22% slower in TTFT (`results/bench/B_multibucket_ep32/`).
+- Below EP=32 the prefill MoE kernel (`moe_cte` `shard_on_i_hybrid`) does
+  not compile on neuronx-cc 2.28. `HY3_MOE_CTE_IMPL=shard_on_i` makes EP=16 /
+  8 work, at about 2.5x the TTFT and no TPOT gain over EP=32.
+- On-device sampling is on by default. If every request is greedy,
+  `"on_device_sampling_config": {"all_greedy": true}` swaps the general
+  sampler for an argmax and saves about 0.5 ms per token; requests that set
+  a temperature are then decoded greedily too.
 
 ## Compatibility Matrix
 
@@ -120,15 +136,8 @@ driver 2.31.7, torch 2.13.0, transformers 5.17.0, Python 3.12.
 
 ## Results
 
-All numbers: trn2.48xlarge, TP=64, full EP=64, FP8 weights, BF16 KV cache,
-`VLLM_NEURON_KV_GMU_BUDGE| input | conc | TTFT med (s) | TTFT P99 (s) | TPOT med (ms) | ITL med (ms) | out tok/s | peak out tok/s | total tok/s |
-|---|---|---|---|---|---|---|---|---|
-| 512 | 32 | 2.37 | 4.44 | 45.0 | 36.4 | 593 | 896 | 1779 |
-| 512 | 63 | 4.48 | 8.76 | 61.3 | 44.2 | 802 | 1449 | 2405 |
-| 512 | 127 | 8.89 | 17.49 | 95.7 | 61.1 | 976 | 2159 | 2927 |
-| 1024 | 32 | 3.23 | 6.20 | 51.1 | 39.3 | 504 | 832 | 2518 |
-| 1024 | 63 | 6.19 | 12.13 | 71.1 | 47.5 | 663 | 1380 | 3314 |
-| 1024 | 127 | 12.31 | 24.24 | 116.5 | 68.6 | 773 | 1905 | 3866 |AP_FRACTION=0.45`, on-device sampling, block size 32.
+All numbers: trn2.48xlarge, TP=64, full EP=64 unless noted, FP8 weights, BF16 KV cache,
+`VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.45`, on-device sampling, block size 32.
 
 ### Accuracy
 
@@ -139,8 +148,8 @@ All numbers: trn2.48xlarge, TP=64, full EP=64, FP8 weights, BF16 KV cache,
 | same, segmented prefill 5000 / 3100-token prompts, cold and prefix-cache hit (4992 / 3072 tokens cached) (`scripts/validate_features.py`) | cosine >= 0.9989, identical cold vs cache hit |
 | batch 128 vs batch 4 decode | greedy identical, cosine >= 0.9993 |
 | DCP=8, same checks (`validate_features.py ... 8`) | cosine >= 0.9988; greedy splits only at near-ties (gap 0.011-0.18 nats) |
-| Integration test (`test/integration/test_model.py`, both cases) | passed: top-K logit error <= 0.06 vs the BF16 golden |
-| Module tests (`test/module/`) | routed experts rel. error ~3e-3; MLP: BF16-activation (TKG) paths ~2e-3, FP8-activation (CTE) paths within 1-2% of an ideal FP8 quantizer |
+| Integration test (`test/integration/test_model.py`, both cases) | passed: top-K logit error <= 0.06 vs the BF16 golden; with `moe_tkg_hits` (the batch-1 case) <= 0.045 |
+| Module tests (`test/module/`) | routed experts rel. error ~3e-3 (`moe_tkg_hits`, 1-3 local hits: 2.5-3.3e-3; 0 hits: exactly 0); MLP: BF16-activation (TKG) paths ~2e-3, FP8-activation (CTE) paths within 1-2% of an ideal FP8 quantizer |
 
 ### Performance
 
@@ -159,18 +168,18 @@ PREFILL_BUCKETS='[512, 1024, 2048, 4096, 8192]' MODEL=<ckpt> \
 
 | input | conc | TTFT med (s) | TTFT P99 (s) | TPOT med (ms) | ITL med (ms) | out tok/s | peak out tok/s | total tok/s |
 |---|---|---|---|---|---|---|---|---|
-| 1024 | 1 | 0.22 | 0.28 | 26.3 | 26.3 | 37 | 39 | 185 |
-| 1024 | 4 | 0.55 | 0.85 | 51.3 | 50.0 | 75 | 88 | 375 |
-| 1024 | 15 | 1.59 | 2.94 | 44.8 | 39.4 | 295 | 390 | 1475 |
-| 4096 | 1 | 0.56 | 0.58 | 26.3 | 26.4 | 35 | 38 | 598 |
-| 4096 | 4 | 1.38 | 2.18 | 50.5 | 47.2 | 72 | 92 | 1217 |
-| 4096 | 15 | 4.26 | 7.97 | 56.9 | 42.2 | 204 | 360 | 3476 |
-| 8192 | 1 | 1.00 | 1.02 | 27.7 | 27.8 | 32 | 37 | 1047 |
-| 8192 | 4 | 2.45 | 3.90 | 52.5 | 46.1 | 65 | 100 | 2139 |
-| 8192 | 15 | 7.72 | 14.45 | 78.2 | 51.7 | 139 | 300 | 4580 |
-| 16000 | 1 | 2.05 | 2.05 | 27.7 | 27.8 | 28 | 37 | 1786 |
-| 16000 | 4 | 4.99 | 7.93 | 53.0 | 41.1 | 55 | 108 | 3509 |
-| 16000 | 15 | 15.80 | 29.50 | 105.6 | 51.7 | 90 | 300 | 5707 |
+| 1024 | 1 | 0.23 | 0.24 | 22.4 | 21.8 | 43 | 47 | 216 |
+| 1024 | 4 | 0.54 | 0.84 | 52.1 | 50.3 | 74 | 84 | 370 |
+| 1024 | 15 | 1.59 | 2.94 | 44.8 | 39.4 | 295 | 390 | 1474 |
+| 4096 | 1 | 0.56 | 0.57 | 22.7 | 22.0 | 41 | 46 | 689 |
+| 4096 | 4 | 1.37 | 2.16 | 51.9 | 48.1 | 70 | 92 | 1192 |
+| 4096 | 15 | 4.26 | 7.97 | 57.0 | 42.2 | 204 | 360 | 3471 |
+| 8192 | 1 | 1.01 | 1.02 | 23.8 | 23.5 | 36 | 43 | 1195 |
+| 8192 | 4 | 2.45 | 3.90 | 52.8 | 45.9 | 64 | 100 | 2119 |
+| 8192 | 15 | 7.70 | 14.43 | 78.3 | 51.8 | 139 | 300 | 4578 |
+| 16000 | 1 | 2.05 | 2.06 | 23.7 | 23.5 | 32 | 43 | 2009 |
+| 16000 | 4 | 4.99 | 7.95 | 54.2 | 41.6 | 54 | 108 | 3458 |
+| 16000 | 15 | 15.78 | 29.49 | 105.7 | 51.7 | 90 | 300 | 5707 |
 
 **High concurrency, short context** (max_model_len 2048, 128 sequences,
 prefill buckets 512 / 1024 / 2048; `results/bench/C_multibucket/`):
@@ -235,13 +244,81 @@ caching, prefill buckets 512..16384 so a 16k prompt is one prefill step;
 
 | input | TTFT med | TPOT med |
 | --- | --- | --- |
-| 1024 | 0.21 s | 26.3 ms |
-| 4096 | 0.54 s | 26.3 ms |
-| 8192 | 0.97 s | 27.7 ms |
-| 16000 | 1.83 s | 27.7 ms |
+| 1024 | 0.22 s | 22.1 ms |
+| 4096 | 0.54 s | 22.4 ms |
+| 8192 | 0.97 s | 23.6 ms |
+| 16000 | 1.83 s | 23.5 ms |
 
 The multi-bucket prefix-caching config is within 3-12% of this TTFT and
-has the same TPOT, so it is the better default.
+about the same TPOT (within 2%), so it is the better default.
+
+### Decode: only the routed experts (`moe_tkg_hits`)
+
+In a batch-1 decode step at EP=64 the routed experts took 45% of the device
+time (`moe_tkg` all-expert, 12.6 of 27.8 ms). Every rank computes its 3 local
+experts although a token's 8 experts hit at most one or two of them on any
+rank. The step is bound by the weights read, not by FLOPs: a one-token
+matmul streams its weight tiles through the PE array at about 180 GB/s per
+physical core, so each expert computed costs its 18.9 MB of FP8 weights.
+`moe_tkg`'s selective mode does not help: it unrolls all 8 top-k slots, and
+the non-local ones run on a dummy expert with affinity 0.
+
+`src/kernels/moe_tkg_hits.py` (forked from nkilib's `selective_expert_impl`,
+Apache 2.0) takes the top-k slots with this rank's experts packed first plus
+their count, and loops over that count at runtime (`nl.fori_loop` on a
+register). A rank with no routed expert does no expert work; the MoE
+all-reduce then waits for the busiest rank, which at EP=64 usually has one
+expert and sometimes two. The runtime loop adds about 30 us of control-flow
+barriers per layer. Steps with more than one token keep `moe_tkg`
+(`HY3_DECODE_HITS=0` turns the new path off everywhere).
+
+Latency config (`scripts/serve_latency.sh`), c=1, `moe_tkg` -> `moe_tkg_hits`
+(`results/bench/opt_latency/`, `results/bench/opt_latency_ep32/`):
+
+| input | TTFT, EP=64 | TPOT, EP=64 | TTFT, EP=32 | TPOT, EP=32 |
+| --- | --- | --- | --- | --- |
+| 1024 | 0.21 -> 0.22 s | 26.3 -> 22.1 ms | 0.26 s | 21.1 ms |
+| 4096 | 0.54 -> 0.54 s | 26.3 -> 22.4 ms | 0.65 s | 20.9 ms |
+| 8192 | 0.97 -> 0.97 s | 27.7 -> 23.6 ms | 1.08 s | 22.3 ms |
+| 16000 | 1.83 -> 1.83 s | 27.7 -> 23.5 ms | 1.88 s | 22.2 ms |
+
+Recommended config B (`scripts/serve.sh`, see above), same machine and day,
+`HY3_DECODE_HITS=0` -> default (`results/bench/B_multibucket_moe_tkg/`,
+`results/bench/B_multibucket/`). Concurrency 1 gets 14-15% lower TPOT. At
+concurrency 4 / 15 the decode batch is mostly larger than one token, so the
+results are unchanged or up to 5% better:
+
+| input | conc | TTFT med (s) | TTFT P99 (s) | TPOT med (ms) | ITL med (ms) | out tok/s | peak out tok/s | total tok/s |
+|---|---|---|---|---|---|---|---|---|
+| 1024 | 1 | 0.22 -> 0.23 | 0.23 -> 0.24 | 26.3 -> 22.4 | 26.3 -> 21.8 | 37 -> 43 | 39 -> 47 | 185 -> 216 |
+| 1024 | 4 | 0.54 -> 0.54 | 0.84 -> 0.84 | 52.1 -> 52.1 | 50.2 -> 50.3 | 74 -> 74 | 84 -> 84 | 370 -> 370 |
+| 1024 | 15 | 1.59 -> 1.59 | 2.95 -> 2.94 | 44.9 -> 44.8 | 39.4 -> 39.4 | 295 -> 295 | 390 -> 390 | 1473 -> 1474 |
+| 4096 | 1 | 0.56 -> 0.56 | 0.57 -> 0.57 | 26.3 -> 22.7 | 26.4 -> 22.0 | 35 -> 41 | 38 -> 46 | 597 -> 689 |
+| 4096 | 4 | 1.38 -> 1.37 | 2.19 -> 2.16 | 53.2 -> 51.9 | 49.2 -> 48.1 | 69 -> 70 | 88 -> 92 | 1166 -> 1192 |
+| 4096 | 15 | 4.26 -> 4.26 | 7.96 -> 7.97 | 56.9 -> 57.0 | 42.2 -> 42.2 | 205 -> 204 | 360 -> 360 | 3478 -> 3471 |
+| 8192 | 1 | 1.01 -> 1.01 | 1.03 -> 1.02 | 27.7 -> 23.8 | 27.8 -> 23.5 | 32 -> 36 | 37 -> 43 | 1046 -> 1195 |
+| 8192 | 4 | 2.45 -> 2.45 | 3.90 -> 3.90 | 55.4 -> 52.8 | 48.4 -> 45.9 | 62 -> 64 | 96 -> 100 | 2036 -> 2119 |
+| 8192 | 15 | 7.71 -> 7.70 | 14.44 -> 14.43 | 78.3 -> 78.3 | 51.7 -> 51.8 | 139 -> 139 | 300 -> 300 | 4579 -> 4578 |
+| 16000 | 1 | 2.06 -> 2.05 | 2.07 -> 2.06 | 27.7 -> 23.7 | 27.8 -> 23.5 | 28 -> 32 | 36 -> 43 | 1785 -> 2009 |
+| 16000 | 4 | 5.00 -> 4.99 | 7.96 -> 7.95 | 54.5 -> 54.2 | 42.0 -> 41.6 | 54 -> 54 | 108 -> 108 | 3461 -> 3458 |
+| 16000 | 15 | 15.77 -> 15.78 | 29.49 -> 29.49 | 105.6 -> 105.7 | 51.7 -> 51.7 | 90 -> 90 | 300 -> 300 | 5710 -> 5707 |
+
+EP degree, small config (2048 context, batch 1, prefill buckets 1024 /
+2048, `all_greedy`), 1024-token prompts:
+
+| EP | prefill MoE | decode MoE | TTFT | TPOT |
+| --- | --- | --- | --- | --- |
+| 64 | `shard_on_i_hybrid` | `moe_tkg` all-expert | 219 ms | 25.8 ms |
+| 64 | `shard_on_i_hybrid` | `moe_tkg_hits` | 211 ms | 21.6 ms |
+| 32 | `shard_on_i_hybrid` | `moe_tkg_hits` | 259 ms | 20.2 ms |
+| 16 | `shard_on_i` | `moe_tkg_hits` | 518 ms | 20.5 ms |
+| 8 | `shard_on_i` | `moe_tkg_hits` | 564 ms | 20.8 ms |
+
+Smaller EP makes each hit cheaper (an expert's I/tp slice) but the busiest
+EP group gets more hits, and the per-layer fixed cost (router, shared expert,
+loop barriers) stays, so TPOT flattens out at EP=32. The remaining batch-1
+step at EP=32 is about 48% MoE fixed cost, 27% waiting for the busiest rank's
+hits, 16% attention and 8% all-reduces.
 
 ### Comparison with the previous implementation (vllm-neuron 0.24, neuronx-cc 2.27)
 
@@ -255,7 +332,7 @@ seeds:
 | B, 1k input, c=15: TTFT / total tok/s | 4.16 s / 1036 | 2.45 s / 1309 (multi-bucket: 1.59 s / 1475) |
 | C, 1k input, c=127: TTFT / output tok/s | 32.8 s / 378 | 12.3 s / 773 (multi-bucket) |
 | C, 512 input, c=127: TTFT / output tok/s | 32.8 s / 388 | 8.9 s / 976 (multi-bucket) |
-| latency config, 16k input, c=1: TTFT / TPOT | 1.80 s / 26.9 ms | 1.83 s / 27.7 ms |
+| latency config, 16k input, c=1: TTFT / TPOT | 1.80 s / 26.9 ms | 1.83 s / 27.7 ms (`moe_tkg_hits`: 1.83 s / 23.5 ms) |
 
 Where the gains come from:
 
@@ -273,8 +350,9 @@ Where the gains come from:
    kv_segment_size_buckets`, so every prompt was padded to a 2048-token step.
    0.29 compiles each (Q bucket, segment size) pair, so short prompts use a
    512 / 1024 bucket and long prompts 4096 / 8192-token steps.
-3. Single-request decode is ~0.8 ms (3%) slower per token than on 0.24 in the
-   latency config (same model code); the cause has not been isolated.
+3. With the same all-expert `moe_tkg`, single-request decode is ~0.8 ms (3%)
+   slower per token than on 0.24 in the latency config (same model code); the
+   cause has not been isolated.
 
 ### Status of issues found on 0.24
 
@@ -316,7 +394,8 @@ HY3_CKPT=/path/to/Hy3-FP8 pytest contrib/models/hy_v3/test/integration/test_mode
 ### Module tests
 
 Single-NeuronCore tests of the FP8 MLP (dense layer, shared expert, 8-way decode
-copy; CTE and TKG paths) and the routed experts (`moe_cte` hybrid, `moe_tkg`).
+copy; CTE and TKG paths) and the routed experts (`moe_cte` hybrid, `moe_tkg`,
+`moe_tkg_hits` with 0-3 local hits).
 They build the kernel inputs from the real checkpoint (rank-0 shard) through
 the model's own weight loaders and compare against an FP32 fake-quant
 reference.
@@ -338,7 +417,7 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 
 | Script | Purpose |
 | --- | --- |
-| `scripts/serve.sh` | `vllm serve` with prefix caching (configs B / C / DCP below) |
+| `scripts/serve.sh` | `vllm serve` with prefix caching (configs B / C / DCP below); `EP=<n>` sets the EP degree |
 | `scripts/serve_latency.sh` | single-request latency config (no prefix caching, prefill buckets 512..16384) |
 | `scripts/bench_matrix.sh` | `vllm bench serve` matrix, random dataset, a distinct seed per cell so cells never share prefix-cache entries |
 | `scripts/bench_prefix_cache.sh` | prefix-cache benchmark: shared-prefix share sweep, hit rate read from the server's `/metrics` |

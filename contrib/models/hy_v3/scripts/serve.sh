@@ -10,6 +10,7 @@
 #   DCP              decode context parallel size, 1 or 8 (default: 1)
 #   KV_CAP           VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION (default: 0.45)
 #   PORT             API port (default: 8000)
+#   EP               neuron_config.ep_degree (default: full EP=64)
 #
 # Configs used in the README:
 #   (max_model_len is always an implicit decode context bucket)
@@ -37,7 +38,7 @@ exec vllm serve "${MODEL:-tencent/Hy3-FP8}" \
     --decode-context-parallel-size "${DCP:-1}" \
     --cp-kv-cache-interleave-size 32 \
     --port "${PORT:-8000}" \
-    --additional-config "{\"neuron_config\": {
+    --additional-config "{\"neuron_config\": {${EP:+\"ep_degree\": $EP,}
         \"num_batched_tokens_buckets\": $PREFILL_BUCKETS,
         \"kv_segment_size_buckets\": ${KV_SEGMENTS:-[2048]},
         \"num_seqs_buckets\": $3,

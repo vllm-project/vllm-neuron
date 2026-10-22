@@ -31,9 +31,22 @@ tencent/Hy3-FP8: ~295B-parameter MoE decoder with a static per-tensor FP8 checkp
 - Routed experts compute BF16 activations x FP8 weights:
   - prefill: `moe_cte` (`shard_on_i_hybrid`, per-channel scales). It runs
     one static block per local expert and skips empty dynamic blocks at
-    runtime, about 3x faster than `shard_on_i` at 2048 tokens.
-  - decode: the `moe_tkg` kernel (STATIC). `NF.moe_tkg` only admits MX / BF16
-    weights, so the model calls the kernel wrapper directly.
+    runtime, about 3x faster than `shard_on_i` at 2048 tokens. neuronx-cc
+    2.28 compiles it at EP=64 and EP=32 only; at EP=16 / 8 / 4 (I/tp = 384 /
+    192 / 96) it fails (`NCC_IGCA108` or a DMA error), and
+    `HY3_MOE_CTE_IMPL=shard_on_i` selects the static kernel instead.
+  - decode, one token: `kernels/moe_tkg_hits.py`, forked from nkilib's
+    selective `moe_tkg`. The model packs the top-k slots whose expert is
+    local to this rank first and passes their count; the kernel loops over
+    that many slots at runtime (`nl.fori_loop` on a register). At EP=64 a
+    rank holds 3 experts and a token's 8 experts hit about 1.3 of them on the
+    busiest rank, where `moe_tkg` computes all 3 (all-expert) or 8 slots
+    (selective, the non-local ones on a dummy expert). `HY3_DECODE_HITS=0`
+    restores `moe_tkg`.
+  - decode, more tokens: the `moe_tkg` kernel (STATIC, all-expert; selective
+    when tokens x top_k < local experts, or `HY3_DECODE_SELECTIVE=1`).
+    `NF.moe_tkg` only admits MX / BF16 weights, so the model calls the kernel
+    wrapper directly.
 - Shared expert:
   - prefill: full weights on every rank, runs on the SP-local tokens
   - decode: a second copy sharded 8 ways (I=192, padded to 256); its partial
