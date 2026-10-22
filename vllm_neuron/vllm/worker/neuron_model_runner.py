@@ -985,6 +985,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self.neuron_config.on_device_sampling_config is not None
         )
         self._on_device_logits: torch.Tensor | None = None
+        # Async spec decode: each request's row of its latest spec-step output.
+        self._last_spec_rows: dict[str, tuple[torch.Tensor, int]] = {}
         # Logprobs inputs of the step whose async output is being built (see _sample()).
         self._async_logprobs_inputs: tuple[torch.Tensor, int] | None = None
         self._debug_logits_dir: str | None = self.neuron_config.debug_logits_dir
@@ -2573,18 +2575,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             prev_sampled, dummy_rows = self._remap_prev_sampled_by_req_id(
                 prev_future, num_reqs_padded
             )
-            # When the previous future has shape [bs, num_spec+1], the previous
-            # step was a spec step with a full num_spec_tokens bucket. Use
-            # num_spec directly: it's always the scheduled draft count for
-            # that step (we never mid-trim draft counts — NeuronAsyncScheduler
-            # clears spec_token_ids entirely near max_model_len instead).
-            # Rows of requests new to the batch carry a dummy (see below).
-            draft_counts = [
-                0 if i in dummy_rows else num_spec for i in range(num_reqs_padded)
-            ]
-            prev_num_draft_tokens_tensor = torch.tensor(
-                draft_counts, dtype=torch.int32
-            ).to(device)
         else:
             # First decode step after prefill, or shape mismatch. Pass a dummy
             # with one valid token and no drafts, so valid_count == 1 and
@@ -2592,11 +2582,73 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # → correction is a no-op (and the last accepted token is the
             # step's first: recurrent-state models resume from state block 0).
             prev_sampled = self._dummy_prev_sampled(num_reqs_padded, num_spec, device)
-            prev_num_draft_tokens_tensor = torch.zeros(
-                (num_reqs_padded,), dtype=torch.int32, device=device
-            )
+            dummy_rows = set(range(num_reqs_padded))
+        # A request absent from the previous step (held back during another request's
+        # prefill, for example) still has the rejected drafts of its own last spec step
+        # to correct: use that step's row instead of the no-op dummy.
+        prev_sampled, dummy_rows = self._fill_from_last_spec_rows(
+            prev_sampled, dummy_rows, prev_future if use_real_prev else None
+        )
+        # A real row comes from a spec step with a full num_spec_tokens bucket, so its
+        # draft count is num_spec (we never mid-trim draft counts —
+        # NeuronAsyncScheduler clears spec_token_ids entirely near max_model_len).
+        draft_counts = [
+            0 if i in dummy_rows else num_spec for i in range(num_reqs_padded)
+        ]
+        prev_num_draft_tokens_tensor = torch.tensor(draft_counts, dtype=torch.int32).to(
+            device
+        )
 
         return prev_sampled, prev_num_draft_tokens_tensor
+
+    def _record_last_spec_rows(self, sampled_token_ids, req_ids: list[str]) -> None:
+        """Remember each request's row of its latest spec-step output (device future
+        [bs, num_spec + 1]), for the correction of a later step it is part of; a request in
+        a non-spec step drops its row. Rows of finished requests are dropped."""
+        rows = self._last_spec_rows
+        is_spec = (
+            isinstance(sampled_token_ids, torch.Tensor)
+            and sampled_token_ids.ndim == 2
+            and sampled_token_ids.shape[1] > 1
+        )
+        for i, req_id in enumerate(req_ids):
+            if is_spec:
+                rows[req_id] = (sampled_token_ids, i)
+            else:
+                rows.pop(req_id, None)
+        for req_id in [r for r in rows if r not in self.requests]:
+            del rows[req_id]
+
+    def _fill_from_last_spec_rows(
+        self,
+        prev_sampled: torch.Tensor,
+        dummy_rows: set[int],
+        prev_future: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, set[int]]:
+        """Replace the dummy rows of real requests whose latest spec step is older than
+        the previous step with their row from that step. Returns the tensor and the rows
+        that stay dummies."""
+        rows = self._last_spec_rows
+        req_ids = self.input_batch.req_ids[: self.input_batch.num_reqs]
+        fill = [
+            (i, rows[req_ids[i]])
+            for i in sorted(dummy_rows)
+            if i < len(req_ids)
+            and req_ids[i] in rows
+            and rows[req_ids[i]][0] is not prev_future
+            and rows[req_ids[i]][0].shape[1] == prev_sampled.shape[1]
+        ]
+        if not fill:
+            return prev_sampled, dummy_rows
+        src = torch.cat([future[row : row + 1] for _, (future, row) in fill]).to(
+            prev_sampled.device
+        )
+        idx = torch.tensor([i for i, _ in fill], dtype=torch.long).to(
+            prev_sampled.device
+        )
+        # Out of place: in-place row writes can give non-contiguous NEFF inputs.
+        prev_sampled = prev_sampled.index_copy(0, idx, src).contiguous()
+        return prev_sampled, dummy_rows - {i for i, _ in fill}
 
     @staticmethod
     def _dummy_prev_sampled(
@@ -10577,6 +10629,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # when condense() reorders the batch (index lookup).
             self.async_execution_buffer["prev_req_ids_ordered"] = list(
                 req_ids_output_copy
+            )
+            self._record_last_spec_rows(
+                sampler_output.sampled_token_ids, req_ids_output_copy
             )
             return model_runner_output
 
