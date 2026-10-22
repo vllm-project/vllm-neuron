@@ -153,6 +153,11 @@ def _hit_expert_moe_tkg(params: MLPParameters, num_hits: nl.NkiTensor, output: n
         (dims.I0, div_ceil(dims.I, dims.I0), 1), dtype=io_dtype, buffer=nl.sbuf, name="gate_up_sb"
     )
     down_sb = sbm.alloc_stack((dims.H0, dims.H1_shard), dtype=io_dtype, buffer=nl.sbuf, name="down_sb")
+    # Gate/up fp32 accumulators live outside the loop: neuronx-cc rejects a
+    # loop-carried tensor defined inside it (NCC_IGCA108, seen at I = 192).
+    gate_up_fp32 = tuple(
+        nl.ndarray((dims.I0, div_ceil(dims.I, dims.I0), 1), dtype=nl.float32, buffer=nl.sbuf) for _ in range(2)
+    )
 
     E, H_w, i_2, I = params.gate_proj_weights_tensor.shape
 
@@ -222,6 +227,10 @@ def _hit_expert_moe_tkg(params: MLPParameters, num_hits: nl.NkiTensor, output: n
             dims=dims,
             sbm=sbm,
             share_memory_scope=True,
+            # DGE for the runtime-indexed weight DMAs: without it neuronx-cc
+            # fails I = 192 (EP8) with NCC_IGCA108; no cost at I = 768 / 1536.
+            use_dge=True,
+            prealloc_gate_up_buffers=gate_up_fp32,
         )
         process_down_projection(
             hidden=gate_up_output,
@@ -230,6 +239,7 @@ def _hit_expert_moe_tkg(params: MLPParameters, num_hits: nl.NkiTensor, output: n
             dims=dims,
             gate_tile_info=gate_tile_info,
             sbm=sbm,
+            use_dge=True,
         )
         nisa.tensor_scalar(dst=down_sb, data=down_sb, op0=nl.multiply, operand0=slot_aff[:, 0])
         nisa.tensor_tensor(
