@@ -94,7 +94,8 @@ Use `temperature=0.0` for transcription, as the model card recommends.
 
 [`jburtoft/Voxtral-Mini-3B-2507-DFlash`](https://huggingface.co/jburtoft/Voxtral-Mini-3B-2507-DFlash)
 is a public DFlash draft for Voxtral-Mini-3B-2507 (5 layers, block size 16,
-Apache-2.0). It is trained on Trainium2 with openly licensed speech data. Add it
+Apache-2.0). It is trained on Trainium2 with openly licensed speech data; the
+training code is at [jimburtoft/voxtral-dflash](https://github.com/jimburtoft/voxtral-dflash). Add it
 to the serving command:
 
 ```bash
