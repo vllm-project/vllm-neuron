@@ -96,6 +96,7 @@ from libtorch_neuronx_lite.compile.capture_backend import CaptureComplete
 from vllm_neuron.vllm.sample.rejection_sampler import RejectionSampler
 from vllm_neuron.vllm.spec_decode.dflash import DFlashProposer
 from vllm_neuron.vllm.spec_decode.eagle import EagleProposer
+from vllm_neuron.vllm.spec_decode.mtp import MTPProposer
 from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE
 from vllm_neuron.utils.bucket_utils import (
     SUPPORTED_KV_SEGMENT_SIZES,
@@ -1218,6 +1219,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Set up speculative decoding.
         self.drafter: EagleProposer | DFlashProposer | None = None
         self.is_eagle3_spec = False
+        self.is_mtp_spec = False
         self.is_dflash_spec = False
         self._draft_token_ids = None
         # Async speculative decoding drafts rows by req_id. Only used at
@@ -1230,6 +1232,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             if self.speculative_config.method == "eagle3":
                 self.is_eagle3_spec = True
                 self.drafter = EagleProposer(
+                    self.vllm_config,
+                    self.device,
+                    self.on_device_sampling,
+                )
+            elif self.speculative_config.method == "mtp":
+                # Same fused-draft flow as EAGLE3 (MTPProposer subclasses
+                # EagleProposer); the target hands over its final hidden state.
+                self.is_mtp_spec = True
+                self.drafter = MTPProposer(
                     self.vllm_config,
                     self.device,
                     self.on_device_sampling,
@@ -1534,7 +1545,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
     @property
     def is_spec_decode(self) -> bool:
-        return self.is_eagle3_spec or self.is_dflash_spec
+        return self.is_eagle3_spec or self.is_mtp_spec or self.is_dflash_spec
 
     @property
     def cp_rank(self) -> int:
@@ -1983,10 +1994,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         if self.is_spec_decode:
             if _supports_aux_hidden_states(self.model):
-                if self.is_dflash_spec:
-                    assert isinstance(self.drafter, DFlashProposer)
+                if self.is_dflash_spec or self.is_mtp_spec:
+                    assert isinstance(self.drafter, (DFlashProposer, MTPProposer))
                     aux_layers = self.drafter.get_target_aux_hidden_state_layers()
-                    logger.info("Using DFlash auxiliary layers: %s", aux_layers)
+                    logger.info(
+                        "Using %s auxiliary layers: %s",
+                        self.speculative_config.method,
+                        aux_layers,
+                    )
                 else:
                     aux_layers = self._get_eagle3_aux_layers_from_config()
                     if aux_layers:
@@ -9851,7 +9866,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             >>> self._dispatch_dummy_draft(batch_size=4, ctx_bucket=2048)
         """
         if not (
-            self.is_eagle3_spec
+            (self.is_eagle3_spec or self.is_mtp_spec)
             and self.drafter is not None
             and (
                 self.neuron_config.embedding_dp_size > 1
@@ -11158,7 +11173,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             assert self.drafter.model is not None
             self.drafter.model.bind_kv_cache(kv_caches)
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
-            if isinstance(self.drafter, DFlashProposer):
+            if isinstance(self.drafter, (DFlashProposer, MTPProposer)):
                 self.drafter.alias_target_weights(target_model=self.model)
 
         if has_kv_transfer_group():
