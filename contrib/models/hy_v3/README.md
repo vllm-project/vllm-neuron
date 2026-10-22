@@ -93,6 +93,12 @@ print(outputs[0].outputs[0].text)
   at 0.6 the server ran out of memory after about 40 minutes.
 - `max_model_len` is always an implicit decode context bucket, so
   `decode_context_length_buckets` must stay strictly below it.
+- Set `decode_context_length_buckets` whenever `max_model_len` is well above
+  the typical context. Without it each decode batch bucket is a single NEFF
+  that reads `max_model_len` worth of KV blocks per request on every step,
+  whatever the request's real length (vllm-neuron 0.21+ makes this opt-in;
+  the NxDI-based 0.2.x bucketed decode by sequence length by default). The
+  configs below all set it.
 - Not supported: data parallel / attention DP, MTP speculative decoding, FP8
   KV cache (the checkpoint has no KV scales). They are rejected at startup.
 - `--decode-context-parallel-size 8 --cp-kv-cache-interleave-size 32` shards
