@@ -2989,14 +2989,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
     def _state_pool_table(self, padded_num_reqs: int, n_blocks: int) -> torch.Tensor:
         """[padded_num_reqs, n_blocks] dedicated-pool pages of each request's state blocks
-        (-1 for padded rows). A request keeps its slot (pages 1 + slot * n_blocks + j) from
-        its first step until it finishes or is preempted (_release_state_pool_slots); running
-        requests can be out of the persistent batch for a step (e.g. during another request's
-        prefill) and keep their state."""
+        (-1 for padded rows). A request keeps its slot from its first step until it finishes
+        or is preempted (_release_state_pool_slots); running requests can be out of the
+        persistent batch for a step (e.g. during another request's prefill) and keep their
+        state. Its 1 + num_speculative_blocks state blocks map to pages
+        1 + slot * (1 + num_speculative_blocks) + j. The block table can be wider (vLLM pads
+        it for alignment); the extra columns map to the null page 0."""
         slots = self._state_pool_slots
         for req_id in [r for r in slots if r not in self.requests]:
             self._state_pool_free.append(slots.pop(req_id))
         table = torch.full((padded_num_reqs, n_blocks), -1, dtype=torch.int32)
+        pages = min(self._state_pool_slot_pages, n_blocks)
         for i, req_id in enumerate(self.input_batch.req_ids[:padded_num_reqs]):
             if req_id is None:
                 continue
@@ -3006,8 +3009,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         "Recurrent-state pool exhausted: more live requests than max_num_seqs"
                     )
                 slots[req_id] = self._state_pool_free.pop(0)
-            table[i] = (
-                1 + slots[req_id] * n_blocks + torch.arange(n_blocks, dtype=torch.int32)
+            table[i] = 0
+            table[i, :pages] = (
+                1
+                + slots[req_id] * self._state_pool_slot_pages
+                + torch.arange(pages, dtype=torch.int32)
             )
         return table.to(self.device)
 
@@ -11752,6 +11758,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             ]
             self._state_pool_slots: dict[str, int] = {}
             self._state_pool_free = list(range(self.max_num_reqs))
+            # Pages per slot: each request's 1 + num_speculative_blocks state blocks.
+            self._state_pool_slot_pages = 1 + max(
+                (
+                    kv_cache_config.kv_cache_groups[
+                        gi
+                    ].kv_cache_spec.num_speculative_blocks
+                    for gi in self._state_pool_groups
+                ),
+                default=0,
+            )
             self.model.bind_state_cache(state_caches)
             self._setup_kv_block_clearing(kv_cache_config, block_sizes, kv_caches)
             self._setup_mamba_align(kv_cache_config, state_caches)
