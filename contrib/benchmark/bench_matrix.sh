@@ -35,6 +35,9 @@
 #   INPUT_RATIO    input-length jitter, +/- fraction (default: 0.03)
 #   OUTPUT_RATIO   output-length jitter, DATASET=random only (default: 0, so TPOT
 #                  is over exact OSL; DATASET=text always decodes exactly OSL)
+#   PROMPTS_PER_CONC  requests per cell = max(MIN_PROMPTS, PROMPTS_PER_CONC x
+#                  concurrency) (default: 10, i.e. ten waves at full concurrency)
+#   MIN_PROMPTS    (default: 10)
 #   NUM_WARMUPS    warmup requests per cell (default: the cell's concurrency)
 #   BASE_URL       (default: http://127.0.0.1:8000)
 #   OUT_DIR        (default: ./results/bench/$LABEL)
@@ -86,7 +89,7 @@ for IN in $ISLS; do
       if [ -n "${MAX_CONC:-}" ] && [ "$C" -gt "$MAX_CONC" ]; then
         continue
       fi
-      N=$(( C * 4 )); [ $N -lt 8 ] && N=8
+      N=$(( C * ${PROMPTS_PER_CONC:-10} )); [ $N -lt ${MIN_PROMPTS:-10} ] && N=${MIN_PROMPTS:-10}
       tag="in${IN}_out${OUT}_c${C}"
       # Distinct prompts per cell (no prefix-cache reuse across cells), identical
       # across servers so different models / configurations see the same requests.

@@ -20,7 +20,7 @@ The scripts are generalised from the Hy3 contrib port's `bench_matrix.sh` and
 | Concurrency | 1, 4, 8, 16, 32 | Latency through batched serving |
 | Input jitter | +/-3% (`INPUT_RATIO=0.03`) | Identical lengths in a burst are not real traffic |
 | Output jitter | none (`OUTPUT_RATIO=0`) | With `--ignore-eos`, every request decodes exactly OSL tokens, so TPOT is comparable |
-| Requests per cell | max(8, 4 x concurrency), plus one warmup wave | Enough for stable medians |
+| Requests per cell | max(10, 10 x concurrency), plus one warmup wave | Ten waves at full concurrency, so ramp-up and drain are a small share of the run (`PROMPTS_PER_CONC`, `MIN_PROMPTS`) |
 | Concurrency cap | the server's real limit (`MAX_CONC`), added as a cell | See "Concurrency" below |
 | Seeds | fixed per (ISL, concurrency) | Every server sees the same prompts |
 
