@@ -345,10 +345,10 @@ class Qwen3_5Attention(nn.Module):
             num_tokens
         )
         blocks, offsets = blocks.repeat(nkh), offsets.repeat(nkh)
-        keep = live.repeat(nkh).view(-1, 1)
-        zero = torch.zeros((), dtype=self.k_cache.dtype, device=k.device)
-        k_rows = torch.where(keep, k.reshape(-1, self.head_dim).to(self.k_cache.dtype), zero)
-        v_rows = torch.where(keep, v.reshape(-1, self.head_dim).to(self.v_cache.dtype), zero)
+        # A float multiply rather than ``torch.where`` (see DeltaNet._write_states).
+        keep = live.repeat(nkh).view(-1, 1).to(self.k_cache.dtype)
+        k_rows = k.reshape(-1, self.head_dim).to(self.k_cache.dtype) * keep
+        v_rows = v.reshape(-1, self.head_dim).to(self.v_cache.dtype) * keep
         self.k_cache.index_put_((blocks, heads, offsets), k_rows)
         self.v_cache.index_put_((blocks, heads, offsets), v_rows)
 

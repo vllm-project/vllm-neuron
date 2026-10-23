@@ -778,7 +778,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         n = indices.shape[0]
         page = torch.cat([conv.reshape(n, -1).float(), rec.reshape(n, -1).float()], dim=1)
         if live is not None:
-            page = torch.where(live.view(n, 1), page, torch.zeros((), dtype=page.dtype, device=page.device))
+            # The page is finite, so multiplying by 0 is exact.
+            page = page * live.view(n, 1).to(page.dtype)
         half = self.state_a[0].numel()
         page = F.pad(page, (0, 2 * half - page.shape[1]))
         self.state_a.index_copy_(0, indices, page[:, :half].reshape((n,) + self.state_a.shape[1:]))
@@ -1018,8 +1019,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # stay zero, matching a sequence that started from a cold state.
         new_conv_state = self._tail_rows(qkv, is_real, self.conv_kernel_size - 1)
 
-        write_idx, live = self.state_indices(metadata, 1)
-        self._write_states(write_idx, new_conv_state.unsqueeze(0), final_state, live)
+        # The raw block id, with no live mask: a prefill always writes a real
+        # sequence. Any arithmetic on the block id or slot mapping on the way to
+        # this write (``state_indices``' compares, a mask multiply, even a clamp)
+        # fails neuronx-cc's DataLocalityOpt in the full prefill graph
+        # ([NCC_IDLO901]), though one layer alone compiles. A warmup prefill's
+        # padded block table points at the null block; what it leaves there is
+        # finite, which is all the dead decode rows that read it need.
+        write_idx = metadata["block_table_tensor"][:1, 0].to(torch.long)
+        self._write_states(write_idx, new_conv_state.unsqueeze(0), final_state)
 
         output = self._output(core, z, num_tokens)
         if self.world_size > 1:
