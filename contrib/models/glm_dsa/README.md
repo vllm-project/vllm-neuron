@@ -37,8 +37,9 @@ pip install -e contrib/models/glm_dsa
 python contrib/models/glm_dsa/scripts/convert_fp8_block_to_neuron_fp8.py \
     --src <dir>/GLM-5.3 --dst <dir>/GLM-5.3-neuron-fp8 --workers 24
 
-# 3. The XLA compile route (see "Known limitations")
-export VLLM_NEURON_BACKEND=vllm_neuron
+# 3. The native PyTorch route, with fewer parallel compiles per rank (see
+#    "Known limitations")
+export VLLM_NEURON_BACKEND=neuron_native VLLM_NEURON_PARALLEL_COMPILE_WORKERS=2
 ```
 
 ### Serve with the OpenAI-compatible server
@@ -80,7 +81,7 @@ python contrib/models/glm_dsa/scripts/run.py --model <dir>/GLM-5.3-neuron-fp8 --
 
 ```bash
 pip install -e contrib/models/glm_dsa
-GLM_MODEL=<dir>/GLM-5.3-neuron-fp8 VLLM_NEURON_BACKEND=vllm_neuron \
+GLM_MODEL=<dir>/GLM-5.3-neuron-fp8 VLLM_NEURON_BACKEND=neuron_native \
     pytest contrib/models/glm_dsa/test/integration/test_model.py -v -s --timeout=7200
 ```
 
@@ -163,9 +164,15 @@ Requantisation error, block -> per-row, over 600 sampled expert tensors: median
   cost grows with the cache span, not with the 2048 keys it keeps (`contrib/models/hy4_preview/README.md`,
   "Known limitations").
 * No MTP, no prefix caching, no mixed prefill/decode batches.
-* **Use the XLA compile route (`VLLM_NEURON_BACKEND=vllm_neuron`)**, as for Hy4:
-  on vllm-neuron 0.29's default native route the decode graphs compile once per
-  rank instead of once.
+* **Native PyTorch route (`VLLM_NEURON_BACKEND=neuron_native`).** On it the decode
+  graphs compile once per rank, and vllm-neuron's default of 8 parallel
+  neuronx-cc jobs per rank ran the host out of memory compiling the 32K bench
+  graphs (`[F137] neuronx-cc was forcibly killed`); cap it with
+  `VLLM_NEURON_PARALLEL_COMPILE_WORKERS=2`. Re-validated on the native route
+  (SDK 2.33): the 30K needle passes (29.8 s, against 76.3 s on the XLA
+  route) and the integration test passes. The "Measured" throughput above is
+  from the XLA route (`VLLM_NEURON_BACKEND=vllm_neuron`, deprecated); the native
+  32K bench has not been rerun with the cap yet.
 * `src/hy_v4/` is a copy of `contrib/models/hy4_preview/src/` (the contrib rules
   forbid importing another model's folder); a fix to one belongs in both.
 * No disaggregated (1P1D) scripts yet: Hy4's `Hy4NixlConnector` (a key-only
