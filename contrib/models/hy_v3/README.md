@@ -441,6 +441,11 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 | `scripts/serve.sh` | `vllm serve` with prefix caching (configs B / C / DCP below); `EP=<n>` sets the EP degree |
 | `scripts/serve_latency.sh` | single-request latency config (no prefix caching, prefill buckets 512..16384) |
 | `scripts/bench_matrix.sh` | `vllm bench serve` matrix, random dataset, a distinct seed per cell so cells never share prefix-cache entries |
+| `scripts/serve_256k.sh` | long-context config: max_model_len 256000, DCP=8, prefill buckets up to 4096 (with DCP the 8192 bucket fails to compile, `NCC_IGCA037`) |
+| `scripts/bench_fixed.sh` | `vllm bench serve` matrix over the fixed real-text prompts in `bench_data/prompts` (same requests every run) |
+| `scripts/gen_bench_prompts.py` | generates `bench_data/prompts`: sglang-style ShareGPT text cut / repeated to an exact token count |
+| `scripts/needle.py` | passkey retrieval at 16k-85k (`gen` writes `bench_data/needle.jsonl.gz`, `run` checks a server) |
+| `scripts/bench_sharegpt.sh` | `vllm bench serve` on ShareGPT (vLLM keeps prompts <= 1024 tokens only) |
 | `scripts/bench_prefix_cache.sh` | prefix-cache benchmark: shared-prefix share sweep, hit rate read from the server's `/metrics` |
 | `scripts/summarize_bench.py` | markdown table from benchmark JSONs, optionally against a baseline directory |
 | `scripts/eval_math500.py` | MATH-500 through the OpenAI API, graded with math-verify |
