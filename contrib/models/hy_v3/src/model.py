@@ -39,6 +39,8 @@ ANNOTATION GUIDE:
 import logging
 
 import nki.language as nl
+import os
+
 import torch
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from nkilib.core.mlp.mlp_parameters import TKG_BS_SEQLEN_THRESHOLD
@@ -70,6 +72,8 @@ from vllm_neuron.utils.weight_loader import (
 )
 
 from .config import HYV3Config
+from .kernels.moe_tkg_hits import moe_tkg_hits
+from .kernels.moe_tkg_hits_batch import moe_tkg_hits_batch
 from .weight_loaders import (
     FP8_DTYPE as _FP8_DTYPE,
 )
@@ -786,8 +790,15 @@ def routed_experts_cte(
     # padding, so this is ~3x faster than shard_on_i at T=2048.
     # (neuronx-cc 2.27 failed with NCC_ICFG001 when this kernel followed
     # segmented attention in one graph; fixed in neuronx-cc 2.28.)
+    # HY3_MOE_CTE_IMPL=shard_on_i: neuronx-cc 2.28 fails shard_on_i_hybrid at
+    # ep_degree 8 / 4 (I/tp 192 / 96) with NCC_IGCA108 in bwmm_shard_on_I.py.
+    impl = (
+        MoECTEImplementation.shard_on_i
+        if os.environ.get("HY3_MOE_CTE_IMPL") == "shard_on_i"
+        else MoECTEImplementation.shard_on_i_hybrid
+    )
     return NF.moe_cte(
-        implementation=MoECTEImplementation.shard_on_i_hybrid,
+        implementation=impl,
         num_static_block=num_local_experts,
         conditions=conditions,
         hidden_states=normed,
@@ -846,6 +857,96 @@ def routed_experts_tkg(
         activation_fn=ActFnType.SiLU,
     )
 
+
+def routed_experts_tkg_hits(
+    normed: torch.Tensor,
+    affinities: torch.Tensor,
+    top_k_index: torch.Tensor,
+    rank_id: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Routed experts for a one-token decode (``moe_tkg_hits``): partial output.
+
+    Same contract as ``routed_experts_tkg``, but only the top-k slots whose
+    expert is one of this rank's ``L`` experts are computed: they are packed
+    first and the kernel loops over their count at runtime.
+    """
+    e_l = gate_up_weight.shape[0]
+    k = top_k_index.shape[1]
+    base = rank_id.long().reshape(1, 1) * e_l
+    local_ids = base.reshape(1) + torch.arange(e_l, device=normed.device, dtype=torch.long)
+    local_aff = NF.get_local_expert_affinities(affinities, local_ids)  # [1, L]
+    local_idx = top_k_index.long() - base
+    valid = (local_idx >= 0) & (local_idx < e_l)
+    # Local hits first, in slot order: the kernel runs the first num_hits.
+    slot = torch.arange(k, device=normed.device, dtype=torch.float32).reshape(1, k)
+    order = torch.topk(torch.where(valid, slot, slot + k), k, dim=1, largest=False).indices
+    packed = torch.gather(torch.where(valid, local_idx, 0), 1, order)
+    # int32 explicitly: sum() of an int32 tensor is int64.
+    num_hits = valid.sum(dim=1, keepdim=True, dtype=torch.int32)
+    dummy_in_scale = torch.ones((e_l, 1), dtype=torch.float32, device=normed.device)
+    return wrap_nki(moe_tkg_hits)[2](
+        hidden_input=normed,
+        expert_gate_up_weights=gate_up_weight,
+        expert_down_weights=down_weight,
+        expert_affinities=local_aff.to(torch.float32),
+        expert_index=packed.to(torch.int32),
+        num_hits=num_hits,
+        expert_gate_up_weights_scale=gate_up_scale,
+        expert_down_weights_scale=down_scale,
+        expert_gate_up_input_scale=dummy_in_scale,
+        expert_down_input_scale=dummy_in_scale,
+        activation_fn=ActFnType.SiLU,
+    )
+
+
+
+def routed_experts_tkg_hits_batch(
+    normed: torch.Tensor,
+    affinities: torch.Tensor,
+    top_k_index: torch.Tensor,
+    rank_id: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Routed experts for a few-token decode (``moe_tkg_hits_batch``): partial output.
+
+    Same contract as ``routed_experts_tkg``, but only this rank's experts that
+    at least one token routed to are computed, each once for the whole batch:
+    they are packed first (with their affinity columns) and the kernel loops
+    over their count at runtime.
+    """
+    e_l = gate_up_weight.shape[0]
+    base = rank_id.long().reshape(1, 1) * e_l
+    expert = torch.arange(e_l, device=normed.device, dtype=torch.long)
+    local_aff = NF.get_local_expert_affinities(affinities, base.reshape(1) + expert)  # [T, L]
+    local_idx = top_k_index.long() - base  # [T, K], local if in [0, L)
+    hit = (local_idx.unsqueeze(-1) == expert.view(1, 1, e_l)).any(dim=1).any(dim=0)  # [L]
+    # Hit experts first, in expert order: the kernel runs the first num_hits.
+    key = torch.where(hit, expert, expert + e_l).to(torch.float32).view(1, e_l)
+    order = torch.topk(key, e_l, dim=1, largest=False).indices.view(e_l)
+    packed_aff = torch.index_select(local_aff.to(torch.float32), 1, order)
+    # int32 explicitly: sum() of a bool tensor is int64.
+    num_hits = hit.sum(dtype=torch.int32).view(1, 1)
+    dummy_in_scale = torch.ones((e_l, 1), dtype=torch.float32, device=normed.device)
+    return wrap_nki(moe_tkg_hits_batch)[2](
+        hidden_input=normed,
+        expert_gate_up_weights=gate_up_weight,
+        expert_down_weights=down_weight,
+        expert_affinities=packed_aff,
+        expert_index=order.view(1, e_l).to(torch.int32),
+        num_hits=num_hits,
+        expert_gate_up_weights_scale=gate_up_scale,
+        expert_down_weights_scale=down_scale,
+        expert_gate_up_input_scale=dummy_in_scale,
+        expert_down_input_scale=dummy_in_scale,
+        activation_fn=ActFnType.SiLU,
+    )
 
 class HYV3MoE(nn.Module):
     """Hy3 sparse MoE block.
@@ -1076,7 +1177,116 @@ class HYV3MoE(nn.Module):
             output = self.tp_group.reduce_scatter(output, dim=0)
         return output
 
+    def _use_selective_decode(self, num_tokens: int) -> bool:
+        """moe_tkg selective (only the routed experts' I/tp slices) vs all-expert.
+
+        All-expert reads every local expert each step (all experts / world per
+        rank whatever the EP x TP split); selective reads top_k slices of I/tp,
+        so it wins while tokens x top_k < local experts (the gpt_oss rule).
+        HY3_DECODE_SELECTIVE=1/0 forces it.
+        """
+        forced = os.environ.get("HY3_DECODE_SELECTIVE")
+        if forced in ("0", "1"):
+            return forced == "1"
+        return num_tokens * self.num_experts_per_token < self.num_local_experts
+
+    def _forward_decode_selective(self, normed, affinities, top_k_index):
+        e_l = self.num_local_experts
+        base = self._ep_row(normed.device).long().reshape(1, 1) * e_l
+        local_ids = base.reshape(1) + torch.arange(e_l, device=normed.device, dtype=torch.long)
+        local_aff = NF.get_local_expert_affinities(affinities, local_ids)  # [T, E_L]
+        local_idx = top_k_index.long() - base
+        valid = (local_idx >= 0) & (local_idx < e_l)
+        # A slot whose expert lives in another EP group points at a local expert
+        # this token did not select (affinity 0): it adds exactly nothing.
+        spare = torch.argmin((local_aff > 0).to(torch.int32), dim=1, keepdim=True)
+        local_idx = torch.where(valid, local_idx, spare)
+        dummy_in_scale = torch.ones((e_l, 1), dtype=torch.float32, device=normed.device)
+        return wrap_nki(moe_tkg_wrapper)[2](
+            hidden_input=normed,
+            expert_gate_up_weights=self.gate_up_proj_weight,
+            expert_down_weights=self.down_proj_weight,
+            # fp32: the selective kernel rejects bf16 affinities.
+            expert_affinities=local_aff.to(torch.float32),
+            expert_index=local_idx.to(torch.int32),
+            is_all_expert=False,
+            expert_gate_up_weights_scale=self.gate_up_proj_scale_tkg,
+            expert_down_weights_scale=self.down_proj_scale_tkg,
+            expert_gate_up_input_scale=dummy_in_scale,
+            expert_down_input_scale=dummy_in_scale,
+            expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+            activation_fn=ActFnType.SiLU,
+        )
+
+    def _use_hit_decode(self, num_tokens: int) -> bool:
+        """moe_tkg_hits: one token, only the experts routed to this rank.
+
+        Both moe_tkg modes run a fixed amount of expert work per token: all
+        local experts, or all top_k slots, the non-local ones on a dummy
+        expert. moe_tkg_hits loops over the local hits at runtime, so the
+        layer costs the busiest rank's hits (usually 1 at EP64) instead.
+        HY3_DECODE_HITS=0 turns it off.
+        """
+        return num_tokens == 1 and os.environ.get("HY3_DECODE_HITS", "1") != "0"
+
+    def _forward_decode_hits(self, normed, affinities, top_k_index):
+        return routed_experts_tkg_hits(
+            normed,
+            affinities,
+            top_k_index,
+            self._ep_row(normed.device).view(1, 1),
+            self.gate_up_proj_weight,
+            self.down_proj_weight,
+            self.gate_up_proj_scale_tkg,
+            self.down_proj_scale_tkg,
+        )
+
+    def _use_hit_batch_decode(self, num_tokens: int) -> bool:
+        """moe_tkg_hits_batch: a few tokens, only the local experts any of them routed to.
+
+        Each hit expert is read once for the batch. The busiest rank's hits
+        grow with the batch, and once it hits all its experts the runtime loop
+        is slower than moe_tkg's unrolled all-expert path, so the batch limit
+        is 4 tokens per 3 local experts (EP64: 4, EP32: 8).
+        HY3_DECODE_HITS_MAX_T overrides it; HY3_DECODE_HITS=0 turns it off.
+        """
+        if os.environ.get("HY3_DECODE_HITS", "1") == "0":
+            return False
+        max_t = os.environ.get("HY3_DECODE_HITS_MAX_T")
+        limit = int(max_t) if max_t else (4 * self.num_local_experts) // 3
+        return 1 < num_tokens <= limit
+
     def _forward_decode(self, normed, affinities, top_k_index, rank, extra=None):
+        if self._use_hit_batch_decode(normed.shape[0]):
+            output = routed_experts_tkg_hits_batch(
+                normed,
+                affinities,
+                top_k_index,
+                self._ep_row(normed.device).view(1, 1),
+                self.gate_up_proj_weight,
+                self.down_proj_weight,
+                self.gate_up_proj_scale_tkg,
+                self.down_proj_scale_tkg,
+            )
+            if extra is not None:
+                output = output + extra
+            if self.world_size > 1:
+                output = self.tp_group.all_reduce(output)
+            return output
+        if self._use_hit_decode(normed.shape[0]):
+            output = self._forward_decode_hits(normed, affinities, top_k_index)
+            if extra is not None:
+                output = output + extra
+            if self.world_size > 1:
+                output = self.tp_group.all_reduce(output)
+            return output
+        if self._use_selective_decode(normed.shape[0]):
+            output = self._forward_decode_selective(normed, affinities, top_k_index)
+            if extra is not None:
+                output = output + extra
+            if self.world_size > 1:
+                output = self.tp_group.all_reduce(output)
+            return output
         output = routed_experts_tkg(
             normed,
             affinities,
