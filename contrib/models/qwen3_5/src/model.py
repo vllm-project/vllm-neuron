@@ -424,7 +424,7 @@ class Qwen3_5Attention(nn.Module):
         self._write_kv(k, v, metadata)
 
         # Gather this batch's pages straight into the layout attention wants:
-        # [reqs * query_heads, ctx, dim].
+        # [reqs * kv_heads, ctx, dim].
         #
         # The obvious route — index the cache with the block table, then
         # ``permute(0, 2, 1, 3, 4)`` to bring the KV-head dim in front of the
@@ -435,9 +435,9 @@ class Qwen3_5Attention(nn.Module):
         # and matches CPU, decode kills the process.
         #
         # So flatten the cache to [blocks * kv_heads, block_size, dim] and gather
-        # rows by an index computed per (request, query head). That removes the
-        # rank-5 permute *and* the ``repeat_interleave`` that expanded KV heads up
-        # to query heads — the index names each query head's KV head directly —
+        # rows by an index computed per (request, KV head). That removes the
+        # rank-5 permute, and grouping the query heads per KV head below removes
+        # the ``repeat_interleave`` that expanded KV heads up to query heads —
         # and everything downstream is rank 3.
         # Clamp for the same reason as DeltaNet's state_indices: padded batch
         # rows keep a stale block id, and an out-of-range id here is an
@@ -456,19 +456,26 @@ class Qwen3_5Attention(nn.Module):
             torch.zeros_like(bt),  # the null block, kept zero
         )
         nh = self.num_heads_per_rank
-        rows = num_reqs * nh
+        groups = self.num_kv_groups  # query heads per KV head
+        rows = num_reqs * nkh  # one context row per (request, KV head)
         ctx_len = blocks.shape[1] * block_size
 
         # After reshaping [blocks, kv_heads, ...] to [blocks * kv_heads, ...] the
-        # row for (block b, kv head h) is ``b * nkh + h``.
-        kv_of_query_head = torch.arange(nh, device=blocks.device) // self.num_kv_groups
-        base = blocks.unsqueeze(1) * nkh + kv_of_query_head.view(1, nh, 1)
+        # row for (block b, kv head h) is ``b * nkh + h``. Each (request, KV head)
+        # context is gathered ONCE and shared by its ``groups`` query heads, which
+        # ride in the matmul's row dim: gathering per query head made the gather
+        # ``groups`` times larger (2x on 2B, 6x on 27B), and on the native route
+        # it is a DMA_INDIRECT per row that dominated batch-8 decode.
+        kv_heads = torch.arange(nkh, device=blocks.device)
+        base = blocks.unsqueeze(1) * nkh + kv_heads.view(1, nkh, 1)
 
         k_flat = self.k_cache.reshape(num_blocks * nkh, block_size, self.head_dim)
         v_flat = self.v_cache.reshape(num_blocks * nkh, block_size, self.head_dim)
         k_ctx = k_flat[base.reshape(-1)].reshape(rows, ctx_len, self.head_dim)
         v_ctx = v_flat[base.reshape(-1)].reshape(rows, ctx_len, self.head_dim)
-        q = q.transpose(0, 1).reshape(rows, 1, self.head_dim)
+        # [heads, reqs, dim] -> [reqs * kv_heads, groups, dim]: query head j uses
+        # KV head j // groups, so a KV head's query heads are contiguous.
+        q = q.transpose(0, 1).reshape(rows, groups, self.head_dim)
 
         scores = (q.float() @ k_ctx.float().transpose(-1, -2)) * self.scaling
         # The pages hold everything *strictly before* this token's position. This
@@ -476,7 +483,7 @@ class Qwen3_5Attention(nn.Module):
         # functionalised, so the gather just done reads the page as it was before
         # the write, and the write only reaches HBM when the step ends.
         key_positions = torch.arange(ctx_len, device=q.device).view(1, 1, ctx_len)
-        visible = key_positions < positions.repeat_interleave(nh).view(rows, 1, 1)
+        visible = key_positions < positions.repeat_interleave(nkh).view(rows, 1, 1)
         scores = scores.masked_fill(~visible, float("-inf"))
         # Masked positions come out of the softmax at probability exactly 0, but
         # that is not enough: blocks are recycled between KV-cache groups, so the
@@ -492,15 +499,12 @@ class Qwen3_5Attention(nn.Module):
         # scores above is already a select, which is why that path was fine.)
         v_ctx = torch.where(visible.transpose(1, 2), v_ctx, torch.zeros_like(v_ctx))
 
-        # k/v arrive as [kv_heads, reqs, dim]; expand to one row per query head
-        # to match ``q``, then append as context column ``ctx_len``. Appending
-        # rather than scattering into ``k_ctx`` keeps this rank-3 and keeps the
-        # column unmaskable, which is what it should be -- a token always
-        # attends to itself, so no row can come out fully -inf.
-        k_cur = torch.index_select(k, 0, kv_of_query_head)
-        v_cur = torch.index_select(v, 0, kv_of_query_head)
-        k_cur = k_cur.transpose(0, 1).reshape(rows, 1, self.head_dim)
-        v_cur = v_cur.transpose(0, 1).reshape(rows, 1, self.head_dim)
+        # k/v arrive as [kv_heads, reqs, dim]; append them as context column
+        # ``ctx_len``. Appending rather than scattering into ``k_ctx`` keeps this
+        # rank-3 and keeps the column unmaskable, which is what it should be -- a
+        # token always attends to itself, so no row can come out fully -inf.
+        k_cur = k.transpose(0, 1).reshape(rows, 1, self.head_dim)
+        v_cur = v.transpose(0, 1).reshape(rows, 1, self.head_dim)
         scores_cur = (q.float() @ k_cur.float().transpose(-1, -2)) * self.scaling
         attn = torch.softmax(torch.cat([scores, scores_cur], dim=-1), dim=-1)
         v_all = torch.cat([v_ctx, v_cur.to(v_ctx.dtype)], dim=1)
