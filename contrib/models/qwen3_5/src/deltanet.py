@@ -656,14 +656,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             torch.empty(self.value_dim, self.hidden_size, dtype=self.dtype)
         )
 
-        # Bound by ``bind_kv_cache``: one page-major float32 view of this
-        # layer's share of the KV pool, [pages, page_floats]. Both states live
-        # inside a single page so that block ``b`` stays inside page ``b`` --
-        # the attention layer sharing this buffer relies on it. The conv window
-        # is logically bf16 but is carried in float32 columns because a
-        # page-major view is only contiguous at full page width, hence one dtype
-        # for the whole page.
-        self.state_pages: torch.Tensor | None = None
+        # Bound by ``bind_state`` (from the model's ``bind_state_cache``): the two
+        # float32 halves of this layer's state pages, see "State plumbing". The
+        # conv window is logically bf16 but is stored as float32, because the
+        # runner's state pages are all float32.
+        self.state_a: torch.Tensor | None = None
+        self.state_b: torch.Tensor | None = None
         self.conv_numel = (self.conv_kernel_size - 1) * self.conv_dim
         self.rec_numel = self.num_v_heads * self.head_k_dim * self.head_v_dim
 
@@ -719,87 +717,96 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
     # ── State plumbing ───────────────────────────────────────────────────
+    #
+    # The runner binds each layer's state as two float32 halves of a page,
+    # ``state_a`` and ``state_b`` (``vllm_neuron.model.state_cache``), indexed by
+    # the layer's state block id. A page holds ``[conv window | recurrent | pad]``
+    # back to back across the two halves. Pages are moved as ``[pages, rows,
+    # _STATE_ROW]`` when the sizes allow: a single ``[pages, half]`` row lands on
+    # one partition, and re-laying it out to the recurrent shape becomes
+    # per-element DMA. The 3-D view is made here, outside the graph, since an
+    # ``index_copy_`` through an in-graph ``.view()`` does not lower reliably.
+    _STATE_ROW = 128
 
-    def bind_state_pages(self, pages: torch.Tensor) -> None:
-        """Bind the page-major state view and check the page has room."""
-        if pages.dim() != 2 or pages.shape[1] < self.conv_numel + self.rec_numel:
+    def bind_state(self, state_a: torch.Tensor, state_b: torch.Tensor) -> None:
+        """Bind this layer's two state halves ``[pages, half]`` (float32)."""
+        if state_a.shape != state_b.shape or state_a.dtype != torch.float32:
             raise ValueError(
-                f"{self.layer_name}: state page view {tuple(pages.shape)} cannot "
-                f"hold {self.conv_numel} conv + {self.rec_numel} recurrent floats"
+                f"{self.layer_name}: expected two float32 state halves of one shape, "
+                f"got {tuple(state_a.shape)} {state_a.dtype} / {tuple(state_b.shape)}"
             )
-        self.state_pages = pages
+        half = state_a.shape[1]
+        if 2 * half < self.conv_numel + self.rec_numel:
+            raise ValueError(
+                f"{self.layer_name}: a state page of 2 x {half} floats cannot hold "
+                f"{self.conv_numel} conv + {self.rec_numel} recurrent floats"
+            )
+        R = self._STATE_ROW
+        if half % R == 0 and self.conv_numel % R == 0 and self.rec_numel % R == 0:
+            state_a = state_a.view(state_a.shape[0], half // R, R)
+            state_b = state_b.view(state_b.shape[0], half // R, R)
+        self.state_a, self.state_b = state_a, state_b
 
     def _read_states(self, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather ``(conv_window, recurrent_state)`` for the batch's pages."""
-        rows = self.state_pages.index_select(0, indices)
-        n = rows.shape[0]
-        conv = rows[:, : self.conv_numel].reshape(
+        n = indices.shape[0]
+        page = torch.cat(
+            [self.state_a.index_select(0, indices), self.state_b.index_select(0, indices)],
+            dim=1,
+        ).reshape(n, -1)
+        conv = page[:, : self.conv_numel].reshape(
             n, self.conv_kernel_size - 1, self.conv_dim
         )
-        rec = rows[:, self.conv_numel : self.conv_numel + self.rec_numel].reshape(
+        rec = page[:, self.conv_numel : self.conv_numel + self.rec_numel].reshape(
             n, self.num_v_heads, self.head_k_dim, self.head_v_dim
         )
         return conv, rec
 
     def _write_states(
-        self, indices: torch.Tensor, conv: torch.Tensor, rec: torch.Tensor
+        self,
+        indices: torch.Tensor,
+        conv: torch.Tensor,
+        rec: torch.Tensor,
+        live: torch.Tensor | None = None,
     ) -> None:
-        """Scatter both states back, as one full-width row per page.
+        """Scatter both states back, one whole half-row per page and half.
 
-        One ``index_copy_`` rather than two narrow writes: a per-state column
-        slice of the page is non-contiguous, and an in-place write through a
-        strided view of a bound device tensor is what Neuron rejects. The
-        leftover columns are the page padding vLLM added, so zeroing them is
-        free.
+        Rows that are not ``live`` (padded batch rows) write zeros: they are
+        redirected to the null block, which dead rows read and which must stay
+        finite.
         """
         n = indices.shape[0]
-        parts = [conv.reshape(n, -1).float(), rec.reshape(n, -1).float()]
-        pad = self.state_pages.shape[1] - self.conv_numel - self.rec_numel
-        if pad:
-            parts.append(
-                torch.zeros(n, pad, dtype=self.state_pages.dtype, device=indices.device)
-            )
-        self.state_pages.index_copy_(0, indices, torch.cat(parts, dim=1))
+        page = torch.cat([conv.reshape(n, -1).float(), rec.reshape(n, -1).float()], dim=1)
+        if live is not None:
+            page = torch.where(live.view(n, 1), page, torch.zeros((), dtype=page.dtype, device=page.device))
+        half = self.state_a[0].numel()
+        page = F.pad(page, (0, 2 * half - page.shape[1]))
+        self.state_a.index_copy_(0, indices, page[:, :half].reshape((n,) + self.state_a.shape[1:]))
+        self.state_b.index_copy_(0, indices, page[:, half:].reshape((n,) + self.state_b.shape[1:]))
 
     def state_indices(
         self, metadata: dict, num_reqs: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Per-request read and write page for the batch, as ``(read, write)``.
+        """Per-request state page for the batch, and which rows are live, as ``(index, live)``.
 
         The recurrent group's ``mamba_block_size`` equals ``max_model_len``, so
-        every sequence owns exactly one block and its state slot is simply that
-        block's id.
+        every sequence owns exactly one block and its state slot is that block's
+        id (``block_table[:, 0]``; the runner maps it into its state pool).
 
-        Padded batch rows need two different redirects, which is why this returns
-        a pair. They must *read* zeros: their output is discarded but their
-        logits are not, and the sampler's argmax reduces across the whole tile,
-        so a dead row that reads another group's bytes as float32 state hands its
-        NaN logits to every live row in the batch. And they must *write*
-        somewhere else, since writing the zero page is what would stop it being
-        zeros. The runner reserves one page for each, past ``num_blocks``.
+        Padded batch rows read and write the null block 0 instead. They must
+        read finite values: their output is discarded but their logits are not,
+        and the sampler's argmax reduces across the whole tile, so one NaN row
+        hands its NaN to every live row. ``_write_states`` writes zeros for
+        them, which keeps the null block zero.
         """
         block_table = metadata["block_table_tensor"]
         indices = block_table[:num_reqs, 0].to(torch.long)
         slot_mapping = metadata["slot_mapping"].view(num_reqs, -1)[:, 0]
-        sink = self.state_pages.shape[0] - 1
-        zero_page = sink - 1
-        # ``> 0``, not ``>= 0``: the runner pads write slots with NULL_BLOCK_ID
-        # (0) or PAD_SLOT_ID (-1) depending on the path, and remaps null block
-        # ids in the block table to -1. 0 is vLLM's reserved null block, so no
-        # live token maps there, and ``> 0`` rejects both sentinels.
-        # Bound-check the id too -- a padded batch row's block_table entry can
-        # be stale from an earlier step, and on device an out-of-range index is
-        # an out-of-bound indirect DMA rather than a wrapped one.
-        live = (slot_mapping > 0) & (indices > 0) & (indices < zero_page)
-        return torch.where(
-            live,
-            indices,
-            torch.full_like(indices, zero_page),
-        ), torch.where(
-            live,
-            indices,
-            torch.full_like(indices, sink),
-        )
+        num_pages = self.state_a.shape[0]
+        # ``> 0`` rejects both padding sentinels (0 = null block, -1 = PAD_SLOT_ID);
+        # the bound check covers a stale block id left in a padded row.
+        live = (slot_mapping > 0) & (indices > 0) & (indices < num_pages)
+        return torch.where(live, indices, torch.zeros_like(indices)), live
 
     # ── Shared pieces ────────────────────────────────────────────────────
 
@@ -1011,8 +1018,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # stay zero, matching a sequence that started from a cold state.
         new_conv_state = self._tail_rows(qkv, is_real, self.conv_kernel_size - 1)
 
-        _, write_idx = self.state_indices(metadata, 1)
-        self._write_states(write_idx, new_conv_state.unsqueeze(0), final_state)
+        write_idx, live = self.state_indices(metadata, 1)
+        self._write_states(write_idx, new_conv_state.unsqueeze(0), final_state, live)
 
         output = self._output(core, z, num_tokens)
         if self.world_size > 1:
@@ -1037,7 +1044,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
 
         qkv, z, beta, g = self._project(hidden_states)
-        read_idx, write_idx = self.state_indices(metadata, num_reqs)
+        state_idx, live = self.state_indices(metadata, num_reqs)
 
         # Depthwise conv over the cached tail plus this token, unrolled tap by
         # tap exactly as ``_causal_conv`` does for prefill.
@@ -1052,7 +1059,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # world_size 32 and above on 397B-A17B, which is why 2B/27B/35B never hit
         # it. Unrolled there is no rank-3 intermediate and no concatenate feeding
         # a broadcast multiply, and the summation order is unchanged.
-        conv_prev, state = self._read_states(read_idx)
+        conv_prev, state = self._read_states(state_idx)
         conv_prev = conv_prev.to(qkv.dtype)
         w = self.conv1d_weight
         last = self.conv_kernel_size - 1
@@ -1073,9 +1080,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Both states go back in one write, so the conv update waits for the
         # recurrence. Nothing reads either state in between.
         self._write_states(
-            write_idx,
+            state_idx,
             torch.cat([conv_prev[:, 1:], qkv.unsqueeze(1)], dim=1),
             new_state,
+            live,
         )
 
         output = self._output(core, z, num_reqs)

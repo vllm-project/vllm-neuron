@@ -23,14 +23,17 @@ share one block pool.
 
 ## Requirements
 
-**This model needs the hybrid KV cache support in `vllm-neuron`**, the framework
-change that comes with this model ("Support hybrid (attention + recurrent-state)
-models on the V1 runner"), plus the two platform / runner fixes it is stacked on
-(text-only vision bucket skip, block-table alignment for non-power-of-2 blocks).
-The hybrid change adds
-`RecurrentLayerSpec` / `KVSpec.recurrent_layers`, the `MambaSpec` allocation
-with page-major views in `NeuronModelRunner`, and the hybrid page-size alignment
-in `NeuronPlatform`. Without it the model fails at `bind_kv_cache`.
+**This model needs the recurrent-state (hybrid) support in `vllm-neuron`** from
+gregnetau's `qwen3_5-upstream` branch ("Recurrent-state (hybrid) models on the V1
+runner, with MTP", and the three commits under it), plus the block-table
+alignment fix for non-power-of-2 blocks. That change adds `StateLayerSpec` /
+`KVSpec.state_layers`, the `HasRecurrentState` / `ServesTextOnly` model
+interfaces, and a dedicated state pool in `NeuronModelRunner`, which keeps the
+recurrent state out of the shared KV buffers. Without it the model fails at
+`bind_state_cache`.
+
+It runs on the native compile route (the default; set
+`VLLM_NEURON_BACKEND=neuron_native` to also get the Precompile Cache).
 
 Hybrid models run on the V1 model runner. `model_runner_v2_policy` already routes
 them there; do not set `VLLM_USE_V2_MODEL_RUNNER=1`.

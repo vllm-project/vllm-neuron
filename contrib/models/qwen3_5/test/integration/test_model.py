@@ -7,9 +7,9 @@ per-token logits against a HuggingFace reference.
 
 Requirements
 ------------
-* A ``vllm-neuron`` build with hybrid KV cache support (``KVSpec.recurrent_layers``
+* A ``vllm-neuron`` build with recurrent-state support (``KVSpec.state_layers``
   in ``vllm_neuron/model/kv_cache.py``). Without it the model fails at
-  ``bind_kv_cache``.
+  ``bind_state_cache``.
 * Neuron hardware. The defaults (Qwen3.5-2B, TP=4) fit a trn2.3xlarge.
 
 Registering the model

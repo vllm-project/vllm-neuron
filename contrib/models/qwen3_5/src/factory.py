@@ -14,8 +14,6 @@ point in this folder's ``pyproject.toml``. See ``plugin.py``.
 
 from __future__ import annotations
 
-from typing import ClassVar, Literal
-
 import torch.nn as nn
 from transformers import PretrainedConfig
 
@@ -26,11 +24,13 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
     """Factory for the dense Qwen3.5 checkpoints.
 
     Registering this class replaces vLLM's own ``Qwen3_5ForConditionalGeneration``
-    in every process, including the frontend. So it must also carry vLLM's
-    hybrid-model contract (``is_hybrid`` and the two ``get_mamba_state_*``
-    classmethods): vLLM reads it from the REGISTERED class to set
-    ``ModelConfig.is_hybrid``, ``mamba_block_size`` and the state page size.
-    Without it vLLM plans the model as attention-only.
+    in every process, including the frontend. It declares the plugin's
+    ``HasRecurrentState`` (the DeltaNet layers are reported as
+    ``KVSpec.state_layers``; the runner allocates and sizes their state pages)
+    rather than vLLM's ``IsHybrid``: with ``IsHybrid`` vLLM's own Mamba config
+    hook would resize the attention blocks as well, against the runner's
+    padding. ``ServesTextOnly`` keeps the platform from configuring vision
+    buckets for the multimodal checkpoint architecture.
 
     The class does not implement ``SupportsMultiModal``, so vLLM treats the
     checkpoint as text-only and builds no multimodal processor.
@@ -44,9 +44,22 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
     with ``from_configs`` and calls ``forward``.
     """
 
-    # vLLM's ``IsHybrid`` / ``HasInnerState`` protocol flags.
-    is_hybrid: ClassVar[Literal[True]] = True
-    has_inner_state: ClassVar[Literal[True]] = True
+    # Native compile route: --model-type=generic, as on the XLA route. The default
+    # "transformer" partitions the prefill graph per layer and remats.
+    NATIVE_COMPILER_MODEL_TYPE = "generic"
+
+    @classmethod
+    def num_recurrent_state_layers(cls, hf_config: PretrainedConfig) -> int:
+        """``interfaces.HasRecurrentState``: the number of DeltaNet layers."""
+        from .config import LINEAR_ATTENTION
+
+        text = getattr(hf_config, "text_config", None) or hf_config
+        return list(text.layer_types).count(LINEAR_ATTENTION)
+
+    @classmethod
+    def serves_text_only(cls) -> bool:
+        """``interfaces.ServesTextOnly``: only the text tower is served."""
+        return True
 
     def __init__(
         self,
@@ -104,57 +117,6 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
 
         return Qwen3_5ForCausalLM.from_configs(
             hf_config, text_neuron_config=text_neuron_config
-        )
-
-    # ── vLLM's hybrid-model contract ─────────────────────────────────────
-    # vLLM uses these to size the recurrent-state pages that the block planner
-    # allocates. Delegating to ``MambaState*Calculator`` keeps that size equal to
-    # what ``Qwen3_5TextConfig.state_shapes`` reports to the model runner. A
-    # second copy of the arithmetic would alias memory instead of raising.
-
-    @classmethod
-    def get_mamba_state_shape_from_config(
-        cls, vllm_config
-    ) -> tuple[tuple[int, ...], ...]:
-        from vllm.model_executor.layers.mamba.mamba_utils import (
-            MambaStateShapeCalculator,
-        )
-
-        hf_text_config = vllm_config.model_config.hf_text_config
-        num_spec = (
-            vllm_config.speculative_config.num_speculative_tokens
-            if vllm_config.speculative_config
-            else 0
-        )
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
-            vllm_config.parallel_config.tensor_parallel_size,
-            hf_text_config.linear_num_key_heads,
-            hf_text_config.linear_num_value_heads,
-            hf_text_config.linear_key_head_dim,
-            hf_text_config.linear_value_head_dim,
-            hf_text_config.linear_conv_kernel_dim,
-            num_spec,
-        )
-
-    @classmethod
-    def get_mamba_state_dtype_from_config(cls, vllm_config):
-        from vllm.model_executor.layers.mamba.mamba_utils import (
-            MambaStateDtypeCalculator,
-        )
-
-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
-            vllm_config.model_config.dtype,
-            vllm_config.cache_config.mamba_cache_dtype,
-            vllm_config.cache_config.mamba_ssm_cache_dtype,
-        )
-
-    @classmethod
-    def get_mamba_state_copy_func(cls):
-        # Only prefix caching over recurrent state (mamba_cache_mode "align" or
-        # "all") copies states between blocks, and the plugin rejects it.
-        raise NotImplementedError(
-            "Qwen3.5 on Neuron does not support prefix caching; set "
-            "enable_prefix_caching=False"
         )
 
 

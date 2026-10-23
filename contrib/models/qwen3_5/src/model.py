@@ -27,10 +27,11 @@ so the 6 attention layers run in torch rather than on the kernel. That was
 6-8% of prefill, because at TP=4 there are only 2 query heads per rank so the
 ``[2, seq, seq]`` score matrix is cheap.
 
-The cache layout comes from the plugin's hybrid KV cache support
-(``NeuronModelRunner.initialize_kv_cache``): every layer binds ONE page-major
-view, and each buffer has two extra pages past ``num_blocks`` that only this
-model uses (the zero page at ``pages - 2`` and the write sink at ``pages - 1``).
+The caches come from the plugin's recurrent-state support (``KVSpec.state_layers``,
+``vllm_neuron.model.state_cache``): attention layers bind ``(k_cache, v_cache)``
+``[blocks, kv_heads, block_size, head_dim]`` in kernel-sized blocks, and DeltaNet
+layers bind two float32 state halves from a dedicated state pool. Padded batch rows
+read and write vLLM's null block 0, which the runner keeps zeroed.
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ from vllm.distributed.parallel_state import get_tp_group
 
 import vllm_neuron.nn as neuron_nn
 from vllm_neuron.model.interfaces import SupportsMRoPE
-from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, RecurrentLayerSpec
+from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, StateLayerSpec
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.nn.sampler import Sampler
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
@@ -246,11 +247,9 @@ class Qwen3_5Attention(nn.Module):
         self.q_norm = Qwen3_5RMSNorm(self.head_dim, self.rms_norm_eps, self.dtype)
         self.k_norm = Qwen3_5RMSNorm(self.head_dim, self.rms_norm_eps, self.dtype)
 
-        # Bound by ``bind_kv_cache``: one page-major view of this layer's
-        # share of the KV pool, [pages, 2, kv_heads, block_size, head_dim].
-        # K and V share a page so that block ``b`` stays inside page ``b`` --
-        # the contract the recurrent groups on the same buffer rely on.
-        self.kv_pages: torch.Tensor | None = None
+        # Bound by ``bind_kv_cache``: [blocks, kv_heads, block_size, head_dim].
+        self.k_cache: torch.Tensor | None = None
+        self.v_cache: torch.Tensor | None = None
 
         # Each head contributes a contiguous 2 * head_dim block to q_proj, so
         # sharding its output dim by whole heads keeps query and gate together.
@@ -328,45 +327,30 @@ class Qwen3_5Attention(nn.Module):
         )
 
     def _write_kv(self, k: torch.Tensor, v: torch.Tensor, metadata: dict) -> None:
-        """Scatter ``[heads, tokens, head_dim]`` K/V into the paged cache."""
+        """Scatter ``[heads, tokens, head_dim]`` K/V into the paged cache.
+
+        Padded tokens carry slot 0 or -1. They write zeros into vLLM's null
+        block 0 instead: a padded *decode* row reads that block, and a gather
+        reads it whole -- including the tail the softmax masks -- so it has to
+        stay finite (``0 * NaN`` is NaN). Writing zeros keeps it zero.
+        """
         slot_mapping = metadata["slot_mapping"]
         block_size = metadata["block_size"]
         num_tokens = slot_mapping.shape[0]
         nkh = self.num_kv_heads_per_rank
-        # The second of the two private pages the runner appends past
-        # ``num_blocks``: the write sink. Pads must not land on the first one,
-        # the zero page, which dead decode rows read precisely because nothing
-        # ever writes it.
-        scratch = self.kv_pages.shape[0] - 1
-
-        # Padded tokens carry slot 0. That is vLLM's reserved null block, so no
-        # live token maps there, but a padded *decode* row's block table still
-        # points at a real page and the gather reads a page whole -- including
-        # the tail beyond the sequence, which the softmax mask multiplies by 0.
-        # ``0 * NaN`` is NaN, so the tail has to stay finite: send every padded
-        # write to the private scratch page instead of block 0.
-        blocks = torch.where(
-            slot_mapping > 0,
-            slot_mapping // block_size,
-            torch.full_like(slot_mapping, scratch),
-        )
-
+        live = slot_mapping > 0
+        blocks = torch.where(live, slot_mapping // block_size, torch.zeros_like(slot_mapping))
+        offsets = torch.where(live, slot_mapping % block_size, torch.zeros_like(slot_mapping))
         heads = torch.arange(nkh, dtype=torch.long, device=k.device).repeat_interleave(
             num_tokens
         )
-        blocks = blocks.repeat(nkh)
-        offsets = (slot_mapping % block_size).repeat(nkh)
-        # Column 0 of the page is K, column 1 is V.
-        k_col = torch.zeros_like(blocks)
-
-        self.kv_pages.index_put_(
-            (blocks, k_col, heads, offsets),
-            k.reshape(-1, self.head_dim).to(self.kv_pages.dtype),
-        )
-        self.kv_pages.index_put_(
-            (blocks, k_col + 1, heads, offsets),
-            v.reshape(-1, self.head_dim).to(self.kv_pages.dtype),
-        )
+        blocks, offsets = blocks.repeat(nkh), offsets.repeat(nkh)
+        keep = live.repeat(nkh).view(-1, 1)
+        zero = torch.zeros((), dtype=self.k_cache.dtype, device=k.device)
+        k_rows = torch.where(keep, k.reshape(-1, self.head_dim).to(self.k_cache.dtype), zero)
+        v_rows = torch.where(keep, v.reshape(-1, self.head_dim).to(self.v_cache.dtype), zero)
+        self.k_cache.index_put_((blocks, heads, offsets), k_rows)
+        self.v_cache.index_put_((blocks, heads, offsets), v_rows)
 
     def _finish(self, attn_output: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """Gate by ``sigmoid(gate)``, then the row-parallel output projection."""
@@ -459,34 +443,31 @@ class Qwen3_5Attention(nn.Module):
         # rows keep a stale block id, and an out-of-range id here is an
         # out-of-bound indirect DMA. Their outputs are discarded downstream.
         # Padded batch rows, and the unused tail of a real row's block table,
-        # carry -1. Those have to read the zero page rather than any block the
-        # allocator might hand out: a dead row's output is discarded but its
-        # logits are not, and the sampler's argmax reduces across the whole
-        # tile, so one NaN row replaces every row's token.
-        zero_page = self.kv_pages.shape[0] - 2
+        # carry -1. Those have to read the null block 0 (kept zero) rather than
+        # any block the allocator might hand out: a dead row's output is
+        # discarded but its logits are not, and the sampler's argmax reduces
+        # across the whole tile, so one NaN row replaces every row's token.
         bt = block_table.to(torch.long)
+        num_blocks, nkh, block_size = self.k_cache.shape[0], self.k_cache.shape[1], self.k_cache.shape[2]
         live_rows = (metadata["slot_mapping"].view(num_reqs, -1)[:, 0] > 0).view(-1, 1)
         blocks = torch.where(
-            live_rows & (bt > 0) & (bt < zero_page),
+            live_rows & (bt > 0) & (bt < num_blocks),
             bt,
-            torch.full_like(bt, zero_page),
+            torch.zeros_like(bt),  # the null block, kept zero
         )
-        nkh = self.num_kv_heads_per_rank
         nh = self.num_heads_per_rank
         rows = num_reqs * nh
-        num_pages, block_size = self.kv_pages.shape[0], self.kv_pages.shape[3]
         ctx_len = blocks.shape[1] * block_size
 
-        # After reshaping [pages, 2, kv_heads, ...] to [pages * 2 * kv_heads, ...]
-        # the row for (page p, K/V column j, kv head h) is
-        # ``(p * 2 + j) * nkh + h``, so K is ``p * 2 * nkh + h`` and V is that
-        # plus ``nkh``.
+        # After reshaping [blocks, kv_heads, ...] to [blocks * kv_heads, ...] the
+        # row for (block b, kv head h) is ``b * nkh + h``.
         kv_of_query_head = torch.arange(nh, device=blocks.device) // self.num_kv_groups
-        base = blocks.unsqueeze(1) * (2 * nkh) + kv_of_query_head.view(1, nh, 1)
+        base = blocks.unsqueeze(1) * nkh + kv_of_query_head.view(1, nh, 1)
 
-        flat = self.kv_pages.reshape(num_pages * 2 * nkh, block_size, self.head_dim)
-        k_ctx = flat[base.reshape(-1)].reshape(rows, ctx_len, self.head_dim)
-        v_ctx = flat[(base + nkh).reshape(-1)].reshape(rows, ctx_len, self.head_dim)
+        k_flat = self.k_cache.reshape(num_blocks * nkh, block_size, self.head_dim)
+        v_flat = self.v_cache.reshape(num_blocks * nkh, block_size, self.head_dim)
+        k_ctx = k_flat[base.reshape(-1)].reshape(rows, ctx_len, self.head_dim)
+        v_ctx = v_flat[base.reshape(-1)].reshape(rows, ctx_len, self.head_dim)
         q = q.transpose(0, 1).reshape(rows, 1, self.head_dim)
 
         scores = (q.float() @ k_ctx.float().transpose(-1, -2)) * self.scaling
@@ -818,26 +799,21 @@ class Qwen3_5ForCausalLM(nn.Module, SupportsMRoPE):
         )
 
         layers: list[LayerSpec] = []
-        recurrent: list[RecurrentLayerSpec] = []
+        state_layers: list[StateLayerSpec] = []
         for layer in self.language_model.layers:
             if layer.is_linear_attention:
                 mixer = layer.linear_attn
-                recurrent.append(
-                    RecurrentLayerSpec(
+                state_layers.append(
+                    StateLayerSpec(
                         name=mixer.layer_name,
                         # Keep the temporal shape the config derives, but report
                         # the conv width the mixer actually uses.
                         # ``state_shapes()`` shards ``conv_dim`` by the world
                         # size, while the mixer shards it by its own -- smaller
                         # -- count whenever the linear key heads cannot divide
-                        # the world (e.g. 16 key heads over 64 ranks).  The
-                        # model itself never notices, because it reads and
-                        # writes the same offsets, but a KV connector registers
-                        # the widths reported here, so a mismatch makes
-                        # disaggregated serving transfer the recurrent state
-                        # shifted and truncated: the first request after a
-                        # decode-role restart is correct, every later one
-                        # decodes garbage.
+                        # the world (e.g. 16 key heads over 64 ranks). The model
+                        # reads and writes the same offsets either way, but a KV
+                        # connector registers the widths reported here.
                         shapes=(
                             MambaStateShapeCalculator._orient_conv_shape(
                                 mixer.conv_dim,
@@ -845,7 +821,9 @@ class Qwen3_5ForCausalLM(nn.Module, SupportsMRoPE):
                             ),
                             self.text_config.state_shapes(self.world_size)[1],
                         ),
-                        dtypes=self.text_config.state_dtypes(),
+                        # The runner's state pages are float32 throughout.
+                        dtypes=(torch.float32, torch.float32),
+                        mamba_type="GDN_ATTN",
                     )
                 )
             else:
@@ -860,24 +838,30 @@ class Qwen3_5ForCausalLM(nn.Module, SupportsMRoPE):
                         chunk_size=None,
                     )
                 )
-        return KVSpec(layers=layers, recurrent_layers=recurrent)
+        return KVSpec(layers=layers, state_layers=state_layers)
 
     def bind_kv_cache(self, kv_caches: dict[str, list[torch.Tensor]]) -> None:
         for layer in self.language_model.layers:
-            mixer = layer.linear_attn if layer.is_linear_attention else layer.self_attn
-            if mixer.layer_name not in kv_caches:
-                raise Exception(f"cache for layer {mixer.layer_name} not initialized")
-            tensors = kv_caches[mixer.layer_name]
-            if len(tensors) != 1:
-                raise Exception(
-                    f"layer {mixer.layer_name} expected one page-major tensor, "
-                    f"got {len(tensors)}. This model needs the hybrid KV cache "
-                    "support in vllm_neuron (KVSpec.recurrent_layers)."
-                )
             if layer.is_linear_attention:
-                mixer.bind_state_pages(tensors[0])
-            else:
-                mixer.kv_pages = tensors[0]
+                continue
+            mixer = layer.self_attn
+            if mixer.layer_name not in kv_caches:
+                raise KeyError(f"KV cache for layer {mixer.layer_name} not initialized")
+            mixer.k_cache, mixer.v_cache = kv_caches[mixer.layer_name][:2]
+
+    def bind_state_cache(self, state_caches: dict[str, list[torch.Tensor]]) -> None:
+        for layer in self.language_model.layers:
+            if not layer.is_linear_attention:
+                continue
+            mixer = layer.linear_attn
+            if mixer.layer_name not in state_caches:
+                raise KeyError(f"State cache for layer {mixer.layer_name} not initialized")
+            mixer.bind_state(*state_caches[mixer.layer_name])
+
+    def set_runner_clears_kv_blocks(self, value: bool) -> None:
+        """The runner zeroes newly allocated attention blocks (and the null block),
+        so stale state bytes recycled into a KV block never reach the gather."""
+        self.runner_clears_kv_blocks = value
 
     # ── Forward ──────────────────────────────────────────────────────────
 

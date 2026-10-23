@@ -2,8 +2,8 @@
 """Text-only offline inference for Qwen3.5 (dense and sparse) on Neuron.
 
 Qwen3.5 is a hybrid stack: most layers are gated DeltaNet (a linear recurrence
-with a fixed-size state) and the rest are full attention. It needs the hybrid
-KV cache support in vllm-neuron (``KVSpec.recurrent_layers``).
+with a fixed-size state) and the rest are full attention. It needs the
+recurrent-state support in vllm-neuron (``KVSpec.state_layers``).
 
 The script registers the architectures itself (Option 1 in
 ``contrib/README.md``). It imports the installed ``qwen3_5`` package when
