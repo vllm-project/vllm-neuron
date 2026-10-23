@@ -105,6 +105,8 @@ def rotational_topk(
 
         return topk_values, topk_indices
     """
+    # rev 1: the NKI compile cache keys on this function's source only; bump on helper edits
+    # (cascaded_max_utils.predicated_folded_load fills partial tiles).
     validate_topk_input(
         inp, n_fold=config.n_stages, local_top_k_per_stage=config.local_top_k_per_stage
     )
