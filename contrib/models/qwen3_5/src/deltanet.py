@@ -29,6 +29,7 @@ stored transposed (``[in_features, out_features]``) so a forward pass is
 
 from __future__ import annotations
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -553,6 +554,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
+        self.is_moe = config.is_moe
         self.layer_name = f"layers.{layer_idx}.linear_attn"
         self.dtype = config.torch_dtype
         self.state_dtype = config.ssm_dtype
@@ -747,13 +749,45 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             state_b = state_b.view(state_b.shape[0], half // R, R)
         self.state_a, self.state_b = state_a, state_b
 
+    def _use_state_kernel(self, x: torch.Tensor, side: str) -> bool:
+        """Move state pages with ``kernels/state_cache.py`` for ``side`` ("read" / "write")?
+
+        On device, with the ``[pages, rows, 128]`` row view bound. Measured on
+        the native route (TP=4, 1024 in / 128 out, TPOT unless noted):
+
+        * write: always. ``index_copy_`` made 35B-A3B's prefill state write slow
+          (TTFT 508 -> 227 ms with the kernel; decode 18.6 -> 18.2 ms).
+        * read: dense checkpoints only. Inside the full dense decode graph the
+          ``index_select`` becomes ~37k small sync-engine DMAs per page (27B
+          batch 1: 603.7 -> 48.1 ms; 2B batch 4: 28.1 -> 11.8 ms). On the sparse
+          checkpoints the torch gather is fast and the kernel's output costs a
+          spilled HBM transpose per layer (35B-A3B batch 1: 18.2 -> 47.7 ms).
+
+        ``QWEN3_5_STATE_KERNEL`` overrides: ``auto`` (the default above), ``1``
+        (both), ``read``, ``write``, ``0`` (neither).
+        """
+        from vllm_neuron.utils.neuron_utils import can_run_kernel
+
+        mode = os.environ.get("QWEN3_5_STATE_KERNEL", "auto")
+        if mode == "auto":
+            wanted = side == "write" or not self.is_moe
+        else:
+            wanted = mode in ("1", side)
+        return wanted and self.state_a.dim() == 3 and can_run_kernel(x)
+
     def _read_states(self, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather ``(conv_window, recurrent_state)`` for the batch's pages."""
         n = indices.shape[0]
-        page = torch.cat(
-            [self.state_a.index_select(0, indices), self.state_b.index_select(0, indices)],
-            dim=1,
-        ).reshape(n, -1)
+        if self._use_state_kernel(indices, "read"):
+            from .kernels.state_cache import gather_state_pages
+
+            page_a, page_b = gather_state_pages(self.state_a, self.state_b, indices)
+            page = torch.cat([page_a.view(n, -1), page_b.view(n, -1)], dim=1)
+        else:
+            page = torch.cat(
+                [self.state_a.index_select(0, indices), self.state_b.index_select(0, indices)],
+                dim=1,
+            ).reshape(n, -1)
         conv = page[:, : self.conv_numel].reshape(
             n, self.conv_kernel_size - 1, self.conv_dim
         )
@@ -782,6 +816,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             page = page * live.view(n, 1).to(page.dtype)
         half = self.state_a[0].numel()
         page = F.pad(page, (0, 2 * half - page.shape[1]))
+        if self._use_state_kernel(page, "write"):
+            from .kernels.state_cache import scatter_state_pages
+
+            scatter_state_pages(
+                self.state_a,
+                self.state_b,
+                page[:, :half].reshape((n,) + self.state_a.shape[1:]),
+                page[:, half:].reshape((n,) + self.state_b.shape[1:]),
+                indices,
+            )
+            return
         self.state_a.index_copy_(0, indices, page[:, :half].reshape((n,) + self.state_a.shape[1:]))
         self.state_b.index_copy_(0, indices, page[:, half:].reshape((n,) + self.state_b.shape[1:]))
 
