@@ -12,15 +12,29 @@
 # Env (defaults give the standard matrix):
 #   SERVED_NAME    --served-model-name of the server (required)
 #   TOKENIZER      tokenizer path or HF id (required)
+#   DATASET        text (default) | random
+#                  text:   real conversations cut to exact lengths by make_prompts.py
+#                          (needs CORPUS, a ShareGPT-format JSON such as
+#                          ShareGPT_V3_unfiltered_cleaned_split.json)
+#                  random: vLLM's random dataset (consecutive vocabulary ids; skews
+#                          MoE routing and speculative-decoding acceptance)
+#   CORPUS         ShareGPT-format JSON for DATASET=text
 #   LABEL          model / configuration tag, saved in every JSON and used as the
 #                  default result dir (default: SERVED_NAME)
 #   ISLS           input lengths            (default: "1024 8192")
 #   OSLS           output lengths           (default: "256 1024")
 #   CONCS          concurrencies            (default: "1 4 8 16 32")
-#   MAX_CONC       skip concurrencies above this, e.g. the server's max_num_seqs
+#   MAX_CONC       the server's real concurrency limit: min(max_num_seqs, KV cap),
+#                  the KV cap being int(X) from its startup log line "Maximum
+#                  concurrency for <max_model_len> tokens per request: X" (the
+#                  scheduler admits a request only if all running ones could grow to
+#                  max_model_len). Concurrencies above it are skipped, and MAX_CONC
+#                  itself is added as a cell when it is not in CONCS (the server's
+#                  maximum-throughput point).
 #   MAX_MODEL_LEN  skip cells whose longest request would not fit
 #   INPUT_RATIO    input-length jitter, +/- fraction (default: 0.03)
-#   OUTPUT_RATIO   output-length jitter (default: 0, so TPOT is over exact OSL)
+#   OUTPUT_RATIO   output-length jitter, DATASET=random only (default: 0, so TPOT
+#                  is over exact OSL; DATASET=text always decodes exactly OSL)
 #   NUM_WARMUPS    warmup requests per cell (default: the cell's concurrency)
 #   BASE_URL       (default: http://127.0.0.1:8000)
 #   OUT_DIR        (default: ./results/bench/$LABEL)
@@ -38,12 +52,26 @@ INPUT_RATIO=${INPUT_RATIO:-0.03}
 OUTPUT_RATIO=${OUTPUT_RATIO:-0}
 BASE_URL=${BASE_URL:-http://127.0.0.1:8000}
 OUT_DIR=${OUT_DIR:-./results/bench/$LABEL}
+DATASET=${DATASET:-text}
+HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$OUT_DIR"
+case "$DATASET" in
+  text)
+    : "${CORPUS:?DATASET=text needs CORPUS, a ShareGPT-format JSON (or set DATASET=random)}"
+    PROMPTS=$OUT_DIR/prompts; mkdir -p "$PROMPTS" ;;
+  random) ;;
+  *) echo "DATASET must be text or random, got $DATASET" >&2; exit 1 ;;
+esac
 
 # Identical input lengths across a concurrent burst are not representative of
 # real traffic, so the input length is jittered by default. The output length is
 # exact (with --ignore-eos), so every request decodes the same number of tokens.
 RATIO="{\"input\": $INPUT_RATIO, \"output\": $OUTPUT_RATIO}"
+if [ -n "${MAX_CONC:-}" ] && ! echo " $CONCS " | grep -q " $MAX_CONC "; then
+  for C in $CONCS; do
+    if [ "$C" -gt "$MAX_CONC" ]; then CONCS="$CONCS $MAX_CONC"; break; fi
+  done
+fi
 first=1
 for IN in $ISLS; do
   for OUT in $OSLS; do
@@ -66,17 +94,26 @@ for IN in $ISLS; do
       ready=()
       [ $first = 1 ] && ready=(--ready-check-timeout-sec 600)
       first=0
-      echo "=== $LABEL $tag (num_prompts=$N)"
+      if [ "$DATASET" = text ]; then
+        # The same prompts for every OSL at this (ISL, concurrency), and for every
+        # model (each cuts the same conversations with its own tokenizer).
+        pf=$PROMPTS/in${IN}_c${C}_s${SEED}.jsonl
+        [ -s "$pf" ] || python3 "$HERE/make_prompts.py" --tokenizer "$TOKENIZER" --corpus "$CORPUS" \
+          --isl "$IN" --input-ratio "$INPUT_RATIO" --num-prompts $N --seed $SEED --out "$pf" || exit 1
+        data=(--dataset-name custom --dataset-path "$pf" --custom-output-len "$OUT"
+              --skip-chat-template --disable-shuffle)
+      else
+        data=(--dataset-name random --random-input-len "$IN" --random-output-len "$OUT"
+              --random-range-ratio "$RATIO")
+      fi
+      echo "=== $LABEL $tag ($DATASET, num_prompts=$N)"
       # shellcheck disable=SC2086
       vllm bench serve \
         --backend openai \
         --base-url "$BASE_URL" \
         --model "$SERVED_NAME" \
         --tokenizer "$TOKENIZER" \
-        --dataset-name random \
-        --random-input-len "$IN" \
-        --random-output-len "$OUT" \
-        --random-range-ratio "$RATIO" \
+        "${data[@]}" \
         --ignore-eos \
         --num-prompts $N \
         --num-warmups "${NUM_WARMUPS:-$C}" \
@@ -86,7 +123,8 @@ for IN in $ISLS; do
         --metric-percentiles 50,90,99 \
         ${ready[@]+"${ready[@]}"} \
         --label "$LABEL" \
-        --metadata label="$LABEL" isl="$IN" osl="$OUT" concurrency="$C" \
+        --metadata label="$LABEL" isl="$IN" osl="$OUT" concurrency="$C" dataset="$DATASET" \
+                   corpus="$(basename "${CORPUS:-none}")" \
                    input_ratio="$INPUT_RATIO" output_ratio="$OUTPUT_RATIO" ${EXTRA_METADATA:-} \
         --save-result --result-dir "$OUT_DIR" --result-filename "$tag.json" \
         2>&1 | grep -E "Successful|Failed|Benchmark duration|throughput|TTFT|TPOT|ITL" | grep -E "Mean|Median|P99|throughput|Successful|Failed|duration"
