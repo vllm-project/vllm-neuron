@@ -19,6 +19,7 @@ from nkilib.core.utils.allocator import SbufManager
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from vllm_neuron.utils.neuron_utils import can_run_kernel
+from vllm_neuron.utils.hardware_config import get_logical_nc_config
 
 # qkv_cte allocates the packed-FP8 store buffer with ``dtype=cfg.kv_dtype`` and
 # only treats an NKI dtype (or the ``"float8e4"`` sentinel) as FP8; a ``torch``
@@ -999,7 +1000,7 @@ def qkv_proj(
         # dispatch (see ``_TORCH_NKI_KV_DTYPE_MAP`` above for why).
         kv_dtype_arg = _TORCH_NKI_KV_DTYPE_MAP.get(kv_dtype, kv_dtype)
 
-        result = wrapped_kernel[2](
+        result = wrapped_kernel[get_logical_nc_config()](
             hidden=hidden,
             qkv_weights=qkv_weights,
             norm_weights=norm_weights,
