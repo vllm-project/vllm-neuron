@@ -781,8 +781,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if self._use_state_kernel(indices, "read"):
             from .kernels.state_cache import gather_state_pages
 
-            page_a, page_b = gather_state_pages(self.state_a, self.state_b, indices)
-            page = torch.cat([page_a.view(n, -1), page_b.view(n, -1)], dim=1)
+            page = gather_state_pages(self.state_a, self.state_b, indices).view(n, -1)
         else:
             page = torch.cat(
                 [self.state_a.index_select(0, indices), self.state_b.index_select(0, indices)],

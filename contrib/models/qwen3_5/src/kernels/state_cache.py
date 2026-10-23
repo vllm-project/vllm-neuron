@@ -34,9 +34,14 @@ from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 
-def _dense_page(t, i):
-    """Page ``i`` of a dense ``[n, rows, R]`` HBM tensor, with the same 3-D pattern as :func:`_page`."""
-    _, rows, r = t.shape
+def _dense_page(t, i, rows=None):
+    """``rows`` rows starting at row ``i * rows`` of a dense ``[n, rows', R]`` HBM tensor.
+
+    The same 3-D pattern as :func:`_page`. ``rows`` defaults to the tensor's own
+    row count, i.e. page ``i``.
+    """
+    _, t_rows, r = t.shape
+    rows = t_rows if rows is None else rows
     return t.ap(pattern=[[rows * r, 1], [r, rows], [1, r]], offset=i * rows * r)
 
 
@@ -53,7 +58,11 @@ def _page(state, idx_sb, i):
 
 @nki.jit
 def _state_gather_kernel(state_a: Tensor, state_b: Tensor, pages: Tensor):
-    """Pages ``pages`` of both halves, as ``([n, rows, R], [n, rows, R])``.
+    """Pages ``pages`` of both halves, as one ``[n, 2 * rows, R]`` tensor (A then B per page).
+
+    One output rather than one per half: concatenating the halves in torch costs
+    a ``[n, 2 * rows * R]`` float32 copy, which at batch 32 on 27B (26 MB) fails to
+    compile (``NCC_IGCA044``).
 
     Args:
         state_a: ``[num_pages, rows, R]`` float32, the first half of every page.
@@ -63,17 +72,17 @@ def _state_gather_kernel(state_a: Tensor, state_b: Tensor, pages: Tensor):
     _, n_prgs, prg_id = get_verified_program_sharding_info("state_gather", (0, 1), 2)
     _, rows, r = state_a.shape
     n = pages.shape[0]
-    out_a = nl.ndarray((n, rows, r), dtype=state_a.dtype, buffer=nl.shared_hbm)
-    out_b = nl.ndarray((n, rows, r), dtype=state_b.dtype, buffer=nl.shared_hbm)
+    out = nl.ndarray((n, 2 * rows, r), dtype=state_a.dtype, buffer=nl.shared_hbm)
     idx_sb = nl.ndarray((n, 1), dtype=pages.dtype, buffer=nl.sbuf)
     nisa.dma_copy(dst=idx_sb, src=pages)
     for i in range(n):
-        # One half per logical core, so the two copies overlap.
+        # One half per logical core, so the two copies overlap. Half h of page i
+        # is rows [(2i + h) * rows, (2i + h + 1) * rows) of the output.
         if n_prgs == 1 or prg_id == 0:
-            nisa.dma_copy(dst=_dense_page(out_a, i), src=_page(state_a, idx_sb, i), dge_mode=nisa.dge_mode.hwdge)
+            nisa.dma_copy(dst=_dense_page(out, 2 * i, rows), src=_page(state_a, idx_sb, i), dge_mode=nisa.dge_mode.hwdge)
         if n_prgs == 1 or prg_id == 1:
-            nisa.dma_copy(dst=_dense_page(out_b, i), src=_page(state_b, idx_sb, i), dge_mode=nisa.dge_mode.hwdge)
-    return out_a, out_b
+            nisa.dma_copy(dst=_dense_page(out, 2 * i + 1, rows), src=_page(state_b, idx_sb, i), dge_mode=nisa.dge_mode.hwdge)
+    return out
 
 
 @nki.jit
@@ -108,10 +117,8 @@ def _state_scatter_kernel(
     return state_a, state_b
 
 
-def gather_state_pages(
-    state_a: Tensor, state_b: Tensor, pages: Tensor
-) -> tuple[Tensor, Tensor]:
-    """``([n, rows, R], [n, rows, R])``: pages ``pages`` (``[n]``) of both halves."""
+def gather_state_pages(state_a: Tensor, state_b: Tensor, pages: Tensor) -> Tensor:
+    """``[n, 2 * rows, R]``: pages ``pages`` (``[n]``) of both halves, A then B per page."""
     return wrap_nki(_state_gather_kernel)[2](
         state_a=state_a, state_b=state_b, pages=pages.to(torch.int32).view(-1, 1)
     )
