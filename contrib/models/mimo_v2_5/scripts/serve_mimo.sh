@@ -72,6 +72,10 @@ PORT="${PORT:-8000}"
 # /sys/bus/pci/devices/.../infiniband".
 export NEURON_SKIP_EFA_AFFINITY=1
 
+# The native compile route (the default); set explicitly so the Precompile Cache
+# is on and a warm start skips the trace.
+export VLLM_NEURON_BACKEND=${VLLM_NEURON_BACKEND:-neuron_native}
+
 echo "Starting $SERVED_NAME server: $MODEL (BS=$BS, SEQ=$SEQ, TP=64, EP=64, experts=$MIMO_V2_5_EXPERT_DTYPE)"
 
 vllm serve "$MODEL" \
@@ -82,6 +86,7 @@ vllm serve "$MODEL" \
     --tensor-parallel-size 64 \
     --enable-expert-parallel \
     --no-enable-prefix-caching \
+    --disable-hybrid-kv-cache-manager \
     --trust-remote-code \
     --hf-overrides '{"quantization_config": null, "vision_config": null}' \
     --additional-config "{

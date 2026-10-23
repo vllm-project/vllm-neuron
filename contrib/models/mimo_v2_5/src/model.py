@@ -94,6 +94,8 @@ from vllm_neuron.utils.weight_loader import (
 
 from .config import BF16_EXPERT_BUDGET_GIB, EXPERT_DTYPE_ENV, MiMoV2Config
 from .kernels.kv_cache_write import write_paged_kv_cache
+from .kernels.moe_tkg_hits import moe_tkg_hits
+from .kernels.moe_tkg_hits_batch import moe_tkg_hits_batch
 from .moe_fp8 import experts_dense_fp8
 from .weight_loaders_bf16 import (
     FP8_DTYPE,
@@ -131,6 +133,31 @@ _DECODE_OPT_LEVEL_ENV = "MIMO_V2_5_DECODE_OPT_LEVEL"
 # Force (=1) or forbid (=0) moe_tkg's selective decode; unset picks it by batch
 # size (see MiMoV2SparseMoeBlock._use_selective_decode).
 _DECODE_SELECTIVE_ENV = "MIMO_V2_5_DECODE_SELECTIVE"
+# Decode through moe_tkg_hits / moe_tkg_hits_batch (only the local experts the
+# step routed to); =0 turns both off. MAX_T overrides the token limit (see
+# MiMoV2SparseMoeBlock._use_hit_decode).
+_DECODE_HITS_ENV = "MIMO_V2_5_DECODE_HITS"
+_DECODE_HITS_MAX_T_ENV = "MIMO_V2_5_DECODE_HITS_MAX_T"
+
+
+def _pack_first_permutation(keep: torch.Tensor) -> torch.Tensor:
+    """One-hot permutation ``P[..., i, j]`` moving the ``keep`` entries first, in order.
+
+    ``keep`` is ``[..., N]`` bool. Entry ``i`` goes to position ``j`` where ``j``
+    counts the kept entries before it (kept) or the kept total plus the dropped
+    entries before it (dropped). Built from prefix sums as matmuls with a
+    triangular matrix, so it needs no sort: the XLA route lowers ``torch.topk``
+    / ``argsort`` to a sort, which neuronx-cc rejects on trn2 (NCC_EVRF029).
+    """
+    n = keep.shape[-1]
+    k = keep.to(torch.float32)
+    upper = torch.triu(torch.ones(n, n, dtype=torch.float32, device=keep.device))
+    kept_before = k @ upper - k  # exclusive prefix count of kept entries
+    dropped_before = (1 - k) @ upper - (1 - k)
+    total_kept = k.sum(dim=-1, keepdim=True)
+    pos = torch.where(keep, kept_before, total_kept + dropped_before)  # [..., N]
+    target = torch.arange(n, dtype=torch.float32, device=keep.device)
+    return (pos.unsqueeze(-1) == target).to(torch.float32)  # [..., N(i), N(j)]
 
 
 def _centred(bias: torch.Tensor) -> torch.Tensor:
@@ -1400,6 +1427,95 @@ class MiMoV2SparseMoeBlock(nn.Module):
         kwargs["expert_down_weights_scale"] = self.down_proj_scale.reshape(e, self.hidden_size)
         return wrap_nki(moe_tkg_wrapper)[2](**kwargs)
 
+    def _use_hit_decode(self, num_tokens: int) -> bool:
+        """Decode through the hit kernels: only the local experts the step routed to?
+
+        ``moe_tkg`` does a fixed amount of expert work per step: every local
+        expert (all-expert) or every top-k slot (selective, non-local slots on
+        a dummy expert). The hit kernels loop over the local experts the step
+        actually routed to, at runtime. Once the busiest rank hits most of its
+        experts the runtime loop is slower than moe_tkg's unrolled paths, so
+        the limit is 4 tokens per 3 local experts, at most 8 (ep_degree 64: 5,
+        ep_degree 8 / 4: 8). fp8 experts (Pro) go up to the batch kernel's 128
+        tokens: past the limit they would fall back to the dense torch path, and
+        the hit kernels beat it at every batch measured (V2.5-Pro, BS 48, median
+        TPOT 107.6 / 217.4 / 346.3 ms at concurrency 1 / 16 / 48 versus 178.5 /
+        262.9 / 374.0). The fp8 all-expert ``moe_tkg`` (ROW scales) is slower
+        still in the full model (V2.6-Pro, 183.9 / 269.1 / 378.3 ms), although
+        a one-core microbenchmark has it ahead once ~4 of 6 local experts are hit.
+        ``MIMO_V2_5_DECODE_HITS_MAX_T`` overrides the limit;
+        ``MIMO_V2_5_DECODE_HITS=0`` turns the hit kernels off.
+        """
+        if os.environ.get(_DECODE_HITS_ENV, "1") == "0":
+            return False
+        max_t = os.environ.get(_DECODE_HITS_MAX_T_ENV)
+        if max_t:
+            return num_tokens <= int(max_t)
+        if self.expert_fp8:
+            return num_tokens <= 128  # the batch kernel's token tile
+        return num_tokens <= min(8, (4 * self.num_local_experts) // 3)
+
+    def _moe_tkg_hits(
+        self,
+        hidden_states: torch.Tensor,
+        affinities: torch.Tensor,
+        expert_index: torch.Tensor,
+        rank: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Decode over only this rank's routed experts (``kernels/moe_tkg_hits*.py``).
+
+        One token: the top-k slots whose expert is local are packed first and
+        ``moe_tkg_hits`` loops over their count. More tokens: the local experts
+        any token routed to are packed first, with their affinity columns, and
+        ``moe_tkg_hits_batch`` reads each once for the whole batch.
+        """
+        e_l = self.num_local_experts
+        t, k = expert_index.shape
+        device = hidden_states.device
+        local_aff = self._local_expert_slice(affinities, rank).to(torch.float32)  # [T, E_L]
+        base = self._ep_rank_tensor(rank, device).to(torch.long).reshape(1, 1) * e_l
+        local_idx = expert_index.to(torch.long) - base  # local if in [0, E_L)
+        scales = {}
+        if self.expert_fp8:
+            i_r = self.intermediate_size_per_rank
+            scales = dict(
+                expert_gate_up_weights_scale=self.gate_up_proj_scale.reshape(e_l, 2, i_r),
+                expert_down_weights_scale=self.down_proj_scale.reshape(e_l, self.hidden_size),
+            )
+        from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
+        if t == 1:
+            valid = (local_idx >= 0) & (local_idx < e_l)
+            perm = _pack_first_permutation(valid)  # [1, K, K]
+            ids = torch.where(valid, local_idx, 0).to(torch.float32)
+            packed = (ids.unsqueeze(-1) * perm).sum(dim=1)  # [1, K], local hits first
+            # int32 explicitly: sum() of a bool tensor is int64.
+            num_hits = valid.sum(dim=1, keepdim=True, dtype=torch.int32)
+            return wrap_nki(moe_tkg_hits)[2](
+                hidden_input=hidden_states,
+                expert_gate_up_weights=self._gate_up_kernel_view(),
+                expert_down_weights=self.down_proj_weight,
+                expert_affinities=local_aff,
+                expert_index=packed.to(torch.int32),
+                num_hits=num_hits,
+                activation_fn=ActFnType.SiLU,
+                **scales,
+            )
+        expert = torch.arange(e_l, device=device, dtype=torch.long)
+        hit = (local_idx.unsqueeze(-1) == expert.view(1, 1, e_l)).any(dim=1).any(dim=0)  # [E_L]
+        perm = _pack_first_permutation(hit)  # [E_L, E_L]
+        order = (expert.to(torch.float32).unsqueeze(-1) * perm).sum(dim=0)  # hit experts first
+        return wrap_nki(moe_tkg_hits_batch)[2](
+            hidden_input=hidden_states,
+            expert_gate_up_weights=self._gate_up_kernel_view(),
+            expert_down_weights=self.down_proj_weight,
+            expert_affinities=local_aff @ perm,  # columns in the same order
+            expert_index=order.view(1, e_l).to(torch.int32),
+            num_hits=hit.sum(dtype=torch.int32).view(1, 1),
+            activation_fn=ActFnType.SiLU,
+            **scales,
+        )
+
     def _gate_up_kernel_view(self) -> torch.Tensor:
         return self.gate_up_proj_weight.reshape(
             self.num_local_experts,
@@ -1561,7 +1677,9 @@ class MiMoV2SparseMoeBlock(nn.Module):
         hidden_states = hidden_states.to(self.dtype)
         affinities, expert_index = self._route(hidden_states)
 
-        if can_run_kernel(hidden_states) and self._use_selective_decode(hidden_states.shape[0]):
+        if can_run_kernel(hidden_states) and self._use_hit_decode(hidden_states.shape[0]):
+            output = self._moe_tkg_hits(hidden_states, affinities, expert_index, rank)
+        elif can_run_kernel(hidden_states) and self._use_selective_decode(hidden_states.shape[0]):
             output = self._moe_tkg_selective(hidden_states, affinities, expert_index, rank)
         elif self.expert_fp8:
             # Same dense torch path as prefill; the slice uses the traced EP
@@ -2037,12 +2155,33 @@ class MiMoV2ForCausalLM(nn.Module):
         return KVSpec(layers=layers)
 
     def bind_kv_cache(self, kv_caches: dict[str, list[torch.Tensor]]) -> None:
+        storages = set()
+        shared = False
         for i, layer in enumerate(self.model.layers):
             layer_name = f"layers.{i}.self_attn"
             if layer_name not in kv_caches:
                 raise KeyError(f"KV cache for layer {layer_name} not initialized")
             layer.self_attn.k_cache = kv_caches[layer_name][0]
             layer.self_attn.v_cache = kv_caches[layer_name][1]
+            ptr = kv_caches[layer_name][0].untyped_storage().data_ptr()
+            shared |= ptr in storages
+            storages.add(ptr)
+        # vLLM's hybrid KV cache manager hands one buffer to several layers (SWA and
+        # full attention here). On the native route those layers' caches become
+        # overlapping graph inputs that AOTAutograd merges into one synthetic base,
+        # so every slot write turns into a write of the whole pool: ~0.8 GB of DMA
+        # per write, 55.8 ms instead of 17.7 ms per decode step on MiMo-V2.6-Flash.
+        if shared:
+            from vllm_neuron.envs import is_native_backend
+
+            if is_native_backend():
+                logger.warning(
+                    "MiMo-V2.5: several layers share one KV cache buffer (vLLM's hybrid "
+                    "KV cache manager). On the native route every KV write then copies "
+                    "the whole pool (~3x slower decode). Start the engine with "
+                    "--disable-hybrid-kv-cache-manager "
+                    "(LLM(..., disable_hybrid_kv_cache_manager=True))."
+                )
 
     # ── Weight loading ───────────────────────────────────────────────────
 

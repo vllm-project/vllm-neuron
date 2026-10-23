@@ -197,6 +197,10 @@ def main():
         # alongside segmented prefill. This port prefills single-shot, so turn
         # APC off.
         enable_prefix_caching=False,
+        # One KV buffer per layer: on the native route a buffer shared by several
+        # layers (vLLM's hybrid KV manager) turns every KV write into a whole-pool
+        # copy (see MiMoV2ForCausalLM.bind_kv_cache).
+        disable_hybrid_kv_cache_manager=True,
         # MiMo ships its config/modeling as custom repo code (model_type
         # "mimo_v2" is not in upstream transformers), so HF needs this to build
         # the PretrainedConfig that MiMoV2Config.from_configs consumes.

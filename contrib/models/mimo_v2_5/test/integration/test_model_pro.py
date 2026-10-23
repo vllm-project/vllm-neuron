@@ -72,6 +72,10 @@ def test_model_pro_greedy_smoke(batch_size: int, seq_len: int) -> None:
         max_num_batched_tokens=seq_len,
         max_num_seqs=batch_size,
         enable_prefix_caching=False,
+        # One KV buffer per layer: on the native route a buffer shared by several
+        # layers (vLLM's hybrid KV manager) turns every KV write into a whole-pool
+        # copy (see MiMoV2ForCausalLM.bind_kv_cache).
+        disable_hybrid_kv_cache_manager=True,
         additional_config={
             "neuron_config": {
                 "quantization": "bf16",

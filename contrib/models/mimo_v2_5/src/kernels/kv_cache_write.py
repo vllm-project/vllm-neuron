@@ -33,10 +33,15 @@ env var, and the torch fallback, which now redirects padded slots to the null
 block with ``paged_slot_indices`` instead of letting ``-1`` wrap to the last
 block.
 
-The measurements in this docstring are from the vllm-neuron 0.21 / SDK 2.31
-stack (XLA route). On 0.29 the default is the native route; the kernel follows
-the same in-kernel-write contract as ``NF.attention_decode(update_cache=True)``
-in ``gpt_oss/model_bf16.py``, but it has not been re-measured there.
+The measurements above are from the vllm-neuron 0.21 / SDK 2.31 stack (XLA
+route). On 0.29's native route the kernel writes in place (0.65 ms for two
+writes whether the pool is 1 MB or 403 MB), as long as no two layers share a
+cache buffer. When they do -- vLLM's hybrid KV cache manager pools SWA and full
+attention layers -- AOTAutograd merges the layers' overlapping cache inputs into
+one synthetic base and each write again copies the whole pool (5.7 ms for the
+same two writes; ~0.8 GB per write on MiMo-V2.6-Flash). Run with
+``--disable-hybrid-kv-cache-manager``; ``MiMoV2ForCausalLM.bind_kv_cache`` warns
+when the buffers are shared.
 """
 
 import os
