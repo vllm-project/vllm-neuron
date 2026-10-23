@@ -93,8 +93,10 @@ process vLLM starts:
 pip install -e contrib/models/mimo_v2_5
 
 export NEURON_SKIP_EFA_AFFINITY=1   # needed on a trn2.48xlarge without EFA
+export VLLM_NEURON_BACKEND=neuron_native   # the native PyTorch route
 vllm serve XiaomiMiMo/MiMo-V2.5 \
     --served-model-name MiMo-V2.5 \
+    --disable-hybrid-kv-cache-manager \
     --tensor-parallel-size 64 \
     --enable-expert-parallel \
     --max-model-len 1024 \
@@ -111,6 +113,12 @@ vllm serve XiaomiMiMo/MiMo-V2.5 \
         "on_device_sampling_config": {"all_greedy": true}},
       "encoder_neuron_config": {"num_encoder_input_buckets": [2048]}}'
 ```
+
+`--disable-hybrid-kv-cache-manager` matters on the native route: vLLM's hybrid
+manager hands one raw buffer to the sliding-window and full-attention layers,
+AOTAutograd merges those overlapping graph inputs into one base, and every KV
+write then copies the whole pool (V2.6-Flash TPOT 55.8 ms instead of 17.7 ms at
+EP=4). `MiMoV2ForCausalLM.bind_kv_cache` warns when the buffers are shared.
 
 `scripts/serve_mimo.sh` wraps the same command (`BS=1 SEQ=512 bash
 scripts/serve_mimo.sh`). With `vision_config: null` the platform still sees the
@@ -449,7 +457,9 @@ kernel wrapper called directly, as in the Hy3 contrib port):
 
 ```bash
 # low-latency serving of V2.6-Flash-RL / V2.5
+VLLM_NEURON_BACKEND=neuron_native \
 vllm serve <ckpt> --max-model-len 1024 --max-num-seqs 1 --max-num-batched-tokens 1024 \
+  --disable-hybrid-kv-cache-manager \
   --tensor-parallel-size 64 --enable-expert-parallel --no-enable-prefix-caching --trust-remote-code \
   --hf-overrides '{"quantization_config": null, "vision_config": null}' \
   --additional-config '{"neuron_config": {"quantization": "bf16", "ep_degree": 4,
@@ -457,6 +467,52 @@ vllm serve <ckpt> --max-model-len 1024 --max-num-seqs 1 --max-num-batched-tokens
       "on_device_sampling_config": {"all_greedy": true}},
     "encoder_neuron_config": {"num_encoder_input_buckets": [2048]}}'
 ```
+
+## Native PyTorch route (SDK 2.33)
+
+Everything above this section that says "XLA compile route" was measured on the
+deprecated `VLLM_NEURON_BACKEND=vllm_neuron`. On the native route
+(`VLLM_NEURON_BACKEND=neuron_native`, which `scripts/serve_mimo.sh` now sets),
+with `--disable-hybrid-kv-cache-manager`, trn2.48xlarge, `scripts/bench.sh`
+900 in / 90 out, medians:
+
+| Checkpoint, configuration | c=1: out tok/s, TTFT, TPOT | c=16 | c=32 / c=48 |
+|---|---|---|---|
+| V2.5, BS=32, EP=64 | 16.9, 201 ms, 57.5 ms | 171.8, 526 ms, 86.7 ms | c=32: 253.3, 999 ms, 112.8 ms |
+| V2.6-Flash-RL, BS=32, EP=64 | 16.9, 202 ms, 57.5 ms | 171.9, 507 ms, 86.7 ms | c=32: 252.6, 975 ms, 112.3 ms |
+| V2.6-Flash-RL, BS=1, EP=64, hit kernels off | 29.0, 202 ms, 32.6 ms | | |
+| V2.6-Flash-RL, BS=1, EP=64, hit kernels on | 48.7, 202 ms, 18.5 ms | | |
+| V2.6-Flash-RL, BS=1, EP=4, hit kernels off (selective) | 194 ms TTFT, 17.7 ms TPOT | | |
+| V2.6-Flash-RL, BS=1, EP=4, hit kernels on | 195 ms TTFT, 14.9 ms TPOT | | |
+| V2.5-Pro, BS=48, dense torch fp8 decode (before) | 5.5, 558 ms, 178.5 ms | 56.7, 1475 ms, 262.9 ms | c=48: 96.2, 5665 ms, 374.0 ms |
+| V2.5-Pro, BS=48, hit kernels at every batch | 8.9, 559 ms, 107.6 ms | 68.5, 1371 ms, 217.4 ms | c=48: 104.9, 5607 ms, 346.3 ms |
+| V2.6-Pro-RL, BS=48, this port's default (hit kernels up to 128 tokens) | 8.9, 558 ms, 107.7 ms | 68.8, 1373 ms, 215.5 ms | c=48: 105.5, 5607 ms, 336.6 ms |
+| V2.6-Pro-RL, BS=48, fp8 all-expert `moe_tkg` above 24 tokens (not used) | 5.3, 559 ms, 183.9 ms | 55.5, 1535 ms, 269.1 ms | c=48: 94.9, 5689 ms, 378.3 ms |
+
+Against the XLA route: Flash at BS=32 is ~10% slower at concurrency 1 (57.5 vs 52.0 ms) and level at 16 / 32. Pro is level at
+concurrency 1 (107.7 vs 108.7 ms) and 9-10% slower at 16 / 48 (215.5 vs 196.7, 336.6 vs 308.0 ms). TTFT is level or better.
+
+**Decode over only the routed local experts** (`src/kernels/moe_tkg_hits.py`,
+`moe_tkg_hits_batch.py`, from the Hy3 contrib). `moe_tkg` does a fixed amount of
+expert work per step: every local expert (all-expert) or every top-k slot
+(selective). The hit kernels loop, at runtime, over the local experts the step
+actually routed to; a batch reads each hit expert once and applies a per-token
+affinity column.
+
+- **bf16 experts:** used up to `min(8, 4 * E_L / 3)` tokens (EP=64: 5; EP=4 and 8: 8),
+  past which `moe_tkg`'s unrolled paths win.
+- **fp8 experts (Pro):** `moe_tkg` rejects fp8 weights, so without the hit kernels
+  decode fell back to the dense torch path. Pro uses the hit kernels up to the
+  batch kernel's 128 tokens. The fp8 all-expert `moe_tkg` (ROW scales, the
+  kernel wrapper called directly) was tried as the large-batch path and is
+  slower in the full model (V2.6-Pro, BS=48: 183.9 / 269.1 / 378.3 ms TPOT at
+  concurrency 1 / 16 / 48), although a one-NeuronCore microbenchmark puts it
+  ahead once ~4 of 6 local experts are hit.
+- `MIMO_V2_5_DECODE_HITS=0` turns the hit kernels off; `MIMO_V2_5_DECODE_HITS_MAX_T`
+  overrides the token limit.
+
+**Expert packing without `torch.topk`**: on the native route it lowers to a sort
+(`NCC_EVRF029`). The packing is a prefix-count matmul plus a one-hot permutation.
 
 ## Compatibility Matrix
 
