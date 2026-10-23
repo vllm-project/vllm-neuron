@@ -45,6 +45,23 @@ def _dense_page(t, i, rows=None):
     return t.ap(pattern=[[rows * r, 1], [r, rows], [1, r]], offset=i * rows * r)
 
 
+def _page_rows(state, idx_sb, i, row0, nrows):
+    """Rows ``[row0, row0 + nrows)`` of page ``idx_sb[i]`` (runtime scalar offset)."""
+    _, rows, r = state.shape
+    return state.ap(
+        pattern=[[rows * r, 1], [r, nrows], [1, r]],
+        offset=row0 * r,
+        scalar_offset=idx_sb[i : i + 1, 0:1],
+        indirect_dim=0,
+    )
+
+
+def _dense_rows(t, i, row0, nrows):
+    """Rows ``[row0, row0 + nrows)`` of item ``i`` of a dense ``[n, rows, R]`` HBM tensor."""
+    _, rows, r = t.shape
+    return t.ap(pattern=[[nrows * r, 1], [r, nrows], [1, r]], offset=(i * rows + row0) * r)
+
+
 def _page(state, idx_sb, i):
     """``state[idx_sb[i]]`` as a DMA access pattern: page ``i``'s id is a runtime scalar offset."""
     _, rows, r = state.shape
@@ -115,6 +132,63 @@ def _state_scatter_kernel(
                 dge_mode=nisa.dge_mode.hwdge, oob_mode=oob_mode.skip,
             )
     return state_a, state_b
+
+
+@nki.jit
+def _state_scatter_split_kernel(
+    state_a: Tensor, state_b: Tensor, conv: Tensor, rec: Tensor, pages: Tensor
+):
+    """Write ``conv`` ``[n, cr, R]`` and ``rec`` ``[n, rr, R]`` into pages ``pages``, in place.
+
+    A page is ``conv | rec`` laid over half A then half B, so ``conv`` fills A's
+    first ``cr`` rows, ``rec`` the rest of A and then the head of B. Writing the
+    pieces directly avoids building the ``[n, 2 * rows * R]`` page in torch, whose
+    concatenate fails to compile at decode batch 32 on 27B (``NCC_IGCA044``).
+
+    Returns:
+        ``(state_a, state_b)``, so the write is reported as an input/output alias.
+    """
+    _, n_prgs, prg_id = get_verified_program_sharding_info("state_scatter_split", (0, 1), 2)
+    _, rows, _ = state_a.shape
+    n, cr, _ = conv.shape
+    rr = rec.shape[1]
+    in_a = rows - cr  # rec rows that land in half A
+    idx_sb = nl.ndarray((n, 1), dtype=pages.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=idx_sb, src=pages)
+    for i in range(n):
+        if n_prgs == 1 or prg_id == 0:
+            nisa.dma_copy(
+                dst=_page_rows(state_a, idx_sb, i, 0, cr), src=_dense_rows(conv, i, 0, cr),
+                dge_mode=nisa.dge_mode.hwdge, oob_mode=oob_mode.skip,
+            )
+            nisa.dma_copy(
+                dst=_page_rows(state_a, idx_sb, i, cr, in_a), src=_dense_rows(rec, i, 0, in_a),
+                dge_mode=nisa.dge_mode.hwdge, oob_mode=oob_mode.skip,
+            )
+        if n_prgs == 1 or prg_id == 1:
+            nisa.dma_copy(
+                dst=_page_rows(state_b, idx_sb, i, 0, rr - in_a), src=_dense_rows(rec, i, in_a, rr - in_a),
+                dge_mode=nisa.dge_mode.hwdge, oob_mode=oob_mode.skip,
+            )
+    return state_a, state_b
+
+
+def can_scatter_split(state_a: Tensor, conv_numel: int, rec_numel: int) -> bool:
+    """Whether :func:`scatter_state_split` applies: whole rows, ``conv`` in A, ``rec`` spanning A and B."""
+    _, rows, r = state_a.shape
+    if conv_numel % r or rec_numel % r:
+        return False
+    cr, rr = conv_numel // r, rec_numel // r
+    return 0 < cr < rows and rows - cr < rr <= 2 * rows - cr
+
+
+def scatter_state_split(
+    state_a: Tensor, state_b: Tensor, conv: Tensor, rec: Tensor, pages: Tensor
+) -> None:
+    """Write ``conv`` ``[n, cr, R]`` and ``rec`` ``[n, rr, R]`` into pages ``pages`` (``[n]``), in place."""
+    wrap_nki(_state_scatter_split_kernel)[2](
+        state_a=state_a, state_b=state_b, conv=conv, rec=rec, pages=pages.to(torch.int32).view(-1, 1)
+    )
 
 
 def gather_state_pages(state_a: Tensor, state_b: Tensor, pages: Tensor) -> Tensor:

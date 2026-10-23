@@ -809,6 +809,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         finite.
         """
         n = indices.shape[0]
+        if self._use_state_kernel(indices, "write"):
+            from .kernels.state_cache import can_scatter_split, scatter_state_split
+
+            if can_scatter_split(self.state_a, self.conv_numel, self.rec_numel):
+                r = self.state_a.shape[-1]
+                conv_rows = conv.reshape(n, -1, r).float()
+                rec_rows = rec.reshape(n, -1, r).float()
+                if live is not None:
+                    # Finite values, so multiplying by 0 is exact.
+                    keep = live.view(n, 1, 1).to(torch.float32)
+                    conv_rows, rec_rows = conv_rows * keep, rec_rows * keep
+                scatter_state_split(self.state_a, self.state_b, conv_rows, rec_rows, indices)
+                return
         page = torch.cat([conv.reshape(n, -1).float(), rec.reshape(n, -1).float()], dim=1)
         if live is not None:
             # The page is finite, so multiplying by 0 is exact.
