@@ -111,8 +111,9 @@ expert near-ties described in the Hy4 README.
 ## Measured
 
 trn2.48xlarge, world 64, `max_model_len` 32768, 2048-token prefill chunks, decode
-buckets `[1, 4]` (`run.py`'s defaults), greedy, XLA compile route. A cold start
-compiles the prefill graph and both decode graphs in ~30 min.
+buckets `[1, 4]` (`run.py`'s defaults), greedy. Native route
+(`VLLM_NEURON_BACKEND=neuron_native`, `VLLM_NEURON_PARALLEL_COMPILE_WORKERS=2`)
+unless noted.
 
 Throughput at a 31,744-token random prompt, 256 output tokens, one request, median
 of 3 (`run.py --bench`; each run within 0.01%). As for Hy4, only one 32K request fits
@@ -120,11 +121,12 @@ the KV cache, so this single stream is also the maximum at this length:
 
 | stack | TTFT | input tok/s | TPOT | output tok/s |
 |---|---|---|---|---|
-| SDK 2.33, vllm-neuron 0.29 (this folder) | 75.3 s | 422 | 182.5 ms | 5.48 |
+| SDK 2.33, vllm-neuron 0.29 (this folder) | 25.9 s | 1,223 | 176.4 ms | 5.67 |
+| SDK 2.33, vllm-neuron 0.29, XLA route (deprecated) | 75.3 s | 422 | 182.5 ms | 5.48 |
 | SDK 2.27, vllm-neuron 0.24 (PR #61) | 84.9 s | 374 | 230.2 ms | 4.34 |
 
-`--needle 30000` (28,782-token prompt, 15 prefill chunks): found, 76.3 s end to end
-on SDK 2.33 (94.2 s on 2.27).
+`--needle 30000` (28,782-token prompt, 15 prefill chunks): found, 29.8 s end to end
+on SDK 2.33 (76.3 s on the XLA route, 94.2 s on 2.27).
 
 `run.py`'s demo prompts on SDK 2.33. Three match 2.27 token for token; the France
 continuation parts after `' Distance from'` (2.27: `' Paris to Paris is 0 km, while
@@ -170,9 +172,8 @@ Requantisation error, block -> per-row, over 600 sampled expert tensors: median
   graphs (`[F137] neuronx-cc was forcibly killed`); cap it with
   `VLLM_NEURON_PARALLEL_COMPILE_WORKERS=2`. Re-validated on the native route
   (SDK 2.33): the 30K needle passes (29.8 s, against 76.3 s on the XLA
-  route) and the integration test passes. The "Measured" throughput above is
-  from the XLA route (`VLLM_NEURON_BACKEND=vllm_neuron`, deprecated); the native
-  32K bench has not been rerun with the cap yet.
+  route) and the integration test passes. With the cap the 32K bench compiles and
+  runs ("Measured" above): prefill is 2.9x the XLA route's, decode about the same.
 * `src/hy_v4/` is a copy of `contrib/models/hy4_preview/src/` (the contrib rules
   forbid importing another model's folder); a fix to one belongs in both.
 * No disaggregated (1P1D) scripts yet: Hy4's `Hy4NixlConnector` (a key-only
