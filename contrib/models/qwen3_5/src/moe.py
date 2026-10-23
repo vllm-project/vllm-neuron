@@ -689,21 +689,28 @@ class Qwen3_5SparseMoeBlock(nn.Module):
         top_values = top_values / top_values.sum(dim=-1, keepdim=True)
         affinities = torch.zeros_like(probs).scatter(1, top_index, top_values)
 
+        # This rank's experts' affinities, sliced here with a constant offset
+        # rather than by the kernel from ``rank_id``. On the native route the
+        # kernel's rank_id slice of the [T, E] affinities (512 experts, 64 local
+        # under EP=8) faults with "scatter/gather (indirect memory copy via
+        # scalar DGE) out-of-bound access" in the decode graph, on every rank.
+        # Unselected experts already carry affinity 0 (the scatter above), so no
+        # mask is needed.
+        lo = self.ep_rank * self.num_local_experts
         out = NF.moe_tkg(
             hidden_input=normed,
             expert_gate_up_weights=self.experts_gate_up_weight,
             expert_down_weights=self.experts_down_weight,
-            expert_affinities=affinities.to(self.dtype),
+            expert_affinities=affinities[:, lo : lo + self.num_local_experts]
+            .contiguous()
+            .to(self.dtype),
             expert_index=top_index.to(torch.int32),
             # The kernel only takes rank_id on the all-expert path, and under EP
-            # (the only way 397B-A17B fits) that path is mandatory.
+            # (the only way 397B-A17B fits) that path is mandatory. The slice
+            # above is already local, so its offset is 0.
             is_all_expert=True,
-            rank_id=(
-                rank_id
-                if rank_id is not None
-                else torch.zeros((1, 1), dtype=torch.int32, device=normed.device)
-            ),
-            mask_unselected_experts=True,
+            rank_id=torch.zeros((1, 1), dtype=torch.int32, device=normed.device),
+            mask_unselected_experts=False,
             expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
             activation_fn=ActFnType.SiLU,
         )
