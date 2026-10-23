@@ -210,8 +210,20 @@ each is commented at its site with the measurement that motivated it:
 
 `DEEPSEEK_V41_TRACE_INPUTS=1`, `DEEPSEEK_V41_DUMP_DIR=<dir>` and
 `DEEPSEEK_V41_CHECK_COLLECTIVES=1` are the diagnostics that found these; all
-are off by default. Throughput on Trn3 has not been measured, and the n-gram
-hash now costs one small device-to-host copy of the step's token ids.
+are off by default. The n-gram hash costs one small device-to-host copy of the
+step's token ids.
+
+**Megakernels (2026-10-23).** On Trn3 the port now runs every block as one NKI
+kernel and the DSpark drafter as another (`src/kernels/layer_kernel.py`,
+`src/kernels/draft_kernel.py`, bridged by `src/mk_model.py`; see
+`src/README.md` "Megakernels"). The integration test passes on that path (needle
+recalled, trivia answered) and the matrix below was re-measured with it:
+TTFT 625 / 1157 / 2134 / 9261 ms and TPOT 73 / 66 / 69 / 70 ms at 512 / 1k /
+2k / 8k input, batch 1 (the per-op path: 1060 / 1701 / 3037 / 13419 ms and
+~100 ms), 13.3 decode tok/s at short contexts and 7.0 at 8k, draft acceptance
+45-50% against the per-op path's 46-52%. `test/unit/EQUIVALENCE_REPORT.md` has
+the component-level and per-layer agreement of the two paths;
+`DEEPSEEK_V41_MEGAKERNEL=0` restores the per-op path.
 
 > **Read this before you deploy.** Every number in this contribution was
 > measured on `vllm-neuron` **0.24.0.1.1.0**, which is the branch the model was

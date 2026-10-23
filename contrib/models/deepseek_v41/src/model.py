@@ -42,6 +42,12 @@ from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
 
 from .config import DeepseekV41Config
+from . import mk_host, mk_model
+
+#: Run every block and the DSpark drafter as one NKI megakernel each
+#: (`kernels/layer_kernel.py`, `kernels/draft_kernel.py`, bridged by `mk_model`).
+#: `DEEPSEEK_V41_MEGAKERNEL=0` keeps the per-op path for comparison.
+_MEGAKERNEL = os.environ.get("DEEPSEEK_V41_MEGAKERNEL", "1") == "1"
 
 logger = logging.getLogger(__name__)
 
@@ -2774,13 +2780,37 @@ class MoE(nn.Module):
         self._uses: dict[int, int] = {}
 
     def allocate_cache_slots(self, config, device, count: int) -> int:
-        """Give this layer `count` HBM slots to hold routed experts."""
+        """Give this layer `count` HBM slots to hold routed experts.
+
+        A full pool is allocated as **one stacked buffer per tensor**
+        (`self.stacked["w1.weight"]` is `[n_local_experts, inter, dim // 2]` and
+        so on) with each slot's linears as views into it: the layer megakernel
+        (`mk_model.run_layer`) reads the stack, and `_stage`'s `copy_` into a
+        view fills it in place.
+        """
         count = max(0, min(count, self.n_local_experts))
         slots = []
-        for _ in range(count):
-            slot = Expert(config, storage="fp4", persistent=False)
-            slot.allocate(device)
-            slots.append(slot)
+        self.stacked = None
+        if count and count == self.n_local_experts:
+            proto = Expert(config, storage="fp4", persistent=False)
+            self.stacked = {}
+            for name in ("w1", "w2", "w3"):
+                for bname, shape, buffer_dtype in getattr(proto, name)._specs:
+                    self.stacked[f"{name}.{bname}"] = torch.zeros(
+                        (count, *shape), dtype=buffer_dtype, device=device
+                    )
+            for i in range(count):
+                slot = Expert(config, storage="fp4", persistent=False)
+                for name in ("w1", "w2", "w3"):
+                    linear = getattr(slot, name)
+                    for bname, _, _ in linear._specs:
+                        setattr(linear, bname, self.stacked[f"{name}.{bname}"][i])
+                slots.append(slot)
+        else:
+            for _ in range(count):
+                slot = Expert(config, storage="fp4", persistent=False)
+                slot.allocate(device)
+                slots.append(slot)
         self.cache_slots = nn.ModuleList(slots)
         self._resident = {}
         self._free = list(range(count))
@@ -4779,7 +4809,30 @@ class DeepseekV41ForCausalLM(nn.Module):
 
         _MOE_LIVE_ROWS[0] = live_rows if live_rows != bucket_rows else None
 
-        for layer_id, block in enumerate(self.layers):
+        if _MEGAKERNEL:
+            # One `layer_forward` per block: the engram read-out, the DSpark tap
+            # and every collective happen inside the kernel. See `mk_model`.
+            if self.pp_size != 1:
+                raise NotImplementedError("the megakernel path serves pp_size == 1")
+            if bucket_rows != int(stream.shape[0]):
+                raise NotImplementedError(
+                    f"the megakernel path wants the spans to tile the {int(stream.shape[0])} "
+                    f"rows of the step, got {bucket_rows}"
+                )
+            step = mk_model.make_step(spans, paged, stream.device, hashes)
+            self._mk_step = step
+            for layer_id, block in enumerate(self.layers):
+                if layer_id % _HEAP_TRIM_EVERY == 0:
+                    host_heap_trim(f"layer {layer_id}", self.world_size)
+                stream, pre_mix = self._run_block(
+                    block, stream, pre_mix, slices, paged, shared, bucket_rows
+                )
+                if _DUMP_DIR:
+                    self._dump(f"layer{layer_id}", stream, live_rows)
+                    self._dump(f"premix{layer_id}", pre_mix, live_rows)
+            main_hiddens = step.taps
+
+        for layer_id, block in enumerate([] if _MEGAKERNEL else self.layers):
             if layer_id % _HEAP_TRIM_EVERY == 0:
                 host_heap_trim(f"layer {layer_id}", self.world_size)
             # `owns` is True for every block when pp_size == 1, which is the
@@ -5352,6 +5405,8 @@ class DeepseekV41ForCausalLM(nn.Module):
         """One layer over a flat `[T, hc, dim]` stream covering several
         sequences.
         """
+        if _MEGAKERNEL:
+            return mk_model.run_layer(self, block, stream, pre_mix, self._mk_step)
         # `stage_group` *is* `tp_group` unless `_PP_EMULATE` narrowed it. The
         # attention and the indexer are unaffected either way: both reduce over
         # `self.attn_group or tp_group` and `attn_group` is always set here, so
@@ -5436,6 +5491,8 @@ class DeepseekV41ForCausalLM(nn.Module):
                 f"{list(self.config.dspark_target_layer_ids)}; forward() "
                 "collected none, so the target-layer tap did not run"
             )
+        if _MEGAKERNEL:
+            return mk_model.run_draft(self, seed_ids, tap, main_hidden, span, paged)
         begin, length, _ = span
         main = main_hidden[begin : begin + length].unsqueeze(0)
 
@@ -5463,6 +5520,82 @@ class DeepseekV41ForCausalLM(nn.Module):
             _graph_break()
         return last.forward_head(stream, pre_mix, seed_ids)
 
+
+    # ---- megakernel bridge (see mk_model) ---------------------------------------
+    _mk_step = None
+    _mk_dummies_ = None
+    _mk_layers_: dict | None = None
+    _mk_freqs_: dict | None = None
+    _mk_draft_ = None
+    _mk_groups_attn_ = None
+
+    @property
+    def _mk_dummies(self):
+        if self._mk_dummies_ is None:
+            self._mk_dummies_ = mk_model.Dummies.on(self.norm.weight.device)
+        return self._mk_dummies_
+
+    def _mk_layer(self, block) -> "mk_model.LayerWeights":
+        if self._mk_layers_ is None:
+            self._mk_layers_ = {}
+        lw = self._mk_layers_.get(block.layer_id)
+        if lw is None:
+            lw = mk_model.layer_weights(self, block)
+            self._mk_layers_[block.layer_id] = lw
+        return lw
+
+    def _mk_draft(self):
+        if self._mk_draft_ is None:
+            self._mk_draft_ = mk_model.draft_weights(self)
+        return self._mk_draft_
+
+    def _mk_freqs(self, attn) -> torch.Tensor:
+        """`[max_pos, 64]` fp32 (cos | sin) of this attention's RoPE table; the
+        compressed layers share one table and the others another."""
+        if self._mk_freqs_ is None:
+            self._mk_freqs_ = {}
+        key = bool(attn.compress_ratio)
+        t = self._mk_freqs_.get(key)
+        if t is None:
+            if attn.freqs_cis is None:
+                raise RuntimeError("bind_kv_cache() must run before the megakernel path")
+            t = mk_model._freqs_table(attn.freqs_cis, self.norm.weight.device)
+            self._mk_freqs_[key] = t
+        return t
+
+    def _mk_nearest_source(self, layer_id: int, kind: str):
+        ids = list(self.config.kv_source_layer_ids if kind == "kv" else self.config.index_source_layer_ids)
+        before = [s for s in ids if s <= layer_id]
+        return self.layers[max(before) if before else min(ids)].attn
+
+    @property
+    def _mk_groups_world(self):
+        return mk_host.replica_groups(self.world_size, self.world_size)
+
+    @property
+    def _mk_groups_attn(self):
+        """Consecutive `attn_tp`-rank groups, checked against the group the
+        plugin gave the attention reduction."""
+        if self._mk_groups_attn_ is None:
+            if self.attn_group_is_world:
+                if self.attn_replicas > 1:
+                    raise NotImplementedError(
+                        "the attention is replicated but reduces over the world; the "
+                        "megakernel wants an attention group of attn_tp ranks "
+                        "(see deepseek_v41.require_attention_group)"
+                    )
+                self._mk_groups_attn_ = self._mk_groups_world
+            else:
+                groups = mk_host.replica_groups(self.world_size, self.attn_tp)
+                ranks = tuple(int(r) for r in self.attn_tp_group.ranks)
+                mine = groups[self.rank // self.attn_tp]
+                if ranks != mine:
+                    raise NotImplementedError(
+                        f"rank {self.rank}: the attention group is {ranks}, not the consecutive "
+                        f"{mine} the megakernel's replica groups assume"
+                    )
+                self._mk_groups_attn_ = groups
+        return self._mk_groups_attn_
 
     def load_weights(
         self,

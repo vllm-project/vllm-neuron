@@ -15,7 +15,9 @@ supports.
 | `model.py` | The implementation: attention, MoE, hyper-connections, engram, the DSpark stages, `forward`, `get_kv_spec`, `bind_kv_cache`, `load_weights`. |
 | `weight_loader.py` | Checkpoint-to-parameter mapping and sharding. Module names are the checkpoint's own paths, so "is this the weight the reference uses here" is a string comparison against `model.safetensors.index.json`. |
 | `drafter.py` | `DSparkProposer`, the in-model speculative proposer registered with `vllm_neuron.vllm.spec_decode`. |
-| `kernels/` | The NKI kernels. `kernels/__init__.py` maps each kernel entry point to its call site in `model.py`. |
+| `kernels/` | The NKI kernels. `kernels/__init__.py` maps each kernel entry point to its call site in `model.py`. `layer_kernel.py` and `draft_kernel.py` are the two megakernels (see below); `mk_common.py` / `mk_compress.py` are their shared helpers. |
+| `mk_model.py` | The bridge from the modules to the megakernels: gathers each block's weights into the kernel's argument order once, builds the per-step index columns, and runs the kernels. |
+| `mk_host.py` | The host-side index arithmetic (window and compressed slot tables, compression groups) over the scheduler's block tables. |
 | `chat_template.jinja` | The checkpoint's chat template, applied to cases with `role=user`. |
 | `verifier/` | The accuracy harness the integration test drives. Lives here rather than under `test/` because its modules import the model with package-relative imports (`from ..config`), so it has to sit inside the same package. |
 
@@ -52,6 +54,43 @@ engram     5.7 GiB    by row, ~6.0M of 384M a table
           ---------
          ~13.9 GiB
 ```
+
+## Megakernels
+
+Every backbone block runs as **one** NKI kernel
+(`kernels/layer_kernel.py:layer_forward`) and the whole DSpark draft path as
+another (`kernels/draft_kernel.py:draft_forward`). Each is a single `@nki.jit`
+launched on both physical NeuronCores of a logical core (`nl.program_id(0)`
+splits rows or output columns between them) that does its own all-reduces
+(`nki.collectives`, over the 8-rank attention group and the 64-rank world), so
+a layer is one graph execution and the stream, caches and index state never
+leave HBM between sublayers. `mk_model.py` is the bridge: it gathers a block's
+weights into the kernel's argument order once (`fn.T` and the router weight as
+fp32, the routed experts as one stacked buffer that `MoE.allocate_cache_slots`
+now allocates and the slots view into), turns the scheduler's block tables into
+the kernels' index columns per step (`mk_host.py`), and hands the top-k, the
+compressed/index caches and the DSpark taps down the stack.
+
+The kernels' arithmetic is the reference's (fp8 activation round trips before
+the quantized GEMMs, fp32 interiors, bf16 roundings where the model has them)
+and is checked component by component against a CPU reference by the unit
+tests (`test/unit/test_layer.py`, `test/unit/test_draft.py`). Two things are
+deliberately simpler than the per-op path: the routed experts run **dense**
+over every row of the step (the routing weight is zero where a row did not
+pick the expert), which costs nothing at decode and is wasteful at long
+prefill; and the candidate-block mask of layer 20 is assumed a no-op, which
+holds while the context reads at most `candidate_topk_blocks x
+candidate_block_size` compressed groups (16384 tokens) and is asserted.
+One detail of the in-kernel reduction: the shared expert's weights are
+replicated on every rank and the model adds its output once, after the expert
+all-reduce; the kernels add it on every rank scaled by `1/world` (an exact
+power-of-two scale of the fp32 partial), so the world sum carries it once.
+The n-gram row ids reach the engram kernel local to the rank's shard
+(`mk_model.StepIndices.hash_cols`): the kernel masks the shard range in fp32, and
+a global id of the 384M-row table is not exact above 2^24.
+`DEEPSEEK_V41_MEGAKERNEL=0` restores the per-op path. The equivalence evidence
+(component R-ratios, a per-layer comparison of the two paths on the real model,
+the verifier) is in `test/unit/EQUIVALENCE_REPORT.md`.
 
 ## Quantization
 

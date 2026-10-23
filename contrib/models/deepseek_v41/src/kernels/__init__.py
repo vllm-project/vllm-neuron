@@ -1,6 +1,59 @@
 # SPDX-License-Identifier: Apache-2.0
 """NKI kernels for the DeepSeek-V4.1-Flash port.
 
+**The megakernels** (the path the model runs, `DEEPSEEK_V41_MEGAKERNEL=1`,
+the default): one `@nki.jit` per backbone block and one for the DSpark drafter,
+both launched on both physical cores of a logical core (`nl.program_id(0)`
+splits the work) and doing their own collectives (`nki.collectives`):
+
+    module                      kernel.entry                 call site
+    ------------------------------------------------------------------------------
+    one whole `Block` -- engram
+      read-out, the DSpark tap,
+      hc sublayer-in, MLA
+      projections + rope + the
+      KV write, the compressor
+      and indexer (kv/index
+      sources), the index top-k,
+      sparse attention over the
+      window + compressed slots,
+      the grouped O projection
+      and its all-reduce, hc
+      sublayer-out, hc sublayer-
+      in, the 384-expert router,
+      the routed + shared
+      experts and their
+      all-reduce, hc sublayer-out layer_kernel.layer_forward  mk_model.run_layer
+                                                              <- model._run_block
+    the DSpark drafter -- the
+      tap projection, the
+      vocab-parallel draft
+      embedding, three MTP
+      stages (window + draft
+      block attention, 128-expert
+      MoE), the head, the markov
+      bias, the argmax over the
+      sharded vocabulary, the
+      confidence head             draft_kernel.draft_forward  mk_model.run_draft
+                                                              <- model.forward_spec
+    shared helpers (row tiles of
+      every sublayer, the fp8/fp4
+      GEMMs over decoded weight
+      rows, gathers/scatters,
+      the attention token body,
+      the router)                 mk_common, mk_compress       (imported by both)
+    the per-step index columns
+      (window/compressed slot
+      tables, group members)      ../mk_host.py                mk_model.StepIndices
+
+The two megakernels borrow `blockquant`'s GEMM and quantization primitives
+(`_gemm`, `_dequant_fp8`, `_dequant_fp4`, `_qdq_fp8`, `_stage_rows`) and
+nothing from any library: every other operation below is written out in
+`mk_common` / `mk_compress`. Unit tests: `test/unit/test_layer.py`,
+`test/unit/test_draft.py` (N ranks through `kharness_mp.py`).
+
+**The per-op kernels** (`DEEPSEEK_V41_MEGAKERNEL=0`, kept for comparison):
+
     module                      kernel.entry                 call site (model.py)
     ------------------------------------------------------------------------------
     MLA attention: Q/O low-rank

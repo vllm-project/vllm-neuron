@@ -31,6 +31,11 @@ from .factory import DeepseekV41ForCausalLM
 logger = logging.getLogger(__name__)
 
 os.environ.setdefault("NEURON_SKIP_EFA_AFFINITY", "1")
+# The NKI trace cache keys a kernel on its own function source; the megakernels
+# fold a hash of their helper modules into their constant flags for the compile
+# cache, but the trace cache has no such hook, so it is off (it only costs a
+# re-trace when the compile cache misses anyway).
+os.environ.setdefault("NKI_DISABLE_TRACE_CACHE", "1")
 
 os.environ.setdefault("VLLM_NEURON_DEBUG_MODE", "1")
 
