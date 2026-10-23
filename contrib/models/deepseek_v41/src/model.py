@@ -411,6 +411,7 @@ def _nki_entry(module: str, name: str = "kernel", grid: int = 0):
         hc_expand,
         hc_mixes,
         index_score,
+        moe_expert,
         rmsnorm,
         sparse_attn as sparse_attn_kernel,
         swiglu as swiglu_kernel,
@@ -426,6 +427,7 @@ def _nki_entry(module: str, name: str = "kernel", grid: int = 0):
         "hc_expand": hc_expand,
         "hc_mixes": hc_mixes,
         "index_score": index_score,
+        "moe_expert": moe_expert,
         "rmsnorm": rmsnorm,
         "sparse_attn": sparse_attn_kernel,
         "swiglu": swiglu_kernel,
@@ -654,12 +656,81 @@ def nki_linear(
     return out[:rows].reshape(*x.shape[:-1], out.shape[-1])
 
 
+#: Store the **routed experts'** fp4 weights with the contracted axis on the
+#: partition axis — `[in//2, out]` nibbles and `[in//32, out]` scales, i.e. the
+#: transpose of what the checkpoint holds — so that `kernels/moe_expert.py` can
+#: DMA the packed nibbles straight into SBUF and dequantize them there.
+#:
+#: **Why the layout is the lever.** `blockquant.fp4_linear` cannot read the
+#: stored `[out, in//2]` layout into the tensor engine directly: `nc_matmul`
+#: wants the contracted axis on partitions, so the kernel dequantizes the whole
+#: weight into a bf16 copy in private HBM and then `dma_transpose`s tiles of
+#: *that* back in. At `n=2304, k=5120` a 5.9 MB fp4 weight therefore costs a
+#: 23.6 MB write plus a >= 23.6 MB read — ~8x the weight, per GEMM, and one
+#: expert runs three of them. `fp4_linear_fused` removed the round trip while
+#: keeping the stored layout, which left it `dma_transpose`ing packed bytes
+#: instead, and it lost 50% of TTFT (see `nki_linear`). Transposing **once at
+#: load time** is what makes the fused expert kernel's weight read contiguous:
+#: one strided `dma_copy` per k-block, no transpose anywhere, 5.9 MB instead of
+#: ~47 MB. `kernels/legacy/moe_short.py` reads exactly this layout and is where
+#: the kernel comes from.
+#:
+#: Set `DEEPSEEK_V41_EXPERT_KMAJOR=0` to go back to the stored layout and the
+#: four-kernel `_swiglu_expert` path; nothing else changes with it, which is
+#: what makes it the fallback if the fused kernel is ever in doubt.
+_EXPERT_KMAJOR = os.environ.get("DEEPSEEK_V41_EXPERT_KMAJOR", "1") != "0"
+
+
+#: Expand every fp8 weight's `32 x 32`-block e8m0 scale **once at load time**
+#: into one bf16 value a weight row, and let the GEMM kernels load that instead
+#: of rebuilding it inside every forward. See `BlockQuantLinear.expand_scale`
+#: and `blockquant._scale_is_rowwise`.
+#:
+#: **Why this is the cheapest full pass in the model to delete.** The stored
+#: scale depends only on the weights, so rebuilding it per GEMM per forward is
+#: the hints' "do not materialize what you can apply" with the cheaper answer
+#: being the other direction: derive it once from data that never changes.
+#: Iteration 5's decode profile attributed **46.8 ms of summed engine time and
+#: 296,451 instructions a forward** to the four instructions
+#: `blockquant._blocked_sf` issues (`nl.load` the codes, `left_shift(add(..)))`,
+#: `tensor_copy`, `broadcast_to`), against **6.5 ms and 8,414** for the single
+#: `nl.load` that replaces them. Across the whole decode forward, on two
+#: captures of the same tree: `blockquant`'s instructions **889,569 -> 425,940
+#: (-52.1%)** and its engine time **172.95 -> 123.95 ms (-28.3%)**,
+#: engine-active union **122.65 -> 105.38 ms (-14.1%)**, device-busy
+#: **248.79 -> 244.06 ms (-1.9%)**, and the same arithmetic (0.983 -> 0.972
+#: TFLOP), the same 93 barriers and the same 32 distinct NEFFs a forward. End to
+#: end, a 200-token request went **21.19 s -> 19.29 s (-9.0%)**. The
+#: second-order half of the win is the semaphore waits those 288 k producer
+#: instructions carried: the `sync` engine dropped 290,241 -> 186,942
+#: instructions a forward.
+#:
+#: **Do not quote a `window / forwards` figure for this change.** That metric
+#: carries the profiler's own `nrt_profile_add_node_info`, which differed by
+#: 74.7 ms between two captures of an instruction-for-instruction identical
+#: stream and moved the metric 7.1%; see `.autohelix/notes/iter-5.md` §7b.
+#:
+#: It costs **175.6 MiB a rank across 355 tensors** — the expansion is
+#: `weight_bytes / 16` against the codes' `weight_bytes / 1024` — and the decode
+#: profile shows the matching extra HBM read (+0.148 GB a forward) for the
+#: instructions it removes. The stored codes are kept, so `dequantized()` and
+#: `DEEPSEEK_V41_FP8_ROWSCALE=0` both still work; the flag restores the old path
+#: exactly, and because the arm is chosen from a *shape* it is resolved at trace
+#: time rather than per call.
+_FP8_ROWSCALE = os.environ.get("DEEPSEEK_V41_FP8_ROWSCALE", "1") != "0"
+
+
 class BlockQuantLinear(nn.Module):
     """A linear whose weight is stored block-scaled, as the checkpoint has it.
 
         fp8  `[out, in]` e4m3 + `[ceil(out/32), ceil(in/32)]`   attention, shared experts
         fp4  `[out, in//2]` two e2m1 per byte + `[out, in/32]`   routed experts
         bf16 `[out, in]`, no scale                               compressor, indexer wk
+
+    `kmajor` transposes the fp4 pair — `[in//2, out]` and `[in//32, out]` — for
+    the fused expert kernel. See `_EXPERT_KMAJOR`. The bytes are the same bytes;
+    only which axis is contiguous changes, and `MoE._stage` does the transpose on
+    the host as it copies an expert in.
     """
 
     def __init__(
@@ -670,12 +741,14 @@ class BlockQuantLinear(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
         block: int = 32,
         persistent: bool = True,
+        kmajor: bool = False,
     ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.storage = storage
         self.block = block
+        self.kmajor = kmajor and storage == "fp4"
 
         if storage == "fp8":
             specs = [
@@ -687,10 +760,17 @@ class BlockQuantLinear(nn.Module):
                 ),
             ]
         elif storage == "fp4":
-            specs = [
-                ("weight", (out_features, in_features // 2), torch.uint8),
-                ("scale", (out_features, in_features // block), torch.uint8),
-            ]
+            specs = (
+                [
+                    ("weight", (in_features // 2, out_features), torch.uint8),
+                    ("scale", (in_features // block, out_features), torch.uint8),
+                ]
+                if self.kmajor
+                else [
+                    ("weight", (out_features, in_features // 2), torch.uint8),
+                    ("scale", (out_features, in_features // block), torch.uint8),
+                ]
+            )
         elif storage == "bf16":
             specs = [("weight", (out_features, in_features), dtype)]
         else:
@@ -710,6 +790,51 @@ class BlockQuantLinear(nn.Module):
         for name, shape, buffer_dtype in self._specs:
             setattr(self, name, torch.zeros(shape, dtype=buffer_dtype, device=device))
 
+    @property
+    def fp8_scale(self) -> torch.Tensor | None:
+        """The scale operand to hand `blockquant`'s GEMMs.
+
+        The row-wise bf16 expansion once `expand_scale` has run, the stored
+        e8m0 codes until then, and `None` for a bf16 weight that has no scale.
+        A non-fp8 storage never has an expansion and so returns what it stores.
+        """
+        expanded = getattr(self, "row_scale", None)
+        return getattr(self, "scale", None) if expanded is None else expanded
+
+    def expand_scale(self) -> int:
+        """Build the row-wise bf16 scale for an fp8 weight. Returns its bytes.
+
+        The device arm this replaces (`blockquant._blocked_sf`) evaluates, in
+        int32, `((code + SC_EXP_ADD) << 23)` viewed as fp32 and narrowed to
+        bf16. **This evaluates the same int32 expression rather than a tidier
+        `2.0 ** (code - 7)`**, and that is deliberate: at `code > 135` the add
+        passes 255 and the shift walks into the sign bit, so a "correct" host
+        implementation would disagree with the device on exactly those codes and
+        nothing in this repo would catch it. Checked bit-identical over the
+        codes the checkpoint holds, a wide range and the full `0..255`.
+
+        The `[1, kb]` code row shared by `BLK` weight rows becomes `BLK`
+        identical bf16 rows, truncated to `out_features` because the stored
+        scale has `ceil(out / BLK)` rows and the kernel only ever reads the
+        first `out` of them.
+        """
+        if self.storage != "fp8" or not _FP8_ROWSCALE:
+            return 0
+        scale = getattr(self, "scale", None)
+        if scale is None or scale.is_meta:
+            return 0
+        from .kernels.blockquant import SC_EXP_ADD
+
+        # `.to("cpu", torch.int32)` would convert the dtype **on the device**,
+        # which this backend has no kernel for; copy first, convert on the host.
+        codes = scale.detach().to("cpu").to(torch.int32)
+        bits = (codes + SC_EXP_ADD) << 23
+        rows = bits.view(torch.float32).to(torch.bfloat16)
+        rows = rows.repeat_interleave(self.block, dim=0)[: self.out_features]
+        expanded = rows.contiguous().to(scale.device)
+        self.register_buffer("row_scale", expanded, persistent=False)
+        return expanded.numel() * expanded.element_size()
+
     def dequantized(self, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
         """The weight in `dtype`."""
         from .weight_loader import dequant_block_fp4, dequant_block_fp8
@@ -717,14 +842,29 @@ class BlockQuantLinear(nn.Module):
         if self.storage == "fp8":
             return dequant_block_fp8(self.weight, self.scale, self.block, dtype)
         if self.storage == "fp4":
+            if self.kmajor:
+                # Back to `[out, in//2]` first: `dequant_block_fp4` unpacks the
+                # low nibble as k even and the high as k odd along the *last*
+                # axis, which is the k axis only in the stored layout.
+                return dequant_block_fp4(
+                    self.weight.t().contiguous(),
+                    self.scale.t().contiguous(),
+                    self.block,
+                    dtype,
+                )
             return dequant_block_fp4(self.weight, self.scale, self.block, dtype)
         return self.weight.to(dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """`x @ weight.T` in a NKI kernel. The only path; there is no fallback."""
-        return nki_linear(
-            x, self.weight, getattr(self, "scale", None), self.storage
-        )
+        if self.kmajor:
+            raise RuntimeError(
+                "this linear's fp4 weight is stored k-major for "
+                "`kernels/moe_expert.fp4_expert_ffn`, and `blockquant`'s GEMMs "
+                "read the checkpoint's `[out, in//2]` layout. Route it through "
+                "`_routed_expert_step`, or set DEEPSEEK_V41_EXPERT_KMAJOR=0."
+            )
+        return nki_linear(x, self.weight, self.fp8_scale, self.storage)
 
     def grouped(self, x: torch.Tensor, group: int, width: int) -> torch.Tensor:
         """One block of a block-diagonal projection: rows
@@ -734,11 +874,15 @@ class BlockQuantLinear(nn.Module):
             raise ValueError(f"grouped() is for fp8 storage, not {self.storage!r}")
         if width % self.block:
             raise ValueError(f"group width {width} must be a multiple of {self.block}")
-        band = width // self.block
+        scale = self.fp8_scale
+        # A row-wise scale is indexed by weight row, the stored codes by
+        # 32-row block — the same distinction `_fp8_2core_span` makes.
+        rowwise = scale.shape[0] == self.out_features
+        step = width if rowwise else width // self.block
         return nki_linear(
             x,
             self.weight[group * width : (group + 1) * width],
-            self.scale[group * band : (group + 1) * band],
+            scale[group * step : (group + 1) * step],
             "fp8",
             quantize_activation=False,
         )
@@ -919,6 +1063,69 @@ _ATTN_SLOT_TILE = 128
 #: rather than imported because `sparse_attn` runs inside a dynamo trace and the
 _ATTN_BIAS_PAD = 16
 
+#: Padded slot-table rows up to which `sparse_attn` takes the **dense** kernel —
+#: `kernels/sparse_attn.dense_attn`, which stages the whole table into SBUF once
+#: a call and batches `128 // heads` tokens into every score tile — instead of
+#: `gathered_attn_idx`, which re-gathers each token's own `topk` rows out of HBM
+#: and runs one token at a time at `heads = 8` of 128 partitions.
+#:
+#: **This bounds the TABLE, not the context length.** The table is the window
+#: slots plus the compressed-KV rows the indexer chose from — 640 to 2432 rows
+#: on the paths this serves — against a cache of up to 8448. Raising this so
+#: the dense arm covered an 8 k cache would be ~13x the necessary arithmetic
+#: while profiling beautifully; `.autohelix/notes/iter-6.md` §11b has the SBUF
+#: arithmetic that says it could not be staged anyway (12544 and 16768 rows
+#: want 401 and 537 KiB a partition against 192 KiB).
+#:
+#: The selection is identical either way (see `dense_attn`'s docstring): the
+#: dense pass reads the same `topk_idxs` as a mask, and an unselected slot
+#: contributes a hard zero. What changes is the work: the dense pass does
+#: `n_padded / topk` times the slot arithmetic, against 16x the tensor-engine
+#: and vector-engine width and ~14x fewer instructions.
+#:
+#: Measured table sizes: in512 prefill 1024 (ratio 2) / 1408 (ratio 1), in1024
+#: 1792 / 2432, in8192 12544 / 16768. So the 8 k cells and the batched-decode
+#: path — whose table is the concatenation of every sequence's own — keep the
+#: gathered kernel, which is why it stays.
+#:
+#: Measured standalone on device at 512 query rows, `heads = 8`,
+#: `head_dim = 512`, `topk = 512`, best of 12 — iteration 7's own run of the
+#: harness at `/mnt/nvme/tmp/iter7/time_attn.py`, reproducing iteration 6's:
+#:
+#:     npad   gathered us   dense us   speedup
+#:      640        4753.2     1000.0     4.75x
+#:     1024        4808.8      853.3     5.64x
+#:     1408        4810.9      994.7     4.84x
+#:     1792        4678.3      965.8     4.84x
+#:     2432        4818.7     1146.8     4.20x
+#:
+#: 4096 compiles and wins too (2.59x, iteration 3); 3072 is the cap because a
+#: kernel holding ~32 bytes a padded slot a partition is ~98 KiB of the 192 KiB
+#: at that width and it has to share SBUF with whatever else the enclosing
+#: graph has resident, which a standalone measurement does not prove.
+_ATTN_DENSE_MAX = int(os.environ.get("DEEPSEEK_V41_ATTN_DENSE_MAX", 3072) or 0)
+
+#: Query rows below which `sparse_attn` keeps the gathered kernel even when the
+#: table would fit. `dense_attn` pays for the whole table once a call — the
+#: transposes that put `head_dim` on partitions — and amortizes it over
+#: `tokens / (128 // heads)` score tiles, so at a handful of rows there is
+#: nothing to amortize it over. Measured, same harness:
+#:
+#:     rows   npad   gathered us   dense us   speedup
+#:        6    640         211.3      319.9     0.66x   (dense LOSES)
+#:        6   1024         265.0      426.0     0.62x   (dense LOSES)
+#:       32   1408         537.7      252.1     2.13x
+#:      512   1408        4810.9      994.7     4.84x
+#:
+#: A decode step gives `1 + dspark_block_size = 6` rows a sequence, so this
+#: keeps **every decode forward on the kernel it already ran**: iteration 6's
+#: capture puts `sparse_attn` at 2.6% of decode engine time against 41.3% at
+#: prefill, so there was never much there to win, and TPOT and decode
+#: throughput are gated.
+_ATTN_DENSE_MIN_ROWS = int(
+    os.environ.get("DEEPSEEK_V41_ATTN_DENSE_MIN_ROWS", 32) or 0
+)
+
 #: Bucket for the compressed-KV and index-key reads. `compress_len` grows with
 #: the decode position and is a tensor *shape*, so reading exactly that many
 #: groups makes every layer recompile once per token. Rounding the read up to a
@@ -1022,9 +1229,20 @@ _EXPERT_USE_CEILING = 64
 #: the GEMM", and report both in `_hbm_mark`'s per-forward line.
 _EXPERT_TIMING = os.environ.get("DEEPSEEK_V41_TIME_EXPERTS", "0") != "0"
 
-#: `[fetch+stage, launch, read, host->device]` seconds since the last forward
-#: boundary. The first is the sum of the last two plus the cache lookup.
-_EXPERT_TIME = [0.0, 0.0, 0.0, 0.0]
+#: `[fetch+stage, launch, read, host->device, route sync, route plan]` seconds
+#: since the last forward boundary. The first is the sum of the next two plus
+#: the cache lookup.
+#:
+#: The last two are the per-block **host round-trip** in `_route_plan`, which
+#: iteration 1 left as the only unmeasured term of the decode step and the only
+#: eager code still on the per-block path. `route sync` is the two `.cpu()`
+#: calls — each drains the device, so 43 of them a forward means host and
+#: device never overlap — and `route plan` is the host-side `torch.where` loop
+#: and the two host-to-device copies a candidate expert that follow it. Read
+#: them off `_hbm_mark`'s per-forward line with
+#: `DEEPSEEK_V41_TIME_EXPERTS=1`; a decode forward is ~316 ms, of which ~82 ms
+#: is known to be the 43 world-wide all-reduces and ~2 ms the graph launches.
+_EXPERT_TIME = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 #: Layers at which `_census_device_tensors` reports. Early, middle and late, so
 #: the difference between them is what the layer loop accumulates.
@@ -1085,18 +1303,18 @@ def _hbm_mark(layer_id: int, rows: int) -> None:
                 "(%.0f%%), %d admitted, ~%.2f GiB fetched; prefetch %d served "
                 "(%d stalled, %d inline); gc %d collections in %.2f s"
                 "; experts %.1f s staging (%.1f read + %.1f h2d) "
-                "+ %.1f s launching",
+                "+ %.1f s launching; route %.3f s sync + %.3f s plan",
                 _HBM_STATE[0], hits, hits + misses,
                 100.0 * hits / max(1, hits + misses), admitted,
                 misses * _EXPERT_BYTES[0] / 1024**3,
                 served, stalled, inline,
                 _GC_STATE[0], _GC_STATE[1],
                 _EXPERT_TIME[0], _EXPERT_TIME[2], _EXPERT_TIME[3],
-                _EXPERT_TIME[1],
+                _EXPERT_TIME[1], _EXPERT_TIME[4], _EXPERT_TIME[5],
             )
         EXPERT_STREAM_STATS[:] = [0, 0, 0]
         _EXPERT_CACHE_STATS[:] = [0, 0, 0]
-        _EXPERT_TIME[:] = [0.0, 0.0, 0.0, 0.0]
+        _EXPERT_TIME[:] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         _GC_STATE[:] = [0, 0.0]
         _HBM_STATE[0] += 1
         _HBM_STATE[1] = None
@@ -1214,12 +1432,56 @@ def window_topk_idxs(
     return idxs.int().unsqueeze(0)
 
 
+def _dense_bias(
+    topk_idxs: torch.Tensor,
+    rows: int,
+    n: int,
+    npad: int,
+    softmax_scale: float,
+    zero: torch.Tensor,
+    neg: torch.Tensor,
+) -> torch.Tensor:
+    """`dense_attn`'s bias: the same selection `topk_idxs` holds, as a mask.
+
+    Every selected slot — and only a selected slot — comes out 0; everything
+    else, including the empties' dump column and the padding past `n`, comes
+    out `-1e30`, which `dense_attn` adds to the logit exactly as
+    `gathered_attn_idx` does for its own padding. **Nothing `topk_idxs` left
+    out can reach the output.**
+
+    `scatter_` lowers to one indirect-DMA descriptor per ~119 elements on
+    GpSimd — iteration 3 measured the per-layer version at 83 ms of prefill
+    engine time over 41 builds — which is why `sparse_attn` takes a
+    `bias_state` and builds this once an index epoch (9 builds a forward at
+    in512) rather than once a layer. Iteration 6's capture put the cached form
+    at 18.9 ms a forward, the same ~2.1 ms a build over a fifth of the builds.
+
+    `Tensor.scatter_` *raises* on an out-of-range index where the gathered
+    path's `clamp_min(0)` would silently gather a wrong row, so anything
+    outside `[0, n)` goes to the dump column rather than trusting the bound.
+    The bound does hold for every producer here; a hard failure across 64 ranks
+    costs an iteration and the guard costs one comparison.
+    """
+    empty = (topk_idxs == EMPTY_SLOT) | (topk_idxs < 0) | (topk_idxs >= n)
+    dump = torch.full_like(topk_idxs, npad - 1)
+    chosen = torch.zeros(
+        (1, rows, npad), dtype=torch.bool, device=topk_idxs.device
+    ).scatter_(2, torch.where(empty, dump, topk_idxs).to(torch.int64), ~empty)
+    mask = torch.where(
+        chosen & (torch.arange(npad, device=topk_idxs.device) < n), zero, neg
+    )
+    return torch.cat(
+        [mask.new_full((1, rows, _ATTN_BIAS_PAD), softmax_scale), mask], dim=2
+    )
+
+
 def sparse_attn(
     q: torch.Tensor,
     kv: torch.Tensor,
     attn_sink: torch.Tensor,
     topk_idxs: torch.Tensor,
     softmax_scale: float,
+    bias_state: "SharedAttentionState | None" = None,
 ) -> torch.Tensor:
     """Multi-head attention over gathered slots, with a learned sink.
 
@@ -1230,6 +1492,16 @@ def sparse_attn(
         the reference kernel's bf16 staging buffer, while the denominator sums
         the fp32 ones;
       - the sink joins the denominator against the final row max.
+
+    Two kernels compute exactly that, over exactly the slots `topk_idxs`
+    selects, and the table size picks between them — see `_ATTN_DENSE_MAX`:
+    `dense_attn` stages the table once and batches `128 // h` tokens a score
+    tile, `gathered_attn_idx` re-gathers each token's own rows and runs one
+    at a time. Simulated against each other on the same selections they agree
+    to ~5e-05 relative, and both are ~2.2e-03 from an exact fp64 masked
+    softmax — i.e. the difference between the two kernels is ~40x smaller than
+    the bf16 rounding they share. **The test is on shapes, so it resolves at
+    trace time and a compiled graph holds one arm, never a branch.**
     """
     b, s, h, d = q.shape
     n = kv.size(1)
@@ -1246,11 +1518,62 @@ def sparse_attn(
         "and every producer in this model (`Attention._window_kv`, "
         "`DSparkAttention.forward`) reshapes to a leading 1"
     )
+
+    # `n + 1` so the padded width always has at least one column past the
+    # table: that column is where an `EMPTY_SLOT` entry is sent, and it stays
+    # masked because the mask is `and`ed with `column < n`. Without it an empty
+    # slot would have to be clamped to 0 like the gathered path does, and would
+    # unmask a real row.
+    npad = -(-(n + 1) // _ATTN_SLOT_TILE) * _ATTN_SLOT_TILE
+    dense_fits = (
+        npad <= _ATTN_DENSE_MAX
+        and _ATTN_SLOT_TILE % h == 0
+        and d % _ATTN_SLOT_TILE == 0
+    )
+
+    # The whole sequence's mask, built once and sliced per query tile, because
+    # a tile's rows are a contiguous row range of it. `bias_state` carries it
+    # across the layers of one index epoch — see `_dense_bias` for what that
+    # is worth and `SharedAttentionState.attn_bias` for why it cannot go
+    # stale. The key is every static thing the mask depends on; `topk_idxs`
+    # itself is covered by the invalidation rather than by the key.
+    #
+    # Built **inside this gate**, which is the one thing iteration 6 changed
+    # from iteration 3 and the reason an 8 k forward never traces the builder
+    # at all: at 8192 tokens iteration 3's index-source-layer version
+    # materialized a `[8192, 16768]` bool and a `[8192, 16784]` fp32, ~550 MB a
+    # layer, for a kernel that is gated off at that table size.
+    dense = None
+    if dense_fits and s >= _ATTN_DENSE_MIN_ROWS:
+        key = (s, n, npad, topk, softmax_scale)
+        if bias_state is not None and bias_state.attn_bias_key == key:
+            dense = bias_state.attn_bias
+        if dense is None:
+            dense = _dense_bias(
+                topk_idxs, s, n, npad, softmax_scale,
+                _bound(sink, 0.0), _bound(sink, _NEG_BOUND),
+            )
+            if bias_state is not None:
+                bias_state.attn_bias = dense
+                bias_state.attn_bias_key = key
+
     for lo in range(0, s, _ATTN_QUERY_TILE):
         hi = min(lo + _ATTN_QUERY_TILE, s)
         t = hi - lo
         idxs = topk_idxs[:, lo:hi]
         empty = idxs == EMPTY_SLOT
+
+        if dense is not None and t >= _ATTN_DENSE_MIN_ROWS:
+            bias = dense[:, lo:hi]
+            tiles.append(
+                _nki_entry("sparse_attn", "dense_attn")(
+                    q[:, lo:hi].reshape(-1, d),
+                    kv.reshape(n, d),
+                    bias.reshape(-1, _ATTN_BIAS_PAD + npad),
+                    sink,
+                ).reshape(b, t, h, d)
+            )
+            continue
 
         bias = empty.float() * _NEG_BOUND
         gidx = idxs.clamp_min(0).int()
@@ -1396,6 +1719,7 @@ class SharedAttentionState:
 
     __slots__ = (
         "compress_kv", "index_k", "topk_idxs", "candidates", "compress_read",
+        "attn_bias", "attn_bias_key",
     )
 
     def __init__(self) -> None:
@@ -1407,6 +1731,22 @@ class SharedAttentionState:
         #: for the layers behind it that would read exactly the same ones.
         #: See `Attention.reads_shared_compress`.
         self.compress_read: torch.Tensor | None = None
+        #: `sparse_attn`'s dense-path mask, and the shape key it was built for.
+        #: Handed down for exactly the same reason `topk_idxs` is: it is a
+        #: function of `topk_idxs` and of nothing else that varies between the
+        #: layers that share them, and building it is a `scatter_` of
+        #: `s x topk` booleans — one indirect-DMA descriptor per ~119 elements
+        #: on GpSimd, ~2.1 ms a build.
+        #:
+        #: Invalidated in `Attention._compress_kv` at the one place
+        #: `topk_idxs` is written, so a layer can never read a mask built from
+        #: a different index map. And a `SharedAttentionState` is **fresh every
+        #: forward** (`DeepseekV41ForCausalLM.forward` makes one per span), so
+        #: nothing survives into the next one — which is what makes the
+        #: `compress_ratio = 0` layers, which build a mask and never invalidate
+        #: one, safe too. See `sparse_attn`'s `bias_state`.
+        self.attn_bias: torch.Tensor | None = None
+        self.attn_bias_key: tuple | None = None
 
 
 class Compressor(nn.Module):
@@ -1812,6 +2152,19 @@ class Attention(nn.Module):
                     paged, tp_group,
                 )
             shared.topk_idxs = idxs
+            # `sparse_attn`'s dense mask is a function of these indices, so it
+            # dies here, at the one place they change, and nowhere else. Every
+            # layer that reads `shared.topk_idxs` instead of computing its own
+            # is a layer whose mask is byte-identical to this one's: the window
+            # half of the index map is `window_topk_idxs(sliding_window,
+            # seqlen, start_pos)` with a `sliding_window` that is global, the
+            # compressed half *is* this tensor, the offset between them is the
+            # window table's own width, `softmax_scale` is `head_dim**-0.5` on
+            # every layer, and an index epoch never crosses a `compress_ratio`
+            # boundary (sources 2, 8, 14 are ratio 2; 20, 24, 28, 32, 36 are
+            # ratio 1), so `n` does not change under it either.
+            shared.attn_bias = None
+            shared.attn_bias_key = None
         else:
             idxs = shared.topk_idxs.to(torch.int32)
 
@@ -2012,7 +2365,9 @@ class Attention(nn.Module):
                 topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
             attended.append(
                 sparse_attn(
-                    q[:, rows], kv, self.attn_sink, topk_idxs, self.softmax_scale
+                    q[:, rows], kv, self.attn_sink, topk_idxs,
+                    self.softmax_scale,
+                    span_shared if self.compress_ratio else None,
                 )
             )
         o = attended[0] if len(attended) == 1 else torch.cat(attended, dim=1)
@@ -2148,6 +2503,54 @@ class Attention(nn.Module):
             idxs.append(
                 torch.cat([window_idxs[b : b + 1], compress_idxs], dim=-1)
             )
+        # One table or one a span, and the choice is `sparse_attn`'s kernel
+        # choice rather than a preference. Concatenating is what lets one
+        # launch serve every span (the paragraphs above), but the table it
+        # concatenates is `bsz` times as wide as any one token can see, and
+        # `sparse_attn`'s dense kernel is bounded by what it can stage in SBUF
+        # (`_ATTN_DENSE_MAX`). At `bsz = 10` the concatenation is ~14000 rows
+        # and falls back to the per-token gather; a span's own is ~1400 and
+        # does not.
+        #
+        # Splitting costs nothing here, which is the only reason it is worth
+        # doing: `sparse_attn` already tiles its query rows at
+        # `_ATTN_QUERY_TILE = 512` and a prefill span is 512 rows, so ten spans
+        # of 512 are ten kernel launches either way — the same ten, over a
+        # tenth of the table each. And it is the same arithmetic for the same
+        # reason the concatenation was: a token's output depends on its own
+        # query row, its own slots and its own bias, so `bsz` calls over `bsz`
+        # tables are bit-identical to one call over their concatenation. The
+        # unshifted per-span `idxs` are what the loop above already built.
+        #
+        # The decision is taken from two Python ints, so the arm that is not
+        # taken costs nothing and the concatenated path traces identically to
+        # the tree before this change. `length >= _ATTN_DENSE_MIN_ROWS` keeps
+        # decode on the single concatenated call.
+        rows_one = sum(p.shape[1] for p in parts[: len(parts) // bsz])
+        if (
+            bsz > 1
+            and length >= _ATTN_DENSE_MIN_ROWS
+            and -(-(rows_one + 1) // _ATTN_SLOT_TILE) * _ATTN_SLOT_TILE
+            <= _ATTN_DENSE_MAX
+        ):
+            per = len(parts) // bsz
+            attended = []
+            for b in range(bsz):
+                span_parts = parts[b * per : (b + 1) * per]
+                attended.append(
+                    sparse_attn(
+                        q[:, b * length : (b + 1) * length],
+                        span_parts[0]
+                        if per == 1
+                        else torch.cat(span_parts, dim=1),
+                        self.attn_sink,
+                        idxs[b],
+                        self.softmax_scale,
+                        shared[b] if self.compress_ratio else None,
+                    )
+                )
+            return torch.cat(attended, dim=1)
+
         kv = torch.cat(parts, dim=1)
         rows_per = kv.shape[1] // bsz
         idx = torch.cat(idxs, dim=0)
@@ -2198,7 +2601,17 @@ class Attention(nn.Module):
             kv = torch.cat([kv, compress_kv], dim=1)
             topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
 
-        o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+        # `shared` only on a `compress_ratio` layer, which is what makes the
+        # mask cache provably fresh: such a layer always reaches
+        # `_compress_kv`, the first one in any forward (layer 2) is an index
+        # source, and an index source invalidates. A `compress_ratio = 0` layer
+        # never calls `_compress_kv`, so nothing in its forward would clear a
+        # mask left over from an earlier one — it builds its own instead, which
+        # is cheap (its index map is the 128-wide window alone).
+        o = sparse_attn(
+            q, kv, self.attn_sink, topk_idxs, self.softmax_scale,
+            shared if self.compress_ratio else None,
+        )
         o = torch.cat(
             [o[..., :-rd], apply_rotary_emb(o[..., -rd:], freqs_cis, True)], -1
         )
@@ -2306,15 +2719,81 @@ def _swiglu_expert(x, weights, w1, s1, w2, s2, w3, s3, storage, limit):
     return nki_linear(y.to(dtype), w2, s2, storage)
 
 
+#: `fp4_expert_ffn`'s launch grid: 2 program instances, one per physical core of
+#: the logical NeuronCore, splitting the intermediate axis (2304 -> 1152 each)
+#: and summing the two partial down-projections through a `core_barrier`. Not a
+#: knob — the kernel asserts on it, the way `blockquant.fp4_linear_2core` does,
+#: because a one-core kernel run at grid 2 computes the same result twice.
+#:
+#: It is here rather than inlined because giving it up is the one way this
+#: kernel could lose: the expert GEMM is compute-bound at the 128-row bucket
+#: (arithmetic intensity ~482 against a ~221 FLOP/byte ridge point), and
+#: `fp4_linear_2core` measured -7.0% TTFT / -15.0% TPOT over the undivided
+#: kernel purely by using the second core. Fusing while dropping the split
+#: would hand back more than the fusion wins.
+_EXPERT_FFN_GRID = 2
+
+
+def _fused_expert(x, route_weights, w1, s1, w2, s2, w3, s3):
+    """One routed expert's whole FFN in **one** NKI kernel, fp32 out.
+
+    Replaces the four kernels `_swiglu_expert` issues — two fp4 GEMMs over the
+    same `x`, a SwiGLU reading both back from HBM, and a third fp4 GEMM over a
+    dtype-cast intermediate — with a single `kernels/moe_expert` invocation in
+    which the gate and up projections share one staged activation, the clamped
+    SwiGLU happens in SBUF, and the down projection accumulates in PSUM. The
+    weights are read as packed fp4 straight into SBUF (`_EXPERT_KMAJOR`), so
+    nothing dequantizes a weight into HBM and nothing reads one back.
+
+    Argument order matches the kernel's, which is `(gate, up, down)` — the
+    model's `(w1, w3, w2)` — rather than this function's historical `w1, w2, w3`.
+    """
+    return _nki_entry("moe_expert", "fp4_expert_ffn", _EXPERT_FFN_GRID)(
+        x, route_weights, w1, s1, w3, s3, w2, s2
+    )
+
+
 def _routed_expert_step(
     carry, flat, rows, route_weights, w1, s1, w2, s2, w3, s3, limit
 ):
-    """Gather one expert's rows, run it, scatter-add into the fp32 carry."""
+    """Gather one expert's rows, run it, scatter-add into the fp32 carry.
+
+    `limit` is unused on the fused path: `moe_expert` bakes `swiglu_limit`, and
+    `MoE.__init__` asserts the config agrees with it. It stays in the signature
+    because `_routed_expert_step2/3` pass it positionally.
+    """
+    if _EXPERT_KMAJOR:
+        return carry.index_add(
+            0,
+            rows,
+            _fused_expert(
+                flat.index_select(0, rows), route_weights,
+                w1, s1, w2, s2, w3, s3,
+            ),
+        )
     y = _swiglu_expert(
         flat.index_select(0, rows), route_weights,
         w1, s1, w2, s2, w3, s3, "fp4", limit,
     )
     return carry.index_add(0, rows, y.float())
+
+
+def _routed_expert_first(
+    flat, rows, route_weights, w1, s1, w2, s2, w3, s3, limit
+):
+    """`_routed_expert_step` against a zero carry it builds **inside its own
+    graph**, for the first expert of a block.
+
+    `_moe_carry` used to build that carry, and because `MoE`'s expert loop is
+    `@torch._dynamo.disable`d it was its own top-level graph execution — one a
+    block, 43 a forward, for a `zeros_like`. Folding it in here costs one more
+    shape key on an entry that already has one per row bucket (measured 3.45
+    variants a rank) and removes the launch.
+    """
+    return _routed_expert_step(
+        torch.zeros_like(flat, dtype=torch.float32), flat, rows, route_weights,
+        w1, s1, w2, s2, w3, s3, limit,
+    )
 
 
 def _routed_expert_step2(
@@ -2350,7 +2829,7 @@ def _routed_expert_step3(
 
 #: Routed experts per graph execution. **1 is today's path, exactly.**
 #:
-#: Why this is the lever it is. Iteration 4 §3 priced one graph execution on
+#: Why this *might* be a lever. Iteration 4 §3 priced one graph execution on
 #: this deployment at ~1.12 ms, by measuring a configuration that adds 720 of
 #: them to a prefill and dividing. A 503-token prefill runs ~258
 #: `_routed_expert_step` executions (6 owned experts x 43 blocks), so the
@@ -2358,6 +2837,16 @@ def _routed_expert_step3(
 #: inside one of them has a roofline of ~154 us. Most of that 1.12 ms is
 #: therefore *not* arithmetic, and the only way to stop paying it is to issue
 #: fewer executions.
+#:
+#: **Iteration 1 falsified the premise of that paragraph** and
+#: `MoE.route_and_run`'s docstring has the measurement: removing 172 launches a
+#: forward moved TPOT by 1.1% and TTFT by 3.0%, which prices a launch at ~20 us
+#: at decode and ~150 us at prefill, not 1.12 ms. The 1.12 ms quotient counted
+#: the arithmetic of the 128-row GEMMs it added. So at `_EXPERT_FUSE=3` the
+#: honest expectation for 6 -> 2 launches a block is ~26 ms of an 833 ms TTFT
+#: (~3%) and nearly nothing at decode, against `(bucket, chunk length)` graph
+#: variants — worth measuring, not worth assuming. It is still **off**, and it
+#: is still not recorded anywhere whether anyone has ever measured it on.
 #:
 #: `_EXPERT_ROW_FLOOR` is **not** the lever, and its comment says why: the
 #: blockquant GEMM tiles the token axis at the 128-wide partition, so a bucket
@@ -2388,6 +2877,57 @@ def _shared_expert_step(carry, flat, ones, w1, s1, w2, s2, w3, s3, limit):
 def _moe_carry(flat):
     """The fp32 accumulator the routed experts scatter into."""
     return torch.zeros_like(flat, dtype=torch.float32)
+
+
+#: `(rows, width, device) -> an all-zero fp32 carry`, for the blocks where this
+#: rank owns none of the experts the router picked.
+_MOE_ZERO_CARRY: dict = {}
+
+#: Largest zero carry worth keeping. 4 MiB covers every decode shape this port
+#: serves — batch 10 at `dspark_block_size` 5 is 60 rows, 1.2 MiB — and leaves a
+#: prefill-sized one to `_moe_carry`. See `_moe_zero_carry`.
+_MOE_ZERO_CARRY_CAP_BYTES = 4 << 20
+
+
+def _moe_zero_carry(flat: torch.Tensor) -> torch.Tensor:
+    """A zero fp32 carry of `flat`'s shape, allocated once and shared.
+
+    Call only from eager code: this allocates.
+
+    Every step that consumes a carry — `_routed_expert_step`,
+    `_shared_expert_step` — is **out of place** (`index_add`, `+`), so nothing
+    on the forward path writes to a carry and one zero tensor a shape can serve
+    every block and every forward. That is what makes the k == 0 case free: at
+    batch 1 a rank owns 6 of 384 experts, so most of a decode step's 43 blocks
+    route to none of them and used to spend a whole graph execution on a
+    `zeros_like`.
+
+    Lazily keyed, and that is deliberate rather than incidental: a block with at
+    least one owned expert takes `_routed_expert_first` instead, so the only
+    shapes that *should* ever reach here are the small ones a decode step asks
+    for — 60 rows at batch 10 is 1.2 MiB. A prefill shape would be
+    `8448 x 5120` fp32 = **165 MiB a rank, held for the life of the process, that
+    nothing ever reads**, and it takes only one block out of 43 routing to none
+    of this rank's 6 experts to key it.
+
+    At 8192 tokens every one of the 384 experts is hit with overwhelming
+    probability, so that is a tail case rather than the normal path — but
+    `_CAP_BYTES` makes it one that cannot cost anything instead of one that is
+    merely unlikely. Over the cap, fall back to the launch this cache exists to
+    avoid. The 8k cells are the HBM-marginal ones (`in8192_bs10` had to be moved
+    to batch 4 because the KV cache is replicated per rank), and an unmeasured
+    165 MiB is not worth the ~20 us a launch costs.
+    """
+    key = (int(flat.shape[0]), int(flat.shape[1]), str(flat.device))
+    hit = _MOE_ZERO_CARRY.get(key)
+    if hit is None:
+        if flat.shape[0] * flat.shape[1] * 4 > _MOE_ZERO_CARRY_CAP_BYTES:
+            return _compiled(_moe_carry)(flat)
+        hit = torch.zeros(
+            flat.shape[0], flat.shape[1], dtype=torch.float32, device=flat.device
+        )
+        _MOE_ZERO_CARRY[key] = hit
+    return hit
 
 
 def _dspark_tap(stream):
@@ -2575,14 +3115,21 @@ class Expert(nn.Module):
         super().__init__()
         inter = intermediate_size or config.moe_intermediate_size
         self.swiglu_limit = config.swiglu_limit
+        # Only the fp4 routed experts go k-major: they are the ones
+        # `kernels/moe_expert.fp4_expert_ffn` runs. The shared expert is fp8 and
+        # stays on `blockquant`, so `kmajor` is inert for it.
+        kmajor = _EXPERT_KMAJOR and storage == "fp4"
         self.w1 = BlockQuantLinear(
-            config.hidden_size, inter, storage=storage, persistent=persistent
+            config.hidden_size, inter, storage=storage, persistent=persistent,
+            kmajor=kmajor,
         )
         self.w2 = BlockQuantLinear(
-            inter, config.hidden_size, storage=storage, persistent=persistent
+            inter, config.hidden_size, storage=storage, persistent=persistent,
+            kmajor=kmajor,
         )
         self.w3 = BlockQuantLinear(
-            config.hidden_size, inter, storage=storage, persistent=persistent
+            config.hidden_size, inter, storage=storage, persistent=persistent,
+            kmajor=kmajor,
         )
 
     def allocate(self, device) -> None:
@@ -2593,12 +3140,31 @@ class Expert(nn.Module):
         self, x: torch.Tensor, weights: torch.Tensor | None = None
     ) -> torch.Tensor:
         limit, ones = swiglu_consts(self.swiglu_limit, x.device)
+        if self.w1.kmajor:
+            # Nothing calls this for a routed expert — `MoE` uses the slots for
+            # their weight buffers and goes through `_routed_expert_step` — so
+            # rather than guess at a broadcast for the `(1, 1)` shared-expert
+            # weight, say what the fused kernel wants.
+            flat = x.reshape(-1, self.w1.in_features)
+            if weights is None or tuple(weights.shape) != (flat.shape[0], 1):
+                raise ValueError(
+                    "a k-major fp4 expert runs through "
+                    "`kernels/moe_expert.fp4_expert_ffn`, which wants one "
+                    f"routing weight a row — `weights` of shape "
+                    f"({flat.shape[0]}, 1), not {None if weights is None else tuple(weights.shape)}"
+                )
+            return _fused_expert(
+                flat, weights,
+                self.w1.weight, self.w1.scale,
+                self.w2.weight, self.w2.scale,
+                self.w3.weight, self.w3.scale,
+            ).to(x.dtype).reshape(x.shape)
         return _swiglu_expert(
             x,
             ones if weights is None else weights,
-            self.w1.weight, self.w1.scale,
-            self.w2.weight, self.w2.scale,
-            self.w3.weight, self.w3.scale,
+            self.w1.weight, self.w1.fp8_scale,
+            self.w2.weight, self.w2.fp8_scale,
+            self.w3.weight, self.w3.fp8_scale,
             self.w1.storage,
             limit,
         )
@@ -2636,6 +3202,25 @@ class MoE(nn.Module):
         self.gate = Gate(config, layer_id)
         self.shared_experts = Expert(config, storage="fp8")
         self.expert_slot = Expert(config, storage="fp4", persistent=False)
+        if _EXPERT_KMAJOR:
+            # `moe_expert` bakes the model's constants, so a config that
+            # disagrees with them has to fail here rather than produce a
+            # plausible wrong number 43 blocks deep.
+            from .kernels import moe_expert as _moe_expert_kernel
+
+            for field, baked in (
+                ("hidden_size", _moe_expert_kernel.DIM),
+                ("moe_intermediate_size", _moe_expert_kernel.INTER),
+                ("swiglu_limit", _moe_expert_kernel.SWIGLU_LIMIT),
+            ):
+                if getattr(config, field) != baked:
+                    raise ValueError(
+                        f"kernels/moe_expert.py bakes {field}={baked} and this "
+                        f"config says {getattr(config, field)}. Either "
+                        "re-derive the kernel's constants or set "
+                        "DEEPSEEK_V41_EXPERT_KMAJOR=0 to take the "
+                        "shape-general `blockquant` path."
+                    )
 
         self.cache_slots = nn.ModuleList()
         #: `expert_id -> slot index` for the experts currently resident.
@@ -2745,8 +3330,29 @@ class MoE(nn.Module):
         slot = self.expert_slot if slot is None else slot
         for name in ("w1", "w2", "w3"):
             linear = getattr(slot, name)
-            linear.weight.copy_(blob[f"{name}.weight"].to(linear.weight.device))
-            linear.scale.copy_(blob[f"{name}.scale"].to(linear.scale.device))
+            weight = blob[f"{name}.weight"]
+            scale = blob[f"{name}.scale"]
+            # Reinterpret, never convert. The checkpoint stores these as `int8`
+            # and `float8_e8m0fnu`; `copy_` into the `uint8` buffers would
+            # *value*-cast, and an e8m0 code of 120 would arrive as 0. The
+            # weight store already hands these over as `uint8` (`as_bytes`, and
+            # `_read_expert`'s views of a `uint8` buffer), so this is insurance
+            # against a future reader that does not — it is the exact bug that
+            # bit this iteration's own equivalence test.
+            if weight.dtype != linear.weight.dtype:
+                weight = weight.view(linear.weight.dtype)
+            if scale.dtype != linear.scale.dtype:
+                scale = scale.view(linear.scale.dtype)
+            if linear.kmajor:
+                # On the host, once, as the expert is admitted: the same bytes
+                # in the layout `fp4_expert_ffn` reads. `blob`'s tensors are
+                # views into the weight store's reusable read buffer, so these
+                # have to be materialized anyway — `.t().contiguous()` costs the
+                # copy `copy_` would have made, not an extra one.
+                weight = weight.t().contiguous()
+                scale = scale.t().contiguous()
+            linear.weight.copy_(weight.to(linear.weight.device))
+            linear.scale.copy_(scale.to(linear.scale.device))
         return slot
 
     @torch._dynamo.disable
@@ -2772,8 +3378,12 @@ class MoE(nn.Module):
             live_rows = override
         ids = indices if live_rows is None else indices[:live_rows]
         wts = weights if live_rows is None else weights[:live_rows]
+        mark = time.perf_counter() if _EXPERT_TIMING else 0.0
         ids_host = ids.cpu()
         wts_host = wts.cpu().float()
+        if _EXPERT_TIMING:
+            synced = time.perf_counter()
+            _EXPERT_TIME[4] += synced - mark
         device = indices.device
 
         candidates = [
@@ -2804,6 +3414,8 @@ class MoE(nn.Module):
                     padded_weights.to(device),
                 )
             )
+        if _EXPERT_TIMING:
+            _EXPERT_TIME[5] += time.perf_counter() - synced
         return plan
 
     @staticmethod
@@ -2856,7 +3468,76 @@ class MoE(nn.Module):
         tp_group=None,
         live_rows: int | None = None,
     ) -> torch.Tensor:
-        """Route to `num_experts_per_tok` of the pool, plus the shared expert."""
+        """Route to `num_experts_per_tok` of the pool, plus the shared expert.
+
+        The whole sublayer in one eager call, which is what `Block.forward`
+        wants. The hot path does not come through here: `_run_block` and
+        `DSparkBlock.forward` call `gate`, `route_and_run` and `finish`
+        separately so that only `route_and_run` — the part that genuinely needs
+        the host — is outside a traced region. See `route_and_run`.
+        """
+        weights, indices = self.gate(x.reshape(-1, self.hidden_size), image_mask)
+        carry, _, ones, shared_limit = self.route_and_run(
+            x, weights, indices, weight_store, live_rows
+        )
+        return self.finish(carry, x, shared_limit, ones, tp_group)
+
+    @torch._dynamo.disable
+    def route_and_run(
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        weight_store,
+        live_rows: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """This rank's routed experts, summed into an fp32 carry.
+
+        **The only part of the FFN that has to be eager**, and the reason the
+        rest of it moved out. `MoE` is `@torch._dynamo.disable`d because
+        `_route_plan` reads the router's choice on the host — `indices.cpu()` —
+        and then issues a data-dependent number of launches. Dynamo therefore
+        treats *every* `_compiled(...)` call made from here as its own top-level
+        graph execution, where the same call made from traced code is inlined
+        into the surrounding graph for free. A bench server log shows exactly
+        that split: `_gate_step`, `_moe_carry`, `_fc_sum`, `_shared_expert_step`
+        and `_moe_narrow` each appear in dynamo's `__recompiles` log as their own
+        frame, while `_post_into`, `attn_half` and every `_nki_entry` reached
+        from `_run_block` appear not at all.
+
+        So the gate moved into `Block.attn_half` (it reads that graph's own
+        output), the all-reduce, the shared expert and the dtype cast moved into
+        `finish` (traced, inlined beside `_post_into`), and the carry moved into
+        `_routed_expert_first` / `_moe_zero_carry`. What is left here is the
+        routed loop itself, whose length is the router's output.
+
+        **What that bought, and the cost model it corrects.** The split removed
+        172 of a decode step's ~270 launches and 172 of a 503-token prefill's
+        ~516, at `in512_bs1`:
+
+            TTFT p50   859.6 ms -> 833.4 ms   (-3.0%)
+            TPOT p50   103.5 ms -> 102.4 ms   (-1.1%)
+            decode      9.233   ->   9.36 tok/s  (+1.4%)
+
+        Both measured passes agreed to 1% with CLEAN windows. Divide it out and a
+        top-level graph launch costs **~20 us at decode** (-3.4 ms a forward over
+        172 launches at acceptance length 3.09) and **~150 us at prefill**, where
+        the inlined boundaries also stop round-tripping a `[503, 5120]` fp32
+        activation through HBM.
+
+        That is ~50x less than the `~1.12 ms a graph execution` that
+        `_EXPERT_FUSE`'s comment below attributes to iteration 4 §3. **That figure
+        is an artifact of how it was taken** — 720 launches were added to a
+        prefill and the time divided by 720, but each added launch was a 128-row
+        fp4 expert GEMM, so the quotient is mostly arithmetic and weight traffic
+        rather than launch overhead. Counting launches is not a cost model here;
+        `.autohelix/notes/iter-1.md` §3 has what is and is not yet attributed of
+        the ~316 ms decode forward.
+
+        Returns `(carry, routed_limit, ones, shared_limit)`. The three constants
+        come back because `swiglu_consts` allocates and so cannot be called from
+        the traced `finish`.
+        """
         if weight_store is None and not self.resident:
             raise RuntimeError(
                 f"layer {self.layer_id} MoE has no weight store and its expert "
@@ -2864,9 +3545,7 @@ class MoE(nn.Module):
                 "load_weights() must have attached one. Running without it "
                 "would mean running without the experts."
             )
-        shape = x.shape
         flat = x.reshape(-1, self.hidden_size)
-        weights, indices = self.gate(flat, image_mask)
         plan = self._route_plan(indices, weights, live_rows, weight_store)
         if _PP_EMULATE > 1 and not self.is_mtp:
             # A rank of a `64 // p`-wide tensor-parallel group owns
@@ -2879,7 +3558,7 @@ class MoE(nn.Module):
             # latency probe and says so.
             plan = list(plan) * _PP_EMULATE
 
-        y = _compiled(_moe_carry)(flat)
+        y = None
         limit, ones = swiglu_consts(self.expert_slot.swiglu_limit, flat.device)
         for chunk in self._expert_chunks(plan):
             mark = time.perf_counter() if _EXPERT_TIMING else 0.0
@@ -2887,14 +3566,20 @@ class MoE(nn.Module):
             staged = time.perf_counter() if _EXPERT_TIMING else 0.0
             if len(chunk) == 1:
                 (_, rows, route_weights), slot = chunk[0], slots[0]
-                y = _compiled(_routed_expert_step)(
-                    y, flat, rows, route_weights,
+                expert_args = (
+                    flat, rows, route_weights,
                     slot.w1.weight, slot.w1.scale,
                     slot.w2.weight, slot.w2.scale,
                     slot.w3.weight, slot.w3.scale,
                     limit,
                 )
+                if y is None:
+                    y = _compiled(_routed_expert_first)(*expert_args)
+                else:
+                    y = _compiled(_routed_expert_step)(y, *expert_args)
             else:
+                if y is None:
+                    y = _compiled(_moe_carry)(flat)
                 args: list = []
                 for (_, rows, route_weights), slot in zip(chunk, slots):
                     args += [
@@ -2912,19 +3597,46 @@ class MoE(nn.Module):
         if weight_store is not None and not self.resident:
             weight_store.end_expert_loop()
 
+        if y is None:
+            # This rank owns none of the experts this block's router picked —
+            # the common case at batch 1, where a rank holds 6 of 384. Its
+            # contribution to the world-wide sum is zeros, and a shared zero
+            # tensor is as good as a freshly launched one because nothing
+            # downstream writes to a carry.
+            y = _moe_zero_carry(flat)
+        shared_limit, _ = swiglu_consts(self.shared_experts.swiglu_limit, flat.device)
+        return y, limit, ones, shared_limit
+
+    def finish(
+        self,
+        carry: torch.Tensor,
+        x: torch.Tensor,
+        shared_limit: torch.Tensor,
+        ones: torch.Tensor,
+        tp_group=None,
+    ) -> torch.Tensor:
+        """Rejoin the expert shards, add the shared expert, cast back.
+
+        **Call this from traced code.** Every step in it — the all-reduce, the
+        shared expert's three GEMMs, the dtype cast — is then inlined into the
+        caller's graph instead of being three separate launches, which is the
+        whole point of `route_and_run` returning a carry rather than a result.
+        Reached from eager code (`MoE.forward`) it still works and still costs
+        the three launches.
+        """
+        flat = x.reshape(-1, self.hidden_size)
         if tp_group is not None and self.n_local_experts != self.n_routed_experts:
-            y = tp_all_reduce(y, tp_group)
+            carry = tp_all_reduce(carry, tp_group)
 
         shared = self.shared_experts
-        shared_limit, _ = swiglu_consts(shared.swiglu_limit, flat.device)
-        y = _compiled(_shared_expert_step)(
-            y, flat, ones,
-            shared.w1.weight, shared.w1.scale,
-            shared.w2.weight, shared.w2.scale,
-            shared.w3.weight, shared.w3.scale,
+        carry = _compiled(_shared_expert_step)(
+            carry, flat, ones,
+            shared.w1.weight, shared.w1.fp8_scale,
+            shared.w2.weight, shared.w2.fp8_scale,
+            shared.w3.weight, shared.w3.fp8_scale,
             shared_limit,
         )
-        return _compiled(_moe_narrow)(y, x.dtype).reshape(shape)
+        return _compiled(_moe_narrow)(carry, x.dtype).reshape(x.shape)
 
 
 def _next_prime(start: int, seen: set[int]) -> int:
@@ -3356,7 +4068,15 @@ class Block(nn.Module):
         self, stream, pre_mix, slices, paged, shared: list, tp_group,
         out_residual=None, out_normed=None,
     ):
-        """Everything from the stream to the MoE's normalized input."""
+        """Everything from the stream to the MoE's routing decision.
+
+        The router is in here rather than in `MoE` because it reads this graph's
+        own last value and produces 6 ints a row. As a separate entry point
+        called from the dynamo-disabled `MoE` it was a whole graph execution a
+        block; inlined here it is free. `MoE.route_and_run` takes the result as
+        an argument, and its docstring has what that and the rest of the split
+        were worth.
+        """
         batched = stream.unsqueeze(0)
         residual = batched
         attn_pre, attn_post, attn_comb = self.hc_attn.mixes(batched)
@@ -3368,11 +4088,17 @@ class Block(nn.Module):
         residual = batched
         ffn_pre, ffn_post, ffn_comb = self.hc_ffn.mixes(batched)
         normed = self.ffn_norm(HyperConnections.pre(batched, attn_pre))
+        route_w, route_i = self.ffn.gate(
+            normed.reshape(-1, self.ffn.hidden_size), None
+        )
         if out_residual is None:
-            return normed, residual, ffn_pre, ffn_post, ffn_comb
+            return normed, residual, ffn_pre, ffn_post, ffn_comb, route_w, route_i
         out_residual.copy_(residual)
         out_normed.copy_(normed)
-        return out_normed, out_residual, ffn_pre, ffn_post, ffn_comb
+        return (
+            out_normed, out_residual, ffn_pre, ffn_post, ffn_comb,
+            route_w, route_i,
+        )
 
     def _attn_rows(self, normed, slices, paged, shared, tp_group):
         """The attention sublayer's output for every row of `normed`.
@@ -3618,7 +4344,14 @@ class DSparkBlock(Block):
         ffn_pre, ffn_post, ffn_comb = self.hc_ffn.mixes(x)
         y = HyperConnections.pre(x, attn_pre)
         y = self.ffn_norm(y)
-        y = self.ffn(y, None, weight_store, tp_group)
+        # Split the same way `_run_block` splits it: this method is traced, so
+        # the router and `finish` are inlined here and only the routed-expert
+        # loop pays a launch. Three stages a draft, five rows each — all launch.
+        route_w, route_i = self.ffn.gate(y.reshape(-1, self.ffn.hidden_size), None)
+        carry, _, ones, shared_limit = self.ffn.route_and_run(
+            y, route_w, route_i, weight_store, None
+        )
+        y = self.ffn.finish(carry, y, shared_limit, ones, tp_group)
         x = HyperConnections.post(y, residual, ffn_post, ffn_comb)
         return x, ffn_pre
 
@@ -4376,6 +5109,34 @@ class DeepseekV41ForCausalLM(nn.Module):
         )
 
 
+    def expand_fp8_scales(self) -> None:
+        """Expand every resident fp8 weight's block scale to one value a row.
+
+        Called once from `weight_loader.load_weights`, after the checkpoint has
+        landed in the buffers and before anything runs a forward, so that no
+        GEMM ever rebuilds the scale. See `_FP8_ROWSCALE` for what it buys and
+        what it costs. Routed experts are fp4 and have no expansion, so a
+        streamed expert staged later by `MoE._stage` cannot go stale.
+        """
+        if not _FP8_ROWSCALE:
+            return
+        count = 0
+        total = 0
+        for module in self.modules():
+            if isinstance(module, BlockQuantLinear) and module.storage == "fp8":
+                written = module.expand_scale()
+                if written:
+                    count += 1
+                    total += written
+        if count:
+            logger.info(
+                "deepseek_v41: expanded %d fp8 block scales to one bf16 value "
+                "a weight row, %.1f MiB a rank — the forward no longer "
+                "rebuilds them",
+                count,
+                total / 2**20,
+            )
+
     def allocate_staging_buffers(self, device: torch.device) -> None:
         """Materialize the per-layer expert staging slots on `device`.
 
@@ -4785,14 +5546,37 @@ class DeepseekV41ForCausalLM(nn.Module):
         #
         # Built only when the bucket actually added a span, so the path every
         # batch-1 forward takes does not gain a device op it has no use for.
-        blank = (
+        # A **distinct** zero tensor per padded slot, not one shared object.
+        #
+        # Dynamo guards on which entries are the *same tensor*, and reports it
+        # as `Duplicate tensors found: ["paged[8].block_table",
+        # "paged[9].block_table"]`. The set of duplicates is a function of the
+        # live count, so one shared `blank` keys a separate 40-layer decode
+        # graph for `Running` = 10, 9, 8, 7 ... — which is the compile storm
+        # `_bucket_spans` above was written to end, surviving it because the
+        # span *count* was bucketed and the tensor *identity pattern* was not.
+        #
+        # Measured 2026-10-21 at `max_num_seqs=10`, one cold `in512_bs10` cell:
+        # 3456 duplicate-tensor guard failures, 63 new NEFFs a rank, and the
+        # engine reporting `generation throughput: 0.0 tokens/s` every time
+        # `Running` fell by one. Distinct objects make the duplicate set empty
+        # at every live count, so one graph serves them all.
+        #
+        # The cost is one `zeros_like` of a few kB per padded row, in host code
+        # (`_paged_spans` is `@torch._dynamo.disable`d), against a 163 s
+        # compile. All of them are still all-zero, so the aliasing argument
+        # above holds unchanged.
+        blanks = [
             torch.zeros_like(block_table[0])
-            if live_spans < len(spans)
-            else None
-        )
+            for _ in range(max(0, len(spans) - live_spans))
+        ]
         return [
             PagedSpan(
-                block_table=block_table[row] if row < live_spans else blank,
+                block_table=(
+                    block_table[row]
+                    if row < live_spans
+                    else blanks[row - live_spans]
+                ),
                 block_size=block_size,
                 slot_mapping=slot_mapping[begin : begin + length],
                 start_pos=start_pos,
@@ -5041,10 +5825,20 @@ class DeepseekV41ForCausalLM(nn.Module):
         # what this selects is the expert-parallel all-reduce inside `MoE`.
         tp_group = self.stage_group if self.world_size > 1 else None
         io_stream, io_residual, io_normed = self._layer_io(stream)
-        normed, residual, ffn_pre, ffn_post, ffn_comb = _block_entry(
-            block, "attn_half"
-        )(stream, pre_mix, slices, paged, shared, tp_group, io_residual, io_normed)
-        ffn_out = block.ffn(normed, None, self.weight_store, tp_group, row_count)
+        (
+            normed, residual, ffn_pre, ffn_post, ffn_comb, route_w, route_i,
+        ) = _block_entry(block, "attn_half")(
+            stream, pre_mix, slices, paged, shared, tp_group,
+            io_residual, io_normed,
+        )
+        # Only the routed-expert loop is eager. `MoE.finish` runs here, in the
+        # same traced region as `_post_into`, so its all-reduce, shared expert
+        # and dtype cast are inlined into one graph instead of being three more
+        # launches a block — see `MoE.route_and_run` for the measurement.
+        carry, _, ones, shared_limit = block.ffn.route_and_run(
+            normed, route_w, route_i, self.weight_store, row_count
+        )
+        ffn_out = block.ffn.finish(carry, normed, shared_limit, ones, tp_group)
         return _compiled(_post_into)(
             io_stream, ffn_out, residual, ffn_post, ffn_comb
         ), ffn_pre.squeeze(0)

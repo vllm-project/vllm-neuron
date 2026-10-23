@@ -79,9 +79,77 @@ model_package.load()
 
 #: The matrix. Overridable, but these are the sizes the deployment is specified
 #: against.
-DEFAULT_INPUT_LENS = (512, 1024, 2048, 8192)
+#: 2048 was dropped on 2026-10-21. It sat between 1024 and 8192 and never
+#: decided anything the other three did not: every conclusion this matrix has
+#: reached held at 1024 and 8192 with 2048 agreeing, and it cost a full cell —
+#: its own prefill bucket to compile and its own two passes to run.
+DEFAULT_INPUT_LENS = (512, 1024, 8192)
 DEFAULT_BATCH_SIZES = (1, 10)
 DEFAULT_OUTPUT_LEN = 128
+
+#: Per-input-length replacements for the concurrent batch size, because the KV
+#: cache is **replicated on every one of the 64 ranks**, so a rank pays for
+#: every sequence's whole context rather than its share.
+#:
+#: `get_kv_spec` declares `num_kv_heads=1, head_size=512` with no world-size
+#: term, and it cannot shard by head: MLA has one 512-dim latent KV head and
+#: each rank needs all of it to reconstruct its own slice of the 64 query
+#: heads. The cost is exactly `1 x 512 x (K,V) x 2 B = 2048 B` a slot a layer,
+#: x 43 layers — which reproduces the engine's own figure to the decimal.
+#:
+#: Per rank, of a 24 GiB bank with 13.92 GiB of resident weights:
+#:
+#:     8448 x bs1     8480 slots   0.74 GiB KV   9.34 GiB left   ran
+#:     1280 x bs10   13120 slots   1.14 GiB KV   8.94 GiB left   ran
+#:     8448 x bs4    33920 slots   2.94 GiB KV   7.14 GiB left
+#:     8448 x bs10   84800 slots   7.35 GiB KV   2.73 GiB left   FAILED twice
+#:
+#: At bs10 the ten contexts leave too little for the graph set and the forward's
+#: own buffers, and it failed both ways round: forcing the KV figure died in
+#: `Executor` loading a NEFF ("Could not load the model status=4 message=
+#: Allocation Failure"), and letting vLLM size it died in `_fc_sum`'s
+#: `torch.empty` ("nrt_tensor_allocate status=4"). Measured 2026-10-22.
+#:
+#: bs4 keeps a real concurrency signal at 8k inside the budget. The honest fix
+#: is to stop replicating the cache — attention data parallelism or context
+#: parallelism, the two axes a single KV head leaves open, both of which
+#: DeepInfer implements — after which this override should go.
+BATCH_OVERRIDES = {8192: (1, 4)}
+
+
+def _batches_for(
+    input_len: int, requested: list[int], defaulted: bool = True
+) -> list[int]:
+    """The batch sizes to run at `input_len`.
+
+    The override corrects the *default* matrix. An explicit `--batch-sizes`
+    wins: an operator narrowing a run to one cell means it, and silently
+    widening the request back out runs a cell they did not ask for — which, at
+    half an hour an 8k cell, is not a small surprise.
+    """
+    override = BATCH_OVERRIDES.get(input_len)
+    if override is None or not defaulted:
+        return list(requested)
+    if list(override) != list(requested):
+        print(
+            f"bench: input {input_len} runs batch {','.join(map(str, override))} "
+            f"rather than {','.join(map(str, requested))} — the KV cache is "
+            f"replicated per rank; see BATCH_OVERRIDES",
+            file=sys.stderr,
+        )
+    return list(override)
+
+
+#: Measured passes per cell, after the discarded warm-up. Two, and the figure
+#: reported is the **second**: the first proves the warm-up finished the job and
+#: the second is read. See `_bench_cell`.
+MEASURED_PASSES = 2
+
+#: Disagreement between measured passes, above which the cell is reported as not
+#: converged. Observed spread on a converged cell was under 1%, so 5% is loose
+#: enough not to cry wolf and tight enough to catch a cell that is still
+#: compiling.
+PASS_SPREAD_WARN_PCT = 5.0
 
 #: Tokens per prompt in the prose cell. Acceptance is sampled over decode
 #: steps, so this is the sample size: 96 tokens over the verifier's 4 cases
@@ -142,8 +210,15 @@ def _fatal_in_log(path: Path) -> str | None:
     return None
 
 #: Shakespeare's sonnets, 2155 verse lines, built from Project Gutenberg #1041.
-#: `sonnet.txt` does not ship with vLLM, so it has to be supplied.
-DEFAULT_SONNET_PATH = "/mnt/nvme/datasets/sonnet.txt"
+#: `sonnet.txt` does not ship with vLLM, so it ships *here*, beside this file,
+#: and the default resolves to that copy.
+#:
+#: It used to name `/mnt/nvme/datasets/sonnet.txt` — a path on the instance
+#: store, which a stop/start wipes. After one the whole matrix fails before a
+#: single token with `FileNotFoundError`, every cell reporting `exit 1`, which
+#: reads like a server fault and is a missing file. Measured 2026-10-21.
+#: Anchored to `__file__` so the dataset travels with the code.
+DEFAULT_SONNET_PATH = str(Path(__file__).resolve().parent / "sonnet.txt")
 
 #: Slack over the time the performance targets imply a cell should take. 3x,
 #: because a cell that is merely 3x slower than target is a failing measurement
@@ -206,8 +281,8 @@ TARGET_TPOT_S = 0.25
 SERVED_NAME = "deepseek-v41-flash"
 
 #: Requests per cell. Enough that a median means something, few enough that the
-#: 8k x 10 cell does not dominate the run: at batch `b` this is `max(8, 2 * b)`,
-#: so batch 1 sends 8 sequentially and batch 10 sends 20 as two full rounds.
+#: 8k x 10 cell does not dominate the run: at batch `b` this is `max(8, b)`, so
+#: batch 1 sends 8 sequentially and batch 10 sends 10 as one full wave.
 def _num_prompts(batch: int) -> int:
     """How many requests a cell sends.
 
@@ -266,7 +341,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--num-prompts",
         type=int,
         default=None,
-        help="requests per cell; default max(8, 2 * batch)",
+        help="requests per cell; default max(8, batch) — one wave, see "
+             "_num_prompts",
     )
     p.add_argument(
         "--max-model-len",
@@ -312,20 +388,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "safeguard against a wedged collective: catching it in minutes beats waiting "
              "out the cell timeout, because the longer 64 ranks sit wedged the likelier a "
              "host reboot is needed to clear them. 0 disables.",
-    )
-    p.add_argument(
-        "--skip-warmup-pass", action="store_true",
-        help="run only the measured pass, relying on `--num-warmups` to warm "
-             "the cell. **Measured as a regression, so not the default.** "
-             "`--num-warmups` sends N copies of the *first* dataset request, "
-             "so it warms one prompt length; the discarded pass sends N "
-             "distinct sonnet prompts, whose lengths vary around the target "
-             "and key different prefill shapes. At in512_bs1 on 2026-10-21, "
-             "skipping it moved TTFT 826 -> 1825 ms (+121%) and decode "
-             "9.59 -> 8.01 tok/s, with **zero** NEFF misses either way -- so "
-             "the cost it leaves in the measured window is dynamo re-tracing, "
-             "not compilation. TPOT moved only +8%, which is the tell: prefill "
-             "shapes are length-dependent and decode shapes are not.",
     )
     p.add_argument(
         "--temperature", default="0",
@@ -964,7 +1026,7 @@ def _bench_cell(
     num_prompts: int, result_dir: Path, timeout: int,
     server: subprocess.Popen | None = None,
     server_log: Path | None = None, stall_timeout: int = 0,
-    temperature: float | None = 0.0, skip_warmup_pass: bool = False,
+    temperature: float | None = 0.0,
 ) -> dict | None:
     """One cell: warm it up, then measure it.
 
@@ -993,60 +1055,150 @@ def _bench_cell(
     A failed warm-up is a note, not a failure: the measurement that follows is
     then simply a cold one, and it is better to report a number with that
     caveat than to drop the cell.
-    """
-    warm = None
-    if skip_warmup_pass:
-        print(f"\nbench: cell {name} — warm-up pass skipped; "
-              f"`--num-warmups {num_prompts}` carries the warming")
-    else:
-        print(f"\nbench: cell {name} — warm-up: {num_prompts} prompts, "
-              f"{output_len} out (discarded)")
-        warm = _bench_serve(
-            model, port, flags(output_len), batch, num_prompts,
-            result_dir, f"{name}.warmup.json",
-            # Compile is paid here, so this pass gets the allowance; see
-            # `CELL_WARMUP_COMPILE_ALLOWANCE` for what it is sized from.
-            timeout + CELL_WARMUP_COMPILE_ALLOWANCE, server=server,
-            server_log=server_log, stall_timeout=stall_timeout,
-            temperature=temperature,
-        )
-    if warm is None and not skip_warmup_pass:
-        print(f"bench:   warm-up for {name} did not complete; the measurement "
-              "below is a cold one", file=sys.stderr)
 
-    print(f"bench: cell {name} — measuring: {num_prompts} prompts, "
-          f"concurrency {batch}, {output_len} out")
-    # Where this cell's measured window starts in the server log. With one
-    # engine serving several cells the acceptance counters are no longer "this
-    # cell's and nothing else's", so they are read from here rather than from
-    # the top of the file. It also excludes the warm-up, which is correct: the
-    # reported rate should be the measured pass's.
-    log_offset = 0
-    if server_log is not None:
-        try:
-            log_offset = server_log.stat().st_size
-        except OSError:
-            log_offset = 0
-    measured = _bench_serve(
+    The warm-up runs **even when the NEFF cache is already warm**: a warm disk
+    cache is not a warm process, since dynamo re-tracing is per-process. At
+    in1024_bs10 with every graph already on disk, the warm-up pass measured
+    6.75 tok/s and the passes after it 25.0 — no compilation involved. Running
+    it unconditionally also rules out a half-populated cache.
+
+    Then `MEASURED_PASSES` passes, and the figure reported is the **last**. The
+    earlier ones are the evidence that the warm-up finished: if they disagree
+    with the last, the cell did not converge. Observed spread once converged was
+    under 1% (in512_bs1, in512_bs10, in1024_bs10).
+
+    The measured passes send no `--num-warmups`: the discarded pass has already
+    absorbed the re-tracing, and they cost ~70% more wall clock (87 s against
+    50 s a pass at batch 10).
+
+    Each measured pass is scored against its own slice of the server log; one
+    that compiled a NEFF or re-traced a frame is flagged DIRTY and is not
+    comparable with a clean one. `_window_counts` reads it and needs
+    `TORCH_LOGS=recompiles`, which `main` exports.
+    """
+    print(f"\nbench: cell {name} — warm-up: {num_prompts} prompts, "
+          f"{output_len} out (discarded)")
+    warm = _bench_serve(
         model, port, flags(output_len), batch, num_prompts,
-        result_dir, f"{name}.json", timeout, server=server,
+        result_dir, f"{name}.warmup.json",
+        # Compile is paid here, so this pass gets the allowance; see
+        # `CELL_WARMUP_COMPILE_ALLOWANCE` for what it is sized from. The base is
+        # doubled because `--num-warmups` below makes this pass send twice the
+        # requests a measured one does.
+        2 * timeout + CELL_WARMUP_COMPILE_ALLOWANCE, server=server,
         server_log=server_log, stall_timeout=stall_timeout,
-        # A full wave re-traced in-process immediately before the timer starts,
-        # on top of the discarded pass above. Belt and braces: the pass above
-        # warms the engine's graphs, this one warms whatever the client's own
-        # process re-traces per invocation.
+        # `--num-warmups` belongs *here*, on the discarded pass, and nowhere
+        # else. `num_prompts` is one wave, so a measured pass never admits a
+        # request mid-decode and never reaches the mixed
+        # prefill-alongside-decode state; these extra requests are what
+        # traverse it, so the measurement cannot be the first to meet it.
         num_warmups=num_prompts,
         temperature=temperature,
     )
-    if measured is not None:
-        # Recorded on the result, so a reader of the report can tell a warmed
-        # measurement from a cold one without going back to the console.
-        # With the discarded pass skipped there is no separate warm-up to have
-        # completed, and `--num-warmups` is awaited by the client before the
-        # timer starts -- so a measurement that exists at all was warmed.
-        measured["_warmed"] = True if skip_warmup_pass else warm is not None
-        measured["_log_offset"] = log_offset
+    if warm is None:
+        print(f"bench:   warm-up for {name} did not complete; the measurement "
+              "below is a cold one", file=sys.stderr)
+
+    measured = None
+    passes: list[dict] = []
+    for attempt in range(1, MEASURED_PASSES + 1):
+        last = attempt == MEASURED_PASSES
+        print(f"bench: cell {name} — measuring (pass {attempt}/"
+              f"{MEASURED_PASSES}{', reported' if last else ', discarded'}): "
+              f"{num_prompts} prompts, concurrency {batch}, {output_len} out")
+        # Where this pass's window starts in the server log. With one engine
+        # serving several cells the acceptance counters are no longer "this
+        # cell's and nothing else's", so they are read from here rather than
+        # from the top of the file. It also excludes the warm-up and the
+        # earlier passes.
+        log_offset = 0
+        if server_log is not None:
+            try:
+                log_offset = server_log.stat().st_size
+            except OSError:
+                log_offset = 0
+        # The reported pass keeps `{name}.json` so every existing reader of the
+        # report finds it where it has always been.
+        filename = f"{name}.json" if last else f"{name}.pass{attempt}.json"
+        result = _bench_serve(
+            model, port, flags(output_len), batch, num_prompts,
+            result_dir, filename, timeout, server=server,
+            server_log=server_log, stall_timeout=stall_timeout,
+            temperature=temperature,
+        )
+        if result is None:
+            print(f"bench:   cell {name} pass {attempt} did not complete",
+                  file=sys.stderr)
+            if last:
+                break
+            continue
+        misses, retraces = _window_counts(server_log, log_offset)
+        result["_warmed"] = warm is not None
+        result["_log_offset"] = log_offset
+        result["_window_neff_misses"] = misses
+        result["_window_retraces"] = retraces
+        result["_window_clean"] = (misses == 0 and retraces == 0)
+        result["_pass"] = attempt
+        passes.append(result)
+        print(f"bench:   pass {attempt}: "
+              f"{result.get('output_throughput', 0):.2f} tok/s, window "
+              f"{'CLEAN' if result['_window_clean'] else f'DIRTY (neff_misses={misses}, retraces={retraces})'}")
+        if last:
+            measured = result
+
+    if measured is not None and len(passes) > 1:
+        # The earlier passes are kept on the reported one rather than thrown
+        # away: a spread between them is the only evidence in the report that
+        # the cell had or had not converged.
+        tps = [p.get("output_throughput") or 0.0 for p in passes]
+        measured["_pass_throughputs"] = tps
+        best, worst = max(tps), min(tps)
+        measured["_pass_spread_pct"] = (
+            100.0 * (best - worst) / best if best else 0.0
+        )
+        if measured["_pass_spread_pct"] > PASS_SPREAD_WARN_PCT:
+            print(f"bench:   WARNING cell {name} — measured passes disagree by "
+                  f"{measured['_pass_spread_pct']:.1f}% ({tps}); the cell did "
+                  f"not converge and this number is not comparable.",
+                  file=sys.stderr)
+    if measured is not None and not measured["_window_clean"]:
+        print(f"bench:   WARNING cell {name} — the reported pass compiled or "
+              f"re-traced inside its measured window "
+              f"(neff_misses={measured['_window_neff_misses']}, "
+              f"retraces={measured['_window_retraces']}); not comparable with a "
+              f"clean measurement.", file=sys.stderr)
     return measured
+
+
+#: What a polluted measured window looks like in the server log. The miss line
+#: is the compile cache saying it has to build; the retrace line is dynamo
+#: saying it threw a graph away. `Local cache hit` is deliberately *not* here:
+#: a hit is a graph being loaded for the first time in this process, which the
+#: warm-up pass should have done but which costs nothing like a compile.
+_WINDOW_MISS = "Local cache miss"
+_WINDOW_RETRACE = "Recompiling function"
+
+
+def _window_counts(server_log: Path | None, offset: int) -> tuple[int, int]:
+    """`(neff_misses, dynamo_retraces)` in the server log past `offset`.
+
+    Both are summed across all ranks, so the numbers are 64x the per-rank
+    count. Only zero versus nonzero is load-bearing.
+
+    Returns `(0, 0)` when there is no log to read, which is the honest answer
+    for "nothing observed" — a caller cannot distinguish a clean window from an
+    unobserved one, so a run without a server log should not be compared
+    either. Retraces are invisible unless `TORCH_LOGS` includes `recompiles`.
+    """
+    if server_log is None:
+        return 0, 0
+    try:
+        with server_log.open("rb") as fh:
+            fh.seek(max(0, offset))
+            window = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return 0, 0
+    return window.count(_WINDOW_MISS), window.count(_WINDOW_RETRACE)
 
 
 #: The port's own clamp line, e.g. `max_num_seqs 10 -> 1`.
@@ -1265,6 +1417,17 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     _check_arch(args.model)
 
+    # Without `recompiles` in TORCH_LOGS a dynamo re-trace leaves no trace in
+    # the server log, and `_window_counts` would call every window clean. Set
+    # before the server is spawned, since `_serve` passes no `env` and the
+    # child inherits this process's. Appended rather than assigned so a caller
+    # who asked for more logging keeps it.
+    _torch_logs = os.environ.get("TORCH_LOGS", "")
+    if "recompiles" not in _torch_logs:
+        os.environ["TORCH_LOGS"] = (
+            f"{_torch_logs},recompiles" if _torch_logs else "recompiles"
+        )
+
     tp = args.tensor_parallel_size
     source = "--tensor-parallel-size"
     if tp is None:
@@ -1275,6 +1438,33 @@ def main(argv: list[str] | None = None) -> int:
 
     input_lens = [int(x) for x in args.input_lens.split(",") if x]
     batch_sizes = [int(x) for x in args.batch_sizes.split(",") if x]
+    # Whether `--batch-sizes` was typed or left at its default decides if
+    # `BATCH_OVERRIDES` may widen it; see `_batches_for`.
+    batches_defaulted = args.batch_sizes == ",".join(map(str, DEFAULT_BATCH_SIZES))
+
+    # **A clamped engine does not measure the batch the cell is named for.**
+    # `config.MAX_NUM_SEQS` is read from `DEEPSEEK_V41_MAX_NUM_SEQS` when the
+    # port is imported, and this module loads the port (`model_package.load()`
+    # above) before `main` runs — so this cannot be fixed from here, only
+    # reported. Left clamped, a `bs10` cell
+    # serves one sequence at a time while the client holds ten in flight: TTFT
+    # becomes queue wait and aggregate throughput cannot exceed single-stream.
+    # Measured 2026-10-21 at in512_bs10: 3.5 tok/s clamped against 30.2
+    # uncapped, from the same code. The number is not wrong so much as not the
+    # one the cell claims, which is worse.
+    from deepseek_v41.config import MAX_NUM_SEQS as _PORT_CLAMP
+
+    if _PORT_CLAMP and max(batch_sizes) > _PORT_CLAMP:
+        want = max(batch_sizes)
+        print(
+            f"bench: WARNING — config.MAX_NUM_SEQS is {_PORT_CLAMP}, so every "
+            f"cell above batch {_PORT_CLAMP} will be served by a "
+            f"{_PORT_CLAMP}-sequence engine and must not be read as a "
+            f"batch-{want} measurement. Export "
+            f"DEEPSEEK_V41_MAX_NUM_SEQS={want} before starting this script to "
+            f"measure the batch sizes requested.",
+            file=sys.stderr,
+        )
     max_model_len = args.max_model_len or (
         max(input_lens) + args.output_len + CONTEXT_HEADROOM
     )
@@ -1402,21 +1592,21 @@ def main(argv: list[str] | None = None) -> int:
                 args.model, port, name, flags, output_len, batch, num_prompts,
                 result_dir, _cell_timeout(args, batch, output_len), server=proc,
                 server_log=log, stall_timeout=args.stall_timeout,
-                # Greedy is withheld from multi-sequence cells. It is worth
-                # ~10% of aggregate decode (acceptance 37.6% -> 43.7%) and is
-                # safe at one sequence and on a clamped engine, but measured
-                # 2026-10-21 it **hangs a cold uncapped multi-sequence
-                # engine**: identical config, 10 concurrent requests, the
-                # warm-up froze at 3 of 10 with every worker blocked in
-                # `_engram_rows` (`state=S`, `wchan=do_wait_intr_irq`) and no
-                # NEFF activity, while the same run with no temperature
-                # completed and measured 25.24 tok/s. A 10% figure is not
-                # worth a known hang in the default path.
-                temperature=(
-                    _parse_temperature(args.temperature)
-                    if min(batch, _CLAMP or batch) <= 1 else None
-                ),
-                skip_warmup_pass=args.skip_warmup_pass,
+                # Greedy at every batch size, which is a change: it used to be
+                # withheld above one sequence after a cold uncapped batch-10
+                # warm-up hung at 3 of 10 requests. That hang has not
+                # reproduced since `_paged_spans` stopped sharing one zero
+                # block table across padded spans — in512_bs10 and in1024_bs10
+                # both ran greedy to completion (30.2 and 25.0 tok/s,
+                # acceptance 45.2%), where before the fix the engine spent the
+                # cold pass compiling a graph per live-sequence count.
+                #
+                # It matters for reproducibility rather than for the figure:
+                # acceptance is a first-order term in throughput, so a cell
+                # that samples at the server's default cannot be compared with
+                # one that does not. `--temperature none` restores the old
+                # behaviour if the hang comes back.
+                temperature=_parse_temperature(args.temperature),
             )
             if probe_prose:
                 print(f"\nbench: prose acceptance probe on {name}'s server "
@@ -1483,7 +1673,7 @@ def main(argv: list[str] | None = None) -> int:
         context = args.max_model_len or (
             input_len + args.output_len + CONTEXT_HEADROOM
         )
-        for batch in batch_sizes:
+        for batch in _batches_for(input_len, batch_sizes, batches_defaulted):
             name = f"in{input_len}_bs{batch}"
             run_cell(
                 name=name,

@@ -438,12 +438,27 @@ class SafetensorsIndex:
                 pass
 
     def close(self) -> None:
+        """Release every descriptor and mapping this index holds.
+
+        **The mmap close is allowed to fail.** `tensor()` hands out
+        `torch.frombuffer` views over the mapping, and a `mmap.mmap` with an
+        exported buffer raises `BufferError` instead of closing — so whether a
+        mapping can be unmapped depends on what the caller is still holding,
+        which is not something this method can know. The file *handle* is closed
+        either way, and that is the descriptor `verifier/check_hbm_resident.py`
+        bounds; a mapping whose last view has gone is reclaimed with the object.
+        Closing the handle does not invalidate an existing view: on Linux a
+        mapping outlives the descriptor it was made from.
+        """
         for fd in self._direct.values():
             if fd != -1:
                 os.close(fd)
         self._direct.clear()
         for mapping in self._maps.values():
-            mapping.close()
+            try:
+                mapping.close()
+            except BufferError:
+                pass
         for handle in self._files.values():
             handle.close()
         self._maps.clear()
@@ -970,8 +985,35 @@ class TimeshareWeightStore:
         self._sealed = False
 
     def seal(self) -> None:
-        """Forbid any further weight read. Called when the model came up resident."""
+        """Forbid any further weight read. Called when the model came up resident.
+
+        **And close the checkpoint**, which is the only point in the run where
+        that is provably safe: `load_weights` calls this exactly when every
+        expert and engram row came up resident, `_refuse_if_sealed` already
+        raises on any read past it, and both readers (`expert()`, `engram()`)
+        go through that check first — so after sealing, no code path can reach
+        a file. Closing the descriptors makes that true of the kernel's view as
+        well as of the control flow.
+
+        Iteration 5 found that nothing ever called `SafetensorsIndex.close()`,
+        so all 6016 descriptors a rank (x 64 ranks) and their mappings stayed
+        open from the end of loading until the engine was torn down. Two
+        consequences, and the second is why this is a fix rather than a tidy-up:
+
+          * `verifier/check_hbm_resident.py` measures the checkpoint-descriptor
+            *episode* and bounds it at 1200 s as "the time a load should take".
+            With the index never closed, the episode is the whole phase, so an
+            iteration whose kernel edit re-keys graphs can lose that constraint
+            on **compile time** wearing a weight-loading costume. Iteration 5's
+            phase 1 ran 1222 s compiling 1088 graphs cold and failed at 1219 s.
+            Closing here makes the episode end when loading ends, which makes
+            the measurement *stricter*: a descriptor seen afterwards is now
+            unambiguous evidence of streaming.
+          * a resident mapping is what produces the minor faults that checker
+            reports and cannot gate on.
+        """
         self._sealed = True
+        self.index.close()
 
     def _refuse_if_sealed(self, what: str) -> None:
         if not self._sealed:
@@ -1356,6 +1398,9 @@ def load_weights(
         shard = model.shard_parameter(key, tensor, device)
         state[_buffer_name(key)] = shard
         loaded_bytes += shard.numel() * shard.element_size()
+    # Python keeps the loop variables alive in this frame, and `tensor` is a
+    # view over the shard's mmap. Drop it so `seal()` can actually unmap.
+    tensor = shard = None
 
     incompatible = model.load_state_dict(state, strict=False, assign=True)
     unexpected = list(getattr(incompatible, "unexpected_keys", ()))
@@ -1378,6 +1423,7 @@ def load_weights(
             f"the meta device; first few: {still_meta[:5]}"
         )
 
+    model.expand_fp8_scales()
     model.allocate_staging_buffers(device)
 
     experts, expert_bytes = load_resident_experts(model, model.weight_store)

@@ -47,6 +47,37 @@ def _align16(n):
     return -(-n // 16) * 16
 
 
+def _spans(npad):
+    """The score tile's free-axis split: fewest spans, then as even as the
+    128-element slot tile allows.
+
+    `nc_matmul`'s moving free axis and a psum bank both top out at 512 fp32, so
+    the score over a `npad`-row table is computed in spans. Iteration 2
+    measured **59.6 ms/TFLOP at a 128-wide moving operand against 30.3 at
+    384**, so a narrow span is paid for twice — which is why this takes the
+    minimum span *count* and then divides the table between those spans evenly
+    instead of filling 512s and leaving the remainder:
+
+        640  -> 384 + 256         (not 512 + 128)
+        1024 -> 512 + 512
+        1408 -> 512 + 512 + 384
+        1792 -> 512 + 512 + 384 + 384
+
+    Recovered verbatim from iteration 3, where it survived the strip that took
+    `dense_attn` itself.
+    """
+    tiles = npad // PT
+    nspans = -(-npad // PSUM_FP32)
+    base, rem = divmod(tiles, nspans)
+    out, start = [], 0
+    for i in range(nspans):
+        width = (base + 1 if i < rem else base) * PT
+        out.append((start, width))
+        start += width
+    assert start == npad, f"_spans({npad}) covered {start}"
+    return out
+
+
 @nki.jit
 def gathered_attn(q, g, bias, sink):
     """Multi-head attention over per-query *pre-gathered* slots.
@@ -320,4 +351,213 @@ def gathered_attn_idx(q, kv, idx, bias, sink):
             dst=o16, data=acc_o, op0=nl.multiply, operand0=rcp
         )
         nl.store(out[t * heads : t * heads + heads, 0:d], value=o16)
+    return out
+
+
+@nki.jit
+def dense_attn(q, kv, bias, sink):
+    """`gathered_attn_idx`'s arithmetic over the **selection table as a whole**,
+    with the selection applied as a mask instead of as a per-token gather.
+
+    **This is not dense over the KV cache and must not be made so.** `npad` is
+    the *selection table* — the sliding-window slots plus the compressed-KV rows
+    the indexer chose from, 640 to 2432 rows on the paths this serves — against
+    a cache of up to 8448. `model._ATTN_DENSE_MAX` bounds that table, not the
+    context length; raising it so this covered an 8 k cache would be ~13x the
+    necessary arithmetic while profiling beautifully.
+
+    **The selection is honoured, not bypassed.** `bias` is `[tokens,
+    BIAS_PAD + npad]`: `0` where the token's `topk_idxs` named that slot and
+    `-1e30` where it did not. An unselected slot contributes
+    `exp(-1e30 - max) = 0` to the denominator and `0 * finite = 0` to the value
+    sum — **exactly** the arithmetic `gathered_attn_idx`'s own docstring relies
+    on for its *padding* slots, reused here for every unselected slot. So a slot
+    the sparse index left out cannot reach the output. `EMPTY_SLOT` entries go
+    to a dump column at `n`, which the mask's `< n` term keeps masked, which is
+    why the caller pads `npad` up from `n + 1` rather than from `n`.
+
+    **Why it is faster, and it is all loop and no arithmetic.** The score
+    product's stationary operand here is `128 // heads` tokens x `heads` = 128
+    rows wide where `gathered_attn_idx`'s is `heads = 8` of 128 — 16x the
+    tensor-engine width — and the table is read **once a call** instead of
+    re-gathered per token. At an in512 prefill every one of 512 tokens draws its
+    top-512 from a table of 1023-1407 rows, so the gathered kernel
+    indirect-gathers and PE-transposes 512 x 512 x 1 KiB = 256 MB a layer out of
+    a table that is 1 MB. The dense pass does 2-2.75x the *slot* arithmetic
+    against 16x the width and ~14x fewer instructions.
+
+    Layout, and every line of it is about keeping both matmuls wide:
+
+      * partition `p` of a score tile is token `p // heads`, head `p % heads` —
+        the row order of `q` (`[b, s, h, d]` flattened) and of `out`, so the
+        group's `q` reaches SBUF as **one `dma_transpose` per `head_dim`
+        chunk** and the output stores in one go;
+      * a token's bias row reaches its `heads` partitions as a **stride-0
+        partition broadcast** — one DMA a token, not one a head;
+      * the sink is tiled to the same `(token, head)` partition order once a
+        call, by `group` small DMAs into one `[128, 1]` buffer whose pattern
+        repeats every `heads`, which is also what lets the ragged tail group
+        reuse it truncated;
+      * `kvn` (natural, the value product's moving operand) and `kvt` (its
+        transpose, the score product's) are both staged once a call and both
+        start as `nl.zeros`, so rows `n .. npad` are **finite zeros**. An
+        all-masked row then gives every slot `p = exp(0) = 1` and
+        `1 * garbage` has to stay a number; such a row still leaves as exactly
+        zero, because its sink term is `exp(sink + 1e30) = +inf` and the
+        reciprocal of the denominator is exactly 0 — the convention
+        `gathered_attn_idx` already documents;
+      * `kvt` is built by `nc_transpose` **out of `kvn`**, not `dma_transpose`
+        out of HBM. That costs `jtiles x dchunks` PE transposes once a call and
+        buys two things: the zero padding past `n` comes for free, and the tail
+        tile's row count never has to satisfy
+        `dma_util_expand_desc_transpose`'s 32 B destination alignment.
+
+    **The ragged tail group.** A prompt's token count is not a multiple of
+    `group` in general, so the group loop runs `tokens // group` full groups and
+    then one more group at the truncated partition width. The body is a Python
+    helper called twice with different static row counts, so both shapes are
+    traced inside one kernel — which is why this costs **no extra graph
+    variant** for a 512-row query tile whatever its token count modulo `group`.
+    """
+    tq, d = q.shape
+    tokens, bw = bias.shape
+    npad = bw - BIAS_PAD
+    heads = tq // tokens
+    n, kvd = kv.shape
+
+    assert tq == tokens * heads, f"q rows {tq} is not tokens({tokens}) * heads"
+    assert kvd == d, f"kv head_dim {kvd} does not match q head_dim {d}"
+    assert d % PT == 0, f"head_dim={d} must be a multiple of {PT}"
+    assert npad % PT == 0, f"table width={npad} must be a multiple of {PT}"
+    assert PT % heads == 0, f"heads={heads} must divide the partition width {PT}"
+    assert n < npad, (
+        f"kv rows {n} leave no dump column under the padded table {npad} — the "
+        "caller pads up from n + 1 so an EMPTY_SLOT entry has somewhere masked "
+        "to land"
+    )
+    assert sink.shape == (heads, 1), f"sink {sink.shape} wants ({heads}, 1)"
+
+    group = PT // heads
+    dchunks = d // PT
+    jtiles = npad // PT
+    spans = _spans(npad)
+
+    out = nl.ndarray((tq, d), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+
+    # ---- staged once a call -------------------------------------------------
+    kvn = nl.zeros((PT, jtiles, d), dtype=nl.bfloat16, buffer=nl.sbuf)
+    kvt = nl.zeros((PT, dchunks, npad), dtype=nl.bfloat16, buffer=nl.sbuf)
+    for j in nl.static_range(jtiles):
+        rows = min(PT, n - j * PT)
+        if rows <= 0:
+            # Wholly past the table. `kvn`/`kvt` are already zero there, which
+            # is what the masked arithmetic above wants, so skip the DMA and
+            # the transposes rather than moving zeros around.
+            continue
+        nisa.tensor_copy(
+            dst=kvn[0:rows, j, 0:d],
+            src=nl.load(kv[j * PT : j * PT + rows, 0:d], dtype=nl.bfloat16),
+        )
+        tps = nl.ndarray((PT, dchunks, PT), dtype=nl.bfloat16, buffer=nl.psum)
+        for c in nl.static_range(dchunks):
+            nisa.nc_transpose(
+                dst=tps[0:PT, c, 0:PT],
+                data=kvn[0:PT, j, c * PT : (c + 1) * PT],
+            )
+        nisa.tensor_copy(
+            dst=kvt[0:PT, 0:dchunks, j * PT : (j + 1) * PT], src=tps
+        )
+
+    sraw = nl.ndarray((PT, 1), dtype=sink.dtype, buffer=nl.sbuf)
+    for g in nl.static_range(group):
+        nisa.dma_copy(
+            dst=sraw[g * heads : (g + 1) * heads, 0:1], src=sink[0:heads, 0:1]
+        )
+    sink_t = nl.copy(sraw, dtype=nl.float32)
+
+    def body(t0, ntok):
+        """One score tile: `ntok` tokens x `heads` heads on the partitions."""
+        rp = ntok * heads
+        rpa = _align16(rp)
+
+        qt = nl.ndarray((PT, dchunks, rpa), dtype=nl.bfloat16, buffer=nl.sbuf)
+        for c in nl.static_range(dchunks):
+            nisa.dma_transpose(
+                dst=qt[0:PT, c, 0:rp],
+                src=q[t0 * heads : t0 * heads + rp, c * PT : (c + 1) * PT],
+            )
+
+        bias_b = nl.ndarray((PT, bw), dtype=nl.float32, buffer=nl.sbuf)
+        for i in nl.static_range(ntok):
+            nisa.dma_copy(
+                dst=bias_b[i * heads : (i + 1) * heads, 0:bw],
+                src=bias[t0 + i : t0 + i + 1, 0:bw].ap(
+                    pattern=[[0, heads], [1, bw]]
+                ),
+            )
+        scale_p = bias_b[0:rp, 0:1]
+
+        sc = nl.ndarray((PT, npad), dtype=nl.float32, buffer=nl.sbuf)
+        for s0, sw in spans:
+            acc = nl.ndarray((rp, sw), dtype=nl.float32, buffer=nl.psum)
+            for c in nl.static_range(dchunks):
+                nisa.nc_matmul(
+                    dst=acc,
+                    stationary=qt[0:PT, c, 0:rp],
+                    moving=kvt[0:PT, c, s0 : s0 + sw],
+                    accumulate=(c > 0),
+                )
+            nisa.scalar_tensor_tensor(
+                dst=sc[0:rp, s0 : s0 + sw],
+                data=acc,
+                op0=nl.multiply,
+                operand0=scale_p,
+                op1=nl.add,
+                operand1=bias_b[0:rp, BIAS_PAD + s0 : BIAS_PAD + s0 + sw],
+            )
+
+        neg_max = nl.negative(nl.max(sc[0:rp, 0:npad], axis=1, keepdims=True))
+        p32 = nl.ndarray((PT, npad), dtype=nl.float32, buffer=nl.sbuf)
+        den = nl.ndarray((rp, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.activation(
+            dst=p32[0:rp, 0:npad],
+            op=nl.exp,
+            data=sc[0:rp, 0:npad],
+            bias=neg_max,
+            scale=1.0,
+            reduce_op=nl.add,
+            reduce_res=den,
+        )
+        sk = nl.ndarray((rp, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.activation(dst=sk, op=nl.exp, data=sink_t[0:rp, 0:1], bias=neg_max)
+        rcp = nl.ndarray((rp, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.reciprocal(dst=rcp, data=nl.add(den, sk))
+        p16 = nl.copy(p32[0:rp, 0:npad], dtype=nl.bfloat16)
+
+        pt = nl.ndarray((PT, jtiles, rpa), dtype=nl.bfloat16, buffer=nl.sbuf)
+        for j in nl.static_range(jtiles):
+            ptps = nl.ndarray((PT, rpa), dtype=nl.bfloat16, buffer=nl.psum)
+            nisa.nc_transpose(
+                dst=ptps[0:PT, 0:rp], data=p16[0:rp, j * PT : (j + 1) * PT]
+            )
+            nisa.tensor_copy(dst=pt[0:PT, j, 0:rp], src=ptps[0:PT, 0:rp])
+        acc_o = nl.ndarray((rp, d), dtype=nl.float32, buffer=nl.psum)
+        for j in nl.static_range(jtiles):
+            nisa.nc_matmul(
+                dst=acc_o,
+                stationary=pt[0:PT, j, 0:rp],
+                moving=kvn[0:PT, j, 0:d],
+                accumulate=(j > 0),
+            )
+        o16 = nl.ndarray((rp, d), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=o16, data=acc_o, op0=nl.multiply, operand0=rcp)
+        nl.store(out[t0 * heads : t0 * heads + rp, 0:d], value=o16)
+
+    full = tokens // group
+    if full:
+        for gi in nl.affine_range(full):
+            body(gi * group, group)
+    rem = tokens - full * group
+    if rem:
+        body(full * group, rem)
     return out

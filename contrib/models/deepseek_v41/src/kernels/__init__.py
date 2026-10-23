@@ -9,6 +9,14 @@
     sparse attention: the slot
       gather, score, softmax
       + weighted sum             sparse_attn.gathered_attn_idx sparse_attn:1795
+      — the same arithmetic over
+      the whole selection table,
+      the selection as a mask,
+      `128 // heads` tokens a
+      score tile. Taken when the
+      table fits SBUF and the
+      rows are prefill-shaped;
+      see `_ATTN_DENSE_MAX`      sparse_attn.dense_attn        sparse_attn:1544
     indexer score                index_score.weighted_scores  Indexer.forward:2112
     KV compression pooling       compress_pool.softmax_pool   Compressor.forward:1962
     every RMSNorm                rmsnorm.rms_norm             RMSNorm.forward:306

@@ -248,16 +248,39 @@ The port's benchmark harness. It serves the model and drives it with
 batch sizes, reporting TTFT, TPOT and aggregate decode throughput per cell.
 
 ```bash
+DEEPSEEK_V41_MAX_NUM_SEQS=10 \
 python contrib/models/deepseek_v41/test/performance/run_bench.py \
     --model /mnt/nvme/hf
 ```
+
+`DEEPSEEK_V41_MAX_NUM_SEQS` lifts the model's default one-sequence clamp. Without
+it every batch cell is served one sequence at a time and measures queueing.
 
 Random input is deliberate: it fixes the token count exactly, so a cell measures
 the shape it names, and no two requests share a prefix the prefix cache could
 serve instead of computing. See
 [`test/performance/README.md`](test/performance/README.md) for the matrix, the
-flags and how to read the output. A full eight-cell run takes hours;
+flags and how to read the output. A full six-cell run takes hours;
 `--input-lens` and `--batch-sizes` narrow it to the cells you care about.
+
+Measured 2026-10-23 on a `trn2.48xlarge`, `vllm-neuron` 0.24.0.1.1.0 with the
+plugin-core change, `DEEPSEEK_V41_MAX_NUM_SEQS=10`, 128 output tokens, warm
+process. Acceptance is DSpark's, from vLLM's own counters over the cell:
+
+| cell | TTFT p50 (ms) | TPOT p50 (ms) | decode (tok/s, aggregate) | acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| in512 bs1 | 596.0 | 85.5 | 11.02 | 44% |
+| in512 bs10 | 3293.9 | 226.5 | 35.85 | 48% |
+| in1024 bs1 | 966.6 | 78.1 | 11.46 | 49% |
+| in1024 bs10 | 5336.8 | 237.0 | 33.73 | 46% |
+| in8192 bs1 | 11261.9 | 95.4 | 5.50 | 43% |
+| in8192 bs4 | 17141.4 | 326.6 | 7.94 | 41% |
+
+Random token ids are close to unpredictable for a drafter, so these figures are
+a lower bound on real traffic; the same run's prose probe measured 47%. The two medians at
+`in8192 bs4` are bimodal across runs, because 8 requests at concurrency 4 put
+the p50 between two waves. Its throughput and mean TPOT (337 ms) are the stable
+figures.
 
 ### Optional: unit and module tests
 

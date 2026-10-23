@@ -6,9 +6,19 @@ tune performance" section prescribes: serve the model, then drive it with
 
 ```bash
 # from the vllm-neuron repo root
+export DEEPSEEK_V41_MAX_NUM_SEQS=10
 .venv/bin/python contrib/models/deepseek_v41/test/performance/run_bench.py \
     --model <checkpoint-dir>
 ```
+
+**`DEEPSEEK_V41_MAX_NUM_SEQS` is not optional for the batch cells.** The model
+clamps `max_num_seqs` to `config.MAX_NUM_SEQS` (1 by default), and reads it
+from the environment when the package is imported. Left unset, every batch-10
+cell is served by a one-sequence engine while the client holds ten requests in
+flight: TTFT becomes queue wait, and aggregate throughput cannot exceed
+single-stream. Measured at in512_bs10, 3.5 tok/s clamped against 30.2 uncapped,
+from the same code. The bench warns when it sees a clamp, and the table marks
+those cells `CAPPED->1`.
 
 The script puts its own folder's parent (`contrib/models/deepseek_v41/test/`) on
 `sys.path` and in `PYTHONPATH`, then imports the model package from the sibling
@@ -24,13 +34,20 @@ different model. A speed number against the wrong weights is worse than none.
 > **Needs the Trainium devices to itself**, like the verifier. It starts real
 > servers; check `neuron-ls` first.
 
-## The matrix — 8 cells
+## The matrix — 6 cells
 
 | | |
 |---|---|
-| input | 512, 1k, 2k, 8k tokens |
+| input | 512, 1k, 8k tokens |
 | output | 128 tokens |
-| batch | 1, 10 |
+| batch | 1 and 10; **1 and 4 at 8k** |
+
+8k runs at batch 4 because the KV cache is **replicated on every one of the 64
+ranks**. MLA has one 512-dim latent KV head and each rank needs all of it, so a
+rank pays for every sequence's whole context. Ten 8448-token contexts are
+7.35 GiB a rank of a 24 GiB bank that already holds 13.92 GiB of weights, and
+that cell failed to allocate both ways round. Four fit. `BATCH_OVERRIDES` holds
+this, and an explicit `--batch-sizes` overrides it.
 
 Random input, with `--random-range-ratio 0` so the lengths are exact: a cell
 measures the shape it is named for, rather than whatever a corpus tokenized to.
@@ -41,34 +58,42 @@ reason.
 `--ignore-eos`, so every request emits exactly 128 tokens. Without it a request
 that stops early shortens its own TPOT sample and under-counts the token total.
 
-Requests per cell is `max(8, 2 * batch)` — 8 at batch 1, 20 at batch 10, so
-batch 10 runs two full rounds. Enough for a median to mean something, few
-enough that the 8k x 10 cell does not dominate the run.
+Requests per cell is `max(8, batch)` — 8 sequentially at batch 1, one full wave
+at batch 10. **One wave, not two:** with `--max-concurrency b` and `2b`
+requests, round two cannot start until round one finishes decoding, so half the
+TTFT sample is queue wait and the throughput is divided by a serial structure.
+Measured at in512_bs10 on the same engine: 20 prompts gave 5.01 tok/s, 10 gave
+10.74.
 
-## Every cell is warmed first
+## Every cell is warmed, then measured twice
 
-**Not optional, and its absence is not a small error.** A cell's first requests
-pay for that cell's own compiled buckets — the prefill shape for its input
-length, the decode shape for its batch — and a graph of this model can take
-minutes to build. At batch 10 the whole first round of ten requests pays it
-concurrently, which is half the sample: an unwarmed cell does not report a slow
-median, it reports a compile.
+**A warm disk cache is not a warm process.** A cell's first requests pay for
+its own compiled buckets, and a graph of this model can take minutes to build;
+even with every graph already on disk, dynamo re-tracing is per process. At
+in1024_bs10 with a fully warm compile cache, the first pass measured 6.75 tok/s
+and the passes after it 25.0. An unwarmed cell does not report a slow median,
+it reports a compile.
 
-So each cell runs twice. The first run is discarded and generates only
-`WARMUP_OUTPUT_LEN = 8` tokens, which is what makes it cheap — the decode shape
-this model keys is
-`(1 + k) * running_seqs` rows, a function of the batch and not of how many
-tokens have been emitted, and with the compressed read pinned to the context
-and the window fixed at 128 slots a longer generation reaches no shape a short
-one does not. 8 tokens compiles the same graph set as 128.
+So each cell runs three passes on one server:
 
-It sends the **same number of requests** as the measurement, which looks like
-waste and is not. With `--max-concurrency b` and `2b` requests the scheduler
-admits a new request each time one finishes, so a *prefill runs concurrently
-with `b - 1` decodes* — a shape that never occurs if the warm-up submits exactly
-`b` requests, which all start together and drain together. Matching the count
-makes the warm-up traverse the same scheduling trajectory, so every shape the
-measurement will key already exists.
+1. **A discarded warm-up** at the measurement's own output length, with
+   `--num-warmups` equal to the prompt count. The extra requests are what
+   admit a prefill alongside running decodes — a state a single wave never
+   reaches — so the measurement is never the first to meet it. It used to
+   generate 8 tokens to stay cheap, and that was wrong: shapes are reached
+   late in the drain (`Running: 4 reqs`), which an 8-token run never gets to.
+2. **Measured pass 1**, kept as evidence that the warm-up finished.
+3. **Measured pass 2**, the one reported. If the two disagree by more than 5%
+   the cell did not converge and the bench says so; the spread lands in the
+   report as `_pass_spread_pct`.
+
+**Every measured pass is scored against its own slice of the server log.** Any
+`Local cache miss` (a NEFF compile) or `Recompiling function` (a dynamo
+re-trace) inside the window marks the pass `DIRTY`, which is not comparable
+with a clean one. The bench exports `TORCH_LOGS=recompiles` for this, since
+re-traces are otherwise invisible. Judge pollution by throughput and by the
+window, not by median TPOT: the median decode step barely moves, while the
+stalls are what the aggregate sees.
 
 A failed warm-up is a note, not a dropped cell: the measurement is then a cold
 one, it is marked `COLD` in the table, and `warmed: false` lands in the report.
@@ -160,9 +185,16 @@ read as a zero.
 
 ## Reading the numbers
 
-Check the `COLD` column before trusting a row: a warmed cell's figures are the
-model's, a cold one's include a compile. `##bench[cells_ok=N]` says how many
+Check for `COLD`, `CAPPED` and a `DIRTY` window before trusting a row: a
+warmed, clean cell's figures are the model's; a cold or dirty one's include a
+compile, and a capped one measured queueing. `##bench[cells_ok=N]` says how many
 cells produced a figure at all.
+
+`ttft_p50_ms` at `in8192_bs4` is bimodal and should not be compared on its own.
+It is a p50 over 8 prompts at concurrency 4, so the TTFTs cluster at T, 2T, 3T
+and 4T, and the interpolated median at index 3.5 sits on the T/2T boundary. It
+lands near either 1.04 T or 1.52 T depending on how the second wave's arrivals
+stagger, independent of the code. Read `in8192_bs1` for 8k prefill latency.
 
 A run against a cold on-disk compile cache is slow whatever the warm-up does —
 the cache is built on the way up and on each cell's first request — but it is

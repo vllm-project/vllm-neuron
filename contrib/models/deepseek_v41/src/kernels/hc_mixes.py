@@ -113,36 +113,72 @@ def kernel(raw, flat, base, scale):
             data=mix[0:nr, 2 * hc : 2 * hc + hc * hc],
             op0=nl.multiply, operand0=s2, op1=nl.add, operand1=b2,
         )
+        # The `hc x hc` mix matrix is one row of `hc * hc` free-axis elements, so
+        # viewing it as `(nr, hc, hc)` makes both Sinkhorn normalizations single
+        # reductions over the whole tile instead of `hc` of them over slices.
+        #
+        # **This is an instruction-count optimization and that is the only kind
+        # that matters here.** The iteration-2 profile measured `hc_mixes` at
+        # **46.4 ms, 4.1% of all prefill engine time and 203,527 instructions** —
+        # more than `swiglu`, `rmsnorm` and `index_score` combined — for an
+        # arithmetic cost of nothing: 20 Sinkhorn passes over a 4x4 matrix a
+        # token. The work is trivial; the issue cost is not, because on this
+        # machine a `[128, 4]` instruction costs about what a `[128, 512]` one
+        # does. Per Sinkhorn iteration this is **10 instructions where the
+        # sliced form issued 25**:
+        #
+        #     rowsum_div  4 sums + 4 adds + 4 reciprocals + 4 tensor_scalars = 16 -> 4
+        #     colsum_div  3 adds + 1 add + 1 reciprocal   + 4 tensor_tensors =  9 -> 6
+        #
+        # `nisa.tensor_reduce` over a reshaped axis and `.broadcast` are both
+        # already used this way elsewhere in this tree (`moe_short._act_quant`,
+        # `_fp4_dequant`), so neither is new ground.
+        #
+        # The sums are *reassociated* — a 4-element reduction instead of three
+        # pairwise adds — so the result is not bit-identical to the sliced form.
+        # Sinkhorn is a contraction, so the difference does not amplify over the
+        # 20 passes; `hc_sinkhorn_iters` itself is untouched, which is what the
+        # module docstring's warning is about.
         def rowsum_div(src, dst):
             """Divide each `hc x hc` row by its own sum (the reference's
-            `dim=-1` normalization). The divisor is one value per token, so it
-            rides the per-partition operand and needs no broadcast.
+            `dim=-1` normalization), as one reduction over the last axis.
             """
-            for i in range(hc):
-                lo, hi = i * hc, (i + 1) * hc
-                s = nl.sum(src[0:nr, lo:hi], axis=1, keepdims=True)
-                nisa.tensor_scalar(
-                    dst=dst[0:nr, lo:hi],
-                    data=src[0:nr, lo:hi],
-                    op0=nl.multiply,
-                    operand0=nl.reciprocal(nl.add(s, HC_EPS)),
-                )
+            s3 = src[0:nr, 0 : hc * hc].reshape((nr, hc, hc))
+            d3 = dst[0:nr, 0 : hc * hc].reshape((nr, hc, hc))
+            s = nl.ndarray((nr, hc, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_reduce(dst=s, op=nl.add, data=s3, axis=2)
+            d = nl.reciprocal(nl.add(s, HC_EPS))
+            nisa.tensor_tensor(
+                dst=d3, data1=s3, data2=d.broadcast(2, hc), op=nl.multiply
+            )
 
         def colsum_div(src, dst):
             """Divide each `hc x hc` column by its own sum (the reference's
             `dim=-2` normalization). The sum of the row blocks *is* the divisor
-            laid out the way each block wants it.
+            laid out the way every block wants it, so one `tensor_tensor` over
+            the whole tile replaces the `hc` sliced ones.
+
+                AssertionError: tensor_reduce axis must be the last contiguous
+                dim(s) of the tile. For a 3D tensor, expected axis=(2,) (or a
+                shorter trailing subset). Got axis=(1,)
+
+            — which is why this keeps the explicit `hc - 1` adds while
+            `rowsum_div` gets a single reduction: the column axis is not
+            trailing, and the only way to make it trailing would be a transpose
+            per iteration, which costs more than the 3 adds it saves.
             """
+            s3 = src[0:nr, 0 : hc * hc].reshape((nr, hc, hc))
+            d3 = dst[0:nr, 0 : hc * hc].reshape((nr, hc, hc))
             s = nl.add(src[0:nr, 0:hc], src[0:nr, hc : 2 * hc])
             for i in range(2, hc):
                 s = nl.add(s, src[0:nr, i * hc : (i + 1) * hc])
             d = nl.reciprocal(nl.add(s, HC_EPS))
-            for i in range(hc):
-                lo, hi = i * hc, (i + 1) * hc
-                nisa.tensor_tensor(
-                    dst=dst[0:nr, lo:hi], data1=src[0:nr, lo:hi], data2=d,
-                    op=nl.multiply,
-                )
+            nisa.tensor_tensor(
+                dst=d3,
+                data1=s3,
+                data2=d.reshape((nr, 1, hc)).broadcast(1, hc),
+                op=nl.multiply,
+            )
 
         a = nl.ndarray((nr, hc * hc), dtype=nl.float32, buffer=nl.sbuf)
         b = nl.ndarray((nr, hc * hc), dtype=nl.float32, buffer=nl.sbuf)
