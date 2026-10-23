@@ -158,9 +158,9 @@ curl http://localhost:8000/v1/completions \
   (tensors exceed the HBM limit). Earlier runs used 0.65 for 27B and 0.72 for
   35B-A3B at TP=4, and 0.7 for 397B-A17B at TP=64.
 - **397B-A17B only:** `enable_expert_parallel=True` with
-  `neuron_config.ep_degree=8` at TP=64, the head-count relaxation in
-  `scripts/run.py` (`relax_head_divisibility`, because vLLM rejects 64 ranks
-  for 32 query heads). Its top-10 routing is above the fused decode kernel's
+  `neuron_config.ep_degree=8` at TP=64, and the head-count relaxation
+  (`relax_head_divisibility` in `src/plugin.py`, applied by the plugin in every
+  process, because vLLM rejects 64 ranks for 32 query heads). Its top-10 routing is above the fused decode kernel's
   limit (`moe_block_tkg` calls `nkilib`'s `router_topk`, which asserts K <= 8),
   so decode routes in torch and runs the experts through `moe_tkg`
   (`_forward_decode_unfused` in `src/moe.py`); prefill's `NF.router` already
