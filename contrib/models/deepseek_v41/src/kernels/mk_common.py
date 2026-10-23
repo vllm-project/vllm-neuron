@@ -8,9 +8,10 @@ owns, or says in its docstring that it runs on both cores unchanged.
 
 Numerics mirror the shipped per-op kernels (`blockquant`, `hc_in`, `hc_attn_out`,
 `sparse_attn`), which were validated token for token against the checkpoint's
-reference: fp8 activation round trips through `_qdq_fp8` (FP8_PEAK = 224), fp8 /
-fp4 weights decoded to bf16 (exact), fp32 PSUM accumulation, bf16 roundings at the
-same points as the torch path.
+reference: the values written to the KV caches round-trip through `_qdq_fp8`
+(FP8_PEAK = 224), the quantized GEMMs run on the tensor engine's MX matmul
+(`mk_mx`, which quantizes their inputs on chip), fp32 PSUM accumulation, bf16
+roundings at the same points as the torch path.
 """
 
 import nki.isa as nisa
@@ -18,10 +19,7 @@ import nki.language as nl
 
 from .blockquant import (  # noqa: F401 - re-exported for the megakernels
     BLK,
-    FP4_POST,
     PT,
-    _dequant_fp4,
-    _dequant_fp8,
     _gemm,
     _qdq_fp8,
     _stage_rows,
@@ -336,17 +334,6 @@ def norm_rows(src_hbm, w_hbm, dst_hbm, tiles, n, qdq, chunk=None):
             nisa.dma_copy(dst=dst_hbm[r0 : r0 + nr, 0:n], src=y16[0:nr, :])
 
 
-def qdq_rows(src_hbm, dst_hbm, tiles, n):
-    """`dst = act_quant_dequant(src)` (fp8 round trip) for the given row tiles."""
-    for r0, nr in tiles:
-        t = nl.ndarray((PT, n), dtype=nl.bfloat16, buffer=nl.sbuf)
-        if nr < PT:
-            nisa.memset(t, 0.0)
-        nisa.dma_copy(dst=t[0:nr, :], src=src_hbm[r0 : r0 + nr, 0:n])
-        out = _qdq_fp8(t, PT, n)
-        nisa.dma_copy(dst=dst_hbm[r0 : r0 + nr, 0:n], src=out[0:nr, :])
-
-
 def load_freqs(freqs_hbm, row_pos_hbm, r0, nr):
     """`(cos, sin)` fp32 `(PT, 32)` tiles for rows `r0..r0+nr`, gathered from the
     `[max_pos, 64]` (cos | sin) table at the rows' absolute positions.
@@ -412,47 +399,7 @@ def rope_rows(src_hbm, dst_hbm, tiles, width, head, nheads, freqs_hbm, row_pos_h
         nisa.dma_copy(dst=dst_hbm[r0 : r0 + nr, 0:width], src=t[0:nr, :])
 
 
-# --------------------------------------------------------------------------- GEMMs (core-split)
-
-
-def gemm_fp8_cols(xq_hbm, w, s, out_hbm, m, k, n, lo, hi, wd_hbm, out_dtype=nl.bfloat16,
-                  out_scale=1.0):
-    """`out[:, lo:hi] = xq[m, k] @ w[lo:hi, :].T` for fp8 `w[n, k]` with 32x32 e8m0 scales.
-
-    `xq_hbm` is bf16 `[m, k]` with `m` a multiple of 128 (already activation-quantized
-    when the projection wants it). The weight rows `[lo, hi)` are decoded to bf16 into
-    `wd_hbm[0:hi-lo, 0:k]` (private HBM scratch, at least `(hi-lo, k)`). `lo`/`hi` are
-    multiples of 128 so the scale rows pair with the weight rows (`_fp8_2core_span`).
-    """
-    span = hi - lo
-    _dequant_fp8(w[lo:hi, 0:k], s[lo // BLK : hi // BLK], wd_hbm, span, k)
-    _gemm(xq_hbm, wd_hbm[0:span, 0:k], out_hbm[0:m, lo:hi], m, k, span,
-          out_scale=out_scale, out_dtype=out_dtype)
-
-
-def gemm_fp8_kslice(xq_hbm, w, s, out_hbm, m, k_lo, k_hi, n, wd_hbm, x_col0=0,
-                    out_dtype=nl.bfloat16, out_scale=1.0):
-    """`out[:, 0:n] = out_scale * xq[:, x_col0 + k_lo : x_col0 + k_hi] @ w[:, k_lo:k_hi].T`
-    -- a contraction slice of an fp8 `w[n, K]`, for splitting `K` across cores or
-    groups. `k_lo`/`k_hi` are multiples of 128.
-    """
-    kk = k_hi - k_lo
-    _dequant_fp8(w[0:n, k_lo:k_hi], s[0 : cdiv(n, BLK), k_lo // BLK : k_hi // BLK], wd_hbm, n, kk)
-    _gemm(xq_hbm[0:m, x_col0 + k_lo : x_col0 + k_hi], wd_hbm[0:n, 0:kk], out_hbm[0:m, 0:n],
-          m, kk, n, out_scale=out_scale, out_dtype=out_dtype)
-
-
-def gemm_fp4_cols(xq_hbm, w, s, out_hbm, m, k, n, lo, hi, wd_hbm):
-    """`out[:, lo:hi] = xq[m, k] @ w[lo:hi].T` for fp4 `w[n, k//2]` with per-row e8m0
-    scales; bf16 out. `lo`/`hi` multiples of 128."""
-    span = hi - lo
-    _dequant_fp4(w[lo:hi, 0 : k // 2], s[lo:hi, 0 : k // BLK], wd_hbm, span, k)
-    _gemm(xq_hbm, wd_hbm[0:span, 0:k], out_hbm[0:m, lo:hi], m, k, span, out_scale=FP4_POST)
-
-
-def gemm_bf16_cols(xs_hbm, w, out_hbm, m, k, n, lo, hi, out_dtype=nl.bfloat16):
-    """`out[:, lo:hi] = xs[m, k] @ w[lo:hi].T` with a bf16 weight, no quantization."""
-    _gemm(xs_hbm, w[lo:hi, 0:k], out_hbm[0:m, lo:hi], m, k, hi - lo, out_dtype=out_dtype)
+# --------------------------------------------------------------------------- GEMMs (fp32 router)
 
 
 def gemm_fp32(x_hbm, w_t_hbm, out_hbm, tiles, k, n):
@@ -655,6 +602,131 @@ def attn_token_body(i, tok0, q_hbm, kvtab_hbm, idx_hbm, o_hbm, sink_t, heads, d,
             dst=sc[0:heads, nb * kt : (nb + 1) * kt], data=acc, op0=nl.multiply, operand0=scale,
             op1=nl.add, operand1=bias_b[0:heads, nb * kt : (nb + 1) * kt],
         )
+
+    neg_max = nl.negative(nl.max(sc[0:heads, 0:kpad], axis=1, keepdims=True))
+    p32 = nl.ndarray((heads, kpad), dtype=nl.float32, buffer=nl.sbuf)
+    den = nl.ndarray((heads, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=p32, op=nl.exp, data=sc[0:heads, 0:kpad], bias=neg_max, scale=1.0,
+                    reduce_op=nl.add, reduce_res=den)
+    sk = nl.ndarray((heads, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=sk, op=nl.exp, data=sink_t, bias=neg_max)
+    rcp = nl.ndarray((heads, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.reciprocal(dst=rcp, data=nl.add(den, sk))
+    p16 = nl.copy(p32, dtype=nl.bfloat16)
+
+    pt = nl.ndarray((PT, ktiles, hp), dtype=nl.bfloat16, buffer=nl.sbuf)
+    for kb in range(ktiles):
+        ptps = nl.ndarray((PT, hp), dtype=nl.bfloat16, buffer=nl.psum)
+        nisa.nc_transpose(dst=ptps[0:PT, 0:heads], data=p16[0:heads, kb * PT : (kb + 1) * PT])
+        nisa.tensor_copy(dst=pt[0:PT, kb, 0:heads], src=ptps[0:PT, 0:heads])
+    acc_o = nl.ndarray((heads, d), dtype=nl.float32, buffer=nl.psum)
+    for kb in range(ktiles):
+        nisa.nc_matmul(dst=acc_o, stationary=pt[0:PT, kb, 0:heads], moving=gn[0:PT, kb, 0:d],
+                       accumulate=(kb > 0))
+    o16 = nl.ndarray((hp, d), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=o16[0:heads, :], data=acc_o, op0=nl.multiply, operand0=rcp)
+    nisa.dma_copy(
+        dst=o_hbm.ap(pattern=[[d, heads], [1, d]], offset=tok0 * hw, scalar_offset=i, indirect_dim=0),
+        src=o16[0:heads, :],
+    )
+
+
+#: SBUF bytes a partition may hold of the resident transposed key table
+#: (`build_kT`): 4 chunks x 2 bytes x rows, so 96 KiB covers 12288 slot-table rows.
+KT_SBUF_BYTES = 96 * 1024
+
+
+def kt_resident(ntab, hd):
+    """Whether a slot table of `ntab` rows fits the resident transposed layout."""
+    return pad_to(ntab, PT) * hd * 2 <= KT_SBUF_BYTES
+
+
+def build_kT(kvtab_hbm, ntab, hd):
+    """The slot table transposed and resident: one SBUF tensor per 128-wide head-dim
+    chunk, `kT[c][d, r] = kvtab[r, c*128 + d]` (bf16), built with DMA transposes.
+    `kvtab_hbm` has at least `pad_to(ntab, 128)` rows."""
+    ntab_p = pad_to(ntab, PT)
+    kTs = []
+    for c in range(hd // PT):
+        kT = nl.ndarray((PT, ntab_p), dtype=nl.bfloat16, buffer=nl.sbuf)
+        for r0 in range(0, ntab_p, PT):
+            nisa.dma_transpose(dst=kT[0:PT, r0 : r0 + PT], src=kvtab_hbm[r0 : r0 + PT, c * PT : (c + 1) * PT])
+        kTs.append(kT)
+    return kTs
+
+
+def attn_token_body_ti(i, tok0, q_hbm, kvtab_hbm, kTs, idx_hbm, o_hbm, sink_t, heads, d, kpad, scale):
+    """`attn_token_body` with the keys selected on chip: the score matmuls read the
+    token's `kpad` columns of the resident `kTs` through tensor indirection (the
+    slot indices in the 16-partition snake the tensor engine reads, replicated into
+    each quadrant), so no per-token transposes; the values are still gathered from
+    `kvtab_hbm` by indirect DMA for the PV matmul."""
+    dchunks = d // PT
+    ktiles = kpad // PT
+    ncol = kpad // 16
+    hp = _align16(heads)
+    hw = heads * d
+
+    ids = nl.ndarray((PT, ktiles), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(
+        dst=ids,
+        src=idx_hbm.ap(pattern=[[1, PT], [PT, ktiles]], offset=tok0 * kpad,
+                       scalar_offset=i, indirect_dim=0),
+    )
+    gidx = nl.ndarray((PT, ktiles), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=gidx, data=ids, op0=nl.maximum, operand0=0.0)
+    idrow = nl.ndarray((1, kpad), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(
+        dst=idrow,
+        src=idx_hbm.ap(pattern=[[kpad, 1], [1, kpad]], offset=tok0 * kpad,
+                       scalar_offset=i, indirect_dim=0),
+    )
+    brow = nl.ndarray((1, kpad), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=brow, data=idrow, op0=nl.less, operand0=0.0,
+                       op1=nl.multiply, operand1=NEG_BOUND)
+    bias_b = nl.broadcast_to(brow, (heads, kpad))
+    # the snake: offset j at [j % 16, j // 16] of each quadrant
+    ix32 = nl.ndarray((PT, ncol), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.memset(ix32, 0)
+    for qd in range(4):
+        nisa.dma_copy(
+            dst=ix32[32 * qd : 32 * qd + 16, 0:ncol],
+            src=idx_hbm.ap(pattern=[[1, 16], [16, ncol]], offset=tok0 * kpad,
+                           scalar_offset=i, indirect_dim=0),
+        )
+    nisa.tensor_scalar(dst=ix32, data=ix32, op0=nl.maximum, operand0=0)
+    ix = nl.ndarray((PT, ncol), dtype=nl.uint16, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=ix, src=ix32)
+
+    qrow = nl.ndarray((hp, d), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.dma_copy(
+        dst=qrow[0:heads, :],
+        src=q_hbm.ap(pattern=[[d, heads], [1, d]], offset=tok0 * hw, scalar_offset=i, indirect_dim=0),
+    )
+    qt = nl.ndarray((PT, dchunks, hp), dtype=nl.bfloat16, buffer=nl.sbuf)
+    for c in range(dchunks):
+        qps = nl.ndarray((PT, hp), dtype=nl.bfloat16, buffer=nl.psum)
+        nisa.nc_transpose(dst=qps[0:PT, 0:heads], data=qrow[0:heads, c * PT : (c + 1) * PT])
+        nisa.tensor_copy(dst=qt[0:PT, c, 0:heads], src=qps[0:PT, 0:heads])
+
+    gn = nl.ndarray((PT, ktiles, d), dtype=nl.bfloat16, buffer=nl.sbuf)
+    for kb in range(ktiles):
+        nisa.dma_copy(
+            dst=gn[0:PT, kb, 0:d],
+            src=kvtab_hbm.ap(pattern=[[d, PT], [1, d]], offset=0,
+                             vector_offset=gidx[0:PT, kb : kb + 1], indirect_dim=0),
+        )
+
+    acc = nl.ndarray((heads, kpad), dtype=nl.float32, buffer=nl.psum)
+    for c in range(dchunks):
+        nisa.nc_matmul(
+            dst=acc, stationary=qt[0:PT, c, 0:heads],
+            moving=kTs[c].indirect(ix, num_elem=kpad), accumulate=(c > 0),
+        )
+    sc = nl.ndarray((heads, kpad), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.scalar_tensor_tensor(
+        dst=sc, data=acc, op0=nl.multiply, operand0=scale, op1=nl.add, operand1=bias_b,
+    )
 
     neg_max = nl.negative(nl.max(sc[0:heads, 0:kpad], axis=1, keepdims=True))
     p32 = nl.ndarray((heads, kpad), dtype=nl.float32, buffer=nl.sbuf)

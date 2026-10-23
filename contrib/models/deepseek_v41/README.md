@@ -216,14 +216,22 @@ step's token ids.
 **Megakernels (2026-10-23).** On Trn3 the port now runs every block as one NKI
 kernel and the DSpark drafter as another (`src/kernels/layer_kernel.py`,
 `src/kernels/draft_kernel.py`, bridged by `src/mk_model.py`; see
-`src/README.md` "Megakernels"). The integration test passes on that path (needle
-recalled, trivia answered) and the matrix below was re-measured with it:
-TTFT 625 / 1157 / 2134 / 9261 ms and TPOT 73 / 66 / 69 / 70 ms at 512 / 1k /
-2k / 8k input, batch 1 (the per-op path: 1060 / 1701 / 3037 / 13419 ms and
-~100 ms), 13.3 decode tok/s at short contexts and 7.0 at 8k, draft acceptance
-45-50% against the per-op path's 46-52%. `test/unit/EQUIVALENCE_REPORT.md` has
-the component-level and per-layer agreement of the two paths;
-`DEEPSEEK_V41_MEGAKERNEL=0` restores the per-op path.
+`src/README.md` "Megakernels"). The quantized projections run on the tensor
+engine's native block-scaled fp8 / fp4 matmul (`nc_matmul_mx`, the weights
+re-laid once into its packed layout, activations quantized on chip), the sparse
+attention selects each token's keys on chip through tensor indirection into a
+resident transposed slot table, and the routed experts run token-grouped: each
+expert only over the rows that picked it, in a runtime-bounded loop, so an
+expert nobody picked costs nothing. The integration test passes on that path
+(needle recalled, trivia answered with the per-op path's exact completion) and
+the matrix below was re-measured with it: TTFT 560 / 1064 / 1954 / 8545 ms and
+TPOT 31.6 / 31.1 / 29.7 / 33.8 ms at 512 / 1k / 2k / 8k input, batch 1
+(the dense-expert megakernels of the morning: 625 / 1157 / 2134 / 9261 ms and
+73 / 66 / 69 / 70 ms; the per-op path: 1060 / 1701 / 3037 / 13419 ms and
+~100 ms), 28 decode tok/s at short contexts and 10 at 8k (13.3 and 7.0 before),
+draft acceptance 42-49% against 45-50% before and the per-op path's 46-52%.
+`test/unit/EQUIVALENCE_REPORT.md` has the component-level and per-layer
+agreement of the paths; `DEEPSEEK_V41_MEGAKERNEL=0` restores the per-op path.
 
 > **Read this before you deploy.** Every number in this contribution was
 > measured on `vllm-neuron` **0.24.0.1.1.0**, which is the branch the model was

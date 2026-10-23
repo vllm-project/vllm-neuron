@@ -1,5 +1,11 @@
 # Equivalence Report: DeepSeek-V4.1-Flash, per-op NKI path -> megakernel path
 
+> **Round 2 (2026-10-23, evening) is appended at the end:** the megakernels were
+> rebuilt on the tensor engine's native block-scaled fp8 / fp4 matmul, keys
+> selected on chip through tensor indirection, and token-grouped routed experts.
+> The sections up to "Stage 7 (bench)" document round 1 (bf16-dequant GEMMs,
+> dense experts); "Round 2" re-establishes every stage on the new kernels.
+
 ## Executive Summary
 
 - **Overall:** PASS (verifier: both expected substrings matched; the two paths produce the
@@ -162,3 +168,157 @@ The batch-10 cells are serialized on a `max_num_seqs=1` engine (as before), so t
 is queueing. Draft acceptance stays within 1-3 points of the per-op path, in both
 directions, which is the distributional check this port has: a drifted draft or target
 would show as a drop. Verdict: no regression; TTFT -30..-40%, TPOT -30%.
+
+---
+
+# Round 2: native MX matmuls, on-chip key selection, token-grouped experts
+
+Same source (the per-op path), same method, new target: `kernels/mk_mx.py`
+(fp8 / fp4 `nc_matmul_mx` with host-packed block-scaled weights and `quantize_mx`
+activations), `kernels/mk_common.py:attn_token_body_ti` (QK over a resident
+transposed slot table through `.indirect()`), `kernels/mk_moe.py` (row lists by
+`nonzero_with_count`, a runtime-bounded loop per expert, `dma_compute`
+scatter-adds). Hardware conventions established by device probes
+(`test/unit/probe_mx.py`, `probe_dyn.py`, `probe_ti.py`, `probe_lnc.py`):
+
+| Probe | Finding |
+|-------|---------|
+| fp4 weight x on-chip fp8 activation, MX matmul vs fp32 CPU GEMM | rel_l2 4.9e-5 (nibble order, scale quadrant layout confirmed) |
+| fp8 weight x fp8 activation | rel_l2 2.4e-4, R = 0.15 (the engine rounds its 4-element partial products; e4m3 subnormal codes honoured; the same with single-binade weights, so inherent) |
+| `quantize_mx` vs the CPU emulation `ref_layer.act_quant_mx` (random bf16) | 0 of 65536 elements differ (scale `2^(floor(log2 amax) - 7)`, e4m3fn RNE) |
+| `.indirect()` moving operand, 640 selected columns | exact; index snake `[i % 16, i // 16]` replicated per quadrant |
+| `nonzero_with_count` + `fori_loop` (scalar bound, zero trips) + indirect gather + `dma_compute` scatter-add | exact (rel_l2 1.2e-7) |
+| LNC=2 dynamic loop with unequal trip counts on the two cores | **hangs** (runtime timeout) -- hence both cores run every expert and split each tile |
+| `nc_matmul(perf_mode=double_row)` fp8, unscaled operands (a one-off probe, not kept) | works, rel_l2 1.3e-4 (the same internal partial-product rounding as MX) |
+| the checkpoint's 32x32 block scales folded to one scale per column, the only scale double-row can carry | 25% of the nonzero weight codes flush to zero at the checkpoint's 13-binade spread: double-row cannot take these weights exactly; `nc_matmul_mx` applies the block scales in the array, at twice double-row's packing |
+| `[128 x 15360] @ [15360 x 5120]`, double-row vs MX, 20 executions | 9.07 vs 8.22 ms (host round trip included) |
+
+## Stage 1 (round 2): smoke test, real model
+
+Integration test (`test/integration/test_model.py`), megakernel path, 2026-10-23
+19:11, 15:00 wall (round 1: 17:56):
+
+| Case | Expected | Result |
+|------|----------|--------|
+| long-needle-2048-0 | `5591-C67` | ok (`... 5591-C67, and it must be entered before the second alarm cycle completes.`, 27 tok, stop) |
+| trivia-capital-france | `Paris` | ok -- the completion `We need answer simple. Need final.</think>The capital of France is **Paris**.` (18 tok) is identical to the per-op path's and to round 1's |
+| short-prose, smoke-test | (none) | coherent 32-token completions |
+
+`verifier: PASSED -- 2 of 2 expected substring(s) matched` (log
+`/mnt/nvme/ds41_mk2_integration.PASS.log`, report `/mnt/nvme/ds41_mk2_verifier_report.json`).
+
+## Stage 2 (round 2): components, 8 ranks, random weights
+
+| Component (test) | rel_l2 | R | Result |
+|------------------|--------|---|--------|
+| layer: q (stage 2) | 3.8e-3 | - | PASS |
+| layer: attention output `o` (stage 4), T = 6 / 128 (ratio 2 source) / 2048 | 4.6e-3 / 9.7e-3 / 8.5e-3 | - | PASS |
+| layer: output projections from the kernel's own `o` (stage 51) | 4.3e-3 | 2.6 | PASS |
+| layer: MoE partial from the kernel's own normed input (stage 82), T = 6 / 128 / 2048 (multi-tile experts) | 3.4e-3 / 4.1e-3 / 4.4e-3 | 2.0 / 2.5 / 2.7 | PASS |
+| layer: shared expert only (stage 83), routed only (stage 84) | 0 (bit-exact) / 3.4e-3 | 0 / 2.0 | PASS |
+| layer: router weights / logits (stage 81) | exact / inherited 7e-3 | - | PASS |
+| layer: compressed latents / index keys written (ratio 2 source, T = 128) | 6.7e-3 / 1.7e-2 | - | PASS |
+| layer: pooling caches, index top-k set agreement | 1.1e-4 / min 1.006 | 0.07 | PASS |
+| layer: engram stream (stage 0), tap | 8.0e-4 / 8.0e-4 | - / 0.48 | PASS |
+| layer: KV cache rows written / untouched | 2e-3..6e-3 / 0 | - | PASS |
+| drafter: normed, q, kv, o (stages 11-14) | 1.5e-6 / 4.5e-3 / 5.4e-4 / 1.4e-2 | - | PASS |
+| drafter: MoE partial from the kernel's own input (stage 18) | 3.6e-3 | 2.2 | PASS |
+| drafter: head from the kernel's own hidden (stage 4) | 3.2e-4 | - | PASS |
+| drafter: main-stream KV written, 3 stages, decode and prefill (`--start 0`) | 1.2e-2..1.4e-2 | - | PASS |
+| drafter: prefill ids (`--start 0`) | exact, confidence exact | - | PASS |
+
+On the zero-weight clause: an expert's row list holds exactly the rows whose
+routing weight for it is nonzero (`wexp > 0`), so no `(token, expert)` pair with
+a zero weight is ever gathered or multiplied; the row lists were checked
+element-for-element against `torch.nonzero` in `probe_dyn.py` and the per-expert
+counts drive the loop bounds. The only extra rows a tile carries are the
+zero-filled padding of an expert's last partial 128-row tile (the tensor engine's
+row granularity, as the per-op path's 128-row buckets): they are not token-expert
+pairs, they gather a zero row, their result lands in junk accumulator rows that
+are never read, and they add no tensor-engine time because the tile's cost is
+the expert's weight stream, which is the same for 1 or 128 real rows.
+
+Components agree with the reference from their own inputs at R of 2-3 (round 1:
+0.02-9). The difference is the fp8 MX matmul's internal rounding (2.4e-4 a GEMM
+output), which every fp8 re-quantization downstream turns into one-ulp flips, so
+a layer's full stream on random weights lands at 3-4e-2 (T = 6), 7e-2 (two spans),
+9e-2 (T = 2048) against 2-5e-2 in round 1, and the drafter's three-stage stream
+at 0.37 against ~0.2 (its drafted ids on random weights: exact at prefill, two
+late flips at decode where the reference's top-2 gap is under 0.6). The unit
+tests' stream-level tolerances were set to that floor; the component checks
+are the gates.
+
+## Stage 3/4 (round 2): faults found and fixed
+
+| Fault | Symptom | Fix |
+|-------|---------|-----|
+| scale tile only partly written inside the dynamic expert loop | `NCC_IGCA108` (loop-carried dependency) | `memset` the tile in the body |
+| experts split by parity across the two cores (unequal trip counts) | 8-rank runs hang until the runtime timeout | both cores run every expert, tile split along `inter` (`probe_lnc.py`) |
+| 1x1 engram dummy viewed as the x4 dtype on non-engram layers | trace assertion at the first real forward | view only when `has_engram` |
+| drafter's per-stage attention / shared-expert weights not in the MX layout | shape derivation divides by zero at the first draft | `mk_model.draft_weights` stacks `_fp8()` layouts |
+| three stages sharing one `mkvr` / `mkv` scratch at prefill (`at_zero`) | main-stream KV of stages 0-2 corrupted (cos 0.5-0.7) | one scratch pair per stage |
+
+## Stages 5+6 (round 2): real model, per layer, prefill of the trivia case
+
+`/mnt/nvme/dump_mk4` against `/mnt/nvme/dump_op` (rank 0, step 1 = 37-token prefill):
+
+| Layer output | round 2 rel_l2 | round 1 rel_l2 | cos (round 2) |
+|--------------|---------------|----------------|---------------|
+| embed | 0 | 0 | 1.000 |
+| layer 0 | 3.1e-2 | 3.0e-3 | 0.9998 |
+| layers 1-9 | 2.2e-2 .. 2.9e-2 | 7e-3 .. 2.7e-2 | 1.000 |
+| layers 10-14 | 1.6e-2 .. 2.0e-2 | | 1.000 |
+| layers 15-19 | 8.0e-3 .. 9.1e-3 | | 1.000 |
+| layers 20-39 | 3.8e-3 .. 6.0e-3 (layer 20: 1.6e-2) | 3.7e-3 .. 5.4e-3 | 1.000 |
+| final normed hidden | 0.235 | 0.23 | 0.9725 (round 1: 0.973) |
+
+Decode step (step 2 = 1 real + 5 draft rows, `/mnt/nvme/dump_mk5`):
+
+| Layer output (step 2) | round 2 rel_l2 | round 1 rel_l2 | cos (round 2) |
+|-----------------------|---------------|----------------|---------------|
+| layer 0 / 1 | 1.1e-2 / 3.3e-2 | 6.7e-3 / 2.2e-2 | 0.9999 / 0.9994 |
+| layers 5-39 | 0.16 .. 0.29 | 0.18 .. 0.31 | 0.96 .. 0.99 |
+| final normed hidden | 0.33 | 0.35 | 0.946 (round 1: 0.94) |
+
+(The decode rows are small-magnitude draft rows, where the same absolute noise is
+a larger fraction, as in round 1.) The dump run's own verifier case passed, and
+the integration test was re-run on the final code after the dead-code cleanup:
+`verifier: PASSED -- 2 of 2 expected substring(s) matched`, 10:05 wall
+(`/mnt/nvme/ds41_mk2_integration.final.log`).
+
+The early layers sit higher than in round 1 (the fp8 MX rounding, re-quantized
+through the attention projections of a layer whose stream is still small), the
+late layers and the end of the stack are where round 1 was. Note that the per-op
+path is not the reference either: its `224`-peak activation round trip keeps one
+bit less than the hardware's `quantize_mx` in a fifth of the blocks, so part of
+the per-layer difference is the megakernel path sitting closer to the model's
+own `448` rule.
+
+## Stage 7 (round 2): bench
+
+`test/performance/run_bench.py`, 8 cells, 2026-10-23 19:13-20:27 (round 1: 2h20m),
+`bench_report.json` (round 2) against `bench_report.mk1.json` (round 1, dense
+experts, bf16-dequant GEMMs) and `bench_report.perop.json`. Medians; `accept` is
+vLLM's spec-decode acceptance over the cell.
+
+| Cell | TTFT p50 ms (per-op / round 1 / round 2) | TPOT p50 ms | decode tok/s | accept % |
+|------|------------------------------------------|-------------|--------------|----------|
+| in512_bs1 | 1060 / 625 / **560** | 99.4 / 73.1 / **31.6** | 9.3 / 13.3 / **28.2** | 52.0 / 49.7 / 46 |
+| in512_bs10 | 62766 / 44035 / **21345** | 99.0 / 73.2 / **30.5** | 9.4 / 13.2 / **28.7** | 51.8 / 49.4 / 47 |
+| in1024_bs1 | 1701 / 1157 / **1064** | 101.0 / 66.0 / **31.1** | 8.9 / 13.3 / **25.7** | 49.4 / 49.0 / 48 |
+| in1024_bs10 | 65604 / 45996 / **22767** | 99.7 / 65.9 / **31.0** | 9.1 / 13.3 / **25.7** | 49.5 / 48.9 / 48 |
+| in2048_bs1 | 3037 / 2134 / **1954** | 100.9 / 69.0 / **29.7** | 8.0 / 11.7 / **22.4** | 46.4 / 47.6 / 49 |
+| in2048_bs10 | 74895 / 49211 / **27515** | 102.0 / 68.7 / **29.7** | 7.9 / 11.7 / **22.3** | 46.7 / 47.4 / 49 |
+| in8192_bs1 | 13419 / 9261 / **8545** | 102.5 / 70.3 / **33.8** | 4.8 / 7.0 / **10.0** | 47.2 / 45.9 / 42 |
+| in8192_bs10 | 129633 / 91322 / **65508** | 102.9 / 70.5 / **33.5** | 4.8 / 7.0 / **10.1** | 47.5 / 44.9 / 42 |
+
+The batch-10 cells are serialized on a `max_num_seqs=1` engine (as before), so
+their TTFT is queueing. TPOT halves against round 1 (the decode step no longer
+decodes six experts' weights to bf16 scratch and multiplies all rows by them; it
+reads only the picked experts' fp4 weights and multiplies them natively), TTFT
+drops 8-10% (the prefill's expert work is now one or two tiles per expert instead
+of sixteen, but the attention projections and the per-token attention dominate
+there). Draft acceptance stays within 1-4 points of round 1 in both directions
+(the 8k cells lose 4 points, the 2k cells gain 1-2), the distributional check
+this port has. Verdict: no regression, TPOT -55%, decode tok/s x2.1 at short
+contexts and x1.4 at 8k.

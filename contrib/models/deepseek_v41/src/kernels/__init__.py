@@ -36,21 +36,39 @@ splits the work) and doing their own collectives (`nki.collectives`):
       sharded vocabulary, the
       confidence head             draft_kernel.draft_forward  mk_model.run_draft
                                                               <- model.forward_spec
+    the fp8 / fp4 GEMMs on the
+      tensor engine's MX matmul
+      (`nc_matmul_mx`: block-
+      scaled weights in the host-
+      packed [K/4, N] layout,
+      activations quantized on
+      chip with `quantize_mx`)    mk_mx                        (imported by both)
+    the token-grouped routed
+      experts (row lists from
+      `nonzero_with_count`, a
+      runtime-bounded loop per
+      expert over gathered row
+      tiles, `dma_compute`
+      scatter-adds)               mk_moe                       (imported by both)
     shared helpers (row tiles of
-      every sublayer, the fp8/fp4
-      GEMMs over decoded weight
-      rows, gathers/scatters,
-      the attention token body,
-      the router)                 mk_common, mk_compress       (imported by both)
+      every sublayer, gathers/
+      scatters, the attention
+      token bodies -- the keys
+      selected on chip through
+      tensor indirection into a
+      resident transposed slot
+      table -- and the router)    mk_common, mk_compress       (imported by both)
     the per-step index columns
       (window/compressed slot
       tables, group members)      ../mk_host.py                mk_model.StepIndices
 
-The two megakernels borrow `blockquant`'s GEMM and quantization primitives
-(`_gemm`, `_dequant_fp8`, `_dequant_fp4`, `_qdq_fp8`, `_stage_rows`) and
-nothing from any library: every other operation below is written out in
-`mk_common` / `mk_compress`. Unit tests: `test/unit/test_layer.py`,
-`test/unit/test_draft.py` (N ranks through `kharness_mp.py`).
+The two megakernels borrow `blockquant`'s activation quantization (`_qdq_fp8`,
+for the values written to the KV caches) and its bf16 `_gemm` (compressor,
+indexer keys, the draft head) and nothing from any library: every other
+operation is written out in `mk_mx` / `mk_moe` / `mk_common` / `mk_compress`.
+Unit tests: `test/unit/test_layer.py`, `test/unit/test_draft.py` (N ranks
+through `kharness_mp.py`); device probes of the hardware conventions the
+kernels rely on: `test/unit/probe_mx.py`, `probe_dyn.py`, `probe_ti.py`.
 
 **The per-op kernels** (`DEEPSEEK_V41_MEGAKERNEL=0`, kept for comparison):
 

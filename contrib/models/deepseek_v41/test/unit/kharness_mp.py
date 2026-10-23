@@ -17,6 +17,9 @@ import time
 
 PORT = int(os.environ.get("KH_MASTER_PORT", "62340"))
 COMM = os.environ.get("KH_ROOT_COMM", "127.0.0.1:62341")
+#: Per-rank logs go here (`KH_LOG_DIR`), so two launches on different core ranges
+#: (`KH_CORE_BASE`, with their own ports) can run side by side.
+LOG_DIR = os.environ.get("KH_LOG_DIR", "/tmp/claude-1000")
 
 
 def init_rank():
@@ -53,7 +56,7 @@ def main():
         env = dict(os.environ)
         env["RANK"] = str(rank)
         env["WORLD_SIZE"] = str(world)
-        log = open(f"/tmp/claude-1000/kh_rank{rank}.log", "w")
+        log = open(f"{LOG_DIR}/kh_rank{rank}.log", "w")
         logs.append(log)
         procs.append(subprocess.Popen(
             [sys.executable, script, *extra], env=env, stdout=log, stderr=subprocess.STDOUT
@@ -65,7 +68,7 @@ def main():
     print(f"ranks exited {rc} after {time.time() - t0:.0f}s")
     for rank in range(world):
         print(f"===== rank {rank} tail")
-        with open(f"/tmp/claude-1000/kh_rank{rank}.log") as fh:
+        with open(f"{LOG_DIR}/kh_rank{rank}.log") as fh:
             lines = [l for l in fh.read().splitlines()
                      if not any(k in l for k in ("INFO", "WARNING", "UserWarning", "warn_once"))]
         print("\n".join(lines[-25:]))

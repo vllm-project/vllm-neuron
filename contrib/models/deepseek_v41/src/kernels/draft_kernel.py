@@ -22,6 +22,9 @@ The argmax over the full vocabulary never gathers the logits: each rank takes th
 
 Per-stage weights arrive stacked on a leading axis of 3, except the two kinds the
 helpers read through an access pattern (`fn.T`, `gate.T`), which come one per stage.
+The fp8 / fp4 weights are in the MX layout (`mk_model.mx_fp8` / `mx_fp4`: `[K/4, N]`
+words) for the tensor engine's block-scaled matmul (`mk_mx`); the routed experts run
+token-grouped (`mk_moe`); the attention selects its keys on chip (`attn_token_body_ti`).
 `flags` = (at_zero, K, win, stage, kver, noise_id, vocab_size, topk, block_size);
 stage 9 is the full drafter, 1..3 return the stream after that MTP stage, 4 the
 masked local logits and the collapsed hidden. Outputs: `output_ids [1, K+1]` int32,
@@ -34,28 +37,26 @@ import nki.collectives as ncc
 import nki.isa as nisa
 import nki.language as nl
 
+from . import mk_moe
+from . import mk_mx as X
 from .mk_common import (
-    BLK,
     KTILE,
     PT,
     add_rows,
     attn_index_table,
-    attn_token_body,
+    attn_token_body_ti,
     bcast_row,
+    build_kT,
     cast_rows,
     cdiv,
     engram_gather,
     gather_rows,
     gemm_fp32,
-    gemm_fp4_cols,
-    gemm_fp8_cols,
-    gemm_fp8_kslice,
     hc_in_tile,
     hc_out_tile,
     load_fn_t,
     norm_rows,
     pad_to,
-    qdq_rows,
     rope_rows,
     route_topk,
     scatter_rows,
@@ -104,22 +105,30 @@ def draft_forward(
     Lp = pad_to(L, PT)
     Kp = PT
     main_in = main_hidden.shape[1]
-    dim = main_proj.shape[0]
+    dim = main_proj.shape[1]
     hc = hca_fn_t0.shape[0] // dim
     width = hc * dim
     mix = hca_fn_t0.shape[1]
-    q_lora = wq_a.shape[1]
-    hd = wkv.shape[1]
-    heads = wq_b.shape[1] // hd
-    o_lora_total = wo_a.shape[1]
-    g_in = wo_a.shape[2]
+    # fp8 / fp4 weights: `[S, K/4, N]` words (the MX layout)
+    q_lora = wq_a.shape[2]
+    hd = wkv.shape[2]
+    heads = wq_b.shape[2] // hd
+    o_lora_total = wo_a.shape[2]
+    g_in = wo_a.shape[1] * 4
     hpg = g_in // hd
     ngroups = heads // hpg
     o_lora = o_lora_total // ngroups
     n_experts = gate_w_t0.shape[1]
     n_local = w1.shape[1]
-    inter = w1.shape[2]
+    inter = w1.shape[3]
     kpad = pad_to(win + K, KTILE)
+    ntab = win + K
+    ntab_p = pad_to(ntab, PT)
+    main_proj4 = main_proj.view(X.FP8_X4)
+    wq_a4, wq_b4, wkv4 = wq_a.view(X.FP8_X4), wq_b.view(X.FP8_X4), wkv.view(X.FP8_X4)
+    wo_a4, wo_b4 = wo_a.view(X.FP8_X4), wo_b.view(X.FP8_X4)
+    sh_w1_4, sh_w3_4, sh_w2_4 = sh_w1.view(X.FP8_X4), sh_w3.view(X.FP8_X4), sh_w2.view(X.FP8_X4)
+    w1_4, w3_4, w2_4 = w1.view(X.FP4_X4), w3.view(X.FP4_X4), w2.view(X.FP4_X4)
     part = head_w.shape[0]
     mrank = mk_embed_w.shape[1]
     world = len(groups_world[0])
@@ -158,12 +167,13 @@ def draft_forward(
     win_slots = nl.ndarray((win, 1), dtype=nl.int32, buffer=nl.shared_hbm, name="win_slots")
     mid = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.shared_hbm, name="mid")
     mh16 = nl.ndarray((Lp, main_in), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="mh16")
-    mhq = nl.ndarray((Lp, main_in), dtype=nl.bfloat16, buffer=nl.private_hbm)
     mxr = nl.ndarray((Lp, dim), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="mxr")
     mx = nl.ndarray((Lp, dim), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="mx")
-    mxq = nl.ndarray((Lp, dim), dtype=nl.bfloat16, buffer=nl.private_hbm)
-    mkvr = nl.ndarray((Lp, hd), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="mkvr")
-    mkv = nl.ndarray((Lp, hd), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="mkv")
+    # One scratch pair per stage: at `at_zero` the three KV writes run back to back
+    # with no other barrier between them, and a shared pair would let a core start
+    # the next stage's projection while the other core still reads this one's.
+    mkvr_s = [nl.ndarray((Lp, hd), dtype=nl.bfloat16, buffer=nl.shared_hbm, name=f"mkvr{s}") for s in range(nstages)]
+    mkv_s = [nl.ndarray((Lp, hd), dtype=nl.bfloat16, buffer=nl.shared_hbm, name=f"mkv{s}") for s in range(nstages)]
     e_loc = nl.ndarray((Kp, dim), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="e_loc")
     e_sum = nl.ndarray((Kp, dim), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="e_sum")
     st = nl.ndarray((K, width), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="st")
@@ -177,31 +187,28 @@ def draft_forward(
     post_f = nl.ndarray((K, hc), dtype=nl.float32, buffer=nl.shared_hbm, name="post_f")
     comb_f = nl.ndarray((K, hc * hc), dtype=nl.float32, buffer=nl.shared_hbm, name="comb_f")
     xn = nl.ndarray((Kp, dim), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="xn")
-    xq = nl.ndarray((Kp, dim), dtype=nl.bfloat16, buffer=nl.private_hbm)
     qa = nl.ndarray((Kp, q_lora), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="qa")
     qr = nl.ndarray((Kp, q_lora), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="qr")
     q = nl.ndarray((Kp, heads * hd), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="q")
     kvr = nl.ndarray((Kp, hd), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="kvr")
     kvd = nl.ndarray((Kp, hd), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="kvd")
-    kvtab = nl.ndarray((win + K, hd), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="kvtab")
+    kvtab = nl.ndarray((ntab_p, hd), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="kvtab")
     idx = nl.ndarray((Kp, kpad), dtype=nl.int32, buffer=nl.shared_hbm, name="idx")
     o = nl.ndarray((Kp, heads * hd), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="o")
     oq = nl.ndarray((Kp, heads * hd), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="oq")
     z = nl.ndarray((Kp, o_lora_total), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="z")
-    zq = nl.ndarray((Kp, o_lora_total), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="zq")
     cc_src = nl.ndarray((Kp, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc_src")
     cc_dst = nl.ndarray((Kp, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc_dst")
     attn_out = nl.ndarray((Kp, dim), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="attn_out")
-    xn2 = nl.ndarray((Kp, dim), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="xn2")
+    # xn2 / wexp / eacc carry one extra zero tile for the routed experts' padding slots.
+    xn2 = nl.ndarray((Kp + PT, dim), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="xn2")
     logits = nl.ndarray((Kp, n_experts), dtype=nl.float32, buffer=nl.shared_hbm, name="logits")
-    wexp = nl.ndarray((Kp, n_local), dtype=nl.float32, buffer=nl.shared_hbm, name="wexp")
+    wexp = nl.ndarray((Kp + PT, n_local), dtype=nl.float32, buffer=nl.shared_hbm, name="wexp")
     eg = nl.ndarray((Kp, inter), dtype=nl.bfloat16, buffer=nl.private_hbm)
     eu = nl.ndarray((Kp, inter), dtype=nl.bfloat16, buffer=nl.private_hbm)
     ey = nl.ndarray((Kp, inter), dtype=nl.bfloat16, buffer=nl.private_hbm)
-    eyq = nl.ndarray((Kp, inter), dtype=nl.bfloat16, buffer=nl.private_hbm)
-    eo = nl.ndarray((Kp, dim), dtype=nl.bfloat16, buffer=nl.private_hbm)
     eo32 = nl.ndarray((Kp, dim), dtype=nl.float32, buffer=nl.private_hbm)
-    eacc = nl.ndarray((Kp, dim), dtype=nl.float32, buffer=nl.private_hbm)
+    eacc = nl.ndarray((Kp + PT, dim), dtype=nl.float32, buffer=nl.private_hbm)
     part_ = nl.ndarray((CORES, Kp, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="part")
     cc2_src = nl.ndarray((Kp, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc2_src")
     cc2_dst = nl.ndarray((Kp, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc2_dst")
@@ -217,8 +224,6 @@ def draft_forward(
     gi_src = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.shared_hbm, name="gi_src")
     gi_dst = nl.ndarray((world, 1), dtype=nl.float32, buffer=nl.shared_hbm, name="gi_dst")
     memb = nl.ndarray((Kp, mrank), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="memb")
-    wd = nl.ndarray((max(dim, inter, heads * hd), max(dim, g_in, inter, main_in, o_lora_total)),
-                    dtype=nl.bfloat16, buffer=nl.private_hbm)
 
     def ret():
         return output_ids, confidence, dbg, cache0, cache1, cache2
@@ -306,9 +311,8 @@ def draft_forward(
         nisa.memset(padm, 0.0)
         nisa.dma_copy(dst=mh16[L:Lp, :], src=padm[0 : Lp - L, :])
     nisa.core_barrier(data=mh16, cores=(0, 1))
-    qdq_rows(mh16, mhq, ltp, main_in)
     lo, hi = _half(dim, pid)
-    gemm_fp8_cols(mhq, main_proj, main_proj_s, mxr, Lp, main_in, dim, lo, hi, wd)
+    X.gemm_rows(mh16, Lp, main_in, main_proj4, main_proj_s, mxr, lo, hi)
     nisa.core_barrier(data=mxr, cores=(0, 1))
     norm_rows(mxr, main_norm_w, mx, lt, dim, qdq=False, chunk=1024)
     if pid == 0 and L < Lp:
@@ -316,7 +320,6 @@ def draft_forward(
         nisa.memset(padx, 0.0)
         nisa.dma_copy(dst=mx[L:Lp, :], src=padx[0 : Lp - L, :])
     nisa.core_barrier(data=mx, cores=(0, 1))
-    qdq_rows(mx, mxq, ltp, dim)
 
     # This rank's embedding rows of [seed, noise, ...] (zero elsewhere), then the world sum.
     if pid == 0:
@@ -341,9 +344,10 @@ def draft_forward(
     cur_st, cur_pre = st, pre_mix
     for s in range(nstages):
         cache = caches[s]
+        mkvr, mkv = mkvr_s[s], mkv_s[s]
         # ---- the main stream's KV for this step, into the stage's window cache
         lo, hi = _half(hd, pid)
-        gemm_fp8_cols(mxq, wkv[s], wkv_s[s], mkvr, Lp, dim, hd, lo, hi, wd)
+        X.gemm_rows(mx, Lp, dim, wkv4[s], wkv_s[s], mkvr, lo, hi)
         nisa.core_barrier(data=mkvr, cores=(0, 1))
         norm_rows(mkvr, kv_norm_w[s : s + 1], mkv, lt, hd, qdq=False, chunk=hd)
         rope_rows(mkv, mkv, lt, hd, hd, 1, freqs, row_pos, inverse=False, qdq=True)
@@ -367,14 +371,13 @@ def draft_forward(
             cast_rows(xn, dbg[0:Kp, 0:dim], kt, dim, nl.float32)
             nisa.core_barrier(data=dbg, cores=(0, 1))
             return ret()
-        qdq_rows(xn, xq, ptiles, dim)
         lo, hi = _half(q_lora, pid)
-        gemm_fp8_cols(xq, wq_a[s], wq_a_s[s], qa, Kp, dim, q_lora, lo, hi, wd)
+        X.gemm_rows(xn, Kp, dim, wq_a4[s], wq_a_s[s], qa, lo, hi)
         lo, hi = _half(hd, pid)
-        gemm_fp8_cols(xq, wkv[s], wkv_s[s], kvr, Kp, dim, hd, lo, hi, wd)
+        X.gemm_rows(xn, Kp, dim, wkv4[s], wkv_s[s], kvr, lo, hi)
         nisa.core_barrier(data=qa, cores=(0, 1))
         nisa.core_barrier(data=kvr, cores=(0, 1))
-        norm_rows(qa, q_norm_w[s : s + 1], qr, kt, q_lora, qdq=True, chunk=q_lora)
+        norm_rows(qa, q_norm_w[s : s + 1], qr, kt, q_lora, qdq=False, chunk=q_lora)
         norm_rows(kvr, kv_norm_w[s : s + 1], kvd, kt, hd, qdq=False, chunk=hd)
         rope_rows(kvd, kvd, kt, hd, hd, 1, freqs, drow_pos, inverse=False, qdq=True)
         if pid == 0:
@@ -384,7 +387,7 @@ def draft_forward(
         nisa.core_barrier(data=qr, cores=(0, 1))
         nisa.core_barrier(data=kvd, cores=(0, 1))
         lo, hi = _half(heads * hd, pid)
-        gemm_fp8_cols(qr, wq_b[s], wq_b_s[s], q, Kp, q_lora, heads * hd, lo, hi, wd)
+        X.gemm_rows(qr, Kp, q_lora, wq_b4[s], wq_b_s[s], q, lo, hi)
         nisa.core_barrier(data=q, cores=(0, 1))
         rope_rows(q, q, kt, heads * hd, hd, heads, freqs, drow_pos, inverse=False)
         if s == 0 and stage == 12:
@@ -399,8 +402,9 @@ def draft_forward(
         gather_rows(cache, win_slots, kvtab[0:win], tiles_of(win, pid), hd)
         if pid == 0:
             dk = nl.ndarray((PT, hd), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.memset(dk, 0.0)
             nisa.dma_copy(dst=dk[0:K, :], src=kvd[0:K, :])
-            nisa.dma_copy(dst=kvtab[win : win + K, :], src=dk[0:K, :])
+            nisa.dma_copy(dst=kvtab[win:ntab_p, :], src=dk[0 : ntab_p - win, :])
             attn_index_table(idx, kt_all, zcol, wvk, win, zcol, tkin, K, kpad)
             padi = nl.ndarray((PT, kpad), dtype=nl.int32, buffer=nl.sbuf)
             nisa.memset(padi, 0)
@@ -413,9 +417,10 @@ def draft_forward(
         nisa.dma_copy(dst=sink_t, src=attn_sink[s, 0:heads, 0:1])
         ntok = cdiv(K, CORES)
         tok0 = 0 if pid == 0 else K - ntok
+        kTs = build_kT(kvtab, ntab, hd)
 
-        def tok_body(i, tok0=tok0):
-            attn_token_body(i, tok0, q, kvtab, idx, o, sink_t, heads, hd, kpad, scale)
+        def tok_body(i, tok0=tok0, kTs=kTs):
+            attn_token_body_ti(i, tok0, q, kvtab, kTs, idx, o, sink_t, heads, hd, kpad, scale)
 
         nl.fori_loop(0, ntok, tok_body)
         nisa.core_barrier(data=o, cores=(0, 1))
@@ -423,7 +428,7 @@ def draft_forward(
             cast_rows(o, dbg[0:Kp, 0 : heads * hd], kt, heads * hd, nl.float32)
             nisa.core_barrier(data=dbg, cores=(0, 1))
             return ret()
-        rope_rows(o, oq, kt, heads * hd, hd, heads, freqs, drow_pos, inverse=True, qdq=True)
+        rope_rows(o, oq, kt, heads * hd, hd, heads, freqs, drow_pos, inverse=True, qdq=False)
         if pid == 0:
             pado = nl.ndarray((PT, heads * hd), dtype=nl.bfloat16, buffer=nl.sbuf)
             nisa.memset(pado, 0.0)
@@ -431,14 +436,10 @@ def draft_forward(
         nisa.core_barrier(data=oq, cores=(0, 1))
         for g in range(ngroups):
             lo, hi = _half(o_lora, pid)
-            gemm_fp8_cols(oq[0:Kp, g * g_in : (g + 1) * g_in], wo_a[s, g * o_lora : (g + 1) * o_lora],
-                          wo_a_s[s, g * o_lora // BLK : (g + 1) * o_lora // BLK],
-                          z[0:Kp, g * o_lora : (g + 1) * o_lora], Kp, g_in, o_lora, lo, hi, wd)
+            X.gemm_rows(oq, Kp, g_in, wo_a4[s], wo_a_s[s], z, g * o_lora + lo, g * o_lora + hi, x_col0=g * g_in)
         nisa.core_barrier(data=z, cores=(0, 1))
-        qdq_rows(z, zq, ptiles, o_lora_total)
-        nisa.core_barrier(data=zq, cores=(0, 1))
         lo, hi = _half(dim, pid)
-        gemm_fp8_cols(zq, wo_b[s], wo_b_s[s], cc_src, Kp, o_lora_total, dim, lo, hi, wd, out_dtype=nl.float32)
+        X.gemm_rows(z, Kp, o_lora_total, wo_b4[s], wo_b_s[s], cc_src, lo, hi, out_dtype=nl.float32)
         nisa.core_barrier(data=cc_src, cores=(0, 1))
         if s == 0 and stage == 15:
             cast_rows(cc_src, dbg[0:Kp, 0:dim], kt, dim, nl.float32)
@@ -462,6 +463,7 @@ def draft_forward(
             padn2 = nl.ndarray((PT, dim), dtype=nl.bfloat16, buffer=nl.sbuf)
             nisa.memset(padn2, 0.0)
             nisa.dma_copy(dst=xn2[K:Kp, :], src=padn2[0 : Kp - K, :])
+            nisa.dma_copy(dst=xn2[Kp : Kp + PT, :], src=padn2)
         nisa.core_barrier(data=xn2, cores=(0, 1))
         # ---- MoE: n_experts routed, top-k, plus the shared expert
         if s == 0 and stage == 17:
@@ -473,30 +475,21 @@ def draft_forward(
         zw = nl.ndarray((PT, n_local), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(zw, 0.0)
         nisa.dma_copy(dst=wexp[K:Kp, :], src=zw[0 : Kp - K, :])
-        qdq_rows(xn2, xq, ptiles, dim)
-        first = True
-        for e in range(n_local):
-            if e % CORES != pid:
-                continue
-            gemm_fp4_cols(xq, w1[s, e], s1[s, e], eg, Kp, dim, inter, 0, inter, wd)
-            gemm_fp4_cols(xq, w3[s, e], s3[s, e], eu, Kp, dim, inter, 0, inter, wd)
-            swiglu_rows(eg, eu, wexp, e, ey, ptiles, inter, SWIGLU_LIMIT)
-            qdq_rows(ey, eyq, ptiles, inter)
-            gemm_fp4_cols(eyq, w2[s, e], s2[s, e], eo, Kp, inter, dim, 0, dim, wd)
-            add_rows(eacc, eo, ptiles, dim, first)
-            first = False
+        nisa.dma_copy(dst=wexp[Kp : Kp + PT, :], src=zw)
+        # routed experts over the rows that picked them, into the zeroed accumulator
         lo, hi = _half(inter, pid)
-        gemm_fp8_cols(xq, sh_w1[s], sh_s1[s], eg, Kp, dim, inter, lo, hi, wd)
-        gemm_fp8_cols(xq, sh_w3[s], sh_s3[s], eu, Kp, dim, inter, lo, hi, wd)
+        mk_moe.routed_experts(pid, n_local, Kp, xn2, wexp, w1_4[s], s1[s], w3_4[s], s3[s],
+                              w2_4[s], s2[s], dim, inter, lo, hi, SWIGLU_LIMIT, eacc)
+        X.gemm_rows(xn2, Kp, dim, sh_w1_4[s], sh_s1[s], eg, lo, hi)
+        X.gemm_rows(xn2, Kp, dim, sh_w3_4[s], sh_s3[s], eu, lo, hi)
         swiglu_rows(eg[0:Kp, lo:hi], eu[0:Kp, lo:hi], None, 0, ey[0:Kp, lo:hi], ptiles, hi - lo, SWIGLU_LIMIT)
-        qdq_rows(ey[0:Kp, lo:hi], eyq[0:Kp, lo:hi], ptiles, hi - lo)
-    # The shared expert's weights are replicated on every rank and the model adds its
-    # output ONCE, after the expert all-reduce. Every rank adds it to its partial here,
-    # scaled by 1/world, so the world sum carries it exactly once (a power-of-two
-    # scale of the fp32 partial is exact).
-        gemm_fp8_kslice(eyq, sh_w2[s], sh_s2[s], eo32, Kp, lo, hi, dim, wd, out_dtype=nl.float32,
-                        out_scale=1.0 / world)
-        add_rows(eacc, eo32, ptiles, dim, first)
+        # The shared expert's weights are replicated on every rank and the model adds its
+        # output ONCE, after the expert all-reduce. Every rank adds it to its partial here,
+        # scaled by 1/world, so the world sum carries it exactly once (a power-of-two
+        # scale of the fp32 partial is exact).
+        X.gemm_rows(ey, Kp, hi - lo, sh_w2_4[s], sh_s2[s], eo32, 0, dim, x_col0=lo, krow0=lo // 4,
+                    out_dtype=nl.float32, out_scale=1.0 / world)
+        add_rows(eacc, eo32, ptiles, dim, False)
         for r0, nr in ptiles:
             t = nl.ndarray((PT, dim), dtype=nl.float32, buffer=nl.sbuf)
             nisa.dma_copy(dst=t[0:nr, :], src=eacc[r0 : r0 + nr, :])

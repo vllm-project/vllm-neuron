@@ -130,9 +130,68 @@ class LayerWeights:
     window: int
 
 
+def mx_fp8(weight: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """An fp8 `[n, k]` e4m3 weight with `[n/32, k/32]` e8m0 scales, re-laid for the
+    tensor engine's MX matmul (`kernels.mk_mx`): `[k/4, n]` int32 words packing
+    `k = 4p + j` in byte `j`, and `[k/32, n]` scale bytes (one per k-group and column).
+    CPU in, CPU out."""
+    n, k = weight.shape
+    w = weight.reshape(n, k // 4, 4).permute(1, 0, 2).contiguous().view(torch.int32).reshape(k // 4, n)
+    s = scale[: n // 32, : k // 32].t().repeat_interleave(32, 1).contiguous()
+    return w, s
+
+
+def mx_fp4(packed: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """An fp4 `[n, k/2]` e2m1-pair weight with `[n, k/32]` e8m0 scales: `[k/4, n]` int16
+    words (nibble `j` = `k = 4p + j`) and `[k/32, n]` scale bytes."""
+    n, k2 = packed.shape
+    w = packed.reshape(n, k2 // 2, 2).permute(1, 0, 2).contiguous().view(torch.int16).reshape(k2 // 2, n)
+    s = scale[:, : k2 // 16].t().contiguous()
+    return w, s
+
+
 def _fp8(linear) -> tuple[torch.Tensor, torch.Tensor]:
+    """The MX layout of an fp8 linear's weight, converted once on the host and kept
+    on the device beside the original (`linear._mx`)."""
     assert linear.storage == "fp8", linear.storage
-    return linear.weight, linear.scale
+    mx = getattr(linear, "_mx", None)
+    if mx is None:
+        w, s = mx_fp8(_host(linear.weight), _host(linear.scale))
+        mx = (w.to(linear.weight.device), s.to(linear.weight.device))
+        linear._mx = mx
+    return mx
+
+
+def _experts_mx(ffn) -> dict:
+    """The resident expert pool in the MX layout: `w1`/`w3` `[E, dim/4, inter]` int16
+    with `[E, dim/32, inter]` scales, `w2` `[E, inter/4, dim]` with `[E, inter/32, dim]`.
+    Converted once; the original stacked buffers are released afterwards (the
+    megakernel is the only reader of a resident pool), which keeps the device
+    footprint where it was."""
+    mx = getattr(ffn, "stacked_mx", None)
+    if mx is not None:
+        return mx
+    stacked = ffn.stacked
+    device = stacked["w1.weight"].device
+    mx = {}
+    for name in ("w1", "w2", "w3"):
+        ws, ss = [], []
+        wh, sh = _host(stacked[f"{name}.weight"]), _host(stacked[f"{name}.scale"])
+        for e in range(wh.shape[0]):
+            w, s = mx_fp4(wh[e], sh[e])
+            ws.append(w)
+            ss.append(s)
+        mx[f"{name}.weight"] = torch.stack(ws).to(device)
+        mx[f"{name}.scale"] = torch.stack(ss).to(device)
+    ffn.stacked_mx = mx
+    # release the per-op layout: the slot views first, then the stacks
+    for slot in ffn.cache_slots:
+        for name in ("w1", "w2", "w3"):
+            linear = getattr(slot, name)
+            linear.weight = None
+            linear.scale = None
+    ffn.stacked = {k: None for k in stacked}
+    return mx
 
 
 def layer_weights(model, block) -> LayerWeights:
@@ -183,12 +242,13 @@ def layer_weights(model, block) -> LayerWeights:
             _dev((_host(eg.q_weight).float() * _host(eg.k_weight).float()).reshape(1, -1), device),
         ]
     stacked = getattr(ffn, "stacked", None)
-    if stacked is None or not ffn.resident:
+    if (stacked is None and getattr(ffn, "stacked_mx", None) is None) or not ffn.resident:
         raise RuntimeError(
             f"layer {layer_id}: the routed experts are not resident as one stacked buffer "
             "(the expert pool streams). The megakernel needs them on the device; raise "
             "DEEPSEEK_V41_EXPERT_CACHE_BYTES."
         )
+    stacked = _experts_mx(ffn)
     moe = [
         _t_f32(ffn.gate.weight, device), _row(ffn.gate.bias, device),
         torch.tensor([[float(ffn.experts_start_idx)]], dtype=torch.float32, device=device),
@@ -396,6 +456,12 @@ def draft_weights(model) -> list:
 
     stack_host = stack
 
+    def stack8(get):
+        """The stages' fp8 linears in the MX layout, stacked: `[3, K/4, N]`, `[3, K/32, N]`."""
+        pairs = [_fp8(get(s)) for s in stages]
+        return (_dev(torch.stack([_host(w) for w, _ in pairs]), device),
+                _dev(torch.stack([_host(sc) for _, sc in pairs]), device))
+
     head = [
         *_fp8(s0.main_proj), _row(s0.main_norm.weight, device), model.embed_weight,
         torch.tensor([[int(model.rank * model.part_vocab_size)]], dtype=torch.int32, device=device),
@@ -407,25 +473,26 @@ def draft_weights(model) -> list:
         *[_t_f32(s.hc_ffn.fn, device) for s in stages],
         stack_host(lambda s: s.hc_ffn.base), stack_host(lambda s: s.hc_ffn.scale),
         stack(lambda s: s.ffn_norm.weight),
-        stack(lambda s: s.attn.wq_a.weight), stack(lambda s: s.attn.wq_a.scale), stack(lambda s: s.attn.q_norm.weight),
-        stack(lambda s: s.attn.wq_b.weight), stack(lambda s: s.attn.wq_b.scale),
-        stack(lambda s: s.attn.wkv.weight), stack(lambda s: s.attn.wkv.scale), stack(lambda s: s.attn.kv_norm.weight),
-        stack(lambda s: s.attn.wo_a.weight), stack(lambda s: s.attn.wo_a.scale),
-        stack(lambda s: s.attn.wo_b.weight), stack(lambda s: s.attn.wo_b.scale),
+        *stack8(lambda s: s.attn.wq_a), stack(lambda s: s.attn.q_norm.weight),
+        *stack8(lambda s: s.attn.wq_b),
+        *stack8(lambda s: s.attn.wkv), stack(lambda s: s.attn.kv_norm.weight),
+        *stack8(lambda s: s.attn.wo_a),
+        *stack8(lambda s: s.attn.wo_b),
         stack_host(lambda s: s.attn.attn_sink.float().reshape(-1, 1)),
         model._mk_freqs(s0.attn),
     ]
     for s in stages:
-        if getattr(s.ffn, "stacked", None) is None or not s.ffn.resident:
+        if (getattr(s.ffn, "stacked", None) is None and getattr(s.ffn, "stacked_mx", None) is None) or not s.ffn.resident:
             raise RuntimeError("the DSpark stages' routed experts are not resident as stacked buffers")
+    mxs = [_experts_mx(s.ffn) for s in stages]
     moe = [
         *[_t_f32(s.ffn.gate.weight, device) for s in stages],
         stack_host(lambda s: s.ffn.gate.bias),
         torch.tensor([[float(s0.ffn.experts_start_idx)]], dtype=torch.float32, device=device),
-        *[stack(lambda s, k=k: s.ffn.stacked[k]) for k in ("w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale")],
-        stack(lambda s: s.ffn.shared_experts.w1.weight), stack(lambda s: s.ffn.shared_experts.w1.scale),
-        stack(lambda s: s.ffn.shared_experts.w3.weight), stack(lambda s: s.ffn.shared_experts.w3.scale),
-        stack(lambda s: s.ffn.shared_experts.w2.weight), stack(lambda s: s.ffn.shared_experts.w2.scale),
+        *[_dev(torch.stack([_host(m[k]) for m in mxs]), device)
+          for k in ("w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale")],
+        *stack8(lambda s: s.ffn.shared_experts.w1), *stack8(lambda s: s.ffn.shared_experts.w3),
+        *stack8(lambda s: s.ffn.shared_experts.w2),
     ]
     tail = [
         _row(last.norm.weight, device), model.head_weight,

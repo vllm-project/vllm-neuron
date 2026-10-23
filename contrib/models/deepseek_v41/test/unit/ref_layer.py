@@ -13,6 +13,22 @@ from deepseek_v41 import model as M
 from deepseek_v41.weight_loader import dequant_block_fp4, dequant_block_fp8
 
 
+def act_quant_mx(x: torch.Tensor, block: int = 32) -> torch.Tensor:
+    """The tensor engine's own activation quantization (`nisa.quantize_mx`, what the
+    megakernels' MX GEMMs apply as they stage their inputs): per 32-wide block of a
+    row, scale `2^(floor(log2 amax) - 7)` (2^-127 for an all-zero block), e4m3fn
+    rounding, back to bf16. Compared with `model.act_quant_dequant` (scale
+    `2^ceil(log2(amax / 224))`) the grid is the same except when the block's amax
+    lies in `[1.75, 2) x 2^e`, where this keeps one more bit."""
+    T, n = x.shape
+    xb = x.float().reshape(T, n // block, block)
+    amax = xb.abs().amax(-1, keepdim=True)
+    e = torch.floor(torch.log2(amax.clamp_min(2.0 ** -127)))
+    scale = torch.exp2(e - 7.0)
+    q = (xb / scale).to(torch.float8_e4m3fn).float() * scale
+    return q.reshape(T, n).to(torch.bfloat16)
+
+
 def rmsnorm(x, w, eps):
     xf = x.float()
     return (xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps) * w.float()).to(torch.bfloat16)
@@ -75,10 +91,10 @@ def attention_ref(p, x_n, cache, idx, ccache=None):
     hd, rd = 512, 64
     cos = p["freqs"][idx.row_pos.reshape(-1).long(), :32]
     sin = p["freqs"][idx.row_pos.reshape(-1).long(), 32:]
-    xq = M.act_quant_dequant(x_n, 32)
+    xq = act_quant_mx(x_n)
     qa = linear_fp8(xq, p["wq_a"], p["wq_a_s"])
     qr = rmsnorm(qa, p["q_norm_w"], 1e-20)
-    q = linear_fp8(M.act_quant_dequant(qr, 32), p["wq_b"], p["wq_b_s"])
+    q = linear_fp8(act_quant_mx(qr), p["wq_b"], p["wq_b_s"])
     heads = q.shape[1] // hd
     q = q.reshape(T, heads, hd)
     q = torch.cat([q[..., :-rd], rope(q[..., -rd:], cos, sin)], -1)
@@ -123,7 +139,7 @@ def attention_ref(p, x_n, cache, idx, ccache=None):
         o[t] = ((p16 @ g) / den).to(torch.bfloat16)
     o_pre = o
     o = torch.cat([o[..., :-rd], rope(o[..., -rd:], cos, sin, True)], -1)
-    oq = M.act_quant_dequant(o.reshape(T, heads * hd), 32)
+    oq = act_quant_mx(o.reshape(T, heads * hd))
     ngroups = p["wo_a"].shape[0] // 1024
     hpg = heads // ngroups
     zs = []
@@ -132,9 +148,30 @@ def attention_ref(p, x_n, cache, idx, ccache=None):
                        p["wo_a"][gi * 1024 : (gi + 1) * 1024], p["wo_a_s"][gi * 32 : (gi + 1) * 32])
         zs.append(z)
     z = torch.cat(zs, -1)
-    zq = M.act_quant_dequant(z, 32)
+    zq = act_quant_mx(z)
     partial = F.linear(zq.float(), dequant_block_fp8(p["wo_b"], p["wo_b_s"], 32, torch.float32))
     return partial, kv, q, o_pre
+
+
+def oproj_ref(p, o, idx):
+    """The attention output projections from a given `o` [T, heads, hd] (bf16, before
+    the inverse rope): the fp32 `wo_b` partial, as `attention_ref` computes it."""
+    T, heads, hd = o.shape
+    rd = 64
+    cos = p["freqs"][idx.row_pos.reshape(-1).long(), :32]
+    sin = p["freqs"][idx.row_pos.reshape(-1).long(), 32:]
+    o = torch.cat([o[..., :-rd], rope(o[..., -rd:], cos, sin, True)], -1)
+    oq = act_quant_mx(o.reshape(T, heads * hd))
+    ngroups = p["wo_a"].shape[0] // 1024
+    hpg = heads // ngroups
+    zs = []
+    for gi in range(ngroups):
+        z = linear_fp8(oq[:, gi * hpg * hd : (gi + 1) * hpg * hd],
+                       p["wo_a"][gi * 1024 : (gi + 1) * 1024], p["wo_a_s"][gi * 32 : (gi + 1) * 32])
+        zs.append(z)
+    z = torch.cat(zs, -1)
+    zq = act_quant_mx(z)
+    return F.linear(zq.float(), dequant_block_fp8(p["wo_b"], p["wo_b_s"], 32, torch.float32)), z
 
 
 def moe_ref(p, x_n, cfg, shared=True, routed=True, shared_scale=1.0):
@@ -148,7 +185,7 @@ def moe_ref(p, x_n, cfg, shared=True, routed=True, shared_scale=1.0):
     top = torch.topk(sel, cfg.num_experts_per_tok, dim=-1).indices
     w = scores.gather(1, top)
     w = w / (w.sum(-1, keepdim=True) + 1e-20) * cfg.routed_scaling_factor
-    xq = M.act_quant_dequant(x_n, 32)
+    xq = act_quant_mx(x_n)
     acc = torch.zeros(T, x_n.shape[1], dtype=torch.float32)
     lo = int(p["expert_lo"])
     wes = []
@@ -161,13 +198,13 @@ def moe_ref(p, x_n, cfg, shared=True, routed=True, shared_scale=1.0):
         u = linear_fp4(xq, p["w3"][e], p["s3"][e]).float()
         y = (F.silu(g.clamp(max=cfg.swiglu_limit)) * u.clamp(-cfg.swiglu_limit, cfg.swiglu_limit) * we)
         y = y.to(torch.bfloat16)
-        yq = M.act_quant_dequant(y, 32)
+        yq = act_quant_mx(y)
         acc += linear_fp4(yq, p["w2"][e], p["s2"][e]).float()
     if shared:
         g = linear_fp8(xq, p["sh_w1"], p["sh_s1"]).float()
         u = linear_fp8(xq, p["sh_w3"], p["sh_s3"]).float()
         y = (F.silu(g.clamp(max=cfg.swiglu_limit)) * u.clamp(-cfg.swiglu_limit, cfg.swiglu_limit)).to(torch.bfloat16)
-        yq = M.act_quant_dequant(y, 32)
+        yq = act_quant_mx(y)
         acc += shared_scale * F.linear(yq.float(), dequant_block_fp8(p["sh_w2"], p["sh_s2"], 32, torch.float32))
     return acc, top, w, torch.cat(wes, -1), logits
 
@@ -225,7 +262,7 @@ def index_ref(p, x_n, qr, idx, kcache, ratio, read_len, cfg, world):
     nh = p["ix_wq_b"].shape[0] // 128
     cos = p["freqs"][idx.row_pos.reshape(-1).long(), :32]
     sin = p["freqs"][idx.row_pos.reshape(-1).long(), 32:]
-    q = linear_fp8(M.act_quant_dequant(qr, 32), p["ix_wq_b"], p["ix_wq_b_s"]).reshape(T, nh, 128)
+    q = linear_fp8(act_quant_mx(qr), p["ix_wq_b"], p["ix_wq_b_s"]).reshape(T, nh, 128)
     q = torch.cat([q[..., :-rd], rope(q[..., -rd:], cos, sin)], -1)
     q = M.fp4_quant_dequant(q, 32)
     w = F.linear(x_n.float(), p["ix_wproj"].float()).to(torch.bfloat16).float()

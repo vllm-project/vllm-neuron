@@ -15,7 +15,7 @@ supports.
 | `model.py` | The implementation: attention, MoE, hyper-connections, engram, the DSpark stages, `forward`, `get_kv_spec`, `bind_kv_cache`, `load_weights`. |
 | `weight_loader.py` | Checkpoint-to-parameter mapping and sharding. Module names are the checkpoint's own paths, so "is this the weight the reference uses here" is a string comparison against `model.safetensors.index.json`. |
 | `drafter.py` | `DSparkProposer`, the in-model speculative proposer registered with `vllm_neuron.vllm.spec_decode`. |
-| `kernels/` | The NKI kernels. `kernels/__init__.py` maps each kernel entry point to its call site in `model.py`. `layer_kernel.py` and `draft_kernel.py` are the two megakernels (see below); `mk_common.py` / `mk_compress.py` are their shared helpers. |
+| `kernels/` | The NKI kernels. `kernels/__init__.py` maps each kernel entry point to its call site in `model.py`. `layer_kernel.py` and `draft_kernel.py` are the two megakernels (see below); `mk_mx.py` (the block-scaled fp8/fp4 GEMMs on the tensor engine's MX matmul), `mk_moe.py` (the token-grouped routed experts), `mk_common.py` / `mk_compress.py` are their shared helpers. |
 | `mk_model.py` | The bridge from the modules to the megakernels: gathers each block's weights into the kernel's argument order once, builds the per-step index columns, and runs the kernels. |
 | `mk_host.py` | The host-side index arithmetic (window and compressed slot tables, compression groups) over the scheduler's block tables. |
 | `chat_template.jinja` | The checkpoint's chat template, applied to cases with `role=user`. |
@@ -71,16 +71,50 @@ now allocates and the slots view into), turns the scheduler's block tables into
 the kernels' index columns per step (`mk_host.py`), and hands the top-k, the
 compressed/index caches and the DSpark taps down the stack.
 
-The kernels' arithmetic is the reference's (fp8 activation round trips before
+The kernels' arithmetic is the reference's (fp8 activation quantization before
 the quantized GEMMs, fp32 interiors, bf16 roundings where the model has them)
 and is checked component by component against a CPU reference by the unit
-tests (`test/unit/test_layer.py`, `test/unit/test_draft.py`). Two things are
-deliberately simpler than the per-op path: the routed experts run **dense**
-over every row of the step (the routing weight is zero where a row did not
-pick the expert), which costs nothing at decode and is wasteful at long
-prefill; and the candidate-block mask of layer 20 is assumed a no-op, which
-holds while the context reads at most `candidate_topk_blocks x
-candidate_block_size` compressed groups (16384 tokens) and is asserted.
+tests (`test/unit/test_layer.py`, `test/unit/test_draft.py`). One thing is
+deliberately simpler than the per-op path: the candidate-block mask of layer 20
+is assumed a no-op, which holds while the context reads at most
+`candidate_topk_blocks x candidate_block_size` compressed groups (16384 tokens)
+and is asserted.
+
+Three parts of the kernels are written for the Trainium3 hardware directly:
+
+* **Native block-scaled matmuls** (`kernels/mk_mx.py`). The checkpoint's fp8 /
+  fp4 weights are microscaled already (one e8m0 scale per 32 contraction
+  elements), which is the OCP MX format the NeuronCore-v4 tensor engine
+  multiplies natively with `nisa.nc_matmul_mx`: one instruction contracts 512
+  elements (128 partitions x 4 packed), dequantizes inside the array and runs at
+  four times the bf16 rate (the quad-row successor of Trn2's double-row fp8
+  mode; a plain `double_row` matmul has no block scales and cannot take these
+  weights). `mk_model.mx_fp8` / `mx_fp4` re-lay each weight once on the host as
+  `[K/4, N]` words (`k = 4p + j` in byte / nibble `j`, so a hardware scaling
+  group is exactly one checkpoint block) with `[K/32, N]` scale bytes, and the
+  kernels stream them into SBUF with plain DMAs; activations are quantized on
+  chip as they are staged (four strided PE transposes per 512-chunk into the
+  packed layout, then `nisa.quantize_mx`). The resident expert pool is converted
+  in place and the per-op layout released (`mk_model._experts_mx`).
+* **Keys selected on chip** (`kernels/mk_common.py:attn_token_body_ti`). The
+  window and compressed slot rows of a step are gathered from the paged caches
+  by indirect DMA into a slot table, DMA-transposed once into a resident
+  `[hd, rows]` SBUF table, and each token's QK matmul reads its `window + top-k`
+  columns of that table through tensor indirection (`.indirect(index)` on the
+  moving operand, the slot indices in the 16-partition snake the engine reads,
+  replicated per quadrant) -- no per-token transposes. The values are gathered
+  per token by indirect DMA (`.ap(vector_offset=...)`) for the PV matmul. The
+  per-token transpose path remains for slot tables too large to keep resident
+  (96 KiB a partition, ~12K rows).
+* **Token-grouped routed experts** (`kernels/mk_moe.py`). The row ids that
+  picked each local expert are compacted on the GpSimd engine
+  (`nonzero_with_count` over the mask rows), and every expert runs a runtime-
+  bounded `fori_loop` over `ceil(rows / 128)` tiles: gather the rows (indirect
+  DMA), stage, w1 / w3, SwiGLU x routing weight, w2, and scatter-add the fp32
+  partial into the accumulator with `dma_compute`. An expert nobody picked
+  costs nothing, not even its weight reads; no `(row, expert)` pair with a zero
+  weight is computed. Both cores run every expert with the same trip count (an
+  LNC=2 dynamic loop must) and split each tile along the intermediate axis.
 One detail of the in-kernel reduction: the shared expert's weights are
 replicated on every rank and the model adds its output once, after the expert
 all-reduce; the kernels add it on every rank scaled by `1/world` (an exact
@@ -98,9 +132,18 @@ The checkpoint declares `quant_method: fp8`, `activation_scheme: dynamic`,
 `weight_block_size: [32, 32]`, `scale_fmt: ue8m0`, `expert_dtype: fp4`.
 Attention and dense projections are fp8 with `ue8m0` scales over 32x32 blocks;
 routed experts are fp4. `kernels/blockquant.py` implements the fp4, fp8 and bf16
-GEMMs, including a two-core column split — for fp8 the scale row for a split
-starting at weight row `lo` has to be read from `lo // 32`, which
-`_fp8_2core_span` handles.
+GEMMs of the per-op path (weights decoded to bf16), including a two-core column
+split — for fp8 the scale row for a split starting at weight row `lo` has to be
+read from `lo // 32`, which `_fp8_2core_span` handles. The megakernels multiply
+the same weights natively on the tensor engine (`kernels/mk_mx.py`, above); their
+activation quantization is the hardware's (`quantize_mx`: scale
+`2^(floor(log2 amax) - 7)`, e4m3fn rounding), which keeps one more bit than the
+per-op path's `224`-peak round trip in the blocks whose amax lies in
+`[1.75, 2) x 2^e` and is otherwise the same grid. The fp8 MX matmul rounds its
+four-element partial products internally (about `2.4e-4` relative per GEMM
+output, a seventh of the bf16 output rounding; fp4 weights `5e-5`), which the
+fp8 re-quantizations downstream amplify, so the two paths agree to about twice
+the per-op path's own bf16 noise on a layer's stream.
 
 Pass `quantization="fp8"` or leave it unset. Anything else is rejected by
 `factory.py`.
