@@ -53,9 +53,22 @@
 # max_model_len turns on segmented prefill by default, which this port does
 # not implement (the factory rejects it at load).
 #
+# Defaults are sized for 8K-token inputs and 1K-token outputs at up to 32
+# concurrent requests (contrib/benchmark's 8192 / 1024 cells):
+#   SEQ=9472             an 8K input with +3% jitter (8435) + 1024 output tokens,
+#                        rounded up to a multiple of 128
+#   BS=32                max_num_seqs
+#   PREFILL_BUCKETS      [8448, $SEQ]: the last bucket must equal SEQ (no
+#                        segmented prefill); 8448 keeps an 8K prompt from
+#                        padding to SEQ. Add buckets for shorter prompts, e.g.
+#                        [1024, 2048, 4096, 8448, 9472]; each is a compile.
+#   DECODE_BUCKETS       [1, 4, 8, 16, 32]: one decode graph per batch size
+# The server holds int(X) requests, X from its "Maximum concurrency for
+# <SEQ> tokens per request" log line.
+#
 # Usage:
-#   bash serve_mimo.sh                 # BS=32, SEQ=1024
-#   BS=1 SEQ=512 bash serve_mimo.sh
+#   bash serve_mimo.sh
+#   BS=1 SEQ=512 PREFILL_BUCKETS='[512]' DECODE_BUCKETS='[1]' bash serve_mimo.sh
 
 set -x
 
@@ -64,7 +77,9 @@ SERVED_NAME="${SERVED_NAME:-MiMo-V2.5}"
 # auto | bf16 | fp8 (routed experts); read by the workers.
 export MIMO_V2_5_EXPERT_DTYPE="${EXPERT_DTYPE:-${MIMO_V2_5_EXPERT_DTYPE:-auto}}"
 BS="${BS:-32}"
-SEQ="${SEQ:-1024}"
+SEQ="${SEQ:-9472}"
+PREFILL_BUCKETS="${PREFILL_BUCKETS:-[8448, $SEQ]}"
+DECODE_BUCKETS="${DECODE_BUCKETS:-[1, 4, 8, 16, 32]}"
 PORT="${PORT:-8000}"
 
 # Mandatory on this instance: the Neuron runtime otherwise probes for an EFA
@@ -75,6 +90,13 @@ export NEURON_SKIP_EFA_AFFINITY=1
 # The native compile route (the default); set explicitly so the Precompile Cache
 # is on and a warm start skips the trace.
 export VLLM_NEURON_BACKEND=${VLLM_NEURON_BACKEND:-neuron_native}
+
+# The native route compiles the decode graphs once per rank (64 here): cap
+# neuronx-cc's parallel jobs per rank (8 can run a 2 TB host out of memory with
+# several buckets), and give the first 64-rank executions more than the
+# runtime's 30 s default, which otherwise looks like a collective hang.
+export VLLM_NEURON_PARALLEL_COMPILE_WORKERS=${VLLM_NEURON_PARALLEL_COMPILE_WORKERS:-4}
+export NEURON_RT_EXEC_TIMEOUT=${NEURON_RT_EXEC_TIMEOUT:-1200}
 
 echo "Starting $SERVED_NAME server: $MODEL (BS=$BS, SEQ=$SEQ, TP=64, EP=64, experts=$MIMO_V2_5_EXPERT_DTYPE)"
 
@@ -93,8 +115,8 @@ vllm serve "$MODEL" \
         \"neuron_config\": {
             \"quantization\": \"bf16\",
             \"ep_degree\": 64,
-            \"num_batched_tokens_buckets\": [$SEQ],
-            \"num_seqs_buckets\": [$BS],
+            \"num_batched_tokens_buckets\": $PREFILL_BUCKETS,
+            \"num_seqs_buckets\": $DECODE_BUCKETS,
             \"on_device_sampling_config\": {\"all_greedy\": true}
         },
         \"encoder_neuron_config\": {\"num_encoder_input_buckets\": [2048]}
