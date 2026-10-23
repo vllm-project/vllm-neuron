@@ -183,41 +183,61 @@ stock `nkilib`) gives coherent greedy output from `scripts/run.py`.
 
 Setup:
 
-- trn2.48xlarge, bf16, greedy.
+- trn2.48xlarge, bf16, greedy, native PyTorch route
+  (`VLLM_NEURON_BACKEND=neuron_native`).
 - 1024-token input, 128-token output, `max_model_len` 2048.
 - `scripts/benchmark_latency.py`: streamed TTFT, then TPOT over the remaining
   tokens; 3 rounds after a warmup round.
 - Batch = `--max-num-seqs` = the number of concurrent requests.
-- Each run had the instance to itself. The TP=4 checkpoints used one Neuron
-  device (`NEURON_VISIBLE_DEVICES=0-3`); running three of them side by side
-  added ~20% to 2B's batch-1 TPOT.
+- The TP=4 checkpoints used one Neuron device each, four runs side by side
+  (`NEURON_VISIBLE_DEVICES=0-3`, `4-7`, ...). `--gpu-memory-utilization` 0.65
+  for 27B and 0.72 for 35B-A3B.
 
 | Checkpoint | Parallelism | Batch | TTFT mean | TPOT mean | Output tok/s (aggregate) |
 | --- | --- | --- | --- | --- | --- |
-| Qwen3.5-2B | TP=4 | 1 | 49.3 ms | 7.01 ms | 136.3 |
-| Qwen3.5-2B | TP=4 | 4 | 125.6 ms | 14.53 ms | 259.2 |
-| Qwen3.5-2B | TP=4 | 8 | 201.2 ms | 25.60 ms | 296.3 |
-| Qwen3.5-27B | TP=4 | 1 | 298.0 ms | 53.60 ms | 18.0 |
-| Qwen3.5-27B | TP=4 | 4 | 821.0 ms | 173.32 ms | 22.4 |
-| Qwen3.5-27B | TP=4 | 8 | 1348.1 ms | 161.67 ms | 46.8 |
-| Qwen3.5-35B-A3B | TP=4 | 1 | 232.9 ms | 34.54 ms | 27.7 |
-| Qwen3.5-35B-A3B | TP=4 | 4 | 599.2 ms | 77.40 ms | 49.0 |
-| Qwen3.5-35B-A3B | TP=4 | 8 | 1058.3 ms | 143.79 ms | 53.0 |
-| Qwen3.5-397B-A17B | TP=64, EP=8 | 1 | 225.8 ms | 51.77 ms | 18.8 |
-| Qwen3.5-397B-A17B | TP=64, EP=8 | 4 | 563.0 ms | 59.50 ms | 63.0 |
-| Qwen3.5-397B-A17B | TP=64, EP=8 | 8 | 959.8 ms | 69.07 ms | 105.2 |
+| Qwen3.5-2B | TP=4 | 1 | 47.9 ms | 6.89 ms | 138.7 |
+| Qwen3.5-2B | TP=4 | 4 | 109.3 ms | 10.89 ms | 342.3 |
+| Qwen3.5-2B | TP=4 | 8 | 202.2 ms | 33.32 ms | 230.7 |
+| Qwen3.5-27B | TP=4 | 1 | 291.8 ms | 35.41 ms | 26.7 |
+| Qwen3.5-27B | TP=4 | 4 | 755.7 ms | 50.40 ms | 71.4 |
+| Qwen3.5-27B | TP=4 | 8 | 1697.5 ms | 478.85 ms | 16.4 |
+| Qwen3.5-35B-A3B | TP=4 | 1 | 228.9 ms | 18.17 ms | 50.5 |
+| Qwen3.5-35B-A3B | TP=4 | 4 | 561.1 ms | 33.99 ms | 104.9 |
+| Qwen3.5-35B-A3B | TP=4 | 8 | 1035.2 ms | 65.76 ms | 109.0 |
 
-397B used `--prefill-buckets 1024,2048`; the others used the plugin's default
-prefill buckets.
+Against the same checkpoints on the XLA route (`VLLM_NEURON_BACKEND=vllm_neuron`,
+earlier on SDK 2.33, each run alone on the instance):
 
-Against the 0.24 port (below):
+| Checkpoint | Batch 1 TPOT | Batch 4 TPOT | Batch 8 TPOT |
+| --- | --- | --- | --- |
+| Qwen3.5-2B | 7.01 ms | 14.53 ms | 25.60 ms |
+| Qwen3.5-27B | 53.60 ms | 173.32 ms | 161.67 ms |
+| Qwen3.5-35B-A3B | 34.54 ms | 77.40 ms | 143.79 ms |
 
-- TTFT is 2.6-3x lower on 2B and ~30% lower on 35B-A3B.
-- 35B-A3B decode is unchanged.
-- 2B decode is ~1.8x slower (7.0 vs 3.9 ms at batch 1). The decode graph's
-  optimization level is not the cause: `QWEN3_5_DENSE_DECODE_OPT_LEVEL=1`
-  measures the same 7.0 ms as the default 3. Not yet explained.
-- 27B's batch-4 TPOT is above its batch-8 TPOT; reproduced in isolation.
+- TTFT is within a few percent of the XLA route (2B 49.3 / 125.6 / 201.2 ms,
+  27B 298.0 / 821.0 / 1348.1 ms, 35B-A3B 232.9 / 599.2 / 1058.3 ms).
+- **Open:** batch 8 on the dense checkpoints is slower than the XLA route
+  (2B 33.3 vs 25.6 ms, 27B 478.9 vs 161.7 ms). 27B is 50.4 ms at batch 4, so
+  something changes between 4 and 8; not yet profiled.
+- **Open:** 397B-A17B (TP=64, EP=8) has not completed on the native route: its
+  batch-1 decode warmup times out in a collective. On the XLA route it measured
+  TTFT 225.8 / 563.0 / 959.8 ms and TPOT 51.77 / 59.50 / 69.07 ms at batch
+  1 / 4 / 8 with `--prefill-buckets 1024,2048`.
+
+Two changes account for most of the native-route decode time:
+
+- **DeltaNet state pages** (`src/kernels/state_cache.py`). Inside the full
+  decode graph, `index_select` over the state pages becomes ~37k small DMAs per
+  page (27B batch 1 was 603.7 ms). `index_copy_` makes the prefill state write
+  slow (35B-A3B TTFT 508 ms). The kernels move each half-page with one
+  hardware-DGE DMA. By default (`QWEN3_5_STATE_KERNEL=auto`) the write kernel
+  is always used and the read kernel only on the dense checkpoints: on the
+  sparse ones the torch gather is fast and the kernel's output costs a spilled
+  HBM transpose per layer (35B-A3B batch 1: 18.2 ms vs 47.7 ms). Overrides:
+  `1` (both), `read`, `write`, `0` (neither).
+- **Decode attention** gathers each KV head's context once and carries the
+  group's query heads in the matmul (2B batch 8: 53.0 -> 33.3 ms). Gathering per
+  query head fetched the same pages 2x (2B) to 6x (27B).
 
 The results below are from the
 earlier in-tree port on vllm-neuron 0.24.0.1.1.0, measured on trn2.3xlarge at
@@ -306,7 +326,7 @@ src/
   deltanet.py      gated DeltaNet mixer (prefill chunked delta rule, decode step)
   moe.py           sparse MoE block (NKI moe_cte / moe_block_tkg kernels)
   flags.py         debug and experiment environment switches
-  kernels/         opt-in NKI kernels for the DeltaNet prefill
+  kernels/         NKI kernels: DeltaNet prefill (opt-in), state-page gather / scatter
 scripts/run.py     offline text generation for all four checkpoints
 test/integration/test_model.py
 ```
