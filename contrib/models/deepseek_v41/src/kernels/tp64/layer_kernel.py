@@ -53,8 +53,7 @@ from .mk_common import (
     build_kT,
     cast_rows,
     cdiv,
-    engram_gate_tile,
-    engram_gather,
+    engram_readout,
     tap_tile,
     gather_rows,
     gemm_fp32,
@@ -87,8 +86,7 @@ def _half(n, pid):
     return lo, hi
 
 
-@nki.jit
-def layer_forward(
+def layer_body(
     stream, pre_mix,
     hca_fn_t, hca_base, hca_scale, attn_norm_w,
     hcf_fn_t, hcf_base, hcf_scale, ffn_norm_w,
@@ -103,8 +101,19 @@ def layer_forward(
     gate_w_t, gate_b, expert_lo, w1, s1, w3, s3, w2, s2,
     sh_w1, sh_s1, sh_w3, sh_s3, sh_w2, sh_s2,
     groups_attn, groups_world, flags,
+    phase="prefill", arch=None, scheme="tp64",
 ):
+    """The block, traced with `phase` ("prefill" / "decode"), the block's `arch`
+    `(ratio, is_kv_src, is_idx_src, has_engram, tap)` and the `scheme` baked in;
+    `mk_kernels` makes one `@nki.jit` entry point per combination. The runtime
+    `flags` must agree with `arch`. Under "tp8pp8" `groups_world` is the 8-rank
+    stage: the expert reduce, and the engram table's row sum, span the stage."""
     ratio, nspans, win, stage, is_kv_src, is_idx_src, has_engram, tap, kver = flags
+    if arch is not None:
+        assert (ratio, is_kv_src, is_idx_src, has_engram, tap) == tuple(arch), (
+            f"flags {flags} disagree with the baked archetype {arch}")
+    # Under both schemes the engram read-out is in-kernel, over `groups_world` (the
+    # stage under "tp8pp8", where the n-gram table is sharded over the stage's ranks).
     T, hc, dim = stream.shape
     Tp = pad_to(T, PT)
     width = hc * dim
@@ -126,7 +135,9 @@ def layer_forward(
     nspan_rows = nwin + read_len
     ntab = nspans * nspan_rows
     ntab_p = pad_to(ntab, PT)
-    resident = kt_resident(ntab, hd)
+    # Prefill keeps the slot table transposed in SBUF and selects keys on chip;
+    # decode's handful of tokens are cheaper with the per-token transposes.
+    resident = phase == "prefill" and kt_resident(ntab, hd)
     topk = min(topk_in.shape[1], read_len) if ratio else 0
     kpad = pad_to(win + topk, KTILE)
     L = T // nspans
@@ -214,31 +225,12 @@ def layer_forward(
     sc_src = nl.ndarray((Tp, max(read_len, 1)), dtype=nl.float32, buffer=nl.shared_hbm, name="sc_src")
     sc_dst = nl.ndarray((Tp, max(read_len, 1)), dtype=nl.float32, buffer=nl.shared_hbm, name="sc_dst")
     sc16 = nl.ndarray((Tp, max(read_len, 1)), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="sc16")
-    ncol = hash_ids.shape[1]
-    ehd = etable.shape[1]
-    e_in = ncol * ehd
-    e_out = e_wkv.shape[1] if has_engram else 0
     stream0 = nl.ndarray((T, width) if has_engram else (1, 1), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="stream0")
-    emb = nl.ndarray((Tp, max(e_in, 1)), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="emb")
-    emb_sum = nl.ndarray((Tp, max(e_in, 1)), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="emb_sum")
-    ekv = nl.ndarray((Tp, max(e_out, 1)), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="ekv")
 
     # ------------------------------------------------------------------ 0. engram, tap
     if has_engram:
-        engram_gather(hash_ids, etable, erow_start, emb, mine, ncol, ehd, etable.shape[0])
-        if pid == 0 and T < Tp:
-            padz = nl.ndarray((PT, e_in), dtype=nl.bfloat16, buffer=nl.sbuf)
-            nisa.memset(padz, 0.0)
-            nisa.dma_copy(dst=emb[T:Tp, :], src=padz[0 : Tp - T, :])
-        nisa.core_barrier(data=emb, cores=(0, 1))
-        # Exactly one rank holds each row, so the bf16 sum is exact.
-        ncc.all_reduce(srcs=[emb], dsts=[emb_sum], replica_group=rg_world, op=nl.add)
-        lo, hi = _half(e_out, pid)
-        X.gemm_rows(emb_sum, Tp, e_in, e_wkv4, e_wkv_s, ekv, lo, hi)
-        nisa.core_barrier(data=ekv, cores=(0, 1))
-        for r0, nr in mine:
-            engram_gate_tile(r0, nr, strm, ekv, e_qk, stream0, hc, dim)
-        nisa.core_barrier(data=stream0, cores=(0, 1))
+        engram_readout(pid, mine, T, Tp, hc, dim, hash_ids, etable, erow_start, e_wkv4, e_wkv_s, e_qk,
+                       strm, stream0, rg_world)
         strm = stream0
     if tap:
         for r0, nr in mine:
@@ -536,3 +528,8 @@ def layer_forward(
     nisa.core_barrier(data=out_stream, cores=(0, 1))
     nisa.core_barrier(data=ffn_pre, cores=(0, 1))
     return out_stream, ffn_pre, topk_out, tap_out, window_kv_cache, compress_kv_cache, pool_kv, pool_score, index_k_cache
+
+
+#: The generic entry (every archetype, prefill, the flat world): what the unit tests
+#: and `compile_layer.py` trace. The model runs the specialized entries of `mk_kernels`.
+layer_forward = nki.jit(layer_body)

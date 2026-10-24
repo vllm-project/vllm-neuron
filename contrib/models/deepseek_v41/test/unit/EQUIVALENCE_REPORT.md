@@ -322,3 +322,274 @@ there). Draft acceptance stays within 1-4 points of round 1 in both directions
 (the 8k cells lose 4 points, the 2k cells gain 1-2), the distributional check
 this port has. Verdict: no regression, TPOT -55%, decode tok/s x2.1 at short
 contexts and x1.4 at 8k.
+
+---
+
+# Round 3: one kernel per phase, archetype and scheme; the TP8 x PP8 pipeline
+
+`kernels/mk_kernels.py` traces a distinct `@nki.jit` entry per (phase, block
+archetype, scheme) from the shared bodies. `DEEPSEEK_V41_SCHEME=tp8pp8` runs
+vLLM pipeline parallelism (`tensor_parallel_size=8, pipeline_parallel_size=8`):
+each of the 8 stages builds and loads only its own 5 blocks, reduces over its 8
+ranks, and hands its activations to the next stage through the in-kernel pair
+collective of `kernels/pp_kernels.py`; the scheduler keeps 8 batches in flight.
+The plugin's V1 model runner gained the non-last-stage path for it
+(`neuron_model_runner._pp_not_last_stage`). An earlier, model-internal lockstep
+version of the scheme (64 tensor-parallel workers, stages run one after another)
+was dropped on 2026-10-24: it overlapped nothing. See `src/README.md`
+"Megakernels" for the design.
+
+| Probe (`test/unit/probe_pp_subset.py`, 16 ranks = 2 stages) | Result |
+|---|---|
+| stage 0 runs kernel A three times, stage 1 kernel B (another NEFF) five times, each an all-reduce over its stage with the full 16-rank mesh declared; then the pair hand-off, then the pair hand-off again after stage 1 ran two more B | 16/16 ranks PASS, 28 s (2026-10-24 00:43): a collective runs on the ranks of its group while the other ranks run other kernels |
+
+## Stage 2 (round 3): components, random weights
+
+| Component (test) | rel_l2 | R | Result |
+|------------------|--------|---|--------|
+| stage boundary, 2 stages x 8 ranks (`test_pp.py`, T = 6 / 128): stream, pre_mix, top-k, compressed-KV and index-key rows at the written slots, untouched rows | 0 (bit-exact) | 0 | PASS |
+| final broadcast (stream, pre_mix, taps) from the last stage's lead rank | 0 (bit-exact) | 0 | PASS |
+| engram kernel (`engram_tp8pp8`) vs the CPU read-out, table sharded over 16 ranks | 7.8e-4 | - | PASS |
+| tp8pp8 block kernel, 48 experts a rank: MoE from the kernel's own input, T = 6 / 128 / 2048 | 5.8e-3 / 3.9e-3 / 3.8e-3 | 3.5 / 2.4 / 2.3 | PASS |
+| tp8pp8 block kernel: attention output, T = 128 | 7.7e-3 | - | PASS |
+| tp64 decode-phase entry (per-token key transposes) at T = 128: attention output / projections from the kernel's `o` / MoE | 7.7e-3 / 3.5e-3 / 4.5e-3 | - / 2.1 / 2.7 | PASS |
+| tp64 generic entry, full layer T = 6 (unchanged by the split) | 3.6e-2 stream (as round 2) | - | PASS |
+
+The stage plan (`mk_model.PipePlan`, checked on the CPU): 5 blocks a stage,
+boundaries after blocks 4, 9, ..., 34, the two pair layouts each cover all 64
+ranks, the DSpark taps (blocks 37-39) land in the last stage, the kv sources in
+stages 0, 1, 2 and 4 with their consumers downstream of them.
+
+## A hang found by the verifier (round 3), and its fix
+
+The first tp64 verifier run of round 3 passed the long-needle phase and hung in
+the short phase at the second prompt's prefill (every rank but 63 in a device
+timeout, "missing collectives status ... waiting for barrier END"; rank 63 with
+no runtime error and one extra graph compile). `TORCH_LOGS=recompiles` named it:
+rank 63 alone re-traced the forward's tail frame (collapse, norm, head, logits
+all-gather, sampler, draft seeds) on the guard
+`not ___dict_contains((2048, float32, neuron:63), self._vocab_pad_slots)`: the
+`-inf` bias of the padded last vocab shard was a lazily filled per-rank dict, so
+the frame's guards differed between rank 63 and the rest after the first step,
+and the rank recompiled a graph with a collective the other 63 were already
+executing. Round 2 never saw it because its per-layer Python loop split the
+frame differently. Fix: the bias is a non-persistent buffer built in
+`allocate_staging_buffers` (`model.py:vocab_pad_bias`). After the fix the three
+short cases (`verify_short.py --case short-prose,smoke-test,trivia-capital-france`)
+pass end to end (23:31). The rule and the knobs that located it
+(`DEEPSEEK_V41_MK_TRACE`, `DEEPSEEK_V41_MK_IN_FLIGHT`, `NEURON_RT_EXEC_TIMEOUT`) are
+in `src/README.md` "Megakernels".
+
+## Stage 7 (round 3): verifier and bench, both schemes
+
+### Verifier (`test/integration/test_model.py`, both phases)
+
+| Scheme | Engine | Result |
+|---|---|---|
+| tp64 | `tensor_parallel_size=64` | PASSED 2026-10-23 23:44 (10:11 wall): needle `5591-C67` recalled, trivia answered `Paris`; the short phase ran its prompts one at a time (`config.MAX_NUM_SEQS` clamps engines to one sequence unless `DEEPSEEK_V41_MAX_NUM_SEQS` is set) (the hang of the first attempt is the vocab-pad bias story above). Report copied to `/mnt/nvme/ds41_s1_verifier_report.json`. |
+| tp8pp8 | `tensor_parallel_size=8, pipeline_parallel_size=8`, synchronous scheduling | PASSED 2026-10-24 03:48 (12:21 wall, kernels cached): needle recalled, trivia answered; report copied to `/mnt/nvme/ds41_pp_verifier_report.json` (log `/mnt/nvme/ds41_pp_integration6.log`). |
+| tp64 (final code) | per-scheme kernel packages | PASSED 2026-10-24 22:30 (17:20 wall): needle `5591-C67` recalled, trivia answered `Paris`; `test/unit/verifier_reports/tp64_2026-10-24.json` |
+| tp8pp8 (final code) | per-scheme kernel packages, output-carried drafts, batched drafter | PASSED 2026-10-24 23:10 (39:54 wall, kernels compiled on the first requests): needle recalled, trivia answered; `test/unit/verifier_reports/tp8pp8_2026-10-24.json`. Both final runs serve one sequence at a time; the batched paths are checked by `verify_short.py` at `max_num_seqs=4` (17:33 / 17:51: both schemes' texts identical to their one-sequence runs) |
+
+The pipeline scheme's bring-up found, in order: the registered model class has to
+declare vLLM's `SupportsPP`; the attention metadata is keyed by the stage's first
+block; the drafter kernel wants vocab shards in 512-column multiples
+(`VOCAB_SHARD_ALIGN`); the async scheduler cannot feed stages before the sampling
+one; under the batch queue, drafts must not be attached to a request before
+that step's sampled tokens (first a deferral in
+`NeuronScheduler.update_draft_token_ids`, replaced on 2026-10-24 by drafts
+carried inside each step's `ModelRunnerOutput` -- see "The draft RPC" below);
+and the
+two sides of a stage boundary must be traced from identical shapes -- the
+runtime hashes a program's collective ops per replica group and refused the
+first 512-row boundary with "replica group signature mismatch ... between
+peers" (the lockstep version's short-phase failure too) because the receiver's
+placeholder top-k was `[T, 512]` while the index-source kernel's real top-k is
+`min(index_topk, read_len)` = 384 columns at a 608-token context
+(`mk_model.topk_width` now sizes both sides; the boundary kernel is also one
+program for both roles, the role a runtime weight, and `test_pp.py --T 512
+--R 257` covers the shape). With those,
+the needle-phase steps reproduce the flat scheme's draft proposals token for
+token (seeds 223, 26307, 5770, 305; one trailing draft differs by an fp8 flip),
+and the short phase run on its own (`verify_short.py`, 3 prompts, `max_num_seqs=4`)
+PASSED at 03:34 with the flat scheme's first four proposals exactly
+(`[2581, 3720, ...]`, `[1309, 3287, ...]`, `[16145, 16, ...]`, `[671, 3072, ...]`);
+its decode steps ran one request per batch (`config.MAX_NUM_SEQS` clamped the
+engine to one sequence, see the batched runs below).
+
+### The draft RPC (2026-10-24, found by the 8192-token pipeline cells)
+
+The pipeline bench's `in8192` cells died on the first request: the last stage
+traced the sampler with a 1-row logits tensor against 6-row sampling metadata
+(`Size does not match at dimension 0 expected index torch.Size([6, 1]) to be no
+larger than self torch.Size([1, 256])`, `server_ctx8448_ms1.log`). The prompt
+prefills in 2048-token chunks, and the drafter runs on every chunk; the engine
+collects drafts with `take_draft_token_ids` after every scheduled step, so a
+non-final chunk's (meaningless) drafts were attached to the request while its
+later chunks were still in flight, the request became schedulable with five spec
+tokens and no bonus token, and the model treated that 5-row single-request step
+as a prefill. The same RPC explains why no two batches ever overlapped under the
+batch queue: it is a collective RPC answered by the output rank -- the last
+stage -- whose worker only replies after the `execute_model` queued ahead of it,
+i.e. after the step has drained all 8 stages, so `EngineCore.post_step` blocked
+the engine until each step finished before it could schedule the next one.
+
+Fix (plugin): the last stage's runner puts each step's drafts inside that step's
+`ModelRunnerOutput` (`neuron_pp_drafts`, only for requests that committed a token
+in the step; the worker-to-engine queue pickles the object, so the attribute
+survives), `NeuronScheduler.update_from_output` attaches them right after the
+sampled tokens of the same step, and `vllm/patches/pp_draft_patch.py` makes
+`post_step` skip the RPC under pipeline parallelism with synchronous scheduling.
+The same module sizes the executor's shared-memory RPC ring (10 chunks by
+default, freed only once all 64 workers have read them, two messages a step, so
+the engine would block after about five steps in flight) to `4 x
+pipeline_parallel_size` chunks.
+
+**Batched requests on the pipeline (2026-10-24).** Every pipeline run at
+`max_num_seqs=4` -- before and after the hand-off change -- "passed" the
+verifier's substring check while producing garbage (`ButTheParis France of
+France? is S`, acceptance 2%); `max_num_seqs=1` on the pipeline and both
+settings on the flat scheme were exact. Per-stage dumps (`_dump` on every
+stage's first rank; `/mnt/nvme/dump_pp3_ms1` vs `dump_pp3_ms4`, forwards
+aligned by their input ids) put the prefill and the first two decode steps of
+each request bit-exact and the third decode step's *first-stage embedding* at
+`[ids[4], ids[5], 0, 0, 0, 0]`: a four-row shift, four being the drafts the step
+before had accepted. Root cause in the plugin's `_update_states` on the stages
+before the last: vLLM's scheduler ships a cached request only the bonus token
+it schedules now, so the accepted drafts never reach `req_state.output_token_ids`
+there; a request re-added to the persistent batch after another request's batch
+ran (every step, with several requests on the pipeline) is rebuilt from that
+short list, its spec tokens land four rows early and the input slice at
+`num_computed_tokens` reads past them. One request alone never leaves the batch
+(the `token_ids_cpu` path), which is why `max_num_seqs=1` was exact. Fix: the
+runner keeps the drafts it scheduled for a request (`pp_prev_spec_token_ids`)
+and restores the accepted prefix before appending the bonus token. The flat
+scheme is unaffected (its only rank is the last one). With the fix the three
+prompts at `max_num_seqs=4` complete **byte-identical** to the one-sequence
+pipeline run (`verify_short.py`, 07:21, `/mnt/nvme/ds41_tp8pp8_short_ms4d.log`;
+52% of the real draft slots accepted, as on the flat scheme), with the three
+batches in flight at once: the last stage finishes one every 45-50 ms and each
+request advances every ~200 ms by 3-6 tokens. The trace also shows where a
+pipeline step's time goes: stages 0-6 spend ~5-6 ms a batch; the last stage
+~50 ms (host prep 4, kernel launches 5, recv + its 5 blocks + norm/head/sampler
+~21, the drafter and its read-back 13-18, with outliers to ~120 ms), so the
+sampling stage is the pipeline's bottleneck and a lone request's ~95 ms step is
+mostly that stage. Measurements with the hand-off and this fix follow in the
+bench section.
+
+### The batched drafter (2026-10-24)
+
+With ten requests on the pipeline (`max_num_seqs=10`, `in512_bs10`) the last
+stage spent ~150 ms of its ~180 ms step drafting: `run_draft` launched the
+drafter kernel once per sequence (~15 ms each, its cost being the kernel's
+collectives, not its arithmetic), so the step gave 49 tok/s in aggregate at a
+179 ms TPOT (vLLM acceptance 38%; `test/performance/history/reports/r3_05_tp8pp8_ms10_0813_seqdraft.json`).
+`kernels/draft_kernel.py` now drafts every sequence of a step in one launch:
+the B sequences' draft blocks are the B x 5 rows of one tile, the host builds
+their per-row columns on the device (`mk_model._draft_rows`: token id,
+position, window validity base, slot-table base, markov row), each sequence
+has its own 128-slot window and draft block in the kernel's slot table at
+`b * 256`, and the token loop drafts token i of all sequences at once (one
+markov all-reduce and one argmax all-gather per token instead of one per token
+per sequence). `kernel_version` is now scoped per kernel kind (block / draft /
+pp), so a drafter edit no longer invalidates the block kernels' NEFFs.
+
+Unit tests (8 ranks, random weights; final run 16:49-17:24 on the per-scheme kernel packages). The flat scheme's per-sequence drafter (`kernels/tp64/draft_kernel.py`, `test_draft_seq.py`) passes on 8 ranks at decode (start 200) and at the prefill step (start 0), with the same ids as before the pipeline work. The pipeline scheme's batched drafter (`kernels/tp8pp8/draft_kernel.py`, `test_draft.py`):
+
+| Case | Result |
+|---|---|
+| `--B 1` (decode, start 200) | PASS on 8 ranks: ids identical to the per-sequence kernel's on the same inputs (`[1234, 14338, 12076, 1641, 11658, 6225]`, the two mismatches against the CPU reference sit at top-2 gaps of 0.26 / 0.59, below the 3.0 criterion), main-stream KV rows written within 1.2e-2 of the reference, untouched rows exact |
+| `--B 3` (starts 200 / 237 / 274, taps 5 / 4 / 3) | PASS: **batch-invariant bit for bit** -- every sequence's ids, confidence (rel 0) and KV rows equal its own single-sequence launch |
+| `--B 1 --start 0` (prefill phase) | PASS (the test now calls the phase-specialized entry `draft_prefill_tp64`; the generic entry's default phase had made this case untestable) |
+| `--B 4 --start 300` | PASS: ids and KV rows batch-invariant bit for bit on 8 ranks; the confidence differs from the single-sequence launch at the 1e-3..4e-2 level when sequences share an expert tile (the random-weight MoE amplifies the accumulation order; the proposer does not consume the confidence, so that comparison is informational) |
+| `--B 10` (starts 200..245) | PASS on 8 ranks: KV rows batch-invariant bit for bit; drafted ids identical to each sequence's lone launch for 9 of 10 sequences; sequence 7 differs from its fourth token on, where the reference's top-2 gap is 0.142 (a near-tie; the batched launch picks the reference's token there), which the gate accepts with the reference check's criterion (gap <= 3.0) |
+
+The confidence comparison against the CPU reference is informational now: the
+per-sequence kernel gives the same 0.9 relative difference on this test (the
+confidence inherits the stream's amplified rounding on random weights, see
+round 2), so it never was a measure of the kernel.
+
+On the real model (`verify_short.py`, three prompts at `max_num_seqs=4`, 10:56):
+the pipeline scheme's three completions are byte-identical to the one-sequence
+reference again, and the run accepts exactly the same 42 of 320 draft slots as
+the per-sequence drafter did -- the drafts themselves are unchanged, only the
+number of launches is (one per step instead of one per sequence). The flat
+scheme at `max_num_seqs=4` (three prompts in one batch, 11:06) is byte-identical
+to its earlier run as well.
+
+**What it bought, and what it did not (traced `in512_bs10` at `max_num_seqs=10`,
+14:13, `test/performance/history/reports/r3_08_tp8pp8_ms10_1353_traced.json`; the trace came from the server log of that run with
+`DEEPSEEK_V41_MK_TRACE=1 VLLM_NEURON_PP_TRACE=1`).** The last stage now spends 66-69 ms a batch
+whether the batch holds one sequence or ten (host prep 6-8, launches 5-6, recv +
+blocks + tail 35-43, draft + read-back 14-19 ms; before, ten sequences drafted
+one after another at ~15 ms each). But of 1101 decode steps the stage ran, 965
+carried **one** sequence and 136 carried ten: vLLM re-dispatches each request on
+its own the moment its previous step's output is in, so with ten requests in
+flight the pipeline runs mostly single-sequence batches, and every such batch
+is padded to the engine's 60-row decode bucket and costs the same as a full
+one. That, not the drafter, is why the batched cells stay at 46-50 tok/s in
+aggregate (TPOT 180-195 ms a stream, acceptance 37-38%): ~15 batches/s through
+the last stage times ~2 sequences a batch on average. Smaller decode buckets
+for small batches, or holding ready requests back briefly so they merge, are the
+next levers; neither is attempted here.
+
+### Bench (`test/performance/run_bench.py`, both schemes, 2026-10-24)
+
+Final run 17:51-22:11, with each scheme on its own kernel package
+(`kernels/tp64/`, `kernels/tp8pp8/`): the flat scheme's block kernels and its
+per-sequence drafter are the round-2 kernels unchanged, and the pipeline
+scheme has its own copies (with the batched drafter and the stage boundary).
+Each cell runs on its own engine (`max_model_len` = input + 256,
+`max_num_seqs=1`): 8 prompts at concurrency 1 for the `bs1` cells, 10 prompts
+at concurrency 10 for the `bs10` cells (queued on the one-sequence engine, so
+their TTFT is queueing), 128 output tokens, medians, vLLM's spec-decode
+acceptance over the cell.
+
+| Cell | TTFT p50 ms (tp64 / tp8pp8) | TPOT p50 ms | decode tok/s | accept % |
+|------|-----------------------------|-------------|--------------|----------|
+| in512_bs1 | 562 / 918 | 31.9 / 49.4 | 28.0 / 17.4 | 46 / 46 |
+| in512_bs10 | 20925 / 33667 | 30.5 / 49.5 | 28.6 / 17.4 | 47 / 46 |
+| in1024_bs1 | 1061 / 1465 | 31.4 / 47.9 | 25.7 / 17.0 | 47 / 50 |
+| in1024_bs10 | 23058 / 34394 | 31.0 / 47.4 | 25.7 / 17.3 | 48 / 50 |
+| in2048_bs1 | 1957 / 2452 | 30.0 / 49.5 | 22.2 / 14.6 | 49 / 41 |
+| in2048_bs10 | 27824 / 42867 | 30.0 / 49.6 | 22.2 / 14.7 | 49 / 42 |
+| in8192_bs1 | 8549 / 4160 | 33.6 / 51.6 | 10.0 / 11.9 | 42 / 47 |
+| in8192_bs10 | 65726 / 53129 | 33.6 / 51.8 | 10.0 / 11.9 | 42 / 46 |
+
+**The flat scheme matches round 2 on every cell** (`bench_report.mk2.json`):
+TPOT within 0.3 ms (31.9 / 30.5 / 31.4 / 31.0 / 30.0 / 30.0 / 33.6 / 33.6 ms
+against 31.6 / 30.5 / 31.1 / 31.0 / 29.7 / 29.7 / 33.8 / 33.5), decode
+throughput within 1%, TTFT within 2%, acceptance within 0.4 points. (An
+interim run at 13:00-15:25, while the two schemes still shared the drafter and
+a narrower launch window, was ~2 ms a token slower on the flat scheme; that is
+what the per-scheme packages removed.) Every run of the day, interim ones included, is indexed with its
+report and console log in `test/performance/history/README.md`.
+
+The pipeline's single-stream TPOT is 47-52 ms: a lone request crosses seven
+stage boundaries and the sampling stage serially and uses one stage at a
+time. Its TTFT is higher at short inputs (the hand-offs again) and lower at
+8192 (4.2 s against 8.5 s: the 2048-token prefill chunks pipeline across the
+stages).
+
+Ten concurrent requests on engines built for them (`DEEPSEEK_V41_MAX_NUM_SEQS=10`,
+`--batch-sizes 10`; `bench_report.<scheme>_ms10.json`):
+
+| Cell (max_num_seqs=10) | TTFT p50 ms (tp64 / tp8pp8) | TPOT p50 ms | decode tok/s | per-stream tok/s | accept % |
+|------------------------|-----------------------------|-------------|--------------|------------------|----------|
+| in512_bs10 | 3091 / 1633 | 116.2 / 162.0 | 59.2 / 55.0 | 8.6 / 6.2 | 23 / 38 |
+| in2048_bs10 | 10805 / 6013 | 145.3 / 197.7 | 35.9 / 40.1 | 6.9 / 5.1 | 35 / 37 |
+
+The flat scheme batches the ten sequences into one step and drafts them one
+after another (its drafter is unchanged): 59 tok/s at 512 input tokens, 36 at
+2048. The pipeline reaches 55 / 40 tok/s, about 3x its single-stream figure;
+as traced above, most of its batches hold one sequence padded to the 60-row
+bucket. **Open item:** with ten sequences in flight, draft acceptance drops on
+both schemes against the same prompts served one at a time (flat 23% / 35%,
+pipeline 38% / 37%, against 46-49% single-stream). The in-model counter shows
+13-27% from the first steps on the flat scheme, so a share of the drafts
+reaches the wrong request or the wrong position once several sequences are
+batched (the runner's "proposer returned 10 draft row(s) for 9 request(s)"
+warning fires at request completion). Every generated text is still exact
+(the target model verifies every draft), so this costs throughput only. This
+port could never run more than one sequence before 2026-10-24
+(`config.MAX_NUM_SEQS`), so there is no earlier batched number to compare to.

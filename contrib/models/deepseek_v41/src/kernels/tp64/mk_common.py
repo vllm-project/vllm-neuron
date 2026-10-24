@@ -14,10 +14,12 @@ reference: the values written to the KV caches round-trip through `_qdq_fp8`
 roundings at the same points as the torch path.
 """
 
+import nki.collectives as ncc
 import nki.isa as nisa
 import nki.language as nl
 
-from .blockquant import (  # noqa: F401 - re-exported for the megakernels
+from . import mk_mx as X
+from ..blockquant import (  # noqa: F401 - re-exported for the megakernels
     BLK,
     PT,
     _gemm,
@@ -901,6 +903,36 @@ def engram_gather(ids_hbm, table_hbm, row_start_hbm, emb_hbm, tiles, ncol, hd, r
             g16 = nl.ndarray((PT, hd), dtype=nl.bfloat16, buffer=nl.sbuf)
             nisa.tensor_copy(dst=g16[0:nr, :], src=gf[0:nr, :])
             nisa.dma_copy(dst=emb_hbm[r0 : r0 + nr, j * hd : (j + 1) * hd], src=g16[0:nr, :])
+
+
+def engram_readout(pid, mine, T, Tp, hc, dim, hash_ids, etable, erow_start, e_wkv4, e_wkv_s, e_qk,
+                   strm, stream0, rg_table):
+    """The engram read-out of a block, both cores: gather this rank's shard rows of the
+    n-gram table, sum the shards over `rg_table` (one rank holds each row, so the
+    bf16 sum is exact), the fp8 `wkv` projection (this core's output columns), and
+    the gate into `stream0[T, hc*dim]` from `strm`. Allocates its own scratch."""
+    ncol = hash_ids.shape[1]
+    ehd = etable.shape[1]
+    e_in = ncol * ehd
+    e_out = e_wkv4.shape[1]
+    emb = nl.ndarray((Tp, e_in), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="emb")
+    emb_sum = nl.ndarray((Tp, e_in), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="emb_sum")
+    ekv = nl.ndarray((Tp, e_out), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="ekv")
+    engram_gather(hash_ids, etable, erow_start, emb, mine, ncol, ehd, etable.shape[0])
+    if pid == 0 and T < Tp:
+        padz = nl.ndarray((PT, e_in), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.memset(padz, 0.0)
+        nisa.dma_copy(dst=emb[T:Tp, :], src=padz[0 : Tp - T, :])
+    nisa.core_barrier(data=emb, cores=(0, 1))
+    ncc.all_reduce(srcs=[emb], dsts=[emb_sum], replica_group=rg_table, op=nl.add)
+    tiles = e_out // PT
+    a = (tiles + 1) // 2
+    lo, hi = (0, a * PT) if pid == 0 else (a * PT, e_out)
+    X.gemm_rows(emb_sum, Tp, e_in, e_wkv4, e_wkv_s, ekv, lo, hi)
+    nisa.core_barrier(data=ekv, cores=(0, 1))
+    for r0, nr in mine:
+        engram_gate_tile(r0, nr, strm, ekv, e_qk, stream0, hc, dim)
+    nisa.core_barrier(data=stream0, cores=(0, 1))
 
 
 def engram_gate_tile(r0, nr, h_hbm, kv_hbm, w_hbm, out_hbm, hc, dim, chunk=1024):

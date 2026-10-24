@@ -112,15 +112,19 @@ REPLICATE = ShardRule(None, "no free axis; every rank needs the whole tensor")
 
 #: Alignment the unembedding's vocab shard is padded to, and the number is the
 #: tensor engine's partition width because that is what the GEMM tiles on.
-VOCAB_SHARD_ALIGN = 128
+#: 512: the drafter megakernel tiles its vocab-parallel head and Markov embedding
+#: in 512-column chunks, so a shard has to be a multiple of 512 (129280 over 8
+#: ranks is 16160 = 126.25 x 128, which it rejects; 16384 it takes). 64 ranks get
+#: 2048 either way, and the last rank's pad stays 1792 under both schemes.
+VOCAB_SHARD_ALIGN = 512
 
 
 def vocab_shard_width(vocab_size: int, world_size: int) -> int:
     """Rows of the vocab-parallel embedding and head that one rank holds.
 
-        129280, 1 rank  -> 129280   (129280 = 1010 x 128)
-        129280, 2 ranks ->  64640   ( 64640 =  505 x 128)
-        129280, 4 ranks ->  32384   ( 32320 =  252.5 x 128, so round up)
+        129280,  1 rank  -> 129536   (129280 = 252.5 x 512, so round up)
+        129280,  8 ranks ->  16384   ( 16160 = 31.56 x 512)
+        129280, 64 ranks ->   2048   (  2020 =  3.95 x 512)
     """
     exact = -(-vocab_size // world_size)
     return -(-exact // VOCAB_SHARD_ALIGN) * VOCAB_SHARD_ALIGN
@@ -1061,7 +1065,12 @@ _EXPERT_CACHE_BYTES = int(
 #: HBM, per rank, to spend holding engram table shards. Both tables together, so
 #: 6 GiB covers the 5.72 GiB two 64-rank shards come to in bf16.
 _ENGRAM_TABLE_BYTES = int(
-    os.environ.get("DEEPSEEK_V41_ENGRAM_TABLE_BYTES", 6 << 30)
+    os.environ.get(
+        "DEEPSEEK_V41_ENGRAM_TABLE_BYTES",
+        # Under the pipeline scheme a stage holds at most one table, sharded over
+        # its 8 ranks (~23 GiB bf16 a rank); the flat scheme two 64-rank shards.
+        (26 << 30) if os.environ.get("DEEPSEEK_V41_SCHEME", "tp64") == "tp8pp8" else (6 << 30),
+    )
 )
 
 #: True once `weight_loader.load_weights` has established that every weight this
@@ -4084,44 +4093,104 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.vocab_pad = max(
             0, (self.rank + 1) * self.part_vocab_size - config.vocab_size
         )
-        #: `(width, dtype, device) -> bias`, filled by `_vocab_pad_bias`. Same
-        #: idea as `_layer_io_slots`: one buffer per shape, so the mask is not
-        #: rebuilt per forward and the graph's retained inputs do not grow.
-        self._vocab_pad_slots: dict[tuple, torch.Tensor] = {}
+        #: `[part_vocab_size]` fp32, zero on real columns and `-inf` on the pad:
+        #: a buffer built here, on every rank, never a lazily filled per-rank
+        #: cache. The forward's tail (norm, logits, the gather, the sampler) is
+        #: one dynamo frame, and dynamo guards on every Python-side value it
+        #: reads; a dict that only the padded rank fills made that rank, alone,
+        #: re-trace the frame on its next prefill-shaped step and recompile its
+        #: all-gather graph while the other 63 ranks already sat in the
+        #: collective -- the whole engine hung (2026-10-23, verifier short phase).
+        #: Built on `allocate_staging_buffers`' device (the module is constructed
+        #: on the meta device).
+        self.register_buffer("vocab_pad_bias", None, persistent=False)
 
-        self.register_buffer(
-            "embed_weight",
-            torch.empty(self.part_vocab_size, config.hidden_size, dtype=torch.bfloat16),
-        )
-        self.layers = nn.ModuleList(
-            [
-                Block(
-                    config, layer_id, self.world_size, self.rank,
+        #: Where this rank sits (`mk_model.PipePlan.from_groups`): the flat scheme
+        #: (one tensor-parallel group of 64) or the pipeline scheme (vLLM's 8 stages
+        #: of 8). A stage builds, loads and runs only its own blocks; their MoE is
+        #: built with the stage's tensor-parallel rank and width (48 experts a rank)
+        #: and the attention is sharded 8 ways within the stage, as it already is in
+        #: the flat scheme. The embedding lives on the first stage (and the last,
+        #: whose DSpark stages embed the drafted ids); the norm, the head and the
+        #: DSpark stages on the last.
+        self.mk_plan = mk_model.PipePlan.from_groups(config.num_hidden_layers)
+        plan = self.mk_plan
+        if plan.pp > 1 and not _MEGAKERNEL:
+            raise NotImplementedError("pipeline_parallel_size > 1 runs on the megakernel path only")
+        if plan.pp > 1 and plan.tp != self.world_size:
+            raise RuntimeError(f"stage width {plan.tp} != tensor-parallel world {self.world_size}")
+        self.block_ids: list[int] = plan.owned()
+        if plan.is_first or plan.is_last:
+            self.register_buffer(
+                "embed_weight",
+                torch.empty(self.part_vocab_size, config.hidden_size, dtype=torch.bfloat16),
+            )
+        else:
+            self.embed_weight = None
+        block_tp, block_rank = plan.tp, plan.stage_rank
+        if plan.pp > 1:
+            logger.info(
+                "deepseek_v41: pipeline scheme -- vLLM runs %d stages x %d tensor-parallel ranks; "
+                "this rank (global %d) is rank %d of stage %d, holds blocks %d-%d with %d of the "
+                "%d routed experts and %d-way attention, reduces over its stage, and hands its "
+                "activations to the next stage through the in-kernel collectives of "
+                "kernels/pp_kernels.py",
+                plan.pp, plan.tp, plan.rank, plan.stage_rank, plan.stage,
+                self.block_ids[0], self.block_ids[-1], config.n_routed_experts // block_tp,
+                config.n_routed_experts, self.attn_tp,
+            )
+        # A `ModuleDict` keyed by the layer id, so the state-dict paths stay
+        # `layers.<layer_id>.*` whichever blocks this rank holds.
+        self.layers = nn.ModuleDict(
+            {
+                str(layer_id): Block(
+                    config, layer_id, block_tp, block_rank,
                     self._max_batch_size(),
                     attn_tp=self.attn_tp, attn_rank=self.attn_rank,
                     attn_group=None if self.attn_group_is_world
                     else self.attn_tp_group,
                 )
-                for layer_id in range(config.num_hidden_layers)
-            ]
+                for layer_id in self.block_ids
+            }
         )
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.register_buffer(
-            "head_weight",
-            torch.empty(self.part_vocab_size, config.hidden_size, dtype=torch.bfloat16),
-        )
-        self.mtp = nn.ModuleList(
-            [
-                DSparkBlock(
-                    config, stage, self.world_size, self.rank,
-                    self._max_batch_size(),
-                    attn_tp=self.attn_tp, attn_rank=self.attn_rank,
-                    attn_group=None if self.attn_group_is_world
-                    else self.attn_tp_group,
-                )
-                for stage in range(config.num_nextn_predict_layers)
-            ]
-        )
+        self.blocks_by_id: dict[int, Block] = {
+            layer_id: self.layers[str(layer_id)] for layer_id in self.block_ids
+        }
+        #: The kv-source block whose cache rows cross the boundary into this stage
+        #: (`mk_model.shipped_source_id`), when another stage owns it: its attention
+        #: module stands in for the source here -- the compressor and indexer weights
+        #: the consumers' kernel arguments borrow, and the caches the boundary fills
+        #: (`bind_kv_cache`). Loaded from the source layer's own checkpoint keys.
+        self.src_attn = nn.ModuleDict()
+        shipped = mk_model.shipped_source_id(config, self.block_ids[0]) if plan.pp > 1 else None
+        if shipped is not None and shipped not in self.blocks_by_id:
+            self.src_attn[str(shipped)] = Attention(
+                config, shipped, self.attn_tp, self._max_batch_size(),
+                replicas=1 if not self.attn_group_is_world else block_tp // self.attn_tp,
+                attn_group=None if self.attn_group_is_world else self.attn_tp_group,
+            )
+        if plan.is_last:
+            self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+            self.register_buffer(
+                "head_weight",
+                torch.empty(self.part_vocab_size, config.hidden_size, dtype=torch.bfloat16),
+            )
+            self.mtp = nn.ModuleList(
+                [
+                    DSparkBlock(
+                        config, stage, self.world_size, self.rank,
+                        self._max_batch_size(),
+                        attn_tp=self.attn_tp, attn_rank=self.attn_rank,
+                        attn_group=None if self.attn_group_is_world
+                        else self.attn_tp_group,
+                    )
+                    for stage in range(config.num_nextn_predict_layers)
+                ]
+            )
+        else:
+            self.norm = None
+            self.head_weight = None
+            self.mtp = nn.ModuleList([])
 
         #: Set by `weight_loader.load_weights`. The handle on the streamed
         #: families; `forward` reaches the routed experts and the engram rows
@@ -4353,6 +4422,10 @@ class DeepseekV41ForCausalLM(nn.Module):
 
         for layer_id in range(config.num_hidden_layers):
             add_block(f"layers.{layer_id}", layer_id)
+        # The pipeline stage's replica of the kv source it receives rows from
+        # (`src_attn`): the source layer's attention rules under the replica's path.
+        for sid in self.src_attn:
+            add_attention(f"src_attn.{sid}", int(sid))
         for stage in range(config.num_nextn_predict_layers):
             add_block(f"mtp.{stage}", config.num_hidden_layers + stage)
 
@@ -4482,7 +4555,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         """
         dtype = self.config.torch_dtype
         layers = []
-        for layer_id, block in enumerate(self.layers):
+        for layer_id, block in zip(self.block_ids, self.layers.values()):
             layers.append(
                 LayerSpec(
                     name=f"layers.{layer_id}.attn",
@@ -4510,7 +4583,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         """Bind the runtime's window-KV allocation, and allocate the shared
         compressed/index caches the spec deliberately leaves out.
         """
-        attentions = [(f"layers.{i}.attn", b.attn) for i, b in enumerate(self.layers)]
+        attentions = [(f"layers.{i}.attn", b.attn) for i, b in zip(self.block_ids, self.layers.values())]
         attentions += [(f"mtp.{s}.attn", b.attn) for s, b in enumerate(self.mtp)]
 
         for name, attn in attentions:
@@ -4523,8 +4596,8 @@ class DeepseekV41ForCausalLM(nn.Module):
 
         max_len = self._max_sequence_length()
         self._bind_compress_read_ceiling(max_len)
-        device = self.norm.weight.device
-        window = self.layers[0].attn.window_kv_cache
+        device = self.device
+        window = next(iter(self.layers.values())).attn.window_kv_cache
         num_slots = window.shape[0] * window.shape[2]
         kv_bytes = sum(
             t.numel() * t.element_size()
@@ -4553,8 +4626,24 @@ class DeepseekV41ForCausalLM(nn.Module):
                     for t in (attn.compress_kv_cache, attn.index_k_cache)
                 )
             attn.build_freqs_cis(max_len, device)
+        # The replica of a kv source another stage owns: the caches the stage boundary
+        # scatters this step's rows into (no compressor state: the source stage pools).
+        for attn in self.src_attn.values():
+            attn.compress_kv_cache = torch.zeros(
+                num_slots, attn.head_dim, dtype=self.config.torch_dtype, device=device
+            )
+            attn.index_k_cache = torch.zeros(
+                num_slots, self.config.index_head_dim, dtype=self.config.torch_dtype, device=device
+            )
+            own_bytes += sum(
+                t.numel() * t.element_size() for t in (attn.compress_kv_cache, attn.index_k_cache)
+            )
 
-        if self.config.engram_layer_ids and self.ngram_hash is None:
+        owns_engram = any(
+            self.blocks_by_id[lid].engram is not None
+            for lid in self.config.engram_layer_ids if lid in self.blocks_by_id
+        )
+        if owns_engram and self.ngram_hash is None:
             self.ngram_hash = self._build_ngram_hash(device)
             self.ngram_hash.allocate_state(device, num_slots)
 
@@ -4609,7 +4698,11 @@ class DeepseekV41ForCausalLM(nn.Module):
 
             NotImplementedError: Cannot copy out of meta tensor; no data!
         """
-        blocks = list(self.layers) + list(self.mtp)
+        bias = torch.zeros(self.part_vocab_size, dtype=torch.float32)
+        if self.vocab_pad:
+            bias[self.part_vocab_size - self.vocab_pad :] = float("-inf")
+        self.vocab_pad_bias = bias.to(device)
+        blocks = list(self.layers.values()) + list(self.mtp)
         for block in blocks:
             block.ffn.expert_slot.allocate(device)
 
@@ -4618,13 +4711,13 @@ class DeepseekV41ForCausalLM(nn.Module):
             for buffer in blocks[0].ffn.expert_slot.buffers()
         )
         _EXPERT_BYTES[0] = per_expert
-        wanted = sum(block.ffn.n_local_experts for block in blocks)
-        affordable = _EXPERT_CACHE_BYTES // (per_expert * max(1, len(blocks)))
+        wants = [block.ffn.n_local_experts for block in blocks]
+        wanted = sum(wants)
+        n_owned = max(1, sum(1 for w in wants if w))
+        affordable = _EXPERT_CACHE_BYTES // (per_expert * n_owned)
         allocated = sum(
-            block.ffn.allocate_cache_slots(
-                self.config, device, min(block.ffn.n_local_experts, affordable)
-            )
-            for block in blocks
+            block.ffn.allocate_cache_slots(self.config, device, min(want, affordable))
+            for block, want in zip(blocks, wants)
         )
         logger.info(
             "deepseek_v41: expert slots %d of %d owned over %d layers "
@@ -4712,18 +4805,8 @@ class DeepseekV41ForCausalLM(nn.Module):
         """This rank's columns of the logits: `[T, part_vocab_size]`."""
         logits = nki_linear(hidden_states, self.head_weight, None, "bf16").float()
         if self.vocab_pad:
-            logits = logits + self._vocab_pad_bias(logits)
+            logits = logits + self.vocab_pad_bias
         return logits
-
-    def _vocab_pad_bias(self, like: torch.Tensor) -> torch.Tensor:
-        """`[part_vocab_size]`, zero on real columns and `-inf` on the pad."""
-        key = (like.shape[-1], like.dtype, like.device)
-        bias = self._vocab_pad_slots.get(key)
-        if bias is None:
-            bias = torch.zeros(key[0], dtype=like.dtype, device=like.device)
-            bias[key[0] - self.vocab_pad :] = float("-inf")
-            self._vocab_pad_slots[key] = bias
-        return bias
 
     def gather_logits(self, logits_shard: torch.Tensor) -> torch.Tensor:
         """Every rank's columns, concatenated and trimmed to the real vocabulary."""
@@ -4793,15 +4876,25 @@ class DeepseekV41ForCausalLM(nn.Module):
         slices = [(begin, length) for begin, length, _ in spans]
         bucket_rows = sum(length for _, length, _ in spans)
 
-        hidden = self.embed_input_ids(input_ids)
-        hidden = NF.merge_prompt_embeds(hidden, inputs_embeds, is_token_ids)
+        plan = self.mk_plan
         if _DUMP_DIR:
             _DUMP_LIVE[0] = live_rows
-            self._dump("embed", hidden, live_rows)
-        stream, pre_mix = _nki_entry("hc_expand")(hidden.unsqueeze(0))
-        stream, pre_mix = stream.squeeze(0), pre_mix.squeeze(0)
+            _DUMP_STEP[0] += 1
+        if plan.is_first:
+            hidden = self.embed_input_ids(input_ids)
+            hidden = NF.merge_prompt_embeds(hidden, inputs_embeds, is_token_ids)
+            if _DUMP_DIR:
+                self._dump("embed", hidden, live_rows)
+            stream, pre_mix = _nki_entry("hc_expand")(hidden.unsqueeze(0))
+            stream, pre_mix = stream.squeeze(0), pre_mix.squeeze(0)
+        else:
+            # A later pipeline stage: the stream arrives from the previous stage
+            # (`mk_model.run_recv`, below).
+            stream = pre_mix = None
 
-        hashes = self._engram_hashes(input_ids, paged)
+        # The n-gram ids of the engram blocks this rank holds (the hash state is
+        # only built on stages with one).
+        hashes = self._engram_hashes(input_ids, paged) if self.ngram_hash is not None else None
 
         shared = [SharedAttentionState() for _ in paged]
         main_hiddens: list[torch.Tensor] = []
@@ -4810,29 +4903,34 @@ class DeepseekV41ForCausalLM(nn.Module):
         _MOE_LIVE_ROWS[0] = live_rows if live_rows != bucket_rows else None
 
         if _MEGAKERNEL:
-            # One `layer_forward` per block: the engram read-out, the DSpark tap
-            # and every collective happen inside the kernel. See `mk_model`.
+            # One specialized megakernel per block (`mk_kernels`: by phase, block
+            # archetype and scheme): the engram read-out, the DSpark tap and every
+            # collective happen inside the kernels. See `mk_model.run_blocks`.
             if self.pp_size != 1:
                 raise NotImplementedError("the megakernel path serves pp_size == 1")
-            if bucket_rows != int(stream.shape[0]):
+            T = int(input_ids.shape[0])
+            if bucket_rows != T:
                 raise NotImplementedError(
-                    f"the megakernel path wants the spans to tile the {int(stream.shape[0])} "
+                    f"the megakernel path wants the spans to tile the {T} "
                     f"rows of the step, got {bucket_rows}"
                 )
-            step = mk_model.make_step(spans, paged, stream.device, hashes)
+            step = mk_model.make_step(spans, paged, self.device, hashes,
+                                      decode_rows=1 + int(self.config.dspark_block_size))
             self._mk_step = step
-            for layer_id, block in enumerate(self.layers):
-                if layer_id % _HEAP_TRIM_EVERY == 0:
-                    host_heap_trim(f"layer {layer_id}", self.world_size)
-                stream, pre_mix = self._run_block(
-                    block, stream, pre_mix, slices, paged, shared, bucket_rows
-                )
-                if _DUMP_DIR:
-                    self._dump(f"layer{layer_id}", stream, live_rows)
-                    self._dump(f"premix{layer_id}", pre_mix, live_rows)
+            host_heap_trim("layers", self.world_size)
+            dump = (lambda name, t: self._dump(name, t, live_rows)) if _DUMP_DIR else None
+            if not plan.is_first:
+                stream, pre_mix = mk_model.run_recv(self, step, T)
+            stream, pre_mix = mk_model.run_blocks(self, stream, pre_mix, step, dump=dump)
+            if not plan.is_last:
+                # Hand off to the next stage; nothing to sample here (the runner's
+                # non-last-stage path ignores the value, which completes with the
+                # hand-off).
+                self.last_draft = None
+                return mk_model.run_send(self, stream, pre_mix, step)
             main_hiddens = step.taps
 
-        for layer_id, block in enumerate([] if _MEGAKERNEL else self.layers):
+        for layer_id, block in ([] if _MEGAKERNEL else zip(self.block_ids, self.layers.values())):
             if layer_id % _HEAP_TRIM_EVERY == 0:
                 host_heap_trim(f"layer {layer_id}", self.world_size)
             # `owns` is True for every block when pp_size == 1, which is the
@@ -4881,7 +4979,7 @@ class DeepseekV41ForCausalLM(nn.Module):
                     self._dump(f"layer{layer_id}", stream, live_rows)
                     self._dump(f"premix{layer_id}", pre_mix, live_rows)
             if self.pp_size > 1 and (
-                layer_id + 1 == len(self.layers)
+                layer_id + 1 == self.config.num_hidden_layers
                 or self.block_stage[layer_id + 1] != self.block_stage[layer_id]
             ):
                 stream, pre_mix = self._pp_boundary(
@@ -4953,7 +5051,7 @@ class DeepseekV41ForCausalLM(nn.Module):
               ... weight_loader.py:308, in rows
                   flat_indices = indices.reshape(-1).to(torch.int64)
         """
-        engram = self.layers[layer_id].engram
+        engram = self.blocks_by_id[layer_id].engram
         if engram is not None and engram.resident:
             rows = _compiled(_engram_gather)(
                 hashes, engram.table, index, engram.row_start, engram.row_width
@@ -4980,7 +5078,10 @@ class DeepseekV41ForCausalLM(nn.Module):
                 "allocation and are addressed through its slot_mapping and "
                 "block_table (see PagedSpan)."
             )
-        name = f"layers.{0}.attn"
+        # The first block this rank holds (block 0 on the flat scheme and the first
+        # pipeline stage; the stage's first block elsewhere): every block's entry is
+        # the same dict.
+        name = f"layers.{self.block_ids[0]}.attn"
         try:
             meta = attn_metadata[name]
         except (TypeError, KeyError) as exc:
@@ -5194,13 +5295,13 @@ class DeepseekV41ForCausalLM(nn.Module):
 
     @torch._dynamo.disable
     def _dump(self, name: str, tensor: torch.Tensor, live_rows: int) -> None:
-        """`DEEPSEEK_V41_DUMP_DIR`: save the live rows of `tensor` from rank 0, one
-        file per forward and name, for comparison against a reference."""
-        if self.rank != 0:
+        """`DEEPSEEK_V41_DUMP_DIR`: save the live rows of `tensor` from the first rank of
+        each pipeline stage (rank 0 on the flat scheme), one file per forward and name,
+        for comparison against a reference. `forward` counts the steps."""
+        plan = getattr(self, "mk_plan", None)
+        if (plan.stage_rank if plan is not None else self.rank) != 0:
             return
         step = _DUMP_STEP[0]
-        if name == "embed":
-            _DUMP_STEP[0] = step = step + 1
         os.makedirs(_DUMP_DIR, exist_ok=True)
         torch.save(tensor[:live_rows].detach().cpu(), os.path.join(_DUMP_DIR, f"step{step}_{name}.pt"))
 
@@ -5388,7 +5489,7 @@ class DeepseekV41ForCausalLM(nn.Module):
                 "buffers for %d rows (%.1f MiB, one set for all %d blocks)",
                 rows,
                 sum(t.numel() * t.element_size() for t in slots) / 1024**2,
-                len(self.layers),
+                len(self.block_ids),
             )
         return slots
 
@@ -5465,6 +5566,15 @@ class DeepseekV41ForCausalLM(nn.Module):
             seeds = _compiled(_select_rows)(sampled.reshape(-1), picks)
             valid, rows_per_seq = ones, 1
         taps = _compiled(_tap_rows)(valid, lengths, rows_per_seq)
+        if _MEGAKERNEL:
+            # One launch drafts every sequence of the step (`mk_model.run_draft`).
+            if main_hidden is None:
+                raise RuntimeError(
+                    "the DSpark stages read the attention inputs of layers "
+                    f"{list(self.config.dspark_target_layer_ids)}; forward() "
+                    "collected none, so the target-layer tap did not run"
+                )
+            return mk_model.run_draft(self, seeds[: len(spans)], taps[: len(spans)], main_hidden, spans, paged)
         return [
             self.forward_spec(
                 seeds[row : row + 1], taps[row : row + 1],
@@ -5492,7 +5602,7 @@ class DeepseekV41ForCausalLM(nn.Module):
                 "collected none, so the target-layer tap did not run"
             )
         if _MEGAKERNEL:
-            return mk_model.run_draft(self, seed_ids, tap, main_hidden, span, paged)
+            return mk_model.run_draft(self, seed_ids, tap, main_hidden, [span], [paged])[0]
         begin, length, _ = span
         main = main_hidden[begin : begin + length].unsqueeze(0)
 
@@ -5530,9 +5640,18 @@ class DeepseekV41ForCausalLM(nn.Module):
     _mk_groups_attn_ = None
 
     @property
+    def device(self) -> torch.device:
+        """The device this rank's weights live on (after `load_weights`); every stage
+        has `vocab_pad_bias`, which `allocate_staging_buffers` materializes."""
+        bias = self.vocab_pad_bias
+        if bias is None:
+            raise RuntimeError("the model is still on the meta device: load_weights() first")
+        return bias.device
+
+    @property
     def _mk_dummies(self):
         if self._mk_dummies_ is None:
-            self._mk_dummies_ = mk_model.Dummies.on(self.norm.weight.device)
+            self._mk_dummies_ = mk_model.Dummies.on(self.device)
         return self._mk_dummies_
 
     def _mk_layer(self, block) -> "mk_model.LayerWeights":
@@ -5559,18 +5678,40 @@ class DeepseekV41ForCausalLM(nn.Module):
         if t is None:
             if attn.freqs_cis is None:
                 raise RuntimeError("bind_kv_cache() must run before the megakernel path")
-            t = mk_model._freqs_table(attn.freqs_cis, self.norm.weight.device)
+            t = mk_model._freqs_table(attn.freqs_cis, self.device)
             self._mk_freqs_[key] = t
         return t
 
     def _mk_nearest_source(self, layer_id: int, kind: str):
+        """The attention of the latest kv ("kv") or index ("index") source at or before
+        `layer_id` (the first one when none precedes it). On a pipeline stage that does
+        not own it, the stage's replica of the shipped kv source stands in: it has the
+        caches the boundary fills and indexer / compressor modules of the right shapes
+        (every kv source is an index source too)."""
         ids = list(self.config.kv_source_layer_ids if kind == "kv" else self.config.index_source_layer_ids)
         before = [s for s in ids if s <= layer_id]
-        return self.layers[max(before) if before else min(ids)].attn
+        sid = max(before) if before else min(ids)
+        block = self.blocks_by_id.get(sid)
+        if block is not None:
+            return block.attn
+        if self.src_attn:
+            return next(iter(self.src_attn.values()))
+        raise RuntimeError(
+            f"layer {layer_id} needs {kind} source {sid}, which this stage neither owns nor "
+            "received a replica of"
+        )
 
     @property
     def _mk_groups_world(self):
-        return mk_host.replica_groups(self.world_size, self.world_size)
+        """The expert-reduce group of a backbone block: the world under tp64, the
+        stage under tp8pp8."""
+        return self.mk_plan.groups_stage()
+
+    @property
+    def _mk_groups_full(self):
+        """The drafter's group: the whole world under tp64, the (last) stage under
+        tp8pp8 -- the same ranks as `_mk_groups_world`."""
+        return self.mk_plan.groups_stage()
 
     @property
     def _mk_groups_attn(self):

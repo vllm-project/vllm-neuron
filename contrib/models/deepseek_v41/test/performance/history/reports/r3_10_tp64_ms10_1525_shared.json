@@ -1,0 +1,94 @@
+{
+  "model": "/mnt/nvme/hf",
+  "tensor_parallel_size": 64,
+  "pipeline_parallel_size": 1,
+  "max_model_len": 2304,
+  "output_len": 128,
+  "input_lens": [
+    512,
+    2048
+  ],
+  "batch_sizes": [
+    10
+  ],
+  "cells": [
+    {
+      "name": "in512_bs10",
+      "output_len": 128,
+      "batch": 10,
+      "max_model_len": 768,
+      "engine_max_num_seqs": 10,
+      "concurrency_capped": false,
+      "num_prompts": 10,
+      "metrics": {
+        "ttft_p50_ms": 3096.7283780046273,
+        "ttft_p99_ms": 5574.19729207817,
+        "tpot_p50_ms": 94.93995351578461,
+        "tpot_p99_ms": 125.99551696746015,
+        "decode_tok_s": 70.08117438370422,
+        "per_stream_tok_s": 10.53297334755637,
+        "total_tok_s": 344.8212783348197,
+        "completed": 10,
+        "duration_s": 18.26453410999966,
+        "mean_input_tokens": 501.8,
+        "warmed": true,
+        "draft_acceptance_pct": 20.528846153846153,
+        "vllm_acceptance_pct": 23.34494773519164,
+        "vllm_accepted_tokens": 1340,
+        "vllm_draft_tokens": 5740
+      },
+      "server_log": "contrib/models/deepseek_v41/test/performance/cells/server_ctx768_ms10.log",
+      "input_len": 512,
+      "dataset": "sonnet"
+    },
+    {
+      "name": "in2048_bs10",
+      "output_len": 128,
+      "batch": 10,
+      "max_model_len": 2304,
+      "engine_max_num_seqs": 10,
+      "concurrency_capped": false,
+      "num_prompts": 10,
+      "metrics": {
+        "ttft_p50_ms": 10797.181297006318,
+        "ttft_p99_ms": 19433.512878041656,
+        "tpot_p50_ms": 143.03266591730247,
+        "tpot_p99_ms": 208.38725699008467,
+        "decode_tok_s": 42.74519353399749,
+        "per_stream_tok_s": 6.991409924346739,
+        "total_tok_s": 719.5886173988889,
+        "completed": 10,
+        "duration_s": 29.94488722999813,
+        "mean_input_tokens": 2026.8,
+        "warmed": true,
+        "draft_acceptance_pct": 17.55,
+        "vllm_acceptance_pct": 35.78034682080925,
+        "vllm_accepted_tokens": 1857,
+        "vllm_draft_tokens": 5190
+      },
+      "server_log": "contrib/models/deepseek_v41/test/performance/cells/server_ctx2304_ms10.log",
+      "input_len": 2048,
+      "dataset": "sonnet"
+    }
+  ],
+  "prose": {
+    "cases": [
+      "short-prose",
+      "long-needle-2048-0",
+      "smoke-test",
+      "trivia-capital-france"
+    ],
+    "dataset": "sharegpt",
+    "output_len": 96,
+    "tokens_generated": 384,
+    "source": "vllm:spec_decode_* /metrics delta around the prose requests",
+    "num_drafts": 125,
+    "draft_tokens": 625,
+    "accepted_tokens": 263,
+    "acceptance_pct": 42.08,
+    "host_cell": "in2048_bs10",
+    "max_model_len": 2304
+  },
+  "completed_cells": 2,
+  "total_cells": 2
+}

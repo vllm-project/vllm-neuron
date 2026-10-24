@@ -29,6 +29,18 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 #: parameter, so nothing checks it against the official config.
 TENSOR_PARALLEL_SIZE = 64
 
+#: The deployment scheme, `DEEPSEEK_V41_SCHEME`: "tp64" (the default: the 64 ranks
+#: are one tensor-parallel group) or "tp8pp8" (vLLM pipeline parallelism: 8 stages
+#: of 8 tensor-parallel ranks, each stage holding only its own blocks' weights, the
+#: scheduler keeping 8 batches in flight). `mk_model.PipePlan` reads the stage layout
+#: back from vLLM's parallel groups; this constant only sizes the engine arguments.
+SCHEME = os.environ.get("DEEPSEEK_V41_SCHEME", "tp64")
+if SCHEME not in ("tp64", "tp8pp8"):
+    raise ValueError(f"DEEPSEEK_V41_SCHEME={SCHEME!r}; expected 'tp64' or 'tp8pp8'")
+PIPELINE_PARALLEL_SIZE = 8 if SCHEME == "tp8pp8" else 1
+if SCHEME == "tp8pp8":
+    TENSOR_PARALLEL_SIZE = 64 // PIPELINE_PARALLEL_SIZE
+
 #: Ranks the **attention and the dense projections** are split across. Capped at
 #: `o_groups` (8) because `wo_a` is block-diagonal over the groups and
 #: `n_local_groups = o_groups // tp` reaches 0 above it; above the cap attention

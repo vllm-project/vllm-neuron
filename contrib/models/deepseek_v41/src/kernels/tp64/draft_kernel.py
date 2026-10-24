@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The DSpark drafter -- `model.forward_spec` for one sequence -- as a single NKI kernel.
+"""The DSpark drafter -- `model.forward_spec` for one sequence -- as a single NKI kernel:
+the flat scheme's drafter, launched once per sequence. The pipeline scheme's copy
+(`../tp8pp8/draft_kernel.py`) drafts every sequence of a step in one launch; this
+one is the pre-batching kernel kept as it was, so the flat scheme's path is unchanged.
 
     main_x   = main_norm(main_proj(main_hidden))                 the three taps, fp8 GEMM
     x        = embed([seed, noise x (K-1)]) expanded to hc copies  vocab-parallel, all_reduce
@@ -85,8 +88,7 @@ def _log2(n):
     return k
 
 
-@nki.jit
-def draft_forward(
+def draft_body(
     meta, main_hidden, row_pos, write_slots, block_table,
     main_proj, main_proj_s, main_norm_w, embed_w, vocab_start,
     hca_fn_t0, hca_fn_t1, hca_fn_t2, hca_base, hca_scale, attn_norm_w,
@@ -98,8 +100,14 @@ def draft_forward(
     cache0, cache1, cache2,
     fnorm_w, head_w, mk_embed_w, mk_head_w, conf_w,
     groups_attn, groups_world, flags,
+    phase="decode", scheme="tp64",
 ):
+    """The drafter, traced with `phase` baked: "prefill" is the `at_zero` step (the
+    main-stream KV writes only), "decode" the draft proper. `mk_kernels` makes one
+    `@nki.jit` entry per phase and scheme. The drafter's groups are the ranks the
+    head and sampler run on: the world under tp64, the last stage under tp8pp8."""
     at_zero, K, win, stage, kver, noise_id, vocab_size, topk_e, bs = flags
+    assert bool(at_zero) == (phase == "prefill"), f"flags at_zero={at_zero} vs phase {phase}"
     nstages = wq_a.shape[0]
     L = main_hidden.shape[0]
     Lp = pad_to(L, PT)
@@ -671,3 +679,7 @@ def draft_forward(
     nisa.core_barrier(data=output_ids, cores=(0, 1))
     nisa.core_barrier(data=confidence, cores=(0, 1))
     return ret()
+
+
+#: The generic entry (both phases by the `at_zero` flag).
+draft_forward = nki.jit(draft_body)

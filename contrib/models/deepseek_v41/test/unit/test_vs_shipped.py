@@ -19,7 +19,9 @@ from kharness import compare, run_nki  # noqa: E402
 from deepseek_v41 import model as M  # noqa: E402
 from deepseek_v41.config import DeepseekV41Config  # noqa: E402
 from deepseek_v41.kernels import engram_gate, hc_attn_out, rmsnorm, sparse_attn, swiglu  # noqa: E402
-from deepseek_v41.kernels import mk_common as C  # noqa: E402
+from deepseek_v41.kernels import mk_kernels  # noqa: E402
+
+C = mk_kernels.pkg("tp64").mk_common  # the helpers are the same in both scheme packages
 
 import nki  # noqa: E402
 import nki.isa as nisa  # noqa: E402

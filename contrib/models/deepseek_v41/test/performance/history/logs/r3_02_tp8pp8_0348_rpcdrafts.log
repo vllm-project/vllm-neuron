@@ -1,0 +1,1070 @@
+2026-10-24 03:48:41,496 - WARNING - runtime.py:70 - Defaulting to PJRT_DEVICE=CPU
+2026-10-24 03:48:41,646 - INFO - complex_decomposition.py:119 - Registered ComplexTensor new_full rule.
+INFO 10-24 03:48:41 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 10-24 03:48:41 [__init__.py:54] - neuron -> vllm_neuron:register
+INFO 10-24 03:48:41 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 10-24 03:48:41 [__init__.py:272] Platform plugin neuron is activated
+2026-10-24 03:48:41,806 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+2026-10-24 03:48:41,806 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+2026-10-24 03:48:43,281 - INFO - __init__.py:168 - deepseek_v41: 8 rank(s) — applied the measured multi-rank host environment {'NEURON_RT_INSPECT_ENABLE': '0', 'NEURON_RT_INSPECT_PRECACHE_ENABLE': '0', 'NEURON_RT_IO_RING_CACHE_SIZE': '1', 'MALLOC_ARENA_MAX': '2', 'MALLOC_TRIM_THRESHOLD_': '131072', 'MALLOC_TOP_PAD_': '131072', 'NEURON_HOST_MEM_PER_RANK_GIB': '20.0'}; see __init__.py for what each is worth
+2026-10-24 03:48:43,283 - WARNING - __init__.py:387 - deepseek_v41: islpy 2026.2.2 is newer than the 2026.1 neuronx-cc 2.27 was validated against. If compiles fail with '[NCC_ISMP902] Simplifier error: is_subset()', that is why, and it is not the graph — pin islpy==2026.1. See deepseek_v41.warn_on_unsupported_islpy
+INFO 10-24 03:52:24 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 10-24 03:52:24 [__init__.py:54] - neuron -> vllm_neuron:register
+INFO 10-24 03:52:24 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+2026-10-24 03:52:26,036 - INFO - complex_decomposition.py:119 - Registered ComplexTensor new_full rule.
+2026-10-24 03:52:26,118 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+2026-10-24 03:52:26,118 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+INFO 10-24 03:52:26 [__init__.py:272] Platform plugin neuron is activated
+2026-10-24 03:52:31,129 - INFO - dp_load_balancer_patch.py:311 - Applied internal-DP load-balancer patch
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x7da61a341440>, trust_remote_code=False, seed=0, num_prompts=8, dataset_name='sonnet', no_stream=False, dataset_path='contrib/models/deepseek_v41/test/performance/sonnet.txt', no_oversample=False, skip_chat_template=False, enable_multimodal_chat=False, disable_shuffle=False, custom_output_len=256, custom_ensure_client_side_data=False, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=512, sonnet_output_len=128, sonnet_prefix_len=0, sharegpt_output_len=None, timed_trace_chunk_hash_size=16, timed_trace_sec_multiplier=1, timed_trace_label_timestamp='timestamp', timed_trace_label_input_length='input_length', timed_trace_label_output_length='output_length', timed_trace_label_hash_ids='hash_ids', blazedit_min_distance=0.0, blazedit_max_distance=1.0, asr_max_audio_len_sec=inf, asr_min_audio_len_sec=0.0, random_input_len=1024, random_output_len=128, random_range_ratio='0.0', random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, bfcl_categories=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, speed_bench_dataset_subset='qualitative', speed_bench_output_len=4096, speed_bench_category=None, label=None, backend='openai', base_url=None, host='127.0.0.1', port=8321, endpoint='/v1/completions', header=None, max_concurrency=1, model='deepseek-v41-flash', input_len=None, output_len=None, tokenizer='/mnt/nvme/hf', tokenizer_mode='auto', use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, probe_request_rate=0.0, disable_tqdm=False, num_warmups=0, profile=False, save_result=True, save_detailed=True, append_result=False, metadata=None, result_dir='contrib/models/deepseek_v41/test/performance/cells', result_filename='in512_bs1.warmup.json', ignore_eos=True, self_timed=None, percentile_metrics='ttft,tpot,itl,e2el', metric_percentiles='50,90,99', goodput=None, request_id_prefix='bench-4c65b458-', top_p=None, top_k=None, min_p=None, temperature=0.0, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, served_model_name=None, lora_modules=None, lora_assignment='random', ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=0, chat_template_kwargs=None, extra_body=None, skip_tokenizer_init=False, insecure=False, plot_timeline=False, timeline_itl_thresholds='25,50', plot_dataset_stats=False)
+ERROR 10-24 03:52:31 [repo_utils.py:119] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 03:52:31 [repo_utils.py:119] 
+ERROR 10-24 03:52:31 [repo_utils.py:119] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`, retrying 1 of 2
+ERROR 10-24 03:52:33 [repo_utils.py:117] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 03:52:33 [repo_utils.py:117] 
+ERROR 10-24 03:52:33 [repo_utils.py:117] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+Starting initial single prompt test run...
+Skipping endpoint ready check.
+Starting main benchmark run...
+Traffic request rate: inf
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: 1
+  0%|          | 0/8 [00:00<?, ?it/s] 12%|█▎        | 1/8 [14:05<1:38:38, 845.56s/it] 25%|██▌       | 2/8 [14:13<35:18, 353.10s/it]   38%|███▊      | 3/8 [14:21<16:17, 195.51s/it] 50%|█████     | 4/8 [14:30<08:06, 121.74s/it] 62%|██████▎   | 5/8 [14:39<04:02, 80.89s/it]  75%|███████▌  | 6/8 [14:48<01:53, 56.58s/it] 88%|████████▊ | 7/8 [14:55<00:40, 40.30s/it]100%|██████████| 8/8 [15:04<00:00, 30.29s/it]100%|██████████| 8/8 [15:04<00:00, 113.01s/it]
+tip: install termplotlib and gnuplot to plot the metrics
+============ Serving Benchmark Result ============
+Successful requests:                     8         
+Failed requests:                         0         
+Maximum request concurrency:             1         
+Benchmark duration (s):                  904.07    
+Total input tokens:                      4026      
+Total generated tokens:                  1024      
+Request throughput (req/s):              0.01      
+Output token throughput (tok/s):         1.13      
+Peak output token throughput (tok/s):    6.00      
+Peak concurrent requests:                2.00      
+Total token throughput (tok/s):          5.59      
+---------------Time to First Token----------------
+Mean TTFT (ms):                          63307.53  
+Median TTFT (ms):                        1643.78   
+P50 TTFT (ms):                           1643.78   
+P90 TTFT (ms):                           150169.61 
+P99 TTFT (ms):                           461008.62 
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          391.34    
+Median TPOT (ms):                        53.95     
+P50 TPOT (ms):                           53.95     
+P90 TPOT (ms):                           869.97    
+P99 TPOT (ms):                           2567.40   
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           1258.23   
+Median ITL (ms):                         171.01    
+P50 ITL (ms):                            171.01    
+P90 ITL (ms):                            176.02    
+P99 ITL (ms):                            180.79    
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          113007.79 
+Median E2EL (ms):                        8554.72   
+P50 E2EL (ms):                           8554.72   
+P90 E2EL (ms):                           260238.55 
+P99 E2EL (ms):                           787026.86 
+---------------Speculative Decoding---------------
+Acceptance rate (%):                     45.13     
+Acceptance length:                       3.26      
+Drafts:                                  316       
+Draft tokens:                            1580      
+Accepted tokens:                         713       
+Per-position acceptance (%):
+  Position 0:                            78.16     
+  Position 1:                            58.54     
+  Position 2:                            41.46     
+  Position 3:                            32.28     
+  Position 4:                            15.19     
+==================================================
+INFO 10-24 04:07:40 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 10-24 04:07:40 [__init__.py:54] - neuron -> vllm_neuron:register
+INFO 10-24 04:07:40 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+2026-10-24 04:07:41,695 - INFO - complex_decomposition.py:119 - Registered ComplexTensor new_full rule.
+2026-10-24 04:07:41,778 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+2026-10-24 04:07:41,778 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+INFO 10-24 04:07:41 [__init__.py:272] Platform plugin neuron is activated
+2026-10-24 04:07:46,846 - INFO - dp_load_balancer_patch.py:311 - Applied internal-DP load-balancer patch
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x70733b96d440>, trust_remote_code=False, seed=0, num_prompts=8, dataset_name='sonnet', no_stream=False, dataset_path='contrib/models/deepseek_v41/test/performance/sonnet.txt', no_oversample=False, skip_chat_template=False, enable_multimodal_chat=False, disable_shuffle=False, custom_output_len=256, custom_ensure_client_side_data=False, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=512, sonnet_output_len=128, sonnet_prefix_len=0, sharegpt_output_len=None, timed_trace_chunk_hash_size=16, timed_trace_sec_multiplier=1, timed_trace_label_timestamp='timestamp', timed_trace_label_input_length='input_length', timed_trace_label_output_length='output_length', timed_trace_label_hash_ids='hash_ids', blazedit_min_distance=0.0, blazedit_max_distance=1.0, asr_max_audio_len_sec=inf, asr_min_audio_len_sec=0.0, random_input_len=1024, random_output_len=128, random_range_ratio='0.0', random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, bfcl_categories=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, speed_bench_dataset_subset='qualitative', speed_bench_output_len=4096, speed_bench_category=None, label=None, backend='openai', base_url=None, host='127.0.0.1', port=8321, endpoint='/v1/completions', header=None, max_concurrency=1, model='deepseek-v41-flash', input_len=None, output_len=None, tokenizer='/mnt/nvme/hf', tokenizer_mode='auto', use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, probe_request_rate=0.0, disable_tqdm=False, num_warmups=8, profile=False, save_result=True, save_detailed=True, append_result=False, metadata=None, result_dir='contrib/models/deepseek_v41/test/performance/cells', result_filename='in512_bs1.json', ignore_eos=True, self_timed=None, percentile_metrics='ttft,tpot,itl,e2el', metric_percentiles='50,90,99', goodput=None, request_id_prefix='bench-ed5f9512-', top_p=None, top_k=None, min_p=None, temperature=0.0, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, served_model_name=None, lora_modules=None, lora_assignment='random', ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=0, chat_template_kwargs=None, extra_body=None, skip_tokenizer_init=False, insecure=False, plot_timeline=False, timeline_itl_thresholds='25,50', plot_dataset_stats=False)
+ERROR 10-24 04:07:47 [repo_utils.py:119] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 04:07:47 [repo_utils.py:119] 
+ERROR 10-24 04:07:47 [repo_utils.py:119] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`, retrying 1 of 2
+ERROR 10-24 04:07:49 [repo_utils.py:117] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 04:07:49 [repo_utils.py:117] 
+ERROR 10-24 04:07:49 [repo_utils.py:117] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+Starting initial single prompt test run...
+Skipping endpoint ready check.
+Warming up with 8 requests...
+  0%|          | 0/8 [00:00<?, ?it/s] 12%|█▎        | 1/8 [00:07<00:51,  7.42s/it] 25%|██▌       | 2/8 [00:14<00:44,  7.41s/it] 38%|███▊      | 3/8 [00:22<00:37,  7.42s/it] 50%|█████     | 4/8 [00:29<00:29,  7.42s/it] 62%|██████▎   | 5/8 [00:37<00:22,  7.42s/it] 75%|███████▌  | 6/8 [00:44<00:14,  7.42s/it] 88%|████████▊ | 7/8 [00:51<00:07,  7.42s/it]100%|██████████| 8/8 [00:59<00:00,  7.42s/it]100%|██████████| 8/8 [00:59<00:00,  7.42s/it]
+Warmup run completed.
+Starting main benchmark run...
+Traffic request rate: inf
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: 1
+  0%|          | 0/8 [00:00<?, ?it/s] 12%|█▎        | 1/8 [00:07<00:51,  7.42s/it] 25%|██▌       | 2/8 [00:14<00:43,  7.32s/it] 38%|███▊      | 3/8 [00:21<00:36,  7.30s/it] 50%|█████     | 4/8 [00:29<00:30,  7.54s/it] 62%|██████▎   | 5/8 [00:38<00:23,  7.88s/it] 75%|███████▌  | 6/8 [00:47<00:16,  8.17s/it] 88%|████████▊ | 7/8 [00:53<00:07,  7.72s/it]100%|██████████| 8/8 [01:01<00:00,  7.69s/it]100%|██████████| 8/8 [01:01<00:00,  7.68s/it]
+tip: install termplotlib and gnuplot to plot the metrics
+============ Serving Benchmark Result ============
+Successful requests:                     8         
+Failed requests:                         0         
+Maximum request concurrency:             1         
+Benchmark duration (s):                  61.48     
+Total input tokens:                      4026      
+Total generated tokens:                  1024      
+Request throughput (req/s):              0.13      
+Output token throughput (tok/s):         16.66     
+Peak output token throughput (tok/s):    6.00      
+Peak concurrent requests:                2.00      
+Total token throughput (tok/s):          82.14     
+---------------Time to First Token----------------
+Mean TTFT (ms):                          925.38    
+Median TTFT (ms):                        925.19    
+P50 TTFT (ms):                           925.19    
+P90 TTFT (ms):                           930.06    
+P99 TTFT (ms):                           930.27    
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          53.22     
+Median TPOT (ms):                        51.91     
+P50 TPOT (ms):                           51.91     
+P90 TPOT (ms):                           60.03     
+P99 TPOT (ms):                           61.45     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           171.12    
+Median ITL (ms):                         170.93    
+P50 ITL (ms):                            170.93    
+P90 ITL (ms):                            176.16    
+P99 ITL (ms):                            178.95    
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          7684.51   
+Median E2EL (ms):                        7517.68   
+P50 E2EL (ms):                           7517.68   
+P90 E2EL (ms):                           8553.00   
+P99 E2EL (ms):                           8728.99   
+---------------Speculative Decoding---------------
+Acceptance rate (%):                     45.13     
+Acceptance length:                       3.26      
+Drafts:                                  316       
+Draft tokens:                            1580      
+Accepted tokens:                         713       
+Per-position acceptance (%):
+  Position 0:                            78.16     
+  Position 1:                            58.54     
+  Position 2:                            41.46     
+  Position 3:                            32.28     
+  Position 4:                            15.19     
+==================================================
+bench: serving /mnt/nvme/hf (DeepseekV41ForCausalLM)
+bench: tensor_parallel_size=8 (from config.TENSOR_PARALLEL_SIZE)
+bench: pipeline_parallel_size=8
+bench: starting server on port 8321 (max_model_len=768, max_num_seqs=1)
+bench:   /opt/aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0/bin/python -m performance._serve_main --model /mnt/nvme/hf --served-model-name deepseek-v41-flash --tensor-parallel-size 8 --pipeline-parallel-size 8 --no-async-scheduling --max-model-len 768 --max-num-seqs 1 --port 8321 --no-enable-prefix-caching
+bench:   still waiting for the server (5400 s left)
+bench:   still waiting for the server (5280 s left)
+bench: server healthy after 220 s
+
+bench: cell in512_bs1 — warm-up: 8 prompts, 128 out (discarded)
+bench: cell in512_bs1 — measuring: 8 prompts, concurrency 1, 128 out
+##autohelix[ttft_p50_ms_in512_bs1=925.193]
+##autohelix[tpot_p50_ms_in512_bs1=51.9071]
+##autohelix[decode_tok_s_in512_bs1=16.6562]
+##autohelix[vllm_acceptance_pct_in512_bs1=46.4356]
+INFO 10-24 04:09:52 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 10-24 04:09:52 [__init__.py:54] - neuron -> vllm_neuron:register
+INFO 10-24 04:09:52 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+2026-10-24 04:09:54,172 - INFO - complex_decomposition.py:119 - Registered ComplexTensor new_full rule.
+2026-10-24 04:09:54,254 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+2026-10-24 04:09:54,254 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+INFO 10-24 04:09:54 [__init__.py:272] Platform plugin neuron is activated
+2026-10-24 04:09:59,328 - INFO - dp_load_balancer_patch.py:311 - Applied internal-DP load-balancer patch
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x7a1f51d6d440>, trust_remote_code=False, seed=0, num_prompts=10, dataset_name='sonnet', no_stream=False, dataset_path='contrib/models/deepseek_v41/test/performance/sonnet.txt', no_oversample=False, skip_chat_template=False, enable_multimodal_chat=False, disable_shuffle=False, custom_output_len=256, custom_ensure_client_side_data=False, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=512, sonnet_output_len=128, sonnet_prefix_len=0, sharegpt_output_len=None, timed_trace_chunk_hash_size=16, timed_trace_sec_multiplier=1, timed_trace_label_timestamp='timestamp', timed_trace_label_input_length='input_length', timed_trace_label_output_length='output_length', timed_trace_label_hash_ids='hash_ids', blazedit_min_distance=0.0, blazedit_max_distance=1.0, asr_max_audio_len_sec=inf, asr_min_audio_len_sec=0.0, random_input_len=1024, random_output_len=128, random_range_ratio='0.0', random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, bfcl_categories=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, speed_bench_dataset_subset='qualitative', speed_bench_output_len=4096, speed_bench_category=None, label=None, backend='openai', base_url=None, host='127.0.0.1', port=8321, endpoint='/v1/completions', header=None, max_concurrency=10, model='deepseek-v41-flash', input_len=None, output_len=None, tokenizer='/mnt/nvme/hf', tokenizer_mode='auto', use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, probe_request_rate=0.0, disable_tqdm=False, num_warmups=0, profile=False, save_result=True, save_detailed=True, append_result=False, metadata=None, result_dir='contrib/models/deepseek_v41/test/performance/cells', result_filename='in512_bs10.warmup.json', ignore_eos=True, self_timed=None, percentile_metrics='ttft,tpot,itl,e2el', metric_percentiles='50,90,99', goodput=None, request_id_prefix='bench-3285835d-', top_p=None, top_k=None, min_p=None, temperature=0.0, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, served_model_name=None, lora_modules=None, lora_assignment='random', ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=0, chat_template_kwargs=None, extra_body=None, skip_tokenizer_init=False, insecure=False, plot_timeline=False, timeline_itl_thresholds='25,50', plot_dataset_stats=False)
+ERROR 10-24 04:09:59 [repo_utils.py:119] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 04:09:59 [repo_utils.py:119] 
+ERROR 10-24 04:09:59 [repo_utils.py:119] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`, retrying 1 of 2
+ERROR 10-24 04:10:01 [repo_utils.py:117] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 04:10:01 [repo_utils.py:117] 
+ERROR 10-24 04:10:01 [repo_utils.py:117] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+Starting initial single prompt test run...
+Skipping endpoint ready check.
+Starting main benchmark run...
+Traffic request rate: inf
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: 10
+  0%|          | 0/10 [00:00<?, ?it/s] 10%|█         | 1/10 [00:07<01:06,  7.42s/it] 20%|██        | 2/10 [00:14<00:58,  7.31s/it] 30%|███       | 3/10 [00:21<00:51,  7.29s/it] 40%|████      | 4/10 [00:29<00:45,  7.54s/it] 50%|█████     | 5/10 [00:38<00:39,  7.87s/it] 60%|██████    | 6/10 [00:45<00:30,  7.50s/it] 70%|███████   | 7/10 [00:53<00:23,  7.92s/it] 80%|████████  | 8/10 [01:01<00:15,  7.82s/it] 90%|█████████ | 9/10 [01:09<00:07,  7.90s/it]100%|██████████| 10/10 [01:18<00:00,  8.18s/it]100%|██████████| 10/10 [01:18<00:00,  7.84s/it]
+tip: install termplotlib and gnuplot to plot the metrics
+============ Serving Benchmark Result ============
+Successful requests:                     10        
+Failed requests:                         0         
+Maximum request concurrency:             10        
+Benchmark duration (s):                  78.36     
+Total input tokens:                      5018      
+Total generated tokens:                  1280      
+Request throughput (req/s):              0.13      
+Output token throughput (tok/s):         16.34     
+Peak output token throughput (tok/s):    6.00      
+Peak concurrent requests:                10.00     
+Total token throughput (tok/s):          80.38     
+---------------Time to First Token----------------
+Mean TTFT (ms):                          35287.52  
+Median TTFT (ms):                        34998.56  
+P50 TTFT (ms):                           34998.56  
+P90 TTFT (ms):                           64043.05  
+P99 TTFT (ms):                           70414.83  
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          53.26     
+Median TPOT (ms):                        51.89     
+P50 TPOT (ms):                           51.89     
+P90 TPOT (ms):                           59.61     
+P99 TPOT (ms):                           61.62     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           171.25    
+Median ITL (ms):                         171.00    
+P50 ITL (ms):                            171.00    
+P90 ITL (ms):                            176.90    
+P99 ITL (ms):                            179.83    
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          42051.86  
+Median E2EL (ms):                        41703.20  
+P50 E2EL (ms):                           41703.20  
+P90 E2EL (ms):                           70436.43  
+P99 E2EL (ms):                           77560.69  
+---------------Speculative Decoding---------------
+Acceptance rate (%):                     45.22     
+Acceptance length:                       3.26      
+Drafts:                                  395       
+Draft tokens:                            1975      
+Accepted tokens:                         893       
+Per-position acceptance (%):
+  Position 0:                            78.48     
+  Position 1:                            57.72     
+  Position 2:                            42.03     
+  Position 3:                            32.15     
+  Position 4:                            15.70     
+==================================================
+INFO 10-24 04:11:22 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 10-24 04:11:22 [__init__.py:54] - neuron -> vllm_neuron:register
+INFO 10-24 04:11:22 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+2026-10-24 04:11:24,152 - INFO - complex_decomposition.py:119 - Registered ComplexTensor new_full rule.
+2026-10-24 04:11:24,232 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+2026-10-24 04:11:24,232 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+INFO 10-24 04:11:24 [__init__.py:272] Platform plugin neuron is activated
+2026-10-24 04:11:29,245 - INFO - dp_load_balancer_patch.py:311 - Applied internal-DP load-balancer patch
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x74684bd5d940>, trust_remote_code=False, seed=0, num_prompts=10, dataset_name='sonnet', no_stream=False, dataset_path='contrib/models/deepseek_v41/test/performance/sonnet.txt', no_oversample=False, skip_chat_template=False, enable_multimodal_chat=False, disable_shuffle=False, custom_output_len=256, custom_ensure_client_side_data=False, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=512, sonnet_output_len=128, sonnet_prefix_len=0, sharegpt_output_len=None, timed_trace_chunk_hash_size=16, timed_trace_sec_multiplier=1, timed_trace_label_timestamp='timestamp', timed_trace_label_input_length='input_length', timed_trace_label_output_length='output_length', timed_trace_label_hash_ids='hash_ids', blazedit_min_distance=0.0, blazedit_max_distance=1.0, asr_max_audio_len_sec=inf, asr_min_audio_len_sec=0.0, random_input_len=1024, random_output_len=128, random_range_ratio='0.0', random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, bfcl_categories=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, speed_bench_dataset_subset='qualitative', speed_bench_output_len=4096, speed_bench_category=None, label=None, backend='openai', base_url=None, host='127.0.0.1', port=8321, endpoint='/v1/completions', header=None, max_concurrency=10, model='deepseek-v41-flash', input_len=None, output_len=None, tokenizer='/mnt/nvme/hf', tokenizer_mode='auto', use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, probe_request_rate=0.0, disable_tqdm=False, num_warmups=10, profile=False, save_result=True, save_detailed=True, append_result=False, metadata=None, result_dir='contrib/models/deepseek_v41/test/performance/cells', result_filename='in512_bs10.json', ignore_eos=True, self_timed=None, percentile_metrics='ttft,tpot,itl,e2el', metric_percentiles='50,90,99', goodput=None, request_id_prefix='bench-568a543f-', top_p=None, top_k=None, min_p=None, temperature=0.0, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, served_model_name=None, lora_modules=None, lora_assignment='random', ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=0, chat_template_kwargs=None, extra_body=None, skip_tokenizer_init=False, insecure=False, plot_timeline=False, timeline_itl_thresholds='25,50', plot_dataset_stats=False)
+ERROR 10-24 04:11:29 [repo_utils.py:119] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 04:11:29 [repo_utils.py:119] 
+ERROR 10-24 04:11:29 [repo_utils.py:119] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`, retrying 1 of 2
+ERROR 10-24 04:11:31 [repo_utils.py:117] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 04:11:31 [repo_utils.py:117] 
+ERROR 10-24 04:11:31 [repo_utils.py:117] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+Starting initial single prompt test run...
+Skipping endpoint ready check.
+Warming up with 10 requests...
+  0%|          | 0/10 [00:00<?, ?it/s] 10%|█         | 1/10 [00:07<01:07,  7.45s/it] 20%|██        | 2/10 [00:14<00:59,  7.43s/it] 30%|███       | 3/10 [00:22<00:51,  7.42s/it] 40%|████      | 4/10 [00:29<00:44,  7.41s/it] 50%|█████     | 5/10 [00:37<00:37,  7.42s/it] 60%|██████    | 6/10 [00:44<00:29,  7.42s/it] 70%|███████   | 7/10 [00:51<00:22,  7.42s/it] 80%|████████  | 8/10 [00:59<00:14,  7.42s/it] 90%|█████████ | 9/10 [01:06<00:07,  7.42s/it]100%|██████████| 10/10 [01:14<00:00,  7.43s/it]100%|██████████| 10/10 [01:14<00:00,  7.42s/it]
+Warmup run completed.
+Starting main benchmark run...
+Traffic request rate: inf
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: 10
+  0%|          | 0/10 [00:00<?, ?it/s] 10%|█         | 1/10 [00:07<01:05,  7.28s/it] 20%|██        | 2/10 [00:14<00:58,  7.28s/it] 30%|███       | 3/10 [00:22<00:52,  7.57s/it] 40%|████      | 4/10 [00:30<00:45,  7.65s/it] 50%|█████     | 5/10 [00:38<00:39,  7.95s/it] 60%|██████    | 6/10 [00:45<00:30,  7.55s/it] 70%|███████   | 7/10 [00:53<00:22,  7.57s/it] 80%|████████  | 8/10 [01:00<00:14,  7.46s/it] 90%|█████████ | 9/10 [01:08<00:07,  7.67s/it]100%|██████████| 10/10 [01:17<00:00,  8.02s/it]100%|██████████| 10/10 [01:17<00:00,  7.73s/it]
+tip: install termplotlib and gnuplot to plot the metrics
+============ Serving Benchmark Result ============
+Successful requests:                     10        
+Failed requests:                         0         
+Maximum request concurrency:             10        
+Benchmark duration (s):                  77.28     
+Total input tokens:                      5018      
+Total generated tokens:                  1280      
+Request throughput (req/s):              0.13      
+Output token throughput (tok/s):         16.56     
+Peak output token throughput (tok/s):    6.00      
+Peak concurrent requests:                10.00     
+Total token throughput (tok/s):          81.50     
+---------------Time to First Token----------------
+Mean TTFT (ms):                          35004.23  
+Median TTFT (ms):                        35423.44  
+P50 TTFT (ms):                           35423.44  
+P90 TTFT (ms):                           62086.63  
+P99 TTFT (ms):                           68694.34  
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          53.56     
+Median TPOT (ms):                        53.39     
+P50 TPOT (ms):                           53.39     
+P90 TPOT (ms):                           59.69     
+P99 TPOT (ms):                           61.56     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           172.19    
+Median ITL (ms):                         171.17    
+P50 ITL (ms):                            171.17    
+P90 ITL (ms):                            176.87    
+P99 ITL (ms):                            181.49    
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          41805.76  
+Median E2EL (ms):                        42124.96  
+P50 E2EL (ms):                           42124.96  
+P90 E2EL (ms):                           69369.44  
+P99 E2EL (ms):                           76482.34  
+---------------Speculative Decoding---------------
+Acceptance rate (%):                     45.22     
+Acceptance length:                       3.26      
+Drafts:                                  395       
+Draft tokens:                            1975      
+Accepted tokens:                         893       
+Per-position acceptance (%):
+  Position 0:                            78.48     
+  Position 1:                            57.72     
+  Position 2:                            42.03     
+  Position 3:                            32.15     
+  Position 4:                            15.70     
+==================================================
+
+bench: cell in512_bs10 — reusing the context-768 max_num_seqs-1 engine on port 8321
+
+bench: cell in512_bs10 — warm-up: 10 prompts, 128 out (discarded)
+bench: cell in512_bs10 — measuring: 10 prompts, concurrency 10, 128 out
+##autohelix[ttft_p50_ms_in512_bs10=35423.4]
+##autohelix[tpot_p50_ms_in512_bs10=53.3914]
+##autohelix[decode_tok_s_in512_bs10=16.5642]
+##autohelix[vllm_acceptance_pct_in512_bs10=46.4465]
+INFO 10-24 04:17:42 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 10-24 04:17:42 [__init__.py:54] - neuron -> vllm_neuron:register
+INFO 10-24 04:17:42 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+2026-10-24 04:17:43,947 - INFO - complex_decomposition.py:119 - Registered ComplexTensor new_full rule.
+2026-10-24 04:17:44,027 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+2026-10-24 04:17:44,027 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+INFO 10-24 04:17:44 [__init__.py:272] Platform plugin neuron is activated
+2026-10-24 04:17:49,098 - INFO - dp_load_balancer_patch.py:311 - Applied internal-DP load-balancer patch
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x707e48795940>, trust_remote_code=False, seed=0, num_prompts=8, dataset_name='sonnet', no_stream=False, dataset_path='contrib/models/deepseek_v41/test/performance/sonnet.txt', no_oversample=False, skip_chat_template=False, enable_multimodal_chat=False, disable_shuffle=False, custom_output_len=256, custom_ensure_client_side_data=False, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=1024, sonnet_output_len=128, sonnet_prefix_len=0, sharegpt_output_len=None, timed_trace_chunk_hash_size=16, timed_trace_sec_multiplier=1, timed_trace_label_timestamp='timestamp', timed_trace_label_input_length='input_length', timed_trace_label_output_length='output_length', timed_trace_label_hash_ids='hash_ids', blazedit_min_distance=0.0, blazedit_max_distance=1.0, asr_max_audio_len_sec=inf, asr_min_audio_len_sec=0.0, random_input_len=1024, random_output_len=128, random_range_ratio='0.0', random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, bfcl_categories=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, speed_bench_dataset_subset='qualitative', speed_bench_output_len=4096, speed_bench_category=None, label=None, backend='openai', base_url=None, host='127.0.0.1', port=8321, endpoint='/v1/completions', header=None, max_concurrency=1, model='deepseek-v41-flash', input_len=None, output_len=None, tokenizer='/mnt/nvme/hf', tokenizer_mode='auto', use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, probe_request_rate=0.0, disable_tqdm=False, num_warmups=0, profile=False, save_result=True, save_detailed=True, append_result=False, metadata=None, result_dir='contrib/models/deepseek_v41/test/performance/cells', result_filename='in1024_bs1.warmup.json', ignore_eos=True, self_timed=None, percentile_metrics='ttft,tpot,itl,e2el', metric_percentiles='50,90,99', goodput=None, request_id_prefix='bench-fb4cde36-', top_p=None, top_k=None, min_p=None, temperature=0.0, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, served_model_name=None, lora_modules=None, lora_assignment='random', ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=0, chat_template_kwargs=None, extra_body=None, skip_tokenizer_init=False, insecure=False, plot_timeline=False, timeline_itl_thresholds='25,50', plot_dataset_stats=False)
+ERROR 10-24 04:17:49 [repo_utils.py:119] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 04:17:49 [repo_utils.py:119] 
+ERROR 10-24 04:17:49 [repo_utils.py:119] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`, retrying 1 of 2
+ERROR 10-24 04:17:51 [repo_utils.py:117] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 04:17:51 [repo_utils.py:117] 
+ERROR 10-24 04:17:51 [repo_utils.py:117] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+Starting initial single prompt test run...
+Skipping endpoint ready check.
+Starting main benchmark run...
+Traffic request rate: inf
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: 1
+  0%|          | 0/8 [00:00<?, ?it/s] 12%|█▎        | 1/8 [14:48<1:43:38, 888.34s/it] 25%|██▌       | 2/8 [14:57<37:06, 371.16s/it]   38%|███▊      | 3/8 [15:06<17:08, 205.68s/it] 50%|█████     | 4/8 [15:14<08:30, 127.60s/it] 62%|██████▎   | 5/8 [15:21<04:13, 84.40s/it]  75%|███████▌  | 6/8 [15:30<01:57, 58.71s/it] 88%|████████▊ | 7/8 [15:40<00:42, 42.58s/it]100%|██████████| 8/8 [15:49<00:00, 31.86s/it]100%|██████████| 8/8 [15:49<00:00, 118.63s/it]
+tip: install termplotlib and gnuplot to plot the metrics
+============ Serving Benchmark Result ============
+Successful requests:                     8         
+Failed requests:                         0         
+Maximum request concurrency:             1         
+Benchmark duration (s):                  949.07    
+Total input tokens:                      8070      
+Total generated tokens:                  1024      
+Request throughput (req/s):              0.01      
+Output token throughput (tok/s):         1.08      
+Peak output token throughput (tok/s):    6.00      
+Peak concurrent requests:                2.00      
+Total token throughput (tok/s):          9.58      
+---------------Time to First Token----------------
+Mean TTFT (ms):                          72662.79  
+Median TTFT (ms):                        2409.42   
+P50 TTFT (ms):                           2409.42   
+P90 TTFT (ms):                           171568.10 
+P99 TTFT (ms):                           525841.06 
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          361.98    
+Median TPOT (ms):                        51.24     
+P50 TPOT (ms):                           51.24     
+P90 TPOT (ms):                           800.90    
+P99 TPOT (ms):                           2370.04   
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           1234.12   
+Median ITL (ms):                         170.93    
+P50 ITL (ms):                            170.93    
+P90 ITL (ms):                            175.77    
+P99 ITL (ms):                            178.88    
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          118633.80 
+Median E2EL (ms):                        8878.16   
+P50 E2EL (ms):                           8878.16   
+P90 E2EL (ms):                           273067.09 
+P99 E2EL (ms):                           826814.67 
+---------------Speculative Decoding---------------
+Acceptance rate (%):                     49.33     
+Acceptance length:                       3.47      
+Drafts:                                  298       
+Draft tokens:                            1490      
+Accepted tokens:                         735       
+Per-position acceptance (%):
+  Position 0:                            77.18     
+  Position 1:                            64.77     
+  Position 2:                            48.32     
+  Position 3:                            35.57     
+  Position 4:                            20.81     
+==================================================
+INFO 10-24 04:33:43 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 10-24 04:33:43 [__init__.py:54] - neuron -> vllm_neuron:register
+INFO 10-24 04:33:43 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+2026-10-24 04:33:44,693 - INFO - complex_decomposition.py:119 - Registered ComplexTensor new_full rule.
+2026-10-24 04:33:44,773 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+2026-10-24 04:33:44,773 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+INFO 10-24 04:33:44 [__init__.py:272] Platform plugin neuron is activated
+2026-10-24 04:33:49,788 - INFO - dp_load_balancer_patch.py:311 - Applied internal-DP load-balancer patch
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x709272b7d440>, trust_remote_code=False, seed=0, num_prompts=8, dataset_name='sonnet', no_stream=False, dataset_path='contrib/models/deepseek_v41/test/performance/sonnet.txt', no_oversample=False, skip_chat_template=False, enable_multimodal_chat=False, disable_shuffle=False, custom_output_len=256, custom_ensure_client_side_data=False, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=1024, sonnet_output_len=128, sonnet_prefix_len=0, sharegpt_output_len=None, timed_trace_chunk_hash_size=16, timed_trace_sec_multiplier=1, timed_trace_label_timestamp='timestamp', timed_trace_label_input_length='input_length', timed_trace_label_output_length='output_length', timed_trace_label_hash_ids='hash_ids', blazedit_min_distance=0.0, blazedit_max_distance=1.0, asr_max_audio_len_sec=inf, asr_min_audio_len_sec=0.0, random_input_len=1024, random_output_len=128, random_range_ratio='0.0', random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, bfcl_categories=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, speed_bench_dataset_subset='qualitative', speed_bench_output_len=4096, speed_bench_category=None, label=None, backend='openai', base_url=None, host='127.0.0.1', port=8321, endpoint='/v1/completions', header=None, max_concurrency=1, model='deepseek-v41-flash', input_len=None, output_len=None, tokenizer='/mnt/nvme/hf', tokenizer_mode='auto', use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, probe_request_rate=0.0, disable_tqdm=False, num_warmups=8, profile=False, save_result=True, save_detailed=True, append_result=False, metadata=None, result_dir='contrib/models/deepseek_v41/test/performance/cells', result_filename='in1024_bs1.json', ignore_eos=True, self_timed=None, percentile_metrics='ttft,tpot,itl,e2el', metric_percentiles='50,90,99', goodput=None, request_id_prefix='bench-a67ec71d-', top_p=None, top_k=None, min_p=None, temperature=0.0, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, served_model_name=None, lora_modules=None, lora_assignment='random', ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=0, chat_template_kwargs=None, extra_body=None, skip_tokenizer_init=False, insecure=False, plot_timeline=False, timeline_itl_thresholds='25,50', plot_dataset_stats=False)
+ERROR 10-24 04:33:50 [repo_utils.py:119] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 04:33:50 [repo_utils.py:119] 
+ERROR 10-24 04:33:50 [repo_utils.py:119] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`, retrying 1 of 2
+ERROR 10-24 04:33:52 [repo_utils.py:117] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 04:33:52 [repo_utils.py:117] 
+ERROR 10-24 04:33:52 [repo_utils.py:117] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+Starting initial single prompt test run...
+Skipping endpoint ready check.
+Warming up with 8 requests...
+  0%|          | 0/8 [00:00<?, ?it/s] 12%|█▎        | 1/8 [00:07<00:54,  7.81s/it] 25%|██▌       | 2/8 [00:15<00:46,  7.80s/it] 38%|███▊      | 3/8 [00:23<00:38,  7.80s/it] 50%|█████     | 4/8 [00:31<00:31,  7.80s/it] 62%|██████▎   | 5/8 [00:38<00:23,  7.79s/it] 75%|███████▌  | 6/8 [00:46<00:15,  7.79s/it] 88%|████████▊ | 7/8 [00:54<00:07,  7.79s/it]100%|██████████| 8/8 [01:02<00:00,  7.80s/it]100%|██████████| 8/8 [01:02<00:00,  7.80s/it]
+Warmup run completed.
+Starting main benchmark run...
+Traffic request rate: inf
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: 1
+  0%|          | 0/8 [00:00<?, ?it/s] 12%|█▎        | 1/8 [00:07<00:54,  7.79s/it] 25%|██▌       | 2/8 [00:15<00:47,  7.90s/it] 38%|███▊      | 3/8 [00:23<00:38,  7.70s/it] 50%|█████     | 4/8 [00:30<00:30,  7.53s/it] 62%|██████▎   | 5/8 [00:38<00:22,  7.63s/it] 75%|███████▌  | 6/8 [00:46<00:15,  7.79s/it] 88%|████████▊ | 7/8 [00:54<00:07,  7.85s/it]100%|██████████| 8/8 [01:02<00:00,  7.99s/it]100%|██████████| 8/8 [01:02<00:00,  7.84s/it]
+tip: install termplotlib and gnuplot to plot the metrics
+============ Serving Benchmark Result ============
+Successful requests:                     8         
+Failed requests:                         0         
+Maximum request concurrency:             1         
+Benchmark duration (s):                  62.70     
+Total input tokens:                      8070      
+Total generated tokens:                  1024      
+Request throughput (req/s):              0.13      
+Output token throughput (tok/s):         16.33     
+Peak output token throughput (tok/s):    6.00      
+Peak concurrent requests:                2.00      
+Total token throughput (tok/s):          145.05    
+---------------Time to First Token----------------
+Mean TTFT (ms):                          1470.60   
+Median TTFT (ms):                        1470.64   
+P50 TTFT (ms):                           1470.64   
+P90 TTFT (ms):                           1472.78   
+P99 TTFT (ms):                           1473.37   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          50.13     
+Median TPOT (ms):                        50.55     
+P50 TPOT (ms):                           50.55     
+P90 TPOT (ms):                           52.73     
+P99 TPOT (ms):                           53.65     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           170.90    
+Median ITL (ms):                         170.73    
+P50 ITL (ms):                            170.73    
+P90 ITL (ms):                            175.71    
+P99 ITL (ms):                            179.12    
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          7836.61   
+Median E2EL (ms):                        7891.80   
+P50 E2EL (ms):                           7891.80   
+P90 E2EL (ms):                           8165.77   
+P99 E2EL (ms):                           8284.16   
+---------------Speculative Decoding---------------
+Acceptance rate (%):                     49.33     
+Acceptance length:                       3.47      
+Drafts:                                  298       
+Draft tokens:                            1490      
+Accepted tokens:                         735       
+Per-position acceptance (%):
+  Position 0:                            77.18     
+  Position 1:                            64.77     
+  Position 2:                            48.32     
+  Position 3:                            35.57     
+  Position 4:                            20.81     
+==================================================
+bench: stopping server
+bench: starting server on port 8321 (max_model_len=1280, max_num_seqs=1)
+bench:   /opt/aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0/bin/python -m performance._serve_main --model /mnt/nvme/hf --served-model-name deepseek-v41-flash --tensor-parallel-size 8 --pipeline-parallel-size 8 --no-async-scheduling --max-model-len 1280 --max-num-seqs 1 --port 8321 --no-enable-prefix-caching
+bench:   still waiting for the server (5400 s left)
+bench:   still waiting for the server (5280 s left)
+bench: server healthy after 215 s
+
+bench: cell in1024_bs1 — warm-up: 8 prompts, 128 out (discarded)
+bench: cell in1024_bs1 — measuring: 8 prompts, concurrency 1, 128 out
+##autohelix[ttft_p50_ms_in1024_bs1=1470.64]
+##autohelix[tpot_p50_ms_in1024_bs1=50.5519]
+##autohelix[decode_tok_s_in1024_bs1=16.3328]
+##autohelix[vllm_acceptance_pct_in1024_bs1=50.0888]
+INFO 10-24 04:35:59 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 10-24 04:35:59 [__init__.py:54] - neuron -> vllm_neuron:register
+INFO 10-24 04:35:59 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+2026-10-24 04:36:01,350 - INFO - complex_decomposition.py:119 - Registered ComplexTensor new_full rule.
+2026-10-24 04:36:01,432 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+2026-10-24 04:36:01,432 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+INFO 10-24 04:36:01 [__init__.py:272] Platform plugin neuron is activated
+2026-10-24 04:36:06,471 - INFO - dp_load_balancer_patch.py:311 - Applied internal-DP load-balancer patch
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x71a38715d440>, trust_remote_code=False, seed=0, num_prompts=10, dataset_name='sonnet', no_stream=False, dataset_path='contrib/models/deepseek_v41/test/performance/sonnet.txt', no_oversample=False, skip_chat_template=False, enable_multimodal_chat=False, disable_shuffle=False, custom_output_len=256, custom_ensure_client_side_data=False, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=1024, sonnet_output_len=128, sonnet_prefix_len=0, sharegpt_output_len=None, timed_trace_chunk_hash_size=16, timed_trace_sec_multiplier=1, timed_trace_label_timestamp='timestamp', timed_trace_label_input_length='input_length', timed_trace_label_output_length='output_length', timed_trace_label_hash_ids='hash_ids', blazedit_min_distance=0.0, blazedit_max_distance=1.0, asr_max_audio_len_sec=inf, asr_min_audio_len_sec=0.0, random_input_len=1024, random_output_len=128, random_range_ratio='0.0', random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, bfcl_categories=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, speed_bench_dataset_subset='qualitative', speed_bench_output_len=4096, speed_bench_category=None, label=None, backend='openai', base_url=None, host='127.0.0.1', port=8321, endpoint='/v1/completions', header=None, max_concurrency=10, model='deepseek-v41-flash', input_len=None, output_len=None, tokenizer='/mnt/nvme/hf', tokenizer_mode='auto', use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, probe_request_rate=0.0, disable_tqdm=False, num_warmups=0, profile=False, save_result=True, save_detailed=True, append_result=False, metadata=None, result_dir='contrib/models/deepseek_v41/test/performance/cells', result_filename='in1024_bs10.warmup.json', ignore_eos=True, self_timed=None, percentile_metrics='ttft,tpot,itl,e2el', metric_percentiles='50,90,99', goodput=None, request_id_prefix='bench-c76894ee-', top_p=None, top_k=None, min_p=None, temperature=0.0, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, served_model_name=None, lora_modules=None, lora_assignment='random', ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=0, chat_template_kwargs=None, extra_body=None, skip_tokenizer_init=False, insecure=False, plot_timeline=False, timeline_itl_thresholds='25,50', plot_dataset_stats=False)
+ERROR 10-24 04:36:06 [repo_utils.py:119] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 04:36:06 [repo_utils.py:119] 
+ERROR 10-24 04:36:06 [repo_utils.py:119] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`, retrying 1 of 2
+ERROR 10-24 04:36:08 [repo_utils.py:117] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 04:36:08 [repo_utils.py:117] 
+ERROR 10-24 04:36:08 [repo_utils.py:117] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+Starting initial single prompt test run...
+Skipping endpoint ready check.
+Starting main benchmark run...
+Traffic request rate: inf
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: 10
+  0%|          | 0/10 [00:00<?, ?it/s] 10%|█         | 1/10 [00:07<01:10,  7.81s/it] 20%|██        | 2/10 [00:15<01:02,  7.87s/it] 30%|███       | 3/10 [00:23<00:53,  7.70s/it] 40%|████      | 4/10 [00:30<00:45,  7.53s/it] 50%|█████     | 5/10 [00:38<00:38,  7.74s/it] 60%|██████    | 6/10 [00:46<00:31,  7.77s/it] 70%|███████   | 7/10 [00:54<00:23,  7.84s/it] 80%|████████  | 8/10 [01:02<00:15,  7.99s/it] 90%|█████████ | 9/10 [01:10<00:08,  8.04s/it]100%|██████████| 10/10 [01:18<00:00,  7.98s/it]100%|██████████| 10/10 [01:18<00:00,  7.87s/it]
+tip: install termplotlib and gnuplot to plot the metrics
+============ Serving Benchmark Result ============
+Successful requests:                     10        
+Failed requests:                         0         
+Maximum request concurrency:             10        
+Benchmark duration (s):                  78.72     
+Total input tokens:                      10087     
+Total generated tokens:                  1280      
+Request throughput (req/s):              0.13      
+Output token throughput (tok/s):         16.26     
+Peak output token throughput (tok/s):    6.00      
+Peak concurrent requests:                10.00     
+Total token throughput (tok/s):          144.39    
+---------------Time to First Token----------------
+Mean TTFT (ms):                          36645.78  
+Median TTFT (ms):                        36028.72  
+P50 TTFT (ms):                           36028.72  
+P90 TTFT (ms):                           65705.84  
+P99 TTFT (ms):                           72308.73  
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          49.31     
+Median TPOT (ms):                        49.82     
+P50 TPOT (ms):                           49.82     
+P90 TPOT (ms):                           52.58     
+P99 TPOT (ms):                           53.66     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           171.11    
+Median ITL (ms):                         170.89    
+P50 ITL (ms):                            170.89    
+P90 ITL (ms):                            176.06    
+P99 ITL (ms):                            180.24    
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          42908.55  
+Median E2EL (ms):                        42532.30  
+P50 E2EL (ms):                           42532.30  
+P90 E2EL (ms):                           71675.05  
+P99 E2EL (ms):                           78015.68  
+---------------Speculative Decoding---------------
+Acceptance rate (%):                     50.44     
+Acceptance length:                       3.52      
+Drafts:                                  366       
+Draft tokens:                            1830      
+Accepted tokens:                         923       
+Per-position acceptance (%):
+  Position 0:                            77.87     
+  Position 1:                            65.57     
+  Position 2:                            50.55     
+  Position 3:                            37.43     
+  Position 4:                            20.77     
+==================================================
+INFO 10-24 04:37:30 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 10-24 04:37:30 [__init__.py:54] - neuron -> vllm_neuron:register
+INFO 10-24 04:37:30 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+2026-10-24 04:37:31,700 - INFO - complex_decomposition.py:119 - Registered ComplexTensor new_full rule.
+2026-10-24 04:37:31,782 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+2026-10-24 04:37:31,782 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+INFO 10-24 04:37:31 [__init__.py:272] Platform plugin neuron is activated
+2026-10-24 04:37:36,856 - INFO - dp_load_balancer_patch.py:311 - Applied internal-DP load-balancer patch
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x701116585440>, trust_remote_code=False, seed=0, num_prompts=10, dataset_name='sonnet', no_stream=False, dataset_path='contrib/models/deepseek_v41/test/performance/sonnet.txt', no_oversample=False, skip_chat_template=False, enable_multimodal_chat=False, disable_shuffle=False, custom_output_len=256, custom_ensure_client_side_data=False, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=1024, sonnet_output_len=128, sonnet_prefix_len=0, sharegpt_output_len=None, timed_trace_chunk_hash_size=16, timed_trace_sec_multiplier=1, timed_trace_label_timestamp='timestamp', timed_trace_label_input_length='input_length', timed_trace_label_output_length='output_length', timed_trace_label_hash_ids='hash_ids', blazedit_min_distance=0.0, blazedit_max_distance=1.0, asr_max_audio_len_sec=inf, asr_min_audio_len_sec=0.0, random_input_len=1024, random_output_len=128, random_range_ratio='0.0', random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, bfcl_categories=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, speed_bench_dataset_subset='qualitative', speed_bench_output_len=4096, speed_bench_category=None, label=None, backend='openai', base_url=None, host='127.0.0.1', port=8321, endpoint='/v1/completions', header=None, max_concurrency=10, model='deepseek-v41-flash', input_len=None, output_len=None, tokenizer='/mnt/nvme/hf', tokenizer_mode='auto', use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, probe_request_rate=0.0, disable_tqdm=False, num_warmups=10, profile=False, save_result=True, save_detailed=True, append_result=False, metadata=None, result_dir='contrib/models/deepseek_v41/test/performance/cells', result_filename='in1024_bs10.json', ignore_eos=True, self_timed=None, percentile_metrics='ttft,tpot,itl,e2el', metric_percentiles='50,90,99', goodput=None, request_id_prefix='bench-4e6df926-', top_p=None, top_k=None, min_p=None, temperature=0.0, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, served_model_name=None, lora_modules=None, lora_assignment='random', ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=0, chat_template_kwargs=None, extra_body=None, skip_tokenizer_init=False, insecure=False, plot_timeline=False, timeline_itl_thresholds='25,50', plot_dataset_stats=False)
+ERROR 10-24 04:37:37 [repo_utils.py:119] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 04:37:37 [repo_utils.py:119] 
+ERROR 10-24 04:37:37 [repo_utils.py:119] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`, retrying 1 of 2
+ERROR 10-24 04:37:39 [repo_utils.py:117] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 04:37:39 [repo_utils.py:117] 
+ERROR 10-24 04:37:39 [repo_utils.py:117] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+Starting initial single prompt test run...
+Skipping endpoint ready check.
+Warming up with 10 requests...
+  0%|          | 0/10 [00:00<?, ?it/s] 10%|█         | 1/10 [00:07<01:10,  7.81s/it] 20%|██        | 2/10 [00:15<01:02,  7.81s/it] 30%|███       | 3/10 [00:23<00:54,  7.81s/it] 40%|████      | 4/10 [00:31<00:46,  7.80s/it] 50%|█████     | 5/10 [00:39<00:39,  7.80s/it] 60%|██████    | 6/10 [00:46<00:31,  7.80s/it] 70%|███████   | 7/10 [00:54<00:23,  7.79s/it] 80%|████████  | 8/10 [01:02<00:15,  7.79s/it] 90%|█████████ | 9/10 [01:10<00:07,  7.79s/it]100%|██████████| 10/10 [01:17<00:00,  7.79s/it]100%|██████████| 10/10 [01:17<00:00,  7.80s/it]
+Warmup run completed.
+Starting main benchmark run...
+Traffic request rate: inf
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: 10
+  0%|          | 0/10 [00:00<?, ?it/s] 10%|█         | 1/10 [00:07<01:10,  7.84s/it] 20%|██        | 2/10 [00:15<01:03,  7.90s/it] 30%|███       | 3/10 [00:23<00:53,  7.61s/it] 40%|████      | 4/10 [00:30<00:45,  7.56s/it] 50%|█████     | 5/10 [00:38<00:38,  7.67s/it] 60%|██████    | 6/10 [00:46<00:31,  7.77s/it] 70%|███████   | 7/10 [00:54<00:23,  7.95s/it] 80%|████████  | 8/10 [01:02<00:15,  7.80s/it] 90%|█████████ | 9/10 [01:09<00:07,  7.59s/it]100%|██████████| 10/10 [01:17<00:00,  7.75s/it]100%|██████████| 10/10 [01:17<00:00,  7.74s/it]
+tip: install termplotlib and gnuplot to plot the metrics
+============ Serving Benchmark Result ============
+Successful requests:                     10        
+Failed requests:                         0         
+Maximum request concurrency:             10        
+Benchmark duration (s):                  77.39     
+Total input tokens:                      10087     
+Total generated tokens:                  1280      
+Request throughput (req/s):              0.13      
+Output token throughput (tok/s):         16.54     
+Peak output token throughput (tok/s):    6.00      
+Peak concurrent requests:                10.00     
+Total token throughput (tok/s):          146.88    
+---------------Time to First Token----------------
+Mean TTFT (ms):                          36279.03  
+Median TTFT (ms):                        35941.87  
+P50 TTFT (ms):                           35941.87  
+P90 TTFT (ms):                           64328.53  
+P99 TTFT (ms):                           70105.46  
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          49.35     
+Median TPOT (ms):                        50.04     
+P50 TPOT (ms):                           50.04     
+P90 TPOT (ms):                           52.41     
+P99 TPOT (ms):                           53.61     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           171.24    
+Median ITL (ms):                         170.99    
+P50 ITL (ms):                            170.99    
+P90 ITL (ms):                            176.67    
+P99 ITL (ms):                            180.26    
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          42546.27  
+Median E2EL (ms):                        42379.65  
+P50 E2EL (ms):                           42379.65  
+P90 E2EL (ms):                           70098.13  
+P99 E2EL (ms):                           76656.46  
+---------------Speculative Decoding---------------
+Acceptance rate (%):                     50.44     
+Acceptance length:                       3.52      
+Drafts:                                  366       
+Draft tokens:                            1830      
+Accepted tokens:                         923       
+Per-position acceptance (%):
+  Position 0:                            77.87     
+  Position 1:                            65.57     
+  Position 2:                            50.55     
+  Position 3:                            37.43     
+  Position 4:                            20.77     
+==================================================
+
+bench: cell in1024_bs10 — reusing the context-1280 max_num_seqs-1 engine on port 8321
+
+bench: cell in1024_bs10 — warm-up: 10 prompts, 128 out (discarded)
+bench: cell in1024_bs10 — measuring: 10 prompts, concurrency 10, 128 out
+##autohelix[ttft_p50_ms_in1024_bs10=35941.9]
+##autohelix[tpot_p50_ms_in1024_bs10=50.0382]
+##autohelix[decode_tok_s_in1024_bs10=16.5402]
+##autohelix[vllm_acceptance_pct_in1024_bs10=51.027]
+INFO 10-24 04:44:03 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 10-24 04:44:03 [__init__.py:54] - neuron -> vllm_neuron:register
+INFO 10-24 04:44:03 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+2026-10-24 04:44:05,032 - INFO - complex_decomposition.py:119 - Registered ComplexTensor new_full rule.
+2026-10-24 04:44:05,113 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+2026-10-24 04:44:05,113 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+INFO 10-24 04:44:05 [__init__.py:272] Platform plugin neuron is activated
+2026-10-24 04:44:10,297 - INFO - dp_load_balancer_patch.py:311 - Applied internal-DP load-balancer patch
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x764700375940>, trust_remote_code=False, seed=0, num_prompts=8, dataset_name='sonnet', no_stream=False, dataset_path='contrib/models/deepseek_v41/test/performance/sonnet.txt', no_oversample=False, skip_chat_template=False, enable_multimodal_chat=False, disable_shuffle=False, custom_output_len=256, custom_ensure_client_side_data=False, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=2048, sonnet_output_len=128, sonnet_prefix_len=0, sharegpt_output_len=None, timed_trace_chunk_hash_size=16, timed_trace_sec_multiplier=1, timed_trace_label_timestamp='timestamp', timed_trace_label_input_length='input_length', timed_trace_label_output_length='output_length', timed_trace_label_hash_ids='hash_ids', blazedit_min_distance=0.0, blazedit_max_distance=1.0, asr_max_audio_len_sec=inf, asr_min_audio_len_sec=0.0, random_input_len=1024, random_output_len=128, random_range_ratio='0.0', random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, bfcl_categories=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, speed_bench_dataset_subset='qualitative', speed_bench_output_len=4096, speed_bench_category=None, label=None, backend='openai', base_url=None, host='127.0.0.1', port=8321, endpoint='/v1/completions', header=None, max_concurrency=1, model='deepseek-v41-flash', input_len=None, output_len=None, tokenizer='/mnt/nvme/hf', tokenizer_mode='auto', use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, probe_request_rate=0.0, disable_tqdm=False, num_warmups=0, profile=False, save_result=True, save_detailed=True, append_result=False, metadata=None, result_dir='contrib/models/deepseek_v41/test/performance/cells', result_filename='in2048_bs1.warmup.json', ignore_eos=True, self_timed=None, percentile_metrics='ttft,tpot,itl,e2el', metric_percentiles='50,90,99', goodput=None, request_id_prefix='bench-d6224e6f-', top_p=None, top_k=None, min_p=None, temperature=0.0, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, served_model_name=None, lora_modules=None, lora_assignment='random', ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=0, chat_template_kwargs=None, extra_body=None, skip_tokenizer_init=False, insecure=False, plot_timeline=False, timeline_itl_thresholds='25,50', plot_dataset_stats=False)
+ERROR 10-24 04:44:10 [repo_utils.py:119] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 04:44:10 [repo_utils.py:119] 
+ERROR 10-24 04:44:10 [repo_utils.py:119] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`, retrying 1 of 2
+ERROR 10-24 04:44:12 [repo_utils.py:117] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 04:44:12 [repo_utils.py:117] 
+ERROR 10-24 04:44:12 [repo_utils.py:117] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+Starting initial single prompt test run...
+Skipping endpoint ready check.
+Starting main benchmark run...
+Traffic request rate: inf
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: 1
+  0%|          | 0/8 [00:00<?, ?it/s] 12%|█▎        | 1/8 [17:46<2:04:26, 1066.66s/it] 25%|██▌       | 2/8 [17:56<44:31, 445.21s/it]    38%|███▊      | 3/8 [18:07<20:33, 246.71s/it] 50%|█████     | 4/8 [18:17<10:12, 153.23s/it] 62%|██████▎   | 5/8 [18:27<05:04, 101.51s/it] 75%|███████▌  | 6/8 [18:35<02:20, 70.01s/it]  88%|████████▊ | 7/8 [18:46<00:50, 50.44s/it]100%|██████████| 8/8 [18:55<00:00, 37.40s/it]100%|██████████| 8/8 [18:55<00:00, 141.95s/it]
+tip: install termplotlib and gnuplot to plot the metrics
+============ Serving Benchmark Result ============
+Successful requests:                     8         
+Failed requests:                         0         
+Maximum request concurrency:             1         
+Benchmark duration (s):                  1135.58   
+Total input tokens:                      16218     
+Total generated tokens:                  1024      
+Request throughput (req/s):              0.01      
+Output token throughput (tok/s):         0.90      
+Peak output token throughput (tok/s):    6.00      
+Peak concurrent requests:                2.00      
+Total token throughput (tok/s):          15.18     
+---------------Time to First Token----------------
+Mean TTFT (ms):                          95433.59  
+Median TTFT (ms):                        3542.93   
+P50 TTFT (ms):                           3542.93   
+P90 TTFT (ms):                           224575.32 
+P99 TTFT (ms):                           688189.58 
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          366.25    
+Median TPOT (ms):                        52.08     
+P50 TPOT (ms):                           52.08     
+P90 TPOT (ms):                           810.03    
+P99 TPOT (ms):                           2398.04   
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           1208.16   
+Median ITL (ms):                         171.14    
+P50 ITL (ms):                            171.14    
+P90 ITL (ms):                            177.27    
+P99 ITL (ms):                            181.24    
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          141947.68 
+Median E2EL (ms):                        10044.11  
+P50 E2EL (ms):                           10044.11  
+P90 E2EL (ms):                           327348.47 
+P99 E2EL (ms):                           992731.11 
+---------------Speculative Decoding---------------
+Acceptance rate (%):                     46.62     
+Acceptance length:                       3.33      
+Drafts:                                  308       
+Draft tokens:                            1540      
+Accepted tokens:                         718       
+Per-position acceptance (%):
+  Position 0:                            74.35     
+  Position 1:                            59.74     
+  Position 2:                            43.83     
+  Position 3:                            34.74     
+  Position 4:                            20.45     
+==================================================
+INFO 10-24 05:03:10 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 10-24 05:03:10 [__init__.py:54] - neuron -> vllm_neuron:register
+INFO 10-24 05:03:10 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+2026-10-24 05:03:12,393 - INFO - complex_decomposition.py:119 - Registered ComplexTensor new_full rule.
+2026-10-24 05:03:12,474 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+2026-10-24 05:03:12,474 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+INFO 10-24 05:03:12 [__init__.py:272] Platform plugin neuron is activated
+2026-10-24 05:03:17,483 - INFO - dp_load_balancer_patch.py:311 - Applied internal-DP load-balancer patch
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x7735fb181440>, trust_remote_code=False, seed=0, num_prompts=8, dataset_name='sonnet', no_stream=False, dataset_path='contrib/models/deepseek_v41/test/performance/sonnet.txt', no_oversample=False, skip_chat_template=False, enable_multimodal_chat=False, disable_shuffle=False, custom_output_len=256, custom_ensure_client_side_data=False, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=2048, sonnet_output_len=128, sonnet_prefix_len=0, sharegpt_output_len=None, timed_trace_chunk_hash_size=16, timed_trace_sec_multiplier=1, timed_trace_label_timestamp='timestamp', timed_trace_label_input_length='input_length', timed_trace_label_output_length='output_length', timed_trace_label_hash_ids='hash_ids', blazedit_min_distance=0.0, blazedit_max_distance=1.0, asr_max_audio_len_sec=inf, asr_min_audio_len_sec=0.0, random_input_len=1024, random_output_len=128, random_range_ratio='0.0', random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, bfcl_categories=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, speed_bench_dataset_subset='qualitative', speed_bench_output_len=4096, speed_bench_category=None, label=None, backend='openai', base_url=None, host='127.0.0.1', port=8321, endpoint='/v1/completions', header=None, max_concurrency=1, model='deepseek-v41-flash', input_len=None, output_len=None, tokenizer='/mnt/nvme/hf', tokenizer_mode='auto', use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, probe_request_rate=0.0, disable_tqdm=False, num_warmups=8, profile=False, save_result=True, save_detailed=True, append_result=False, metadata=None, result_dir='contrib/models/deepseek_v41/test/performance/cells', result_filename='in2048_bs1.json', ignore_eos=True, self_timed=None, percentile_metrics='ttft,tpot,itl,e2el', metric_percentiles='50,90,99', goodput=None, request_id_prefix='bench-c793c916-', top_p=None, top_k=None, min_p=None, temperature=0.0, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, served_model_name=None, lora_modules=None, lora_assignment='random', ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=0, chat_template_kwargs=None, extra_body=None, skip_tokenizer_init=False, insecure=False, plot_timeline=False, timeline_itl_thresholds='25,50', plot_dataset_stats=False)
+ERROR 10-24 05:03:17 [repo_utils.py:119] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 05:03:17 [repo_utils.py:119] 
+ERROR 10-24 05:03:17 [repo_utils.py:119] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`, retrying 1 of 2
+ERROR 10-24 05:03:19 [repo_utils.py:117] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 05:03:19 [repo_utils.py:117] 
+ERROR 10-24 05:03:19 [repo_utils.py:117] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+Starting initial single prompt test run...
+Skipping endpoint ready check.
+Warming up with 8 requests...
+  0%|          | 0/8 [00:00<?, ?it/s] 12%|█▎        | 1/8 [00:10<01:10, 10.13s/it] 25%|██▌       | 2/8 [00:20<01:00, 10.13s/it] 38%|███▊      | 3/8 [00:30<00:50, 10.14s/it] 50%|█████     | 4/8 [00:40<00:40, 10.15s/it] 62%|██████▎   | 5/8 [00:50<00:30, 10.14s/it] 75%|███████▌  | 6/8 [01:00<00:20, 10.14s/it] 88%|████████▊ | 7/8 [01:10<00:10, 10.14s/it]100%|██████████| 8/8 [01:21<00:00, 10.14s/it]100%|██████████| 8/8 [01:21<00:00, 10.14s/it]
+Warmup run completed.
+Starting main benchmark run...
+Traffic request rate: inf
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: 1
+  0%|          | 0/8 [00:00<?, ?it/s] 12%|█▎        | 1/8 [00:10<01:11, 10.14s/it] 25%|██▌       | 2/8 [00:19<00:57,  9.57s/it] 38%|███▊      | 3/8 [00:28<00:46,  9.37s/it] 50%|█████     | 4/8 [00:37<00:37,  9.34s/it] 62%|██████▎   | 5/8 [00:46<00:27,  9.08s/it] 75%|███████▌  | 6/8 [00:54<00:17,  8.81s/it] 88%|████████▊ | 7/8 [01:03<00:08,  8.86s/it]100%|██████████| 8/8 [01:12<00:00,  8.85s/it]100%|██████████| 8/8 [01:12<00:00,  9.05s/it]
+tip: install termplotlib and gnuplot to plot the metrics
+============ Serving Benchmark Result ============
+Successful requests:                     8         
+Failed requests:                         0         
+Maximum request concurrency:             1         
+Benchmark duration (s):                  72.43     
+Total input tokens:                      16218     
+Total generated tokens:                  1024      
+Request throughput (req/s):              0.11      
+Output token throughput (tok/s):         14.14     
+Peak output token throughput (tok/s):    6.00      
+Peak concurrent requests:                2.00      
+Total token throughput (tok/s):          238.04    
+---------------Time to First Token----------------
+Mean TTFT (ms):                          2458.41   
+Median TTFT (ms):                        2457.18   
+P50 TTFT (ms):                           2457.18   
+P90 TTFT (ms):                           2465.64   
+P99 TTFT (ms):                           2470.24   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          51.93     
+Median TPOT (ms):                        51.96     
+P50 TPOT (ms):                           51.96     
+P90 TPOT (ms):                           55.77     
+P99 TPOT (ms):                           60.09     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           171.31    
+Median ITL (ms):                         171.28    
+P50 ITL (ms):                            171.28    
+P90 ITL (ms):                            176.69    
+P99 ITL (ms):                            180.78    
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          9053.98   
+Median E2EL (ms):                        9055.40   
+P50 E2EL (ms):                           9055.40   
+P90 E2EL (ms):                           9535.02   
+P99 E2EL (ms):                           10081.90  
+---------------Speculative Decoding---------------
+Acceptance rate (%):                     46.62     
+Acceptance length:                       3.33      
+Drafts:                                  308       
+Draft tokens:                            1540      
+Accepted tokens:                         718       
+Per-position acceptance (%):
+  Position 0:                            74.35     
+  Position 1:                            59.74     
+  Position 2:                            43.83     
+  Position 3:                            34.74     
+  Position 4:                            20.45     
+==================================================
+bench: stopping server
+bench: starting server on port 8321 (max_model_len=2304, max_num_seqs=1)
+bench:   /opt/aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0/bin/python -m performance._serve_main --model /mnt/nvme/hf --served-model-name deepseek-v41-flash --tensor-parallel-size 8 --pipeline-parallel-size 8 --no-async-scheduling --max-model-len 2304 --max-num-seqs 1 --port 8321 --no-enable-prefix-caching
+bench:   still waiting for the server (5400 s left)
+bench:   still waiting for the server (5280 s left)
+bench: server healthy after 225 s
+
+bench: cell in2048_bs1 — warm-up: 8 prompts, 128 out (discarded)
+bench: cell in2048_bs1 — measuring: 8 prompts, concurrency 1, 128 out
+##autohelix[ttft_p50_ms_in2048_bs1=2457.18]
+##autohelix[tpot_p50_ms_in2048_bs1=51.9558]
+##autohelix[decode_tok_s_in2048_bs1=14.1369]
+##autohelix[vllm_acceptance_pct_in2048_bs1=41.0329]
+INFO 10-24 05:05:56 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 10-24 05:05:56 [__init__.py:54] - neuron -> vllm_neuron:register
+INFO 10-24 05:05:56 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+2026-10-24 05:05:57,600 - INFO - complex_decomposition.py:119 - Registered ComplexTensor new_full rule.
+2026-10-24 05:05:57,681 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+2026-10-24 05:05:57,681 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+INFO 10-24 05:05:57 [__init__.py:272] Platform plugin neuron is activated
+2026-10-24 05:06:02,685 - INFO - dp_load_balancer_patch.py:311 - Applied internal-DP load-balancer patch
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x7850e4b6d940>, trust_remote_code=False, seed=0, num_prompts=10, dataset_name='sonnet', no_stream=False, dataset_path='contrib/models/deepseek_v41/test/performance/sonnet.txt', no_oversample=False, skip_chat_template=False, enable_multimodal_chat=False, disable_shuffle=False, custom_output_len=256, custom_ensure_client_side_data=False, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=2048, sonnet_output_len=128, sonnet_prefix_len=0, sharegpt_output_len=None, timed_trace_chunk_hash_size=16, timed_trace_sec_multiplier=1, timed_trace_label_timestamp='timestamp', timed_trace_label_input_length='input_length', timed_trace_label_output_length='output_length', timed_trace_label_hash_ids='hash_ids', blazedit_min_distance=0.0, blazedit_max_distance=1.0, asr_max_audio_len_sec=inf, asr_min_audio_len_sec=0.0, random_input_len=1024, random_output_len=128, random_range_ratio='0.0', random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, bfcl_categories=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, speed_bench_dataset_subset='qualitative', speed_bench_output_len=4096, speed_bench_category=None, label=None, backend='openai', base_url=None, host='127.0.0.1', port=8321, endpoint='/v1/completions', header=None, max_concurrency=10, model='deepseek-v41-flash', input_len=None, output_len=None, tokenizer='/mnt/nvme/hf', tokenizer_mode='auto', use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, probe_request_rate=0.0, disable_tqdm=False, num_warmups=0, profile=False, save_result=True, save_detailed=True, append_result=False, metadata=None, result_dir='contrib/models/deepseek_v41/test/performance/cells', result_filename='in2048_bs10.warmup.json', ignore_eos=True, self_timed=None, percentile_metrics='ttft,tpot,itl,e2el', metric_percentiles='50,90,99', goodput=None, request_id_prefix='bench-bcdd7724-', top_p=None, top_k=None, min_p=None, temperature=0.0, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, served_model_name=None, lora_modules=None, lora_assignment='random', ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=0, chat_template_kwargs=None, extra_body=None, skip_tokenizer_init=False, insecure=False, plot_timeline=False, timeline_itl_thresholds='25,50', plot_dataset_stats=False)
+ERROR 10-24 05:06:03 [repo_utils.py:119] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 05:06:03 [repo_utils.py:119] 
+ERROR 10-24 05:06:03 [repo_utils.py:119] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`, retrying 1 of 2
+ERROR 10-24 05:06:05 [repo_utils.py:117] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 05:06:05 [repo_utils.py:117] 
+ERROR 10-24 05:06:05 [repo_utils.py:117] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+Starting initial single prompt test run...
+Skipping endpoint ready check.
+Starting main benchmark run...
+Traffic request rate: inf
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: 10
+  0%|          | 0/10 [00:00<?, ?it/s] 10%|█         | 1/10 [00:10<01:31, 10.15s/it] 20%|██        | 2/10 [00:19<01:16,  9.52s/it] 30%|███       | 3/10 [00:28<01:05,  9.37s/it] 40%|████      | 4/10 [00:37<00:55,  9.32s/it] 50%|█████     | 5/10 [00:46<00:45,  9.07s/it] 60%|██████    | 6/10 [00:55<00:36,  9.04s/it] 70%|███████   | 7/10 [01:04<00:26,  8.96s/it] 80%|████████  | 8/10 [01:12<00:17,  8.75s/it] 90%|█████████ | 9/10 [01:22<00:09,  9.28s/it]100%|██████████| 10/10 [01:31<00:00,  9.12s/it]100%|██████████| 10/10 [01:31<00:00,  9.16s/it]
+tip: install termplotlib and gnuplot to plot the metrics
+============ Serving Benchmark Result ============
+Successful requests:                     10        
+Failed requests:                         0         
+Maximum request concurrency:             10        
+Benchmark duration (s):                  91.58     
+Total input tokens:                      20268     
+Total generated tokens:                  1280      
+Request throughput (req/s):              0.11      
+Output token throughput (tok/s):         13.98     
+Peak output token throughput (tok/s):    6.00      
+Peak concurrent requests:                10.00     
+Total token throughput (tok/s):          235.30    
+---------------Time to First Token----------------
+Mean TTFT (ms):                          44212.20  
+Median TTFT (ms):                        44435.73  
+P50 TTFT (ms):                           44435.73  
+P90 TTFT (ms):                           76502.02  
+P99 TTFT (ms):                           84962.59  
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          51.80     
+Median TPOT (ms):                        51.91     
+P50 TPOT (ms):                           51.91     
+P90 TPOT (ms):                           58.20     
+P99 TPOT (ms):                           60.26     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           171.31    
+Median ITL (ms):                         171.36    
+P50 ITL (ms):                            171.36    
+P90 ITL (ms):                            176.21    
+P99 ITL (ms):                            179.40    
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          50790.34  
+Median E2EL (ms):                        50793.81  
+P50 E2EL (ms):                           50793.81  
+P90 E2EL (ms):                           83691.90  
+P99 E2EL (ms):                           90785.34  
+---------------Speculative Decoding---------------
+Acceptance rate (%):                     46.77     
+Acceptance length:                       3.34      
+Drafts:                                  384       
+Draft tokens:                            1920      
+Accepted tokens:                         898       
+Per-position acceptance (%):
+  Position 0:                            74.48     
+  Position 1:                            59.90     
+  Position 2:                            44.53     
+  Position 3:                            34.90     
+  Position 4:                            20.05     
+==================================================
+INFO 10-24 05:07:39 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 10-24 05:07:39 [__init__.py:54] - neuron -> vllm_neuron:register
+INFO 10-24 05:07:39 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+2026-10-24 05:07:40,847 - INFO - complex_decomposition.py:119 - Registered ComplexTensor new_full rule.
+2026-10-24 05:07:40,928 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+2026-10-24 05:07:40,928 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+INFO 10-24 05:07:40 [__init__.py:272] Platform plugin neuron is activated
+2026-10-24 05:07:46,028 - INFO - dp_load_balancer_patch.py:311 - Applied internal-DP load-balancer patch
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x701da457d940>, trust_remote_code=False, seed=0, num_prompts=10, dataset_name='sonnet', no_stream=False, dataset_path='contrib/models/deepseek_v41/test/performance/sonnet.txt', no_oversample=False, skip_chat_template=False, enable_multimodal_chat=False, disable_shuffle=False, custom_output_len=256, custom_ensure_client_side_data=False, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=2048, sonnet_output_len=128, sonnet_prefix_len=0, sharegpt_output_len=None, timed_trace_chunk_hash_size=16, timed_trace_sec_multiplier=1, timed_trace_label_timestamp='timestamp', timed_trace_label_input_length='input_length', timed_trace_label_output_length='output_length', timed_trace_label_hash_ids='hash_ids', blazedit_min_distance=0.0, blazedit_max_distance=1.0, asr_max_audio_len_sec=inf, asr_min_audio_len_sec=0.0, random_input_len=1024, random_output_len=128, random_range_ratio='0.0', random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, bfcl_categories=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, speed_bench_dataset_subset='qualitative', speed_bench_output_len=4096, speed_bench_category=None, label=None, backend='openai', base_url=None, host='127.0.0.1', port=8321, endpoint='/v1/completions', header=None, max_concurrency=10, model='deepseek-v41-flash', input_len=None, output_len=None, tokenizer='/mnt/nvme/hf', tokenizer_mode='auto', use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, probe_request_rate=0.0, disable_tqdm=False, num_warmups=10, profile=False, save_result=True, save_detailed=True, append_result=False, metadata=None, result_dir='contrib/models/deepseek_v41/test/performance/cells', result_filename='in2048_bs10.json', ignore_eos=True, self_timed=None, percentile_metrics='ttft,tpot,itl,e2el', metric_percentiles='50,90,99', goodput=None, request_id_prefix='bench-fd617193-', top_p=None, top_k=None, min_p=None, temperature=0.0, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, served_model_name=None, lora_modules=None, lora_assignment='random', ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=0, chat_template_kwargs=None, extra_body=None, skip_tokenizer_init=False, insecure=False, plot_timeline=False, timeline_itl_thresholds='25,50', plot_dataset_stats=False)
+ERROR 10-24 05:07:46 [repo_utils.py:119] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 05:07:46 [repo_utils.py:119] 
+ERROR 10-24 05:07:46 [repo_utils.py:119] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`, retrying 1 of 2
+ERROR 10-24 05:07:48 [repo_utils.py:117] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 05:07:48 [repo_utils.py:117] 
+ERROR 10-24 05:07:48 [repo_utils.py:117] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+Starting initial single prompt test run...
+Skipping endpoint ready check.
+Warming up with 10 requests...
+  0%|          | 0/10 [00:00<?, ?it/s] 10%|█         | 1/10 [00:10<01:31, 10.17s/it] 20%|██        | 2/10 [00:20<01:21, 10.15s/it] 30%|███       | 3/10 [00:30<01:11, 10.15s/it] 40%|████      | 4/10 [00:40<01:00, 10.14s/it] 50%|█████     | 5/10 [00:50<00:50, 10.15s/it] 60%|██████    | 6/10 [01:00<00:40, 10.15s/it] 70%|███████   | 7/10 [01:11<00:30, 10.14s/it] 80%|████████  | 8/10 [01:21<00:20, 10.14s/it] 90%|█████████ | 9/10 [01:31<00:10, 10.14s/it]100%|██████████| 10/10 [01:41<00:00, 10.14s/it]100%|██████████| 10/10 [01:41<00:00, 10.14s/it]
+Warmup run completed.
+Starting main benchmark run...
+Traffic request rate: inf
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: 10
+  0%|          | 0/10 [00:00<?, ?it/s] 10%|█         | 1/10 [00:10<01:31, 10.16s/it] 20%|██        | 2/10 [00:19<01:16,  9.58s/it] 30%|███       | 3/10 [00:28<01:05,  9.38s/it] 40%|████      | 4/10 [00:37<00:56,  9.34s/it] 50%|█████     | 5/10 [00:46<00:45,  9.08s/it] 60%|██████    | 6/10 [00:54<00:35,  8.81s/it] 70%|███████   | 7/10 [01:03<00:26,  8.87s/it] 80%|████████  | 8/10 [01:12<00:17,  8.85s/it] 90%|█████████ | 9/10 [01:22<00:09,  9.14s/it]100%|██████████| 10/10 [01:30<00:00,  8.83s/it]100%|██████████| 10/10 [01:30<00:00,  9.04s/it]
+tip: install termplotlib and gnuplot to plot the metrics
+============ Serving Benchmark Result ============
+Successful requests:                     10        
+Failed requests:                         0         
+Maximum request concurrency:             10        
+Benchmark duration (s):                  90.37     
+Total input tokens:                      20268     
+Total generated tokens:                  1280      
+Request throughput (req/s):              0.11      
+Output token throughput (tok/s):         14.16     
+Peak output token throughput (tok/s):    6.00      
+Peak concurrent requests:                10.00     
+Total token throughput (tok/s):          238.43    
+---------------Time to First Token----------------
+Mean TTFT (ms):                          43962.66  
+Median TTFT (ms):                        44519.97  
+P50 TTFT (ms):                           44519.97  
+P90 TTFT (ms):                           75882.31  
+P99 TTFT (ms):                           83815.67  
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          51.86     
+Median TPOT (ms):                        52.01     
+P50 TPOT (ms):                           52.01     
+P90 TPOT (ms):                           58.11     
+P99 TPOT (ms):                           60.36     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           171.50    
+Median ITL (ms):                         171.43    
+P50 ITL (ms):                            171.43    
+P90 ITL (ms):                            176.83    
+P99 ITL (ms):                            180.03    
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          50548.29  
+Median E2EL (ms):                        50521.77  
+P50 E2EL (ms):                           50521.77  
+P90 E2EL (ms):                           83060.09  
+P99 E2EL (ms):                           89639.39  
+---------------Speculative Decoding---------------
+Acceptance rate (%):                     46.77     
+Acceptance length:                       3.34      
+Drafts:                                  384       
+Draft tokens:                            1920      
+Accepted tokens:                         898       
+Per-position acceptance (%):
+  Position 0:                            74.48     
+  Position 1:                            59.90     
+  Position 2:                            44.53     
+  Position 3:                            34.90     
+  Position 4:                            20.05     
+==================================================
+
+bench: cell in2048_bs10 — reusing the context-2304 max_num_seqs-1 engine on port 8321
+
+bench: cell in2048_bs10 — warm-up: 10 prompts, 128 out (discarded)
+bench: cell in2048_bs10 — measuring: 10 prompts, concurrency 10, 128 out
+##autohelix[ttft_p50_ms_in2048_bs10=44520]
+##autohelix[tpot_p50_ms_in2048_bs10=52.0137]
+##autohelix[decode_tok_s_in2048_bs10=14.1633]
+##autohelix[vllm_acceptance_pct_in2048_bs10=41.1043]
+INFO 10-24 05:14:43 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 10-24 05:14:43 [__init__.py:54] - neuron -> vllm_neuron:register
+INFO 10-24 05:14:43 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+2026-10-24 05:14:45,585 - INFO - complex_decomposition.py:119 - Registered ComplexTensor new_full rule.
+2026-10-24 05:14:45,667 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+2026-10-24 05:14:45,667 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+INFO 10-24 05:14:45 [__init__.py:272] Platform plugin neuron is activated
+2026-10-24 05:14:50,670 - INFO - dp_load_balancer_patch.py:311 - Applied internal-DP load-balancer patch
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x789f8af6d440>, trust_remote_code=False, seed=0, num_prompts=8, dataset_name='sonnet', no_stream=False, dataset_path='contrib/models/deepseek_v41/test/performance/sonnet.txt', no_oversample=False, skip_chat_template=False, enable_multimodal_chat=False, disable_shuffle=False, custom_output_len=256, custom_ensure_client_side_data=False, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=8192, sonnet_output_len=128, sonnet_prefix_len=0, sharegpt_output_len=None, timed_trace_chunk_hash_size=16, timed_trace_sec_multiplier=1, timed_trace_label_timestamp='timestamp', timed_trace_label_input_length='input_length', timed_trace_label_output_length='output_length', timed_trace_label_hash_ids='hash_ids', blazedit_min_distance=0.0, blazedit_max_distance=1.0, asr_max_audio_len_sec=inf, asr_min_audio_len_sec=0.0, random_input_len=1024, random_output_len=128, random_range_ratio='0.0', random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, bfcl_categories=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, speed_bench_dataset_subset='qualitative', speed_bench_output_len=4096, speed_bench_category=None, label=None, backend='openai', base_url=None, host='127.0.0.1', port=8321, endpoint='/v1/completions', header=None, max_concurrency=1, model='deepseek-v41-flash', input_len=None, output_len=None, tokenizer='/mnt/nvme/hf', tokenizer_mode='auto', use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, probe_request_rate=0.0, disable_tqdm=False, num_warmups=0, profile=False, save_result=True, save_detailed=True, append_result=False, metadata=None, result_dir='contrib/models/deepseek_v41/test/performance/cells', result_filename='in8192_bs1.warmup.json', ignore_eos=True, self_timed=None, percentile_metrics='ttft,tpot,itl,e2el', metric_percentiles='50,90,99', goodput=None, request_id_prefix='bench-35109233-', top_p=None, top_k=None, min_p=None, temperature=0.0, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, served_model_name=None, lora_modules=None, lora_assignment='random', ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=0, chat_template_kwargs=None, extra_body=None, skip_tokenizer_init=False, insecure=False, plot_timeline=False, timeline_itl_thresholds='25,50', plot_dataset_stats=False)
+ERROR 10-24 05:14:51 [repo_utils.py:119] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 05:14:51 [repo_utils.py:119] 
+ERROR 10-24 05:14:51 [repo_utils.py:119] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`, retrying 1 of 2
+ERROR 10-24 05:14:53 [repo_utils.py:117] Error parsing config for /mnt/nvme/hf: The checkpoint you are trying to load has model type `deepseek_v41` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+ERROR 10-24 05:14:53 [repo_utils.py:117] 
+ERROR 10-24 05:14:53 [repo_utils.py:117] You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+Starting initial single prompt test run...
+Skipping endpoint ready check.
+Starting main benchmark run...
+Traffic request rate: inf
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: 1
+  0%|          | 0/8 [00:00<?, ?it/s]bench:   FATAL in the engine log: 'WorkerProc hit an exception' — killing the cell now rather than waiting out the timeout.
+bench:   The surviving ranks are wedged in a collective. `~/reset_neuron.sh` reloads the driver, which clears it without a host reboot.
+bench:   warm-up for in8192_bs1 did not complete; the measurement below is a cold one
+INFO 10-24 05:38:10 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 10-24 05:38:10 [__init__.py:54] - neuron -> vllm_neuron:register
+INFO 10-24 05:38:10 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+2026-10-24 05:38:12,309 - INFO - complex_decomposition.py:119 - Registered ComplexTensor new_full rule.
+2026-10-24 05:38:12,387 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+2026-10-24 05:38:12,387 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+INFO 10-24 05:38:12 [__init__.py:272] Platform plugin neuron is activated
+bench:   FATAL in the engine log: 'WorkerProc hit an exception' — killing the cell now rather than waiting out the timeout.
+bench:   The surviving ranks are wedged in a collective. `~/reset_neuron.sh` reloads the driver, which clears it without a host reboot.
+[transformers] DeepseekV41TextConfig got `key=rope_scaling` in kwargs but hasn't set it as attribute. For RoPE standardization you need to set `self.rope_parameters` in model's config. 
+[transformers] DeepseekV41TextConfig got `key=rope_scaling` in kwargs but hasn't set it as attribute. For RoPE standardization you need to set `self.rope_parameters` in model's config. 
+bench:   /metrics unreachable: <urlopen error [Errno 111] Connection refused>
+bench:   prose prompt short-prose (158 tok) rejected: <urlopen error [Errno 111] Connection refused>
+bench:   prose prompt long-needle-2048-0 (2008 tok) rejected: <urlopen error [Errno 111] Connection refused>
+bench:   prose prompt smoke-test (37 tok) rejected: <urlopen error [Errno 111] Connection refused>
+bench:   prose prompt trivia-capital-france (37 tok) rejected: <urlopen error [Errno 111] Connection refused>
+bench:   /metrics unreachable: <urlopen error [Errno 111] Connection refused>
+INFO 10-24 05:38:16 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 10-24 05:38:16 [__init__.py:54] - neuron -> vllm_neuron:register
+INFO 10-24 05:38:16 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+2026-10-24 05:38:18,395 - INFO - complex_decomposition.py:119 - Registered ComplexTensor new_full rule.
+2026-10-24 05:38:18,472 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+2026-10-24 05:38:18,472 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+INFO 10-24 05:38:18 [__init__.py:272] Platform plugin neuron is activated
+bench:   FATAL in the engine log: 'WorkerProc hit an exception' — killing the cell now rather than waiting out the timeout.
+bench:   The surviving ranks are wedged in a collective. `~/reset_neuron.sh` reloads the driver, which clears it without a host reboot.
+bench:   warm-up for in8192_bs10 did not complete; the measurement below is a cold one
+INFO 10-24 05:38:21 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 10-24 05:38:21 [__init__.py:54] - neuron -> vllm_neuron:register
+INFO 10-24 05:38:21 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+2026-10-24 05:38:23,471 - INFO - complex_decomposition.py:119 - Registered ComplexTensor new_full rule.
+2026-10-24 05:38:23,549 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+2026-10-24 05:38:23,549 - INFO - port_hold_patch.py:228 - Port-hold patch applied (EADDRINUSE file-rendezvous)
+INFO 10-24 05:38:23 [__init__.py:272] Platform plugin neuron is activated
+bench:   FATAL in the engine log: 'WorkerProc hit an exception' — killing the cell now rather than waiting out the timeout.
+bench:   The surviving ranks are wedged in a collective. `~/reset_neuron.sh` reloads the driver, which clears it without a host reboot.
+bench: stopping server
+bench: starting server on port 8321 (max_model_len=8448, max_num_seqs=1)
+bench:   /opt/aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0/bin/python -m performance._serve_main --model /mnt/nvme/hf --served-model-name deepseek-v41-flash --tensor-parallel-size 8 --pipeline-parallel-size 8 --no-async-scheduling --max-model-len 8448 --max-num-seqs 1 --port 8321 --no-enable-prefix-caching
+bench:   still waiting for the server (5400 s left)
+bench:   still waiting for the server (5280 s left)
+bench: server healthy after 220 s
+
+bench: cell in8192_bs1 — warm-up: 8 prompts, 128 out (discarded)
+bench: stopping server
+bench: cell in8192_bs1 — measuring: 8 prompts, concurrency 1, 128 out
+
+bench: prose acceptance probe on in8192_bs1's server (context 8448, 96 out)
+bench:   0/0 drafts accepted = unmeasured over case(s) []
+
+bench: cell in8192_bs10 — reusing the context-8448 max_num_seqs-1 engine on port 8321
+
+bench: cell in8192_bs10 — warm-up: 10 prompts, 128 out (discarded)
+bench: cell in8192_bs10 — measuring: 10 prompts, concurrency 10, 128 out
+
+======================================================================================
+DeepSeek-V4.1-Flash — forward inference, `vllm bench serve`, random input
+==============================================================================================
+         cell   out     ctx   TTFT p50   TPOT p50     decode   per-str  accept   vllm  done
+                                    ms         ms      tok/s     tok/s       %      %      
+----------------------------------------------------------------------------------------------
+    in512_bs1   128     768      925.2       51.9      16.66     19.27      46     46     8
+   in512_bs10   128     768    35423.4       53.4      16.56     18.73      46     46    10
+   in1024_bs1   128    1280     1470.6       50.6      16.33     19.78      50     50     8
+  in1024_bs10   128    1280    35941.9       50.0      16.54     19.98      50     51    10
+   in2048_bs1   128    2304     2457.2       52.0      14.14     19.25      43     41     8
+  in2048_bs10   128    2304    44520.0       52.0      14.16     19.23      43     41    10
+   in8192_bs1   128    8448     FAILED
+  in8192_bs10   128    8448     FAILED
+==============================================================================================
+
+bench: 6 of 8 cell(s) measured — report at contrib/models/deepseek_v41/test/performance/bench_report.tp8pp8.json
+##bench[cells_ok=6]

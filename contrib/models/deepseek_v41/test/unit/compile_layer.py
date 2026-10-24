@@ -6,7 +6,8 @@ os.environ.setdefault("RANK", "0"); os.environ.setdefault("WORLD_SIZE", "8")
 import torch
 from kharness import compile_only, run_nki
 from deepseek_v41.config import DeepseekV41Config
-from deepseek_v41.kernels import layer_kernel
+from deepseek_v41.kernels import mk_kernels
+layer_kernel = mk_kernels.pkg("tp64").layer_kernel
 from deepseek_v41 import mk_host
 import test_layer as TL
 

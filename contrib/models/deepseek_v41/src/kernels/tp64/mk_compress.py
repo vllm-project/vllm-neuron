@@ -20,7 +20,7 @@ owns, except where the docstring says otherwise. Numerics mirror `model.py`:
 import nki.isa as nisa
 import nki.language as nl
 
-from .blockquant import _pow2_ceil_log2
+from ..blockquant import _pow2_ceil_log2
 from .mk_common import (
     PT,
     NEG_BOUND,

@@ -20,6 +20,14 @@ def apply_patches():
 
     apply_dp_load_balancer_patch()
 
+    from vllm_neuron.vllm.patches.pp_draft_patch import (
+        apply_pp_draft_patch,
+        apply_pp_mq_depth_patch,
+    )
+
+    apply_pp_draft_patch()
+    apply_pp_mq_depth_patch()
+
     # patches/jf_grammar_patch.py wraps a specific
     # StructuredOutputManager and is applied from NeuronScheduler.__init__.
 

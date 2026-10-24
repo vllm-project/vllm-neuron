@@ -7,6 +7,7 @@ It uses a holdback queue pattern for cleaner request management and
 bucket-aware admission control.
 """
 
+import os
 import logging
 from collections import deque
 from enum import Enum, auto
@@ -15,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
 
@@ -46,6 +48,8 @@ if TYPE_CHECKING:
     from vllm.v1.structured_output import StructuredOutputManager
 
 logger = logging.getLogger(__name__)
+
+_PP_TRACE = os.environ.get("VLLM_NEURON_PP_TRACE", "") not in ("", "0")
 
 
 def _kv_capacity_guidance() -> str:
@@ -355,6 +359,32 @@ class NeuronScheduler(Scheduler):
         # in the pinned vLLM, delete all three and use the stock path.
         self._ec_locator_by_mm_hash: dict[str, dict] = {}
 
+    def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
+        """Attach the drafter's tokens.
+
+        Under pipeline parallelism the drafts do not come this way. The engine's
+        `take_draft_token_ids` RPC after every scheduled step would sit behind
+        the in-flight `execute_model` on the last stage -- serializing the batch
+        queue, so no two batches ever overlap -- and its drafts would reach this
+        scheduler several outputs ahead of the step they belong to (a request
+        would become schedulable with the drafts but without the sampled token
+        they hang off). `pp_draft_patch` turns that RPC off; the model runner
+        ships each step's drafts inside its `ModelRunnerOutput`
+        (`neuron_pp_drafts`) and `update_from_output` attaches them right after
+        the sampled tokens of the same step. Anything still arriving here under
+        PP is ignored, with one warning.
+        """
+        if self.vllm_config.parallel_config.pipeline_parallel_size <= 1:
+            return super().update_draft_token_ids(draft_token_ids)
+        if not self.__dict__.get("_pp_rpc_drafts_warned"):
+            self.__dict__["_pp_rpc_drafts_warned"] = True
+            logger.warning(
+                "NeuronScheduler: ignoring %d draft row(s) handed over by "
+                "take_draft_token_ids under pipeline parallelism; drafts are "
+                "attached from each step's output instead",
+                len(draft_token_ids.req_ids),
+            )
+
     def update_from_output(self, scheduler_output, model_runner_output):
         """Process output. Additionally, check if we can advance
         reqs with JF tokens in next iteration.
@@ -381,7 +411,43 @@ class NeuronScheduler(Scheduler):
                 if grammar is not None:
                     grammar.rollback(len(jf_tokens))
 
+        if _PP_TRACE:
+            logger.warning(
+                "PP-TRACE scheduler.update_from_output scheduled=%s spec=%s sampled=%s",
+                dict(scheduler_output.num_scheduled_tokens),
+                {k: len(v) for k, v in scheduler_output.scheduled_spec_decode_tokens.items()},
+                getattr(model_runner_output, "sampled_token_ids", None),
+            )
         result = super().update_from_output(scheduler_output, model_runner_output)
+        # Pipeline parallelism: this step's drafts came inside its own output
+        # (`NeuronModelRunner._attach_pp_drafts`). Attach them now that the
+        # sampled tokens they hang off are in -- only for requests that
+        # committed a token in this step (a chunked prefill's non-final chunk
+        # has none) and are still alive.
+        pp_drafts = getattr(model_runner_output, "neuron_pp_drafts", None)
+        if pp_drafts:
+            sampled = model_runner_output.sampled_token_ids
+            index = model_runner_output.req_id_to_index
+            req_ids, drafts = [], []
+            for req_id, spec in pp_drafts.items():
+                request = self.requests.get(req_id)
+                if not spec or request is None or request.is_finished():
+                    continue
+                idx = index.get(req_id)
+                if idx is None or not sampled or idx >= len(sampled) or not sampled[idx]:
+                    continue
+                req_ids.append(req_id)
+                drafts.append(spec)
+            if req_ids:
+                super().update_draft_token_ids(DraftTokenIds(req_ids, drafts))
+        if _PP_TRACE:
+            for req_id in scheduler_output.num_scheduled_tokens:
+                request = self.requests.get(req_id)
+                if request is not None:
+                    logger.warning(
+                        "PP-TRACE after update req=%s num_computed=%d num_tokens=%d spec=%d",
+                        req_id, request.num_computed_tokens, request.num_tokens, len(request.spec_token_ids),
+                    )
 
         # Prefill-async pipeline: retire producers from the send-lane once their
         # KV send completes. super() above frees a finished-sending req and deletes

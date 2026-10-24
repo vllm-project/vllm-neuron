@@ -714,14 +714,29 @@ def build_weight_mappings(model: DeepseekV41ForCausalLM) -> dict[str, str | list
         row.
     """
     config = model.config
-    mappings: dict[str, str | list[str]] = {
-        "embed.weight": "embed.weight",
-        "norm.weight": "norm.weight",
-        "head.weight": "head.weight",
-    }
+    plan = model.mk_plan
+    mappings: dict[str, str | list[str]] = {}
+    # Under the pipeline scheme a rank holds its stage's blocks only: the embedding
+    # on the first stage (and the last, whose DSpark stages embed the drafted ids),
+    # the norm, the head and the DSpark stages on the last.
+    if plan.is_first or plan.is_last:
+        mappings["embed.weight"] = "embed.weight"
+    if plan.is_last:
+        mappings["norm.weight"] = "norm.weight"
+        mappings["head.weight"] = "head.weight"
 
-    for layer_id in range(config.num_hidden_layers):
+    for layer_id in model.block_ids:
         mappings.update(_block_keys(f"layers.{layer_id}", config, layer_id))
+
+    # The stage's replica of the kv source it receives rows from (`model.src_attn`):
+    # the source layer's attention weights, under the replica's module path.
+    for sid in model.src_attn:
+        src_prefix = f"layers.{sid}.attn"
+        for name, key in _attention_keys(src_prefix, config, int(sid)).items():
+            mappings[name.replace(src_prefix, f"src_attn.{sid}", 1)] = key
+
+    if not plan.is_last:
+        return mappings
 
     for stage in range(config.num_nextn_predict_layers):
         layer_id = config.num_hidden_layers + stage
@@ -1231,7 +1246,8 @@ def load_engram_tables(
     """Put this rank's rows of each n-gram table in HBM. Returns the bytes."""
     loaded = 0
     for layer_id in list(model.config.engram_layer_ids):
-        engram = model.layers[layer_id].engram
+        block = model.blocks_by_id.get(layer_id)
+        engram = block.engram if block is not None else None
         if engram is None:
             continue
         weight_key = f"layers.{layer_id}.engram.embed.weight"
@@ -1255,7 +1271,10 @@ def load_engram_tables(
         from .model import _ENGRAM_TABLE_BYTES
 
         shard_bytes = width * engram.head_dim * 2
-        budget = _ENGRAM_TABLE_BYTES // max(1, len(list(model.config.engram_layer_ids)))
+        owned_engram = [
+            lid for lid in model.config.engram_layer_ids if lid in model.blocks_by_id
+        ]
+        budget = _ENGRAM_TABLE_BYTES // max(1, len(owned_engram))
         if shard_bytes > budget:
             engram.table = torch.empty(
                 0, engram.head_dim, dtype=torch.bfloat16, device=device
@@ -1298,7 +1317,7 @@ def load_resident_experts(
     model: DeepseekV41ForCausalLM, weight_store: "TimeshareWeightStore"
 ) -> tuple[int, int]:
     """Fill every expert slot this rank owns. Returns `(experts, bytes)`."""
-    blocks = list(model.layers) + list(model.mtp)
+    blocks = list(model.layers.values()) + list(model.mtp)
     per_expert = sum(
         buffer.numel() * buffer.element_size()
         for buffer in blocks[0].ffn.expert_slot.buffers()
@@ -1384,12 +1403,13 @@ def load_weights(
     engram_bytes = load_engram_tables(model, index, device)
 
     wanted_experts = sum(
-        block.ffn.n_local_experts for block in list(model.layers) + list(model.mtp)
+        block.ffn.n_local_experts for block in list(model.layers.values()) + list(model.mtp)
     )
     engram_resident = all(
-        model.layers[layer_id].engram is None
-        or model.layers[layer_id].engram.resident
+        model.blocks_by_id[layer_id].engram is None
+        or model.blocks_by_id[layer_id].engram.resident
         for layer_id in list(model.config.engram_layer_ids)
+        if layer_id in model.blocks_by_id
     )
     resident = experts == wanted_experts and engram_resident
     if resident:

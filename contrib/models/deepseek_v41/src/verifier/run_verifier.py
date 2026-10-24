@@ -85,6 +85,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "implementation's choice rather than the verifier's; pass this only to "
         "override it for one run.",
     )
+    p.add_argument(
+        "--pipeline-parallel-size",
+        type=int,
+        default=None,
+        help="engine pipeline-parallel degree. Defaults to the port's "
+        "`config.PIPELINE_PARALLEL_SIZE` (1, or 8 under DEEPSEEK_V41_SCHEME=tp8pp8).",
+    )
     p.add_argument("--max-num-seqs", type=int, default=4)
     p.add_argument(
         "--max-model-len",
@@ -172,7 +179,8 @@ def _phases(cases, kept, args) -> list[dict]:
     ]
 
 
-def _run_phase(phase: dict, args, tensor_parallel_size: int) -> list[dict]:
+def _run_phase(phase: dict, args, tensor_parallel_size: int,
+               pipeline_parallel_size: int = 1) -> list[dict]:
     """One engine, one `generate`, then tear it down so its HBM comes back."""
     import gc
 
@@ -199,7 +207,15 @@ def _run_phase(phase: dict, args, tensor_parallel_size: int) -> list[dict]:
         max_model_len=max_model_len,
         max_num_batched_tokens=mnbt,
         tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
         enable_prefix_caching=apc,
+        # Pipeline stages: synchronous scheduling. The async scheduler fills the
+        # next step's draft positions with -1 placeholders that only the sampling
+        # (last) stage can substitute; the stages before it embed real ids, so
+        # they need the scheduler to hand them the sampled and drafted tokens,
+        # which it does only when scheduling synchronously. The batch queue still
+        # keeps `pipeline_parallel_size` batches in flight.
+        async_scheduling=pipeline_parallel_size == 1,
     )
     try:
         texts = [text for _, (text, _) in phase["cases"]]
@@ -261,6 +277,12 @@ def main(argv: list[str] | None = None) -> int:
         print("##verifier[passed=0]")
         return 1
     print(f"verifier: tensor_parallel_size={tensor_parallel_size} (from {source})")
+    pipeline_parallel_size = args.pipeline_parallel_size
+    if pipeline_parallel_size is None:
+        from ..config import PIPELINE_PARALLEL_SIZE
+
+        pipeline_parallel_size = PIPELINE_PARALLEL_SIZE
+    print(f"verifier: pipeline_parallel_size={pipeline_parallel_size}")
 
     from .prompts import build_cases, render
 
@@ -346,6 +368,7 @@ def main(argv: list[str] | None = None) -> int:
         "max_tokens": MAX_TOKENS,
         "temperature": TEMPERATURE,
         "tensor_parallel_size": tensor_parallel_size,
+        "pipeline_parallel_size": pipeline_parallel_size,
         "max_model_len": max_model_len,
         # In the report because which prefill mode ran is the difference between a
         # 9k-token segment and a short one.
@@ -397,7 +420,8 @@ def main(argv: list[str] | None = None) -> int:
     errors: list[str] = []
     for phase in phases:
         try:
-            results.extend(_run_phase(phase, args, tensor_parallel_size))
+            results.extend(_run_phase(phase, args, tensor_parallel_size,
+                                      pipeline_parallel_size))
         except Exception:  # noqa: BLE001 - a phase failing is a verifier failure
             errors.append(f"phase {phase['name']}:\n{traceback.format_exc()}")
             print(f"\nverifier: phase {phase['name']} FAILED", file=sys.stderr)

@@ -1,0 +1,101 @@
+{
+  "model": "/mnt/nvme/hf",
+  "max_tokens": 32,
+  "temperature": 0.0,
+  "tensor_parallel_size": 8,
+  "pipeline_parallel_size": 8,
+  "max_model_len": 2104,
+  "max_num_batched_tokens": 2048,
+  "enable_prefix_caching": true,
+  "prompt_tokens": [
+    158,
+    2008,
+    37,
+    37
+  ],
+  "notes": [],
+  "cases": [
+    {
+      "id": "long-needle-2048-0",
+      "phase": "long-needle-2048-0",
+      "source": "transonic:long.jsonl",
+      "role": "raw",
+      "expected_substring": "5591-C67",
+      "prompt_excerpt": "The following is an internal operations record. Read it carefully; you will be asked about a specific detail at the end.\n\nThe archivist catalogued crate 20 under general supplies pending further review.\nBatch 21 passed visual inspection with no deviations from the specification.\nLedger entry 22 balances against the corresponding receipt with no discrepancy.\nBatch 23 passed visual inspection with no deviations from the specification.\nLedger entry 24 balances against the corresponding receipt with no discrepancy.\nThe archivist catalogued crate 25 under general supplies pending further review.\nRo\n\n[... 10182 chars elided ...]\n\nnspection with no deviations from the specification.\nBatch 156 passed visual inspection with no deviations from the specification.\nLedger entry 157 balances against the corresponding receipt with no discrepancy.\nLedger entry 158 balances against the corresponding receipt with no discrepancy.\nQuestion: what is the access code for the archive vault, and what must happen before it is entered?\nAnswer:",
+      "prompt_chars": 11182,
+      "prompt_tokens": 2008,
+      "text": " 5591-C67, and it must be entered before the second alarm cycle completes.\n...and the second alarm cycle completes. The access code for the archive",
+      "num_tokens": 32,
+      "finish_reason": "length"
+    },
+    {
+      "id": "short-prose",
+      "phase": "short",
+      "source": "transonic:short.jsonl",
+      "role": "user",
+      "expected_substring": null,
+      "prompt_excerpt": "The old lighthouse at Cape Ferris had not been lit in forty years, but every autumn the townspeople still gathered on the cliff path to watch the equinox storms roll in from the west. Mira had grown up hearing that her grandmother once climbed the spiral stairs during the worst gale on record to hang a lantern in the broken glass. Nobody could agree on whether the story was true. What everyone did agree on was that the light had saved a fishing boat that night, and that the boat had carried Mira's grandfather home. Describe what Mira finds when she finally unlocks the lighthouse door, and why it changes how she understands the story.",
+      "prompt_chars": 641,
+      "prompt_tokens": 158,
+      "text": "We need answer. Need craft narrative. User asks: \"The old lighthouse at Cape Ferris had not been lit in forty years, but every autumn the towns",
+      "num_tokens": 32,
+      "finish_reason": "length"
+    },
+    {
+      "id": "smoke-test",
+      "phase": "short",
+      "source": "onboarding-guide (adapted: templated question)",
+      "role": "user",
+      "expected_substring": null,
+      "prompt_excerpt": "Hello, what is your name?",
+      "prompt_chars": 25,
+      "prompt_tokens": 37,
+      "text": "We need answer. User asks \"Hello, what is your name?\" We are AI assistant. Need identify? We are likely DeepSeek? Wait system says",
+      "num_tokens": 32,
+      "finish_reason": "length"
+    },
+    {
+      "id": "trivia-capital-france",
+      "phase": "short",
+      "source": "builtin:trivia",
+      "role": "user",
+      "expected_substring": "Paris",
+      "prompt_excerpt": "What is the capital of France?",
+      "prompt_chars": 30,
+      "prompt_tokens": 37,
+      "text": "We need answer simple. Need comply. Capital of France is Paris. Final concise.</think>The capital of France is **Paris**.",
+      "num_tokens": 27,
+      "finish_reason": "stop"
+    }
+  ],
+  "execution_error": null,
+  "checks": [
+    {
+      "id": "long-needle-2048-0",
+      "expected": "5591-C67",
+      "matched": true
+    },
+    {
+      "id": "trivia-capital-france",
+      "expected": "Paris",
+      "matched": true
+    }
+  ],
+  "passed": true,
+  "phases": [
+    {
+      "name": "long-needle-2048-0",
+      "max_model_len": 2104,
+      "max_num_seqs": 1,
+      "max_num_batched_tokens": 2048,
+      "enable_prefix_caching": true
+    },
+    {
+      "name": "short",
+      "max_model_len": 608,
+      "max_num_seqs": 4,
+      "max_num_batched_tokens": 512,
+      "enable_prefix_caching": true
+    }
+  ]
+}

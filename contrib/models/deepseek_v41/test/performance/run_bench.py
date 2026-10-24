@@ -259,6 +259,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="defaults to the port's own `config.TENSOR_PARALLEL_SIZE`, so the "
         "benchmark measures the parallelism the implementation chose",
     )
+    p.add_argument(
+        "--pipeline-parallel-size",
+        type=int,
+        default=None,
+        help="defaults to the port's `config.PIPELINE_PARALLEL_SIZE` (1, or 8 under "
+        "DEEPSEEK_V41_SCHEME=tp8pp8)",
+    )
     p.add_argument("--input-lens", default=",".join(map(str, DEFAULT_INPUT_LENS)))
     p.add_argument("--batch-sizes", default=",".join(map(str, DEFAULT_BATCH_SIZES)))
     p.add_argument("--output-len", type=int, default=DEFAULT_OUTPUT_LEN)
@@ -384,6 +391,10 @@ def _free_port(port: int) -> int:
     raise SystemExit(f"bench: no free port in [{port}, {port + 64})")
 
 
+#: The pipeline degree `main` resolved, read by `_serve` (one process, one engine).
+_PARALLEL: dict = {"pp": 1}
+
+
 def _serve(
     model: str, tp: int, max_model_len: int, max_num_seqs: int, port: int,
     log: Path,
@@ -399,6 +410,9 @@ def _serve(
         "--model", model,
         "--served-model-name", SERVED_NAME,
         "--tensor-parallel-size", str(tp),
+        "--pipeline-parallel-size", str(_PARALLEL["pp"]),
+        # Synchronous scheduling for pipeline stages (see run_verifier._run_phase).
+        *(["--no-async-scheduling"] if _PARALLEL["pp"] > 1 else []),
         "--max-model-len", str(max_model_len),
         "--max-num-seqs", str(max_num_seqs),
         "--port", str(port),
@@ -1272,6 +1286,13 @@ def main(argv: list[str] | None = None) -> int:
 
         tp, source = TENSOR_PARALLEL_SIZE, "config.TENSOR_PARALLEL_SIZE"
     print(f"bench: tensor_parallel_size={tp} (from {source})")
+    pp = args.pipeline_parallel_size
+    if pp is None:
+        from deepseek_v41.config import PIPELINE_PARALLEL_SIZE
+
+        pp = PIPELINE_PARALLEL_SIZE
+    print(f"bench: pipeline_parallel_size={pp}")
+    _PARALLEL["pp"] = pp
 
     input_lens = [int(x) for x in args.input_lens.split(",") if x]
     batch_sizes = [int(x) for x in args.batch_sizes.split(",") if x]
@@ -1295,6 +1316,7 @@ def main(argv: list[str] | None = None) -> int:
     report: dict = {
         "model": args.model,
         "tensor_parallel_size": tp,
+        "pipeline_parallel_size": pp,
         "max_model_len": max_model_len,
         "output_len": args.output_len,
         "input_lens": input_lens,

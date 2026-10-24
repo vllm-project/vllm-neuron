@@ -233,6 +233,48 @@ draft acceptance 42-49% against 45-50% before and the per-op path's 46-52%.
 `test/unit/EQUIVALENCE_REPORT.md` has the component-level and per-layer
 agreement of the paths; `DEEPSEEK_V41_MEGAKERNEL=0` restores the per-op path.
 
+**Two parallelization schemes (2026-10-24).** `DEEPSEEK_V41_SCHEME=tp64` (the
+default) is the layout above: one tensor-parallel group of 64 ranks, the
+attention sharded 8 ways and replicated 8 times, 6 routed experts a rank, every
+expert reduce over the 64 ranks. `DEEPSEEK_V41_SCHEME=tp8pp8` runs vLLM pipeline
+parallelism, `tensor_parallel_size=8, pipeline_parallel_size=8`: the 64 workers
+form 8 stages, each stage builds and loads only its own 5 blocks (48 experts a
+rank, the engram table of its engram block sharded over its 8 ranks), reduces
+over its 8 ranks, and hands its activations to the next stage inside a kernel;
+the scheduler keeps 8 batches in flight so the stages overlap on different
+batches. The plugin's V1 model runner gained the non-last-stage path for it
+(`neuron_model_runner._pp_not_last_stage`), the drafter's tokens ride inside
+each step's output instead of the engine's per-step draft RPC (which would
+block the batch queue on the last stage: `vllm/patches/pp_draft_patch.py`,
+`NeuronScheduler.update_from_output`), and the model class declares
+vLLM's `SupportsPP`. Every kernel is a distinct `@nki.jit` entry per phase
+(prefill / decode), block archetype and scheme (`src/kernels/mk_kernels.py`).
+The verifier and the benchmark read the scheme from the environment
+(`--pipeline-parallel-size` overrides it); see `src/README.md` "Megakernels" for
+the design and `test/unit/EQUIVALENCE_REPORT.md` "Round 3" for the measurements.
+Each scheme has its own copy of every megakernel (`src/kernels/tp64/`,
+`src/kernels/tp8pp8/`), so the flat scheme runs the round-2 kernels unchanged.
+Measured 2026-10-24 on one-sequence engines (`run_bench.py`, 8 cells each):
+
+| Cell | TTFT p50 ms (tp64 / tp8pp8) | TPOT p50 ms | decode tok/s | accept % |
+|------|-----------------------------|-------------|--------------|----------|
+| in512_bs1 | 562 / 918 | 31.9 / 49.4 | 28.0 / 17.4 | 46 / 46 |
+| in1024_bs1 | 1061 / 1465 | 31.4 / 47.9 | 25.7 / 17.0 | 47 / 50 |
+| in2048_bs1 | 1957 / 2452 | 30.0 / 49.5 | 22.2 / 14.6 | 49 / 41 |
+| in8192_bs1 | 8549 / 4160 | 33.6 / 51.6 | 10.0 / 11.9 | 42 / 47 |
+
+The flat scheme's numbers match round 2 on every cell (TPOT within 0.3 ms,
+acceptance within 0.4 points). A lone request is slower on the pipeline: it
+crosses seven stage boundaries and the sampling stage serially and uses one
+stage at a time. The exception is 8192 input tokens, where the 2048-token
+prefill chunks pipeline across the stages and TTFT halves. With ten
+concurrent requests (`DEEPSEEK_V41_MAX_NUM_SEQS=10`) the pipeline gives 55
+tok/s in aggregate at 512 input tokens and 40 at 2048, and the flat scheme 59
+and 36. Draft acceptance drops when several sequences are batched, on both
+schemes (an open item; the generated text stays exact). The report's "Round 3"
+section has the batched cells and the traces behind these explanations, and
+`test/performance/history/README.md` indexes every bench run with its report and log.
+
 > **Read this before you deploy.** Every number in this contribution was
 > measured on `vllm-neuron` **0.24.0.1.1.0**, which is the branch the model was
 > developed against. The code is contributed on top of `main`, and the port's
@@ -321,8 +363,9 @@ flags and how to read the output. A full eight-cell run takes hours;
 
 ### Optional: unit and module tests
 
-None are contributed yet — `test/unit/` and `test/module/` are placeholders. The
-port's component-level checking was done against a private reference
-implementation that cannot be redistributed, so re-deriving it against a public
-reference is left as follow-up work. The accuracy test above is the gate that
-runs today.
+`test/unit/` holds the megakernels' component tests against a CPU reference
+(`test_layer.py`, `test_draft.py`, `test_pp.py`, run on N cores through
+`kharness_mp.py`), the hardware probes that established the kernels' conventions
+(`probe_*.py`) and `compile_entries.py`, which traces every specialized kernel
+entry without a device; `test/unit/EQUIVALENCE_REPORT.md` is the write-up. The
+accuracy test above remains the gate.

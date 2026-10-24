@@ -117,6 +117,10 @@ from vllm_neuron.parallel.neuron_parallel_state import stamp_spmd_rank_tensors
 
 logger = logging.getLogger(__name__)
 
+#: ``VLLM_NEURON_PP_TRACE=1``: step-level trace of the pipeline-parallel token flow
+#: (what each stage's runner records and what the sampling stage hands back).
+_PP_TRACE = os.environ.get("VLLM_NEURON_PP_TRACE", "") not in ("", "0")
+
 
 NULL_BLOCK_ID = 0
 # Read-side sentinel for block tables; write-side padding uses NULL_BLOCK_ID.
@@ -2962,12 +2966,39 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     num_new_tokens = (
                         num_computed_tokens + len(new_token_ids) - req_state.num_tokens
                     )
+                    # Speculative decoding: the scheduler ships only the tokens it
+                    # schedules now (the bonus token), not the drafts the last stage
+                    # accepted in the previous step. Those are the first `missing`
+                    # of the spec tokens this request was scheduled with then, so
+                    # restore them here; otherwise a request that is re-added to
+                    # the batch (another batch ran in between, as under pipeline
+                    # parallelism with several requests in flight) is `missing`
+                    # tokens short and its input slice reads past its known tokens
+                    # (measured 2026-10-24: a 4-token shift after a step accepting
+                    # 4 drafts, the first stage embedding `[ids[4], ids[5], 0, 0,
+                    # 0, 0]`, garbage text at max_num_seqs=4 while max_num_seqs=1,
+                    # whose one request never leaves the batch, was exact).
+                    missing = num_new_tokens - len(new_token_ids)
+                    if missing > 0:
+                        prev_spec = getattr(req_state, "pp_prev_spec_token_ids", None) or []
+                        if len(prev_spec) >= missing:
+                            req_state.output_token_ids.extend(prev_spec[:missing])
+                            num_new_tokens -= missing
+                        else:
+                            logger.warning(
+                                "PP: request %s gained %d tokens but the scheduler sent "
+                                "%d and the previous step scheduled %d draft(s); its "
+                                "cached token list will be short",
+                                req_id, num_new_tokens, len(new_token_ids), len(prev_spec),
+                            )
                     if num_new_tokens == 1:
                         req_state.output_token_ids.append(new_token_ids[-1])
                     elif num_new_tokens > 0:
                         req_state.output_token_ids.extend(
                             new_token_ids[-num_new_tokens:]
                         )
+                # The drafts this step schedules, for the accounting above next time.
+                req_state.pp_prev_spec_token_ids = list(scheduled_spec_tokens.get(req_id, ()))
             elif num_output_tokens < len(req_state.output_token_ids):
                 del req_state.output_token_ids[num_output_tokens:]
                 if req_index is not None:
@@ -2976,6 +3007,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         + num_output_tokens
                     )
                     self.input_batch.num_tokens_no_spec[req_index] = end_idx
+
+            if _PP_TRACE and get_tp_group().rank_in_group == 0:
+                logger.warning(
+                    "PP-TRACE update_states pp_rank=%d req=%s last_rank=%s num_computed=%d "
+                    "new_token_ids=%s req.num_tokens=%d output_tokens=%d num_tokens_no_spec=%s spec=%s",
+                    get_pp_group().rank_in_group, req_id, is_last_rank, num_computed_tokens,
+                    (req_data.new_token_ids[i] if req_data.new_token_ids else None),
+                    req_state.num_tokens, len(req_state.output_token_ids),
+                    (int(self.input_batch.num_tokens_no_spec[req_index]) if req_index is not None else None),
+                    scheduled_spec_tokens.get(req_id),
+                )
 
             # Update the block IDs.
             if not resumed_from_preemption:
@@ -7529,6 +7571,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 mm_kwargs=mm_kwargs,
             )
 
+        # Pipeline parallelism: a stage that is not the last one has handed its
+        # activations to the next stage inside the model's own forward and has
+        # nothing to sample. `sample_tokens` reads the None state as "PP
+        # non-final rank" and returns None, which the executor ignores (it only
+        # collects the last stage's first TP worker).
+        if self._pp_not_last_stage():
+            self.execute_model_state = None
+            self.kv_connector_output = kv_connector_output
+            return None
+
         # Store the last-accepted token from the rejection sampler (spec
         # decode only) so the next step's transition handler can use it
         # directly as input_ids without slicing or stride manipulation on
@@ -7920,6 +7972,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         if not self.use_async_scheduling:
             logger.debug(f"Model runner output: {output}")
+            if get_pp_group().world_size > 1:
+                # Pipeline stages run under the batch queue: this step's drafts
+                # travel inside its own output (see `_attach_pp_drafts`).
+                self._attach_pp_drafts(output, scheduler_output)
+            if _PP_TRACE and get_tp_group().rank_in_group == 0:
+                logger.warning(
+                    "PP-TRACE sample_tokens pp_rank=%d req_ids=%s sampled_token_ids=%s drafts=%s",
+                    get_pp_group().rank_in_group, output.req_ids, output.sampled_token_ids,
+                    getattr(output, "neuron_pp_drafts", None),
+                )
             return output
 
         async_output = AsyncNeuronModelRunnerOutput(
@@ -9154,6 +9216,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             bucket_name=neff_bucket_name,
         ).inc()
 
+        if self._pp_not_last_stage():
+            # Not the last pipeline stage: the forward's value is the stage's
+            # hand-off marker, not logits or tokens. Keep a reference so the
+            # in-flight NRT request is not freed under the device (as the DP
+            # dummy batch does), and parse nothing.
+            self._pp_stage_output_keepalive = model_output
+            return None, None, None
+
         # Parse model output based on on-device sampling and spec decode configuration
         self._on_device_logits = None
         last_accepted_token: torch.Tensor | None = None
@@ -9205,6 +9275,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             model_output_tensor = model_output_tensor.to("cpu")
 
         return model_output_tensor, aux_hidden_states, last_accepted_token
+
+    def _pp_not_last_stage(self) -> bool:
+        """True on a pipeline stage that is not the last: it runs its layers and
+        hands off, and the last stage alone samples. (Single-stage deployments:
+        always False.)"""
+        pp = get_pp_group()
+        return pp.world_size > 1 and not pp.is_last_rank
 
     def _has_component_dp(self) -> bool:
         """Return True if any component DP size > 1 (attention, embedding, mlp, lm_head)."""
@@ -10589,7 +10666,55 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             len([t for tokens in sampled_token_ids for t in tokens]),
         )
 
+    def _attach_pp_drafts(
+        self, output: ModelRunnerOutput, scheduler_output: "SchedulerOutput | None"
+    ) -> None:
+        """Pipeline parallelism, synchronous scheduling: ship this step's drafts
+        inside its own ``ModelRunnerOutput`` as ``output.neuron_pp_drafts``
+        (``{req_id: [draft ids]}``).
+
+        The engine normally collects drafts with a blocking
+        ``take_draft_token_ids`` RPC after every scheduled step
+        (``EngineCore.post_step``). Under the batch queue that RPC is answered
+        by the last stage only after the ``execute_model`` queued ahead of it,
+        i.e. after the step has drained the whole pipeline -- so the engine
+        never schedules the next batch before the previous one has finished,
+        and no two batches overlap. The drafts also reach the scheduler
+        several outputs ahead of the step they belong to. Carrying them in the
+        output fixes both: the result queue pickles the object (the extra
+        attribute survives), ``NeuronScheduler.update_from_output`` attaches
+        them right after it appended the sampled tokens of the same step, and
+        ``pp_draft_patch`` turns the RPC off.
+
+        Only a request that committed a token in this step gets a row. A
+        chunked prefill's non-final chunk has no sampled token
+        (``_generate_model_runner_output`` blanks it), and a draft hung off it
+        made the request schedulable with five spec tokens and no bonus token:
+        the last stage then traced a 1-row logits tensor against 6-row
+        sampling metadata and the engine died (8192-token inputs, 2048-token
+        prefill chunks, 2026-10-24).
+        """
+        drafts = self._draft_token_ids
+        self._draft_token_ids = None
+        rows: dict[str, list[int]] = {}
+        if drafts is not None:
+            if isinstance(drafts, torch.Tensor):
+                drafts = drafts.tolist()
+            partial = self._get_partial_prefill_req_ids(scheduler_output, output.req_ids)
+            sampled = output.sampled_token_ids
+            for i, (req_id, spec) in enumerate(zip(output.req_ids, drafts)):
+                if req_id in partial:
+                    continue
+                if sampled is not None and (i >= len(sampled) or not sampled[i]):
+                    continue
+                rows[req_id] = [int(t) for t in spec]
+        output.neuron_pp_drafts = rows
+
     def take_draft_token_ids(self) -> DraftTokenIds | None:
+        if get_pp_group().world_size > 1 and not self.use_async_scheduling:
+            # The drafts ride in the step's output (`_attach_pp_drafts`);
+            # `pp_draft_patch` keeps the engine from issuing this RPC at all.
+            return None
         if self._draft_token_ids is None:
             if self.use_async_scheduling and self.speculative_config is not None:
                 # Async mode: we must proactively signal "no drafts next step"
