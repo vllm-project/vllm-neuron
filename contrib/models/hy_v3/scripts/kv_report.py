@@ -269,8 +269,12 @@ def accuracy(B, F, max_drop, name="greedy"):
         errs.append("math-verify not importable: run the gate with the client python")
     if delta < -max_drop:
         errs.append(f"accuracy drop {delta:.1f} pp > {max_drop}")
+    ni = "shown" if lo >= -max_drop else "not shown (CI lower bound below the margin)"
+    print(f"Non-inferiority at the {max_drop} pp margin (paired-bootstrap CI lower bound >= −{max_drop}): {ni}. "
+          f"The pass rule is the point estimate (goal: drop <= {max_drop} pp).\n")
     check("accuracy", "FAIL" if errs else "PASS",
-          "; ".join(errs) if errs else f"Δ {delta:+.1f} pp (limit −{max_drop}), CI [{lo:+.1f}, {hi:+.1f}]")
+          "; ".join(errs) if errs else f"Δ {delta:+.1f} pp (limit −{max_drop}), CI [{lo:+.1f}, {hi:+.1f}], "
+          f"non-inferiority {ni.split(' ')[0]}")
 
 
 # ── performance ───────────────────────────────────────────────────────────
