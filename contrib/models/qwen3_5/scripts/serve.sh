@@ -12,13 +12,13 @@
 #   SERVED_NAME       --served-model-name (default: the checkpoint dir name)
 #   MAX_MODEL_LEN     default 9472: an 8K input with +3% jitter (8435) plus 1024
 #                     output tokens, rounded up to a multiple of 128
-#   MAX_NUM_SEQS      default 32
+#   MAX_NUM_SEQS      default 32 (30 for 397B-A17B, its KV limit at 9472)
 #   PREFILL_BUCKETS   default [8448, 9472]. Prefill is single-shot (DeltaNet cannot
 #                     continue from a chunk), so the last bucket must be
 #                     MAX_MODEL_LEN; 8448 keeps an 8K prompt from being padded to it.
 #                     Add smaller buckets for shorter prompts, e.g.
 #                     [1024, 2048, 4096, 8448, 9472]; each is one more compile.
-#   DECODE_BUCKETS    default [1, 4, 8, 16, 32]: one graph per batch size served
+#   DECODE_BUCKETS    default [1, 4, 8, 16, MAX_NUM_SEQS]: one graph per batch size
 #   TP, EP_DEGREE     tensor / expert parallel degree
 #   GMU               --gpu-memory-utilization
 #   PORT              default 8000
@@ -30,17 +30,19 @@ set -eu
 MODEL=${1:?usage: serve.sh <checkpoint dir> [extra vllm serve args...]}
 shift
 name=$(basename "${MODEL%/}")
+# seqs / decode buckets: the KV cache's concurrency at MAX_MODEL_LEN 9472 bounds
+# them (397B-A17B holds 30.82 requests); the last bucket must equal seqs.
 case "$name" in
-  *397B*) tp=64; ep=8; gmu=0.7 ;;   # 64 ranks; moe_intermediate 1024 needs EP for tp_degree <= 8
-  *35B*)  tp=4;  ep=;  gmu=0.85 ;;
-  *27B*)  tp=4;  ep=;  gmu=0.9 ;;
-  *)      tp=4;  ep=;  gmu= ;;      # 2B: vLLM's default leaves KV for 100+ requests
+  *397B*) tp=64; ep=8; gmu=0.7;  seqs=30 ;;   # moe_intermediate 1024 needs EP for tp_degree <= 8
+  *35B*)  tp=4;  ep=;  gmu=0.85; seqs=32 ;;
+  *27B*)  tp=4;  ep=;  gmu=0.9;  seqs=32 ;;
+  *)      tp=4;  ep=;  gmu=;     seqs=32 ;;   # 2B: vLLM's default leaves KV for 100+ requests
 esac
 TP=${TP:-$tp}; EP_DEGREE=${EP_DEGREE:-$ep}; GMU=${GMU:-$gmu}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-9472}
-MAX_NUM_SEQS=${MAX_NUM_SEQS:-32}
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-$seqs}
 PREFILL_BUCKETS=${PREFILL_BUCKETS:-[8448, $MAX_MODEL_LEN]}
-DECODE_BUCKETS=${DECODE_BUCKETS:-[1, 4, 8, 16, 32]}
+DECODE_BUCKETS=${DECODE_BUCKETS:-[1, 4, 8, 16, $MAX_NUM_SEQS]}
 
 export VLLM_NEURON_BACKEND=${VLLM_NEURON_BACKEND:-neuron_native}
 export NEURON_SKIP_EFA_AFFINITY=${NEURON_SKIP_EFA_AFFINITY:-1}   # instances without EFA
