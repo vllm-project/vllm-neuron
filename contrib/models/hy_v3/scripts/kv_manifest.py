@@ -78,11 +78,14 @@ def main():
     ap.add_argument("serve_log")
     ap.add_argument("out")
     ap.add_argument("--repo", default=None)
+    ap.add_argument("--no-process", action="store_true",
+                    help="post-hoc manifest from a log only (do not read a running server)")
     a = ap.parse_args()
     man = {"created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
            "host": os.uname().nodename, "serve_log": os.path.abspath(a.serve_log)}
     man.update(parse_log(a.serve_log))
-    proc = server_process()
+    proc = None if a.no_process else server_process()
+    man["post_hoc"] = a.no_process
     man["server_process"] = proc
     prof = (proc or {}).get("env", {}).get("HY3_KV_SCALE_PROFILE")
     if prof and os.path.exists(prof):
