@@ -64,6 +64,9 @@ HF_TEXT_PREFIX = "model.language_model"
 
 LINEAR_ATTENTION = "linear_attention"
 
+# Query rows per block of the full-attention prefill (Qwen3_5Attention.forward_prefill).
+PREFILL_ATTN_BLOCK = 2048
+
 
 class Qwen3_5RMSNorm(nn.Module):
     """RMSNorm with a zero-centred weight: ``normalise(x) * (1 + weight)``.
@@ -392,15 +395,32 @@ class Qwen3_5Attention(nn.Module):
         k = k.repeat_interleave(self.num_kv_groups, dim=0)
         v = v.repeat_interleave(self.num_kv_groups, dim=0)
 
-        # Already rank 3 ([heads, tokens, tokens]), which is what neuronx-cc
+        # Causal attention in blocks of PREFILL_ATTN_BLOCK query rows, each
+        # against only the keys up to its last row, and only the diagonal
+        # [rows, rows] piece masked: every key left of it is visible. A
+        # [T, T] causal mask at T=8448 fails to compile on 397B-A17B ("NCC_IINAR001
+        # ... pftranspose ... 'start_addr_active_channels'"; in int32 as well as
+        # int64, and replacing just the mask with a constant compiles), while the
+        # 2048 x 2048 one does. Skipping the keys above the diagonal also roughly
+        # halves the work.
+        #
+        # Every block is rank 3 ([heads, rows, keys]), which is what neuronx-cc
         # wants. ``masked_fill`` rather than ``torch.where``: the latter needs a
         # materialised full-size sentinel tensor, and at T=1024 that is an extra
         # [heads, 1024, 1024] float32 allocation the compiler did not accept.
-        scores = (q.float() @ k.float().transpose(-1, -2)) * self.scaling
-        causal = torch.ones(tokens, tokens, dtype=torch.bool, device=q.device).triu(1)
-        scores = scores.masked_fill(causal, float("-inf"))
-        attn = torch.softmax(scores, dim=-1).to(v.dtype)
-        attn_output = (attn @ v).transpose(0, 1).reshape(tokens, self.q_size)
+        qf, kf = q.float(), k.float()
+        outs = []
+        for start in range(0, tokens, PREFILL_ATTN_BLOCK):
+            end = min(start + PREFILL_ATTN_BLOCK, tokens)
+            qb = qf[:, start:end]
+            causal = torch.ones(end - start, end - start, dtype=torch.bool, device=q.device).triu(1)
+            scores = (qb @ kf[:, start:end].transpose(-1, -2)).masked_fill(causal, float("-inf"))
+            if start:
+                scores = torch.cat([qb @ kf[:, :start].transpose(-1, -2), scores], dim=-1)
+            attn = torch.softmax(scores * self.scaling, dim=-1).to(v.dtype)
+            outs.append(attn @ v[:, :end])
+        attn_output = outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
+        attn_output = attn_output.transpose(0, 1).reshape(tokens, self.q_size)
 
         output = self._finish(attn_output, gate)
         if self.world_size > 1:
