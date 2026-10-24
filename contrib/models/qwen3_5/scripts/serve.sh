@@ -50,8 +50,11 @@ if [ "$TP" -ge 64 ]; then
   # The native route compiles every rank's graphs; each neuronx-cc job takes
   # 40-50 GB of host memory, and a cold 64-rank compile runs for hours with
   # fewer jobs. 8 (vllm-neuron's default) fits a 2 TB host at these lengths.
-  # Also give the first 64-rank executions more than the runtime's 30 s.
+  # Ranks that finish first wait in a barrier whose timeout (vllm-neuron's
+  # default 3600 s) a cold compile can outlast. Also give the first 64-rank
+  # executions more than the runtime's 30 s.
   export VLLM_NEURON_PARALLEL_COMPILE_WORKERS=${VLLM_NEURON_PARALLEL_COMPILE_WORKERS:-8}
+  export VLLM_NEURON_BARRIER_TIMEOUT=${VLLM_NEURON_BARRIER_TIMEOUT:-43200}
   export NEURON_RT_EXEC_TIMEOUT=${NEURON_RT_EXEC_TIMEOUT:-1200}
 fi
 
