@@ -103,9 +103,12 @@ export VLLM_NEURON_BACKEND=${VLLM_NEURON_BACKEND:-neuron_native}
 # The native route compiles every rank's graphs (64 here); each neuronx-cc job
 # takes 40-50 GB of host memory, and a cold compile runs for hours with fewer
 # jobs (Pro with 4: more than 4 h). 8 (vllm-neuron's default) fits a 2 TB host
-# at SEQ 9472. Also give the first 64-rank executions more than the runtime's
-# 30 s default, which otherwise looks like a collective hang.
+# at SEQ 9472. Ranks that finish first wait in a barrier whose timeout
+# (vllm-neuron's default 3600 s) a cold compile can outlast. Also give the first
+# 64-rank executions more than the runtime's 30 s default, which otherwise looks
+# like a collective hang.
 export VLLM_NEURON_PARALLEL_COMPILE_WORKERS=${VLLM_NEURON_PARALLEL_COMPILE_WORKERS:-8}
+export VLLM_NEURON_BARRIER_TIMEOUT=${VLLM_NEURON_BARRIER_TIMEOUT:-43200}
 export NEURON_RT_EXEC_TIMEOUT=${NEURON_RT_EXEC_TIMEOUT:-1200}
 
 echo "Starting $SERVED_NAME server: $MODEL (BS=$BS, SEQ=$SEQ, TP=64, EP=64, experts=$MIMO_V2_5_EXPERT_DTYPE)"
