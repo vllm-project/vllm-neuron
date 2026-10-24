@@ -11,8 +11,10 @@ not given; HuggingFaceH4/MATH-500 is then downloaded).
 
 import argparse
 import asyncio
+import hashlib
 import json
 import time
+from importlib import metadata
 from pathlib import Path
 
 from math_verify import parse, verify
@@ -105,6 +107,18 @@ async def main(args):
     Path(args.out).write_text(
         "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in results)
     )
+    # Sidecar for paired comparisons (kv_report.py): sampling config, problem set, grader.
+    problems = "".join(r["unique_id"] + "\0" + r["problem"] + "\0" + r["answer"] + "\n" for r in rows)
+    meta = {
+        "reasoning_effort": args.reasoning_effort, "temperature": args.temperature,
+        "top_p": 1.0, "max_tokens": args.max_tokens, "seed": args.seed,
+        "concurrency": args.concurrency, "limit": args.limit, "n": len(rows),
+        "prompt_template": PROMPT, "problems_sha256": hashlib.sha256(problems.encode()).hexdigest(),
+        "math_verify": metadata.version("math-verify"), "base_url": args.base_url,
+        "models": [m.id for m in (await client.models.list()).data],
+        "wall_s": time.time() - t0,
+    }
+    Path(args.out + ".meta.json").write_text(json.dumps(meta, indent=1))
 
     n = len(results)
     acc = sum(x["correct"] for x in results) / n

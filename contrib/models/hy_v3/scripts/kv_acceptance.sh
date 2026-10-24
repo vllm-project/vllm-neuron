@@ -6,9 +6,15 @@
 #   bench   PR load matrix: inputs 1024/4096/8192/16000 x concurrency 1/4/15, 256 out
 #   math    full MATH-500, greedy (temperature 0), no_think, max 4096 tokens
 #   math09  full MATH-500 at the PR's temperature 0.9 (seeded requests)
-#   stab    30 min sustained load with prefix reuse (75% shared 8k prompts, c=8)
+#   stab    >= 30 min sustained load with prefix reuse (75% shared 8k prompts, c=8):
+#           STAB_PROMPTS requests (default 1200, ~36-40 min); kv_report.py fails
+#           the run if it lasted less than 1800 s
+# Always:   manifest.json (kv_manifest.py: args, env, commit, profile hash, KV pool)
+#           and mem_timeseries.jsonl (neuron-monitor reduced by kv_mem_sampler.py
+#           over the whole run, for the peak device memory per category)
 # Env: SERVE_LOG (server log), MODEL (tokenizer / ckpt), BASE_URL, CLIENT_PY
-#      (python with openai + math-verify + datasets), STAB_PROMPTS (default 900),
+#      (python with openai + math-verify + datasets), STAB_PROMPTS, REPO (repo
+#      checkout for the manifest; default: this script's repo),
 #      PAUSE_PATTERN (pgrep -f pattern of host jobs, e.g. a CPU calibration, that
 #      are SIGSTOPped during the latency phases bench / stab and resumed after)
 set -uo pipefail
@@ -21,10 +27,18 @@ mkdir -p "$OUT"
 log() { echo "[$(date -u +%FT%TZ)] $*" | tee -a "$OUT/acceptance.log"; }
 quiet() { [ -n "${PAUSE_PATTERN:-}" ] && pkill -STOP -f "$PAUSE_PATTERN" && log "paused: $PAUSE_PATTERN"; true; }
 loud() { [ -n "${PAUSE_PATTERN:-}" ] && pkill -CONT -f "$PAUSE_PATTERN" && log "resumed: $PAUSE_PATTERN"; true; }
-trap loud EXIT
+MPID=""
+stop_sampler() { [ -n "$MPID" ] && kill "$MPID" 2>/dev/null; pkill -f "kv_mem_sampler.py $OUT/" 2>/dev/null; true; }
+trap 'loud; stop_sampler' EXIT
+REPO=${REPO:-$(cd "$HERE/../../../.." && pwd)}
+errlines() { grep -a -c -i -E "traceback|\\bnan\\b|exception|error" "$SERVE_LOG"; }
 
 until [ "$(curl -s -m 3 "$BASE_URL/health" -o /dev/null -w '%{http_code}')" = 200 ]; do sleep 15; done
 log "server healthy; phases: $PHASES"
+python3 "$HERE/kv_manifest.py" "$SERVE_LOG" "$OUT/manifest.json" --repo "$REPO" > "$OUT/manifest.log" 2>&1
+log "manifest: $(tail -1 "$OUT/manifest.log")"
+(neuron-monitor 2>/dev/null | python3 "$HERE/kv_mem_sampler.py" "$OUT/mem_timeseries.jsonl") &
+MPID=$!
 
 for ph in $PHASES; do
   case $ph in
@@ -54,13 +68,16 @@ for ph in $PHASES; do
     ;;
   stab)
     quiet; log "stability start"
-    before=$(grep -a -c -i -E "error|exception|nan" "$SERVE_LOG")
+    before=$(errlines)
+    curl -s "$BASE_URL/metrics" | grep -E "^vllm:(prefix_cache_(hits|queries)|num_preemptions|request_success)_total" \
+      > "$OUT/stability_metrics_before.txt"
     vllm bench serve --backend openai --base-url "$BASE_URL" --model hy3 --tokenizer "$MODEL" \
       --dataset-name random --random-prefix-len 6144 --random-input-len 2048 --random-output-len 256 \
-      --random-range-ratio 0 --ignore-eos --num-prompts "${STAB_PROMPTS:-900}" --seed 42 \
+      --random-range-ratio 0 --ignore-eos --num-prompts "${STAB_PROMPTS:-1200}" --seed 42 \
       --max-concurrency 8 --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,99 \
       --save-result --result-dir "$OUT" --result-filename stability.json > "$OUT/stability.log" 2>&1
-    after=$(grep -a -c -i -E "error|exception|nan" "$SERVE_LOG")
+    after=$(errlines)
+    echo "{\"error_lines_before\": $before, \"error_lines_after\": $after}" > "$OUT/stability_errlines.json"
     curl -s "$BASE_URL/metrics" | grep -E "^vllm:(prefix_cache_(hits|queries)|num_preemptions|request_success)_total" \
       > "$OUT/stability_metrics.txt"
     log "stability done: $(grep -E 'Successful|Failed' "$OUT/stability.log" | tr '\n' ' ') server-log error/nan lines +$((after - before))"

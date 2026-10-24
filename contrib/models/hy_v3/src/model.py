@@ -1818,6 +1818,16 @@ class HYV3ForCausalLM(nn.Module):
             attn.k_cache = k_cache
             attn.v_cache = v_cache
             attn.fp8_packed = packed
+        # The persistent KV pool of this rank (acceptance: KV bytes per cached token).
+        k0, v0 = kv_caches["layers.0.self_attn"]
+        pool_bytes = sum(
+            t.numel() * t.element_size() for k, v in kv_caches.values() for t in (k, v)
+        )
+        logger.info(
+            "Hy3 KV pool: %d layers, K %s %s, V %s %s, %d bytes on this rank",
+            len(self.model.layers), tuple(k0.shape), k0.dtype, tuple(v0.shape), v0.dtype,
+            pool_bytes,
+        )
 
     # ── Weight loading ────────────────────────────────────────────────────
 
