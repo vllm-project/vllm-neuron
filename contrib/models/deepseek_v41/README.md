@@ -157,31 +157,46 @@ Neuron SDK versions and instance types this model was tested with.
 Trn1 is not applicable: the checkpoint does not fit, and the port's kernels
 target Trainium2.
 
-The exact stack behind the "Working" cells:
+The exact stacks behind the "Working" cells. Both pass the integration test
+below on a `trn2.48xlarge`, with the same system packages:
 
-| | Validated | PR base |
+| | Neuron SDK 2.32 | Neuron SDK 2.33 |
 | --- | --- | --- |
-| `vllm-neuron` | **0.24.0.1.1.0** | main (0.29.0.1.2.0) |
-| vLLM | 0.24.0 | 0.29.x |
-| Python | 3.12.3 | — |
-| `torch` / `torch-xla` | 2.11.0 | — |
-| `neuronx-cc` | 2.27.5334.0 | — |
-| `libtorch-neuronx-lite` | 2.11.0.1.0.2651 | — |
-| `nki` | 0.6.0 | — |
-| Driver (`aws-neuronx-dkms`) | 2.31.7.0 | — |
-| Runtime (`aws-neuronx-runtime-lib`) | 2.35.30.0 | — |
-| Collectives (`aws-neuronx-collectives`) | 2.35.43.0 | — |
-| Tools (`aws-neuronx-tools`) | 2.33.38.0 | — |
+| `vllm-neuron` | 0.24.0.1.1.0 | 0.29.0.1.2.0 (`main`) + the plugin-core change |
+| vLLM | 0.24.0 | 0.29.0 |
+| Python | 3.12.3 | 3.12.3 |
+| `torch` | 2.11.0 | 2.13.0 |
+| `libtorch-neuronx-lite` | 2.11.0.1.0.2651 | 2.13.0.1.0.3112 |
+| `neuronx-cc` | 2.27.5334.0 | 2.28.7631.0 |
+| `nki` | 0.6.0 | 0.7.0 |
+| Driver (`aws-neuronx-dkms`) | 2.31.7.0 | 2.31.7.0 |
+| Runtime (`aws-neuronx-runtime-lib`) | 2.35.30.0 | 2.35.30.0 |
+| Collectives (`aws-neuronx-collectives`) | 2.35.43.0 | 2.35.43.0 |
+| Tools (`aws-neuronx-tools`) | 2.33.38.0 | 2.33.38.0 |
 
-> **Read this before you deploy.** Every number in this contribution was
-> measured on `vllm-neuron` **0.24.0.1.1.0**, which is the branch the model was
-> developed against. The code is contributed on top of `main`, and the port's
-> imports against `main` have been checked symbol by symbol, but **the model has
-> not been executed on `main`** — doing so needs vLLM 0.29, and the validated
-> environment is on 0.24. If you are on `main`, treat this as untested and run
-> the integration test below before trusting it. If you want the validated
-> configuration exactly, check out `release-0.24.0.1.1.0`, where the
-> accompanying `spec_decode` change also applies unmodified.
+The SDK 2.33 column is the DLAMI's `aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0`
+environment with `pytest-timeout` added. It compiles at vLLM's default `-O2`;
+SDK 2.32 compiles at `-O1`, the level its platform defaults to.
+
+> **Read this before you deploy.**
+>
+> * **Speculative decoding needs the plugin-core change on both stacks**; see
+>   [Speculative decoding needs one plugin change](#speculative-decoding-needs-one-plugin-change).
+> * **SDK 2.33 is slower.** See [Speed (performance)](#speed-performance) for
+>   both stacks' numbers. Device traces of one decode step put the gap inside
+>   the SDK's execution path, not this model's code: the per-layer graph runs
+>   ~25% longer on the device, and the device idles longer between graph
+>   submissions. The compiler version, `nki` version, optimization level
+>   (`-O1`/`-O2`), backend route (native/XLA), IO ring cache size and lite's
+>   index bound checks were each ruled out by measurement.
+> * **Segmented prefill at an untested shape fails on both stacks.** A
+>   1215-token prompt served with `max_model_len=1599` and
+>   `max_num_batched_tokens=1024` (two prefill segments) hit a `neuronx-cc`
+>   internal error (`NCC_ILSA902`) on SDK 2.32 and an out-of-bounds indirect
+>   DMA on SDK 2.33. The configurations the integration test and benchmark use
+>   — one prefill segment per prompt — are unaffected. Prefer a
+>   `max_num_batched_tokens` at least as long as your prompts until this is
+>   understood.
 
 ## Example Checkpoints
 
@@ -263,9 +278,11 @@ serve instead of computing. See
 flags and how to read the output. A full six-cell run takes hours;
 `--input-lens` and `--batch-sizes` narrow it to the cells you care about.
 
-Measured 2026-10-23 on a `trn2.48xlarge`, `vllm-neuron` 0.24.0.1.1.0 with the
-plugin-core change, `DEEPSEEK_V41_MAX_NUM_SEQS=10`, 128 output tokens, warm
-process. Acceptance is DSpark's, from vLLM's own counters over the cell:
+Measured on a `trn2.48xlarge` with the plugin-core change,
+`DEEPSEEK_V41_MAX_NUM_SEQS=10`, 128 output tokens, warm process. Acceptance is
+DSpark's, from vLLM's own counters over the cell.
+
+**Neuron SDK 2.32** (`vllm-neuron` 0.24.0.1.1.0, `-O1`), 2026-10-23:
 
 | cell | TTFT p50 (ms) | TPOT p50 (ms) | decode (tok/s, aggregate) | acceptance |
 | --- | ---: | ---: | ---: | ---: |
@@ -276,11 +293,31 @@ process. Acceptance is DSpark's, from vLLM's own counters over the cell:
 | in8192 bs1 | 11261.9 | 95.4 | 5.50 | 43% |
 | in8192 bs4 | 17141.4 | 326.6 | 7.94 | 41% |
 
+**Neuron SDK 2.33** (`vllm-neuron` 0.29.0.1.2.0, `-O2`), 2026-10-24:
+
+| cell | TTFT p50 (ms) | TPOT p50 (ms) | decode (tok/s, aggregate) | acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| in512 bs1 | 666.8 | 124.8 | 7.41 | 44% |
+| in512 bs10 | 3809.8 | 392.7 | 20.14 | 44% |
+| in1024 bs1 | 1040.7 | 128.1 | 7.52 | 44% |
+| in1024 bs10 | 5707.4 | 415.6 | 20.60 | 46% |
+| in8192 bs1 | 11900.1 | 139.1 | 4.32 | 41% |
+| in8192 bs4 | 24203.8 | 505.3 | 5.68 | 40% |
+
+SDK 2.33 costs 5-12% on prefill and 21-44% on decode, worst at batch 10, where
+a step runs the most graphs. A rank-0 system trace of one in512 bs1 decode step
+on each SDK puts it below this model: per-graph device time is up (the per-layer
+graph runs 2.1 → 2.7 ms) and the device idles longer between graph
+submissions, while the work submitted is the same and acceptance matches. The
+SDK 2.32 table predates the fixes that let this folder run on SDK 2.33; with
+them SDK 2.32's integration-test completions are token-identical, and none of
+them changes what a step computes.
+
 Random token ids are close to unpredictable for a drafter, so these figures are
-a lower bound on real traffic; the same run's prose probe measured 47%. The two medians at
-`in8192 bs4` are bimodal across runs, because 8 requests at concurrency 4 put
-the p50 between two waves. Its throughput and mean TPOT (337 ms) are the stable
-figures.
+a lower bound on real traffic; the prose probe measured 47% (SDK 2.32) and 46%
+(SDK 2.33). The two medians at `in8192 bs4` are bimodal across runs, because 8
+requests at concurrency 4 put the p50 between two waves; its throughput and
+mean TPOT are the stable figures.
 
 ### Optional: unit and module tests
 

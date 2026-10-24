@@ -189,6 +189,83 @@ _COMPILE_OPTIONS = {
     ],
 }
 
+#: `vllm_neuron.envs.get_compile_backend_name()`, resolved once in eager code.
+_COMPILE_BACKEND: list[str] = []
+
+
+def _compile_backend_name() -> str:
+    """The `torch.compile` backend every entry point in this file is built with.
+
+    `_nki_entry` and `_compile_fn` build their graphs lazily, on first use,
+    which is inside the traced forward. The getter there is not traceable on
+    libtorch-neuronx-lite 2.13 (Neuron SDK 2.33): it calls the backend's
+    `register()`, which calls `torch._dynamo.lookup_backend`, and dynamo
+    refuses to trace its own module:
+
+        torch._dynamo.exc.Unsupported: Attempted to call function marked as
+        skipped ... the function `lookup_backend` ... should not be traced.
+
+    So the model's constructor resolves the name here, and a traced call reads
+    a string out of a list rather than registering anything.
+    """
+    if not _COMPILE_BACKEND:
+        from vllm_neuron.envs import get_compile_backend_name
+
+        _COMPILE_BACKEND.append(get_compile_backend_name())
+    return _COMPILE_BACKEND[0]
+
+
+def _tolerate_unresolvable_alias_sources() -> None:
+    """Stop a recompile from crashing inside dynamo's own diagnostics.
+
+    `_run_block` is one code object compiled once per layer, and its guards hold
+    source paths through the block it was traced on. Blocks differ in shape:
+    `Compressor.wgate` exists only where `compress_ratio > 1`. On torch 2.13
+    (Neuron SDK 2.33) the guard that fails first for the next layer can be the
+    no-tensor-aliasing one, and building its recompile reason evaluates every
+    aliasing source against the *new* frame, with no `try`. The path through a
+    `wgate` the new block does not have raises out of the recompile:
+
+        File ".../torch/_dynamo/guards.py", in
+            recompilation_reason_for_no_tensor_aliasing_guard
+          tensor_id = id(eval(tensor_source, global_scope, scope))
+        KeyError: 'wgate'
+
+    The reason is a log string, computed on every recompile whether or not
+    recompiles are logged. This version skips the sources that no longer
+    resolve, as the general guard-reason path beside it already does for its
+    own `eval`. Which graph runs is decided by the guards, not by this.
+    """
+    import collections
+
+    import torch._dynamo.guards as guards
+
+    original = guards.recompilation_reason_for_no_tensor_aliasing_guard
+    if getattr(original, "_deepseek_v41_tolerant", False):
+        return
+
+    def tolerant(guard_manager, scope):  # noqa: ANN001, ANN202
+        global_scope = dict(guard_manager.global_scope)
+        ids_to_source = collections.defaultdict(list)
+        unresolved = 0
+        for tensor_source in guard_manager.no_tensor_aliasing_sources:
+            global_scope["__compile_source__"] = tensor_source
+            try:
+                tensor_id = id(eval(tensor_source, global_scope, scope))
+            except Exception:  # noqa: BLE001 - a path the new frame lacks
+                unresolved += 1
+                continue
+            ids_to_source[tensor_id].append(tensor_source)
+        duplicates = [str(v) for v in ids_to_source.values() if len(v) > 1]
+        reason = f"Duplicate tensors found: {', '.join(duplicates)}"
+        if unresolved:
+            reason += f" ({unresolved} aliasing source(s) absent from this frame)"
+        return [reason]
+
+    tolerant._deepseek_v41_tolerant = True
+    guards.recompilation_reason_for_no_tensor_aliasing_guard = tolerant
+
+
 def _raise_dynamo_limits() -> None:
     """Let dynamo compile as many graph variants as this model has.
 
@@ -229,8 +306,15 @@ def _fc_sum(x: torch.Tensor, group_name: str) -> torch.Tensor:
 
 
 def _fc_gather_last(x: torch.Tensor, group_name: str) -> torch.Tensor:
-    """Every rank's `x` concatenated along the last axis."""
-    return _fc_all_gather_tensor(x, -1, group_name)
+    """Every rank's `x` concatenated along the last axis.
+
+    The axis is passed as a non-negative index. torch 2.13's
+    `_maybe_view_chunk_cat` takes `gather_dim=-1` down its view path and builds
+    `shape[gather_dim + 1:]` as the whole shape, so a `[64, 2048]` gather asks
+    for `.view([1, 131072, 64, 2048])` and the trace fails. torch 2.11
+    concatenated chunks and handled -1.
+    """
+    return _fc_all_gather_tensor(x, x.dim() - 1, group_name)
 
 
 def _group_name(tp_group) -> str:
@@ -400,8 +484,6 @@ def _nki_entry(module: str, name: str = "kernel", grid: int = 0):
     """
     from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
-    from vllm_neuron.envs import get_compile_backend_name
-
     from .kernels import (
         blockquant,
         compress_pool,
@@ -446,7 +528,7 @@ def _nki_entry(module: str, name: str = "kernel", grid: int = 0):
     entry.__name__ = f"nki_{module}_{name}"
     return torch.compile(
         entry,
-        backend=get_compile_backend_name(),
+        backend=_compile_backend_name(),
         fullgraph=True,
         options=_COMPILE_OPTIONS,
     )
@@ -2641,12 +2723,10 @@ def _compile_fn(fn):
         skipped ... Dynamo does not know how to trace the builtin
         `time.perf_counter`
     """
-    from vllm_neuron.envs import get_compile_backend_name
-
     _raise_dynamo_limits()
     return torch.compile(
         fn,
-        backend=get_compile_backend_name(),
+        backend=_compile_backend_name(),
         fullgraph=True,
         options=_COMPILE_OPTIONS,
     )
@@ -4588,6 +4668,9 @@ class DeepseekV41ForCausalLM(nn.Module):
             self._init_pp_emulation(_PP_EMULATE)
 
         _log_two_core_plan()
+        # Before the first forward, so no traced call is the one that resolves it.
+        _compile_backend_name()
+        _tolerate_unresolvable_alias_sources()
 
         if _PROBE_AR_WIDTH:
             from vllm_neuron.parallel.neuron_parallel_state import (
@@ -5249,12 +5332,27 @@ class DeepseekV41ForCausalLM(nn.Module):
         return logits
 
     def _vocab_pad_bias(self, like: torch.Tensor) -> torch.Tensor:
-        """`[part_vocab_size]`, zero on real columns and `-inf` on the pad."""
+        """`[part_vocab_size]`, zero on real columns and `_NEG_BOUND` on the pad.
+
+        Finite, not `-inf`. The last rank's shard ends in 1792 pad columns, and
+        the sampler's distributed top-k runs the NKI rotational top-k over each
+        rank's shard. Given a row that ends in that much `-inf`, the kernel
+        returns NaN values and wrong indices — measured on one core under both
+        Neuron SDK 2.32 and 2.33, while `-1e30` comes back exact under both. On
+        SDK 2.33 (vllm-neuron 0.29) the NaN then poisons the global selection,
+        which falls back to candidate 0, the best token of rank 0's own 2048
+        columns: every sampled id came out below 2048, the text read like a
+        weak, drifting model, and DSpark acceptance fell from ~50% to ~10%
+        because drafts were verified against the wrong target. vllm-neuron
+        0.24's sampler happened to tolerate it. `-1e30` is as unselectable as
+        `-inf` against logits of a few tens, and `exp(-1e30 - max)` is still
+        exactly 0 in a softmax.
+        """
         key = (like.shape[-1], like.dtype, like.device)
         bias = self._vocab_pad_slots.get(key)
         if bias is None:
             bias = torch.zeros(key[0], dtype=like.dtype, device=like.device)
-            bias[key[0] - self.vocab_pad :] = float("-inf")
+            bias[key[0] - self.vocab_pad :] = _NEG_BOUND
             self._vocab_pad_slots[key] = bias
         return bias
 

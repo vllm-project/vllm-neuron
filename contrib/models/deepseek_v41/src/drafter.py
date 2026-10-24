@@ -5,6 +5,7 @@
     target_model_provider      set by the runner: a callable returning the loaded target model
     num_speculative_tokens     `config.dspark_block_size` = 5, the draft block's length
     model                      the module the runner may bind caches on; the target itself
+    compile_kwargs             what a runner re-wrapping `model` in `torch.compile` passes
     load_model(target_hidden_size)   no weights to load -- the stages came with the checkpoint
     warmup(...)                no separate NEFF to warm; the stages run inside the target's
                                own forward, so its warmup is theirs
@@ -89,10 +90,26 @@ class DSparkProposer:
         self.num_speculative_tokens = block
 
 
+    #: For the runner's `redecorate_compiled_model`, which on vllm-neuron 0.29 re-wraps
+    #: every drafter's model as `drafter.model = torch.compile(drafter.model._orig_mod,
+    #: **drafter.compile_kwargs)` after warmup. The wrapper is discarded by the setter
+    #: below, so these are never used to compile anything.
+    compile_kwargs: dict = {}
+
     @property
     def model(self):
         """What the runner and the worker treat as this drafter's own model."""
         return self._draft_model
+
+    @model.setter
+    def model(self, value) -> None:  # noqa: ANN001
+        """Keep the plain module whatever the runner wraps it in.
+
+        `_InModelDraftModel` has no forward of its own: the draft stages run inside
+        the target's forward, which the runner compiles. A compiled wrapper of it
+        would be a graph that is never called.
+        """
+        self._draft_model = getattr(value, "_orig_mod", value)
 
     @property
     def target(self):
