@@ -53,16 +53,17 @@
 # max_model_len turns on segmented prefill by default, which this port does
 # not implement (the factory rejects it at load).
 #
-# Defaults are sized for 8K-token inputs and 1K-token outputs at up to 32
-# concurrent requests (contrib/benchmark's 8192 / 1024 cells):
+# Defaults are sized for 8K-token inputs and 1K-token outputs at the highest
+# concurrency the KV cache holds (contrib/benchmark's 8192 / 1024 cells):
 #   SEQ=9472             an 8K input with +3% jitter (8435) + 1024 output tokens,
 #                        rounded up to a multiple of 128
-#   BS=32                max_num_seqs
+#   BS                   max_num_seqs: 12 for Pro, 20 otherwise (the KV limit)
 #   PREFILL_BUCKETS      [8448, $SEQ]: the last bucket must equal SEQ (no
 #                        segmented prefill); 8448 keeps an 8K prompt from
 #                        padding to SEQ. Add buckets for shorter prompts, e.g.
 #                        [1024, 2048, 4096, 8448, 9472]; each is a compile.
-#   DECODE_BUCKETS       [1, 4, 8, 16, 32]: one decode graph per batch size
+#   DECODE_BUCKETS       one decode graph per batch size, ending at BS
+#                        (Pro [1, 4, 8, 12], otherwise [1, 4, 8, 16, 20])
 # The server holds int(X) requests, X from its "Maximum concurrency for
 # <SEQ> tokens per request" log line.
 #
@@ -76,10 +77,18 @@ MODEL="${MODEL:-XiaomiMiMo/MiMo-V2.5}"
 SERVED_NAME="${SERVED_NAME:-MiMo-V2.5}"
 # auto | bf16 | fp8 (routed experts); read by the workers.
 export MIMO_V2_5_EXPERT_DTYPE="${EXPERT_DTYPE:-${MIMO_V2_5_EXPERT_DTYPE:-auto}}"
-BS="${BS:-32}"
+# BS defaults to what the KV cache holds at SEQ 9472 (the server's "Maximum
+# concurrency" line): Pro 12, Flash / V2.5 20. A larger BS only adds decode
+# graphs the cache cannot fill, and their device memory: Pro at BS 32 failed to
+# load its graphs ("Could not load the model status=4 message=Allocation Failure").
+case "$MODEL" in
+  *Pro*) bs_default=12; buckets_default="[1, 4, 8, 12]" ;;
+  *)     bs_default=20; buckets_default="[1, 4, 8, 16, 20]" ;;
+esac
+BS="${BS:-$bs_default}"
 SEQ="${SEQ:-9472}"
 PREFILL_BUCKETS="${PREFILL_BUCKETS:-[8448, $SEQ]}"
-DECODE_BUCKETS="${DECODE_BUCKETS:-[1, 4, 8, 16, 32]}"
+DECODE_BUCKETS="${DECODE_BUCKETS:-$buckets_default}"
 PORT="${PORT:-8000}"
 
 # Mandatory on this instance: the Neuron runtime otherwise probes for an EFA
@@ -91,11 +100,12 @@ export NEURON_SKIP_EFA_AFFINITY=1
 # is on and a warm start skips the trace.
 export VLLM_NEURON_BACKEND=${VLLM_NEURON_BACKEND:-neuron_native}
 
-# The native route compiles the decode graphs once per rank (64 here): cap
-# neuronx-cc's parallel jobs per rank (8 can run a 2 TB host out of memory with
-# several buckets), and give the first 64-rank executions more than the
-# runtime's 30 s default, which otherwise looks like a collective hang.
-export VLLM_NEURON_PARALLEL_COMPILE_WORKERS=${VLLM_NEURON_PARALLEL_COMPILE_WORKERS:-4}
+# The native route compiles every rank's graphs (64 here); each neuronx-cc job
+# takes 40-50 GB of host memory, and a cold compile runs for hours with fewer
+# jobs (Pro with 4: more than 4 h). 8 (vllm-neuron's default) fits a 2 TB host
+# at SEQ 9472. Also give the first 64-rank executions more than the runtime's
+# 30 s default, which otherwise looks like a collective hang.
+export VLLM_NEURON_PARALLEL_COMPILE_WORKERS=${VLLM_NEURON_PARALLEL_COMPILE_WORKERS:-8}
 export NEURON_RT_EXEC_TIMEOUT=${NEURON_RT_EXEC_TIMEOUT:-1200}
 
 echo "Starting $SERVED_NAME server: $MODEL (BS=$BS, SEQ=$SEQ, TP=64, EP=64, experts=$MIMO_V2_5_EXPERT_DTYPE)"
