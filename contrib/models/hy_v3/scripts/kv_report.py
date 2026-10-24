@@ -301,7 +301,7 @@ def accuracy(B, F, max_drop, name="greedy"):
           f"The pass rule is the point estimate (goal: drop <= {max_drop} pp).\n")
     check("accuracy", "FAIL" if errs else "PASS",
           "; ".join(errs) if errs else f"Δ {delta:+.1f} pp (limit −{max_drop}), CI [{lo:+.1f}, {hi:+.1f}], "
-          f"non-inferiority {ni.split(' ')[0]}")
+          f"non-inferiority {'shown' if lo >= -max_drop else 'not shown'}")
 
 
 # ── performance ───────────────────────────────────────────────────────────
@@ -404,7 +404,8 @@ def stability(B, F, min_s, fp8_only=False):
         if new_err is None or new_err:
             errs.append(f"{lab}: new server-log error/NaN lines {new_err}")
     print("\n".join(lines) + "\n")
-    check("stability", "FAIL" if errs else "PASS", "; ".join(errs) if errs else f"both runs >= {min_s} s, clean")
+    check("stability", "FAIL" if errs else "PASS", "; ".join(errs) if errs else
+          f"{'FP8 run' if fp8_only else 'both runs'} >= {min_s:.0f} s, all requests ok, no new error / NaN lines")
 
 
 def main():
