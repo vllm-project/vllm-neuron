@@ -105,6 +105,7 @@ def gen_attention_decode_mask(
     local_filled_slots: Optional[Tensor] = None,
     dcp_active_mask: Optional[Tensor] = None,
     is_causal: bool = True,
+    use_kernel: bool = True,
 ) -> Tensor:
     """
     Generate an attention mask for token-generation (TKG).
@@ -128,6 +129,8 @@ def gen_attention_decode_mask(
                       broadcast the same way as ``local_filled_slots``.
         is_causal:    Whether active tokens use causal attention. DFlash passes
                       ``False`` for bidirectional block attention.
+        use_kernel:   Set ``False`` to always build the mask with the PyTorch
+                      implementation (same values).
 
     Returns:
         Tensor of shape [s_prior, bs, q_head, s_active] with values in {0, 1}.
@@ -228,7 +231,7 @@ def gen_attention_decode_mask(
     )
 
     # SWA + s_active > 1: NKI mask kernel now supports per-token start bounds.
-    if _can_use_kernel(pos_ids, bs, s_active, s_prior):
+    if use_kernel and _can_use_kernel(pos_ids, bs, s_active, s_prior):
         return _gen_mask_via_kernel(
             pos_ids,
             bs,

@@ -238,6 +238,11 @@ class DFlashQwen3Model(nn.Module):
 
         # Build one non-causal mask on device and share it across draft layers.
         # Tests may provide a precomputed mask through attention metadata.
+        # Build it with torch ops, not the gen_mask_tkg_hbm kernel. At LNC=2
+        # with 2 to 8 requests per step, the kernel-built mask in this graph
+        # roughly halves DFlash acceptance; the target output stays correct.
+        # On its own the kernel returns the same mask as torch. The mask is
+        # small, so the torch build adds no measurable time.
         attn0 = self.layers[0].self_attn
         layer0_meta = attn_metadata[f"layers.{attn0.layer_idx}.self_attn"]
         attention_mask = layer0_meta.get("attention_mask", None)
@@ -254,6 +259,7 @@ class DFlashQwen3Model(nn.Module):
                 s_prior=s_prior,
                 block_len=block_size,
                 is_causal=False,
+                use_kernel=False,
             )
 
         for layer in self.layers:
