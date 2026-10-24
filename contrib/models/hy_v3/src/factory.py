@@ -75,11 +75,25 @@ class HYV3ForCausalLM(nn.Module):
         tp = parallel.tensor_parallel_size
 
         cache_dtype = vllm_config.cache_config.cache_dtype
-        if cache_dtype not in ("auto", "bfloat16"):
+        if cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
             raise ValueError(
-                f"Hy3 supports only a BF16 KV cache (the checkpoint has no KV "
-                f"scales); got kv_cache_dtype={cache_dtype!r}."
+                "Hy3 supports a BF16 KV cache or an FP8 (E4M3) KV cache with a "
+                f"calibrated KV scale profile; got kv_cache_dtype={cache_dtype!r}."
             )
+        if cache_dtype in ("fp8", "fp8_e4m3"):
+            # The checkpoint ships no KV scales: they come from a calibrated
+            # profile (HY3_KV_SCALE_PROFILE), loaded and validated by the model.
+            packed = bool(neuron_config is not None and neuron_config.fp8_packed_kv)
+            dcp = getattr(parallel, "decode_context_parallel_size", 1)
+            prefix = bool(vllm_config.cache_config.enable_prefix_caching)
+            if (dcp > 1 or prefix) and not packed:
+                raise ValueError(
+                    "Hy3 FP8 KV with prefix caching or DCP reads the cache in the "
+                    "segmented prefill kernels, which need the packed FP8 K layout: "
+                    'set "fp8_packed_kv": true in neuron_config.'
+                )
+            if packed and vllm_config.cache_config.block_size % 2 != 0:
+                raise ValueError("The packed FP8 K cache needs an even --block-size.")
         if parallel.data_parallel_size != 1:
             raise ValueError("Hy3 does not support data parallelism yet.")
         if vllm_config.speculative_config is not None:

@@ -57,6 +57,11 @@ from vllm.distributed.parallel_state import get_dcp_group, get_tp_group
 
 import vllm_neuron.functional as NF
 import vllm_neuron.nn as neuron_nn
+from vllm_neuron.functional.attention.attention_decode import (
+    _swizzle_packed_k,
+    _unswizzle_packed_k,
+    packed_fp8_viable_for_bucket,
+)
 from vllm_neuron.functional.moe.moe_tkg_wrapper import moe_tkg_wrapper
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, paged_slot_indices
 from vllm_neuron.model.neuron_config import NeuronConfig
@@ -64,6 +69,11 @@ from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.nn.sampler import Sampler
 from vllm_neuron.parallel.neuron_parallel_state import shard_select
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
+from vllm_neuron.utils.dtype_utils import (
+    FP8_CLAMP_MAX,
+    QUANTIZED_KV_CACHE_DTYPES,
+    validate_fp8_segmented_supported,
+)
 from vllm_neuron.utils.weight_loader import (
     expert_parallel_grouped_loader,
     fused_qkv_weight_loader,
@@ -71,6 +81,7 @@ from vllm_neuron.utils.weight_loader import (
     sharding_weight_loader,
 )
 
+from . import kv_scales
 from .config import HYV3Config
 from .kernels.moe_tkg_hits import moe_tkg_hits
 from .kernels.moe_tkg_hits_batch import moe_tkg_hits_batch
@@ -121,6 +132,100 @@ def _validate_dcp_decode_sequence_length(dcp_size: int, sequence_length: int) ->
 
 def _fp32_param(*shape) -> nn.Parameter:
     return nn.Parameter(torch.empty(*shape, dtype=torch.float32), requires_grad=False)
+
+
+# FP8 KV cache. Scales are per-layer Python floats from the KV scale profile
+# (src/kv_scales.py), so they are graph constants: a different profile traces
+# to different HLO and therefore different NEFFs (compile-cache isolation).
+_FP8_KV_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+# Test hook: decode reads the packed K cache through the unpacked kernel
+# (un-swizzle -> kernel -> re-swizzle the returned K) even when the packed
+# kernel is viable, so the fallback write-back can be exercised on every bucket.
+_FORCE_UNPACKED_DECODE = os.environ.get("HY3_FP8_KV_FORCE_UNPACKED_DECODE") == "1"
+
+
+def _is_fp8_kv(cache: torch.Tensor | None) -> bool:
+    return cache is not None and cache.dtype in _FP8_KV_DTYPES
+
+
+def _quantize_kv(x: torch.Tensor, q, dtype: torch.dtype) -> torch.Tensor:
+    """Cache write: ``fp8(clamp(x * q, +-FP8_CLAMP_MAX))`` (q = 1 / dequant)."""
+    return (x.to(torch.float32) * q).clamp(-FP8_CLAMP_MAX, FP8_CLAMP_MAX).to(dtype)
+
+
+def _write_packed_k(
+    k_cache: torch.Tensor,
+    k_rows: torch.Tensor,
+    block_idx: torch.Tensor,
+    head_idx: torch.Tensor,
+    pos_idx: torch.Tensor,
+) -> None:
+    """Write pair-aligned K rows into the packed cache [blocks, kvh, block // 2, D, 2].
+
+    Same pair coordinates and preconditions as vllm_neuron's ``scatter_packed_k``
+    (rows (2j, 2j + 1) are lanes 0 / 1 of one packed slot; null-block rows are
+    padding), but without its gather of every target slot to preserve the null
+    lane: that O(tokens) gather made the full-model prefill NEFFs 2-4x larger and
+    their compile outlast the startup TP barrier. In Hy3 prefill the only
+    half-valid slot is the last one of an odd-length chunk, whose null lane is
+    the request's next position in its own (not yet full, so never shared)
+    block; it is written before it is ever read. All-null slots go to the null
+    block like the upstream helper.
+    """
+    num_rows, d_head = k_rows.shape
+    k_pairs = k_rows.view(-1, 2, d_head).transpose(1, 2).contiguous()
+    block_lanes = block_idx.view(-1, 2)
+    head_lanes = head_idx.view(-1, 2)
+    pos_lanes = pos_idx.view(-1, 2)
+    lane0_valid = block_lanes[:, 0] > 0
+    block_pair = torch.where(lane0_valid, block_lanes[:, 0], block_lanes[:, 1])
+    head_pair = torch.where(lane0_valid, head_lanes[:, 0], head_lanes[:, 1])
+    outer_pair = torch.where(lane0_valid, pos_lanes[:, 0], pos_lanes[:, 1]) // 2
+    pair_valid = (block_lanes > 0).any(dim=1)
+    outer_pair = torch.where(pair_valid, outer_pair, torch.zeros_like(outer_pair))
+    k_cache.index_put_((block_pair, head_pair, outer_pair), k_pairs)
+
+
+# Segmented prefill over an FP8 cache: "bf16" (default) reads a BF16 copy of
+# the request's blocks (see _request_blocks_bf16) with the BF16 segmented
+# kernel; "packed" reads the packed FP8 K cache in the NKI kernel. On the full
+# model (80 layers, 8139 blocks, prefill buckets up to 8192) the packed read
+# makes the prefill NEFFs 10-16x larger (48-116+ MB vs 3-7 MB) and their cold
+# compile take hours, past the startup TP barrier. DCP prefill always uses the
+# BF16 copy (see forward_prefill).
+_PREFILL_READ = os.environ.get("HY3_FP8_KV_PREFILL_READ", "bf16")
+
+
+def _request_blocks_bf16(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    packed: bool,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """BF16 copy of one prefill request's KV blocks and the matching block table.
+
+    Prefill runs one request per step, so its block table row lists every block
+    the segmented kernel may read. Gathering those (at most max_model_len /
+    block_size) blocks, un-swizzling a packed K and casting to BF16 is exact
+    (FP8 codes are representable in BF16) and small next to the prefill; the
+    kernel then reads a standard BF16 cache with a 0..n-1 block table.
+    """
+    blocks = block_table.reshape(-1).to(torch.long).clamp(min=0)
+    k_sel = torch.index_select(k_cache, 0, blocks)
+    if packed:
+        k_sel = _unswizzle_packed_k(k_sel)
+    v_sel = torch.index_select(v_cache, 0, blocks)
+    local_table = torch.arange(
+        blocks.shape[0], dtype=block_table.dtype, device=block_table.device
+    ).view(block_table.shape)
+    return k_sel.to(dtype), v_sel.to(dtype), local_table
+
+
+def _scale_column(value: float, device: torch.device) -> torch.Tensor:
+    """A [PMAX, 1] fp32 replicated scalar, the layout the attention kernels take."""
+    return torch.full((_PMAX, 1), value, dtype=torch.float32, device=device)
 
 
 # =============================================================================
@@ -257,11 +362,39 @@ class HYV3Attention(nn.Module):
         self.q_norm = HYV3RMSNorm(self.head_dim, config.rms_norm_eps, self.dtype)
         self.k_norm = HYV3RMSNorm(self.head_dim, config.rms_norm_eps, self.dtype)
 
-        # KV caches bound externally via bind_kv_cache() (BF16 only).
+        # KV caches bound externally via bind_kv_cache(): BF16, or FP8 with K in
+        # either the standard [blocks, kvh, block, D] or the packed
+        # [blocks, kvh, block // 2, D, 2] layout (fp8_packed, set at bind time).
         self.k_cache = None
         self.v_cache = None
+        self.fp8_packed = False
+        # FP8 KV quantizing scales q = 1 / dequant (cache = fp8(x * q)), set from
+        # the KV scale profile by load_weights / load_weights_lite. 1.0 is only
+        # the BF16-KV value; FP8 KV refuses to bind without a loaded profile.
+        self.k_scale_float = 1.0
+        self.v_scale_float = 1.0
+        self.kv_scales_loaded = False
 
         self._setup_weight_loaders()
+
+    def set_kv_scales(self, q_k: float, q_v: float, device) -> None:
+        """<-- FP8 KV: this layer's quantizing scales (q = 1 / dequant).
+
+        Decode passes them to the megakernel as compile-time values. Prefill
+        reads them from ``kv_scale_t`` ([q_k, q_v, 1/q_k, 1/q_v], a graph input)
+        so that all 80 prefill layers stay structurally identical: with
+        per-layer constants the compiler cannot reuse one layer module for the
+        others, which made the full-model prefill NEFFs 10-16x larger and their
+        cold compile take hours.
+        """
+        self.k_scale_float, self.v_scale_float = q_k, q_v
+        self.kv_scale_t = nn.Parameter(
+            torch.tensor(
+                [q_k, q_v, 1.0 / q_k, 1.0 / q_v], dtype=torch.float32, device=device
+            ),
+            requires_grad=False,
+        )
+        self.kv_scales_loaded = True
 
     def _setup_weight_loaders(self):
         set_weight_loader(
@@ -331,6 +464,14 @@ class HYV3Attention(nn.Module):
         tf = tf * torch.rsqrt(tf.pow(2).mean(-1, keepdim=True) + norm.variance_epsilon)
         return tf * norm.weight.to(torch.float32)
 
+    def _fp8_prefill_q(self, q: torch.Tensor) -> torch.Tensor:
+        """Q * (1 / q_k): (Q / q_k) . (K * q_k) = Q . K for the cached FP8 K."""
+        return (q.to(torch.float32) * self.kv_scale_t[2]).to(q.dtype)
+
+    def _fp8_prefill_out(self, out: torch.Tensor) -> torch.Tensor:
+        """Attention over V * q_v, times 1 / q_v."""
+        return (out.to(torch.float32) * self.kv_scale_t[3]).to(out.dtype)
+
     def forward_prefill(
         self,
         hidden_states: torch.Tensor,
@@ -389,25 +530,55 @@ class HYV3Attention(nn.Module):
             ),
             pos_idx.repeat(nkh),
         )
-        self.k_cache.index_put_(
-            index, k.reshape(-1, self.head_dim).to(self.k_cache.dtype)
-        )
-        self.v_cache.index_put_(
-            index, v.reshape(-1, self.head_dim).to(self.v_cache.dtype)
-        )
+        # <-- FP8 KV: K is quantized after QK-norm + RoPE, V after v_proj, with
+        # the profile's static per-layer scale.
+        kv_fp8 = _is_fp8_kv(self.k_cache)
+        if kv_fp8:
+            k_rows = _quantize_kv(
+                k.reshape(-1, self.head_dim), self.kv_scale_t[0], self.k_cache.dtype
+            )
+            v_rows = _quantize_kv(
+                v.reshape(-1, self.head_dim), self.kv_scale_t[1], self.v_cache.dtype
+            )
+        else:
+            k_rows = k.reshape(-1, self.head_dim).to(self.k_cache.dtype)
+            v_rows = v.reshape(-1, self.head_dim).to(self.v_cache.dtype)
+        self.v_cache.index_put_(index, v_rows)
+        if self.fp8_packed:
+            # Packed K [blocks, kvh, block // 2, D, 2] stores token pairs
+            # (2j, 2j + 1). One prefill per step starting at a block-aligned
+            # (prefix hit) or chunk-aligned position keeps rows pair-aligned.
+            _write_packed_k(self.k_cache, k_rows, *index)
+        else:
+            self.k_cache.index_put_(index, k_rows)
 
         # Step 4: Attention
         kv_segment_size = meta.get("kv_segment_size")
+        if kv_fp8 and (self.dcp_size > 1 or kv_segment_size):
+            # The segmented kernels read a non-packed FP8 K cache wrongly.
+            validate_fp8_segmented_supported(kv_fp8, self.fp8_packed)
         if self.dcp_size > 1:
             # Full Q against this rank's local KV shard (read from the cache,
             # which now includes the current tokens), LSE-combined across the
             # DCP group.
             cached_seq_len = meta.get("cached_seq_len")
+            k_attn, v_attn = self.k_cache, self.v_cache
+            block_table = meta["block_table_tensor"]
+            if kv_fp8:
+                # <-- FP8 KV under DCP: on the installed nkilib (nki 0.7.0) the
+                # KV-parallel segmented kernel reads the PRIOR segments of a
+                # packed FP8 K cache wrongly (multi-chunk prefill / prefix hits
+                # diverge from BF16 KV, with or without its k_scale / v_scale;
+                # the first chunk is correct). Read a BF16 copy of this rank's
+                # blocks of the request instead (exact for FP8 codes).
+                k_attn, v_attn, block_table = _request_blocks_bf16(
+                    self.k_cache, self.v_cache, block_table, self.fp8_packed, self.dtype
+                )
             attn_output = NF.segmented_attention_cp(
-                q=q,
-                k_cache=self.k_cache,
-                v_cache=self.v_cache,
-                block_tables=meta["block_table_tensor"],
+                q=self._fp8_prefill_q(q) if kv_fp8 else q,
+                k_cache=k_attn,
+                v_cache=v_attn,
+                block_tables=block_table,
                 prior_tokens=(
                     cached_seq_len // self.dcp_size
                     if cached_seq_len is not None
@@ -418,24 +589,43 @@ class HYV3Attention(nn.Module):
                 cp_world_size=self.dcp_size,
                 cp_kv_cache_interleave_size=block_size,
                 cp_group=self.dcp_group,
+                # <-- FP8 KV: the BF16 copy holds k * q_k / v * q_v. Q carries the
+                # K dequant (see _fp8_prefill_q) and the V dequant is applied
+                # after the LSE combine (linear in V).
                 scale=self.scaling,
                 tp_q=True,
                 tp_out=True,
             )
+            if kv_fp8:
+                attn_output = self._fp8_prefill_out(attn_output)
         elif kv_segment_size:
+            # <-- FP8 KV: the cache holds k * q_k / v * q_v. Q carries the K
+            # dequant and the output the V dequant (runtime scales, so the
+            # layers stay identical; see set_kv_scales).
+            k_attn, v_attn = self.k_cache, self.v_cache
+            block_table, packed_read = meta["block_table_tensor"], self.fp8_packed
+            if kv_fp8 and _PREFILL_READ == "bf16":
+                k_attn, v_attn, block_table = _request_blocks_bf16(
+                    self.k_cache, self.v_cache, block_table, self.fp8_packed, self.dtype
+                )
+                packed_read = False
             attn_output = NF.segmented_attention(
-                q,
-                k_cache=self.k_cache,
-                v_cache=self.v_cache,
-                block_tables=meta["block_table_tensor"],
+                self._fp8_prefill_q(q) if kv_fp8 else q,
+                k_cache=k_attn,
+                v_cache=v_attn,
+                block_tables=block_table,
                 prior_tokens=meta.get("cached_seq_len"),
                 block_size=block_size,
                 kv_segment_size=kv_segment_size,
                 scale=self.scaling,
                 tp_q=True,
                 tp_out=True,
+                fp8_packed=packed_read,
             )
+            if kv_fp8:
+                attn_output = self._fp8_prefill_out(attn_output)
         else:
+            # Full prefill attends over this step's BF16 K/V, not the cache.
             k = k.repeat_interleave(self.num_key_value_groups, dim=0)
             v = v.repeat_interleave(self.num_key_value_groups, dim=0)
             attn_output = NF.flash_attention(
@@ -534,6 +724,50 @@ class HYV3Attention(nn.Module):
             )
             attn_metadata[_DECODE_MASK_CACHE_KEY] = attention_mask
 
+        # <-- FP8 KV (installed nkilib attention_block_tkg contract):
+        #  * k_scale / v_scale are QUANT multipliers: the kernel writes the
+        #    active token as fp8(clip(x * q)); the history is read undequantized.
+        #  * K: the explicit softmax_scale must carry 1 / q_k.
+        #  * V: the attention output reaches the STATIC O-projection scaled by
+        #    q_v. The O-proj quantizes attn / input_scale and rescales by
+        #    weight_scale * input_scale, so scale input_scale by q_v (the FP8
+        #    input keeps its normal range) and weight_scale by 1 / q_v (their
+        #    product, and so the output, is unchanged). Scaling only the weight
+        #    scale would clip the O-proj input at 240 / q_v of its range.
+        kv_fp8 = _is_fp8_kv(self.k_cache)
+        o_weight_scale, o_input_scale = self.o_weight_scale, self.o_input_scale
+        decode_kv_kwargs = {}
+        packed_fallback = False
+        k_cache_arg = self.k_cache
+        if kv_fp8:
+            if self.v_scale_float != 1.0:
+                o_input_scale = o_input_scale * self.v_scale_float
+                o_weight_scale = o_weight_scale / self.v_scale_float
+            use_packed = (
+                self.fp8_packed
+                and not _FORCE_UNPACKED_DECODE
+                and packed_fp8_viable_for_bucket(
+                    block_len=block_size,
+                    bs=B,
+                    # DCP gathers the group's Q heads (as in the decode mask).
+                    q_head=self.num_attention_heads_per_rank * self.dcp_size,
+                    s_active=S_decode,
+                    s_prior=S_ctx,
+                )
+            )
+            # A packed cache on a bucket the packed kernel cannot take is read
+            # (and updated) through a standard-layout copy; the updated copy is
+            # swizzled back below so the next step sees the new token.
+            packed_fallback = self.fp8_packed and not use_packed
+            if packed_fallback:
+                k_cache_arg = _unswizzle_packed_k(self.k_cache)
+            decode_kv_kwargs = dict(
+                k_scale=_scale_column(self.k_scale_float, X.device),
+                v_scale=_scale_column(self.v_scale_float, X.device),
+                fp8_packed=use_packed,
+                return_updated_kv=packed_fallback,
+            )
+
         output = NF.attention_decode(
             X=X,
             X_hidden_dim_actual=self.hidden_size,
@@ -556,26 +790,29 @@ class HYV3Attention(nn.Module):
             rope_contiguous_layout=True,
             K_cache_transposed=False,
             active_blocks_table=block_table,
-            K_cache=self.k_cache,
+            K_cache=k_cache_arg,
             V_cache=self.v_cache,
             attention_mask=attention_mask,
-            softmax_scale=self.scaling,
+            softmax_scale=self.scaling / self.k_scale_float,
             sink=None,
             update_cache=True,
             kv_cache_update_idx=slot_mapping.view(B, S_decode).to(torch.uint32),
             W_out=self.o_proj_weight,
             bias_out=None,
             quantization_type_out=QuantizationType.STATIC,
-            weight_dequant_scale_out=self.o_weight_scale,
-            input_dequant_scale_out=self.o_input_scale,
+            weight_dequant_scale_out=o_weight_scale,
+            input_dequant_scale_out=o_input_scale,
             transposed_out=False,
             out_in_sb=False,
-            k_scale=None,
-            v_scale=None,
             dcp_size=self.dcp_size,
             dcp_group=self.dcp_group,
             dcp_active_owner=dcp_active_mask,
+            **decode_kv_kwargs,
         )
+        if packed_fallback:
+            # Use the kernel's RETURNED K (k_cache_arg is the pre-kernel copy).
+            output, k_updated, _ = output
+            self.k_cache.copy_(_swizzle_packed_k(k_updated))
 
         # >>> PARALLELISM: TP all-reduce of the O projection (after the DCP combine) <<<
         if self.world_size > 1:
@@ -1557,8 +1794,30 @@ class HYV3ForCausalLM(nn.Module):
             name = f"layers.{i}.self_attn"
             if name not in kv_caches:
                 raise KeyError(f"KV cache for layer {name} not initialized")
-            layer.self_attn.k_cache = kv_caches[name][0]
-            layer.self_attn.v_cache = kv_caches[name][1]
+            attn = layer.self_attn
+            k_cache, v_cache = kv_caches[name]
+            k_fp8, v_fp8 = _is_fp8_kv(k_cache), _is_fp8_kv(v_cache)
+            if k_fp8 != v_fp8:
+                raise ValueError(
+                    f"{name}: K cache {k_cache.dtype} and V cache {v_cache.dtype} "
+                    "must both be FP8 or both BF16"
+                )
+            # Packed K (neuron_config.fp8_packed_kv) is one dim higher than V,
+            # which is never packed.
+            packed = k_cache.dim() == v_cache.dim() + 1
+            if packed and not (k_fp8 and k_cache.dim() == 5 and v_cache.dim() == 4):
+                raise ValueError(
+                    f"{name}: unexpected KV layout K {tuple(k_cache.shape)} "
+                    f"{k_cache.dtype}, V {tuple(v_cache.shape)} {v_cache.dtype}"
+                )
+            if k_fp8 and not attn.kv_scales_loaded:
+                raise RuntimeError(
+                    f"{name}: FP8 KV cache bound but no KV scale profile was loaded "
+                    f"(set ${kv_scales.PROFILE_ENV})"
+                )
+            attn.k_cache = k_cache
+            attn.v_cache = v_cache
+            attn.fp8_packed = packed
 
     # ── Weight loading ────────────────────────────────────────────────────
 
@@ -1644,8 +1903,56 @@ class HYV3ForCausalLM(nn.Module):
                 raise RuntimeError(
                     f"Parameter {name} was not loaded from the checkpoint"
                 )
+        self._load_kv_scale_profile(checkpoint_path, device)
 
     def load_weights_lite(
         self, checkpoint_path: str, device: torch.device, cache_dir: str | None
     ) -> None:
-        """CPU compile: no scale-derived compile-time constants to load."""
+        """CPU compile: only the KV scales (decode uses them as graph constants)."""
+        self._load_kv_scale_profile(checkpoint_path, device)
+
+    def _load_kv_scale_profile(self, checkpoint_path: str, device) -> None:
+        """<-- FP8 KV: per-layer K/V scales from the calibrated profile.
+
+        No-op for a BF16 KV cache. For FP8 KV a profile is required (a missing
+        one is an error, never a silent scale of 1.0); it is validated against
+        this platform's FP8 range and the checkpoint's attention weights.
+        """
+        from vllm.config import get_current_vllm_config
+
+        cache_dtype = get_current_vllm_config().cache_config.cache_dtype
+        if cache_dtype not in QUANTIZED_KV_CACHE_DTYPES:
+            return
+        if not os.path.isdir(checkpoint_path):
+            raise ValueError(
+                "Hy3 FP8 KV needs a local checkpoint directory to validate the KV "
+                f"scale profile against; got {checkpoint_path!r}"
+            )
+        path = kv_scales.resolve_profile_path(checkpoint_path)
+        if path is None:
+            raise ValueError(
+                f"kv_cache_dtype={cache_dtype!r} needs a KV scale profile: set "
+                f"${kv_scales.PROFILE_ENV} or put kv_scales.safetensors in the "
+                "checkpoint directory (see scripts/calibrate_kv_scales.py)"
+            )
+        layers = self.model.layers
+        q_k, q_v, meta = kv_scales.load_profile(
+            path,
+            checkpoint_path,
+            num_layers=len(layers),
+            target_fp8_max=FP8_CLAMP_MAX,
+            check_fingerprint=os.environ.get("HY3_KV_SCALE_SKIP_FINGERPRINT") != "1",
+        )
+        for layer, qk, qv in zip(layers, q_k, q_v):
+            layer.self_attn.set_kv_scales(qk, qv, device)
+        logger.info(
+            "Hy3 FP8 KV scale profile %s (sha256 %s, %d layers): "
+            "q_k in [%.4g, %.4g], q_v in [%.4g, %.4g]",
+            path,
+            meta["sha256"][:16],
+            len(layers),
+            min(q_k),
+            max(q_k),
+            min(q_v),
+            max(q_v),
+        )

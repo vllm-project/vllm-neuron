@@ -3,6 +3,7 @@
 Usage: python eval_math500.py <reasoning_effort> <out.jsonl>
            [--concurrency 64] [--max-tokens 4096] [--temperature 0.9] [--limit N]
            [--data math500.jsonl] [--base-url http://127.0.0.1:8000/v1]
+           [--seed S]  (per-request seed S + problem index; same across servers)
 
 Requires: openai, math-verify[antlr4_13_2], and datasets (only when --data is
 not given; HuggingFaceH4/MATH-500 is then downloaded).
@@ -74,6 +75,7 @@ async def main(args):
                 temperature=args.temperature,
                 top_p=1.0,
                 max_tokens=args.max_tokens,
+                **({"seed": args.seed + i} if args.seed is not None else {}),
                 extra_body={
                     "chat_template_kwargs": {"reasoning_effort": args.reasoning_effort}
                 },
@@ -133,4 +135,5 @@ if __name__ == "__main__":
         "--data", default=None, help="local MATH-500 jsonl (default: download)"
     )
     p.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
+    p.add_argument("--seed", type=int, default=None)
     asyncio.run(main(p.parse_args()))
