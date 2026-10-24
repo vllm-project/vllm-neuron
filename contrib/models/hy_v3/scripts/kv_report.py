@@ -12,9 +12,13 @@ evidence fails the gate). The exit code is 0 only if every selected check passes
               one 80-layer KV scale profile (file sha256 matching the logged one)
   memory      persistent KV pool: exact per-rank bytes from the "Hy3 KV pool"
               log line, FP8 / BF16 = 0.5; device "tensors" difference = that pool
-              difference (1 %); transient / non-KV memory: the per-category PEAK
-              over the run (mem_timeseries.jsonl) must not grow with FP8 (1 % or
-              64 MiB); reports the BF16 request-block copy bound per prefill step
+              difference (1 %); peak over the run (mem_timeseries.jsonl, every
+              runtime category): the effective saving, BF16 peak device total
+              minus FP8 peak device total, must be >= --min-peak-saving (default
+              0.45) of the BF16 KV pool ("KV memory about -50 %" including every
+              FP8-only overhead); each non-KV category that grows is listed (WARN;
+              FAIL with --strict-transient); reports the BF16 request-block copy
+              bound per prefill step
   accuracy    MATH-500 paired per problem: same 500 problems and sampling config
               (.meta.json if present), every problem re-graded with math-verify
               here, accuracy drop <= --max-acc-drop pp; reports discordant pairs,
@@ -130,10 +134,14 @@ def peaks(d):
         for k, v in r["device"].items():
             pk[k] = max(pk.get(k, 0), v)
     pk["device_total"] = max(r["device_total"] for r in rows)
+    # Boundedness: growth of each category over the last quarter of the run.
+    q = rows[len(rows) * 3 // 4:]
+    pk["_late_growth"] = {k: max(r["device"].get(k, 0) for r in q) - q[0]["device"].get(k, 0)
+                          for k in q[0]["device"]}
     return pk, len(rows), rows[-1]["t"] - rows[0]["t"]
 
 
-def memory(B, F):
+def memory(B, F, min_peak_saving=0.45, strict=False):
     print("\n## Memory\n")
     mb, mf = load_json(B / "manifest.json") or {}, load_json(F / "manifest.json") or {}
     pb, pf = mb.get("kv_pool_bytes_per_rank") or [], mf.get("kv_pool_bytes_per_rank") or []
@@ -162,27 +170,46 @@ def memory(B, F):
     kb, nb, tb = peaks(B)
     kf, nf, tf = peaks(F)
     if not (kb and kf):
-        check("memory: peak non-KV / transient", "MISSING",
+        check("memory: peak (persistent + transient)", "MISSING",
               "mem_timeseries.jsonl (peak over the run) missing in "
               + ", ".join(str(x) for x, k in ((B, kb), (F, kf)) if not k))
     else:
         print("| peak over the run (GiB, all ranks) | BF16 KV | FP8 KV | Δ |\n|---|---|---|---|")
-        errs = []
+        grow = []
+        late = {lab: {k: v for k, v in p.pop("_late_growth").items() if v > 0.01 * max(p.get(k, 1), 1)}
+                for lab, p in (("BF16", kb), ("FP8", kf))}
         for k in sorted(set(kb) | set(kf)):
             a, b = kb.get(k, 0), kf.get(k, 0)
             print(f"| {k} | {a / G:.2f} | {b / G:.2f} | {(b - a) / G:+.2f} |")
             if k in ("tensors", "device_total"):
                 continue
             if b > a * 1.01 + 64 * 2**20:
-                errs.append(f"{k} +{(b - a) / 2**20:.0f} MiB")
-        if pool_delta:
+                grow.append(f"{k} +{(b - a) / G:.2f} GiB")
+        if pool_delta and kf["tensors"] + pool_delta > kb["tensors"] * 1.01:
             # Peak tensors minus each run's own KV pool: weights + other persistent tensors.
-            if kf["tensors"] + pool_delta > kb["tensors"] * 1.01:
-                errs.append(f"non-KV tensors +{(kf['tensors'] + pool_delta - kb['tensors']) / 2**20:.0f} MiB")
+            grow.append(f"non-KV tensors +{(kf['tensors'] + pool_delta - kb['tensors']) / G:.2f} GiB")
         print(f"\n({nb} / {nf} samples over {tb / 60:.0f} / {tf / 60:.0f} min)\n")
-        check("memory: peak non-KV / transient", "FAIL" if errs else "PASS",
+        errs = []
+        if pool_delta:
+            bf16_pool = 2 * pool_delta  # BF16 pool = 2 x the difference (FP8 / BF16 = 0.5)
+            saved = kb["device_total"] - kf["device_total"]
+            frac = saved / bf16_pool
+            print(f"Effective peak saving {saved / G:.2f} GiB = {100 * frac:.1f} % of the BF16 KV pool "
+                  f"({bf16_pool / G:.2f} GiB); FP8-only overhead at peak {(pool_delta - saved) / G:+.2f} GiB.\n")
+            if frac < min_peak_saving:
+                errs.append(f"effective peak saving {100 * frac:.1f} % < {100 * min_peak_saving:.0f} %")
+        for lab, lg in late.items():
+            if lg:
+                grow.append(f"{lab} still growing in the last quarter: "
+                            + ", ".join(f"{k} +{v / G:.2f} GiB" for k, v in lg.items()))
+        if grow:
+            print("WARN non-KV categories larger with FP8 at peak: " + "; ".join(grow) + "\n")
+            if strict:
+                errs += grow
+        check("memory: peak (persistent + transient)", "FAIL" if errs else "PASS",
               "; ".join(errs) if errs else
-              "no category (scratchpad, code, constants, runtime, non-KV tensors) grows with FP8 at peak")
+              (f"effective peak saving {100 * frac:.1f} % of the BF16 KV pool"
+               + (f"; WARN {'; '.join(grow)}" if grow else "; no non-KV category grows")))
     args = mf.get("non_default_args") or {}
     if args:
         W = math.ceil(args.get("max_model_len", 0) / args.get("block_size", 32))
@@ -389,13 +416,15 @@ def main():
     ap.add_argument("--max-acc-drop", type=float, default=1.0)
     ap.add_argument("--min-stab-seconds", type=float, default=1800)
     ap.add_argument("--json", default=None)
+    ap.add_argument("--min-peak-saving", type=float, default=0.45)
+    ap.add_argument("--strict-transient", action="store_true")
     ap.add_argument("--stability-fp8-only", action="store_true",
                     help="only the FP8 run needs a stability run (e.g. DCP 8 functional pair)")
     a = ap.parse_args()
     B, F = Path(a.bf16), Path(a.fp8)
     print(f"# KV acceptance gate: {B} (BF16 KV) vs {F} (FP8 KV)\n")
     for c in a.checks.split(","):
-        {"provenance": lambda: provenance(B, F), "memory": lambda: memory(B, F),
+        {"provenance": lambda: provenance(B, F), "memory": lambda: memory(B, F, a.min_peak_saving, a.strict_transient),
          "accuracy": lambda: accuracy(B, F, a.max_acc_drop), "perf": lambda: perf(B, F, a.max_regress),
          "stability": lambda: stability(B, F, a.min_stab_seconds, a.stability_fp8_only)}[c]()
     ok = all(r["status"] == "PASS" for r in RESULTS)
