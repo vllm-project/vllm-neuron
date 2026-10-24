@@ -395,14 +395,14 @@ class Qwen3_5Attention(nn.Module):
         k = k.repeat_interleave(self.num_kv_groups, dim=0)
         v = v.repeat_interleave(self.num_kv_groups, dim=0)
 
-        # Causal attention in blocks of PREFILL_ATTN_BLOCK query rows, each
-        # against only the keys up to its last row, and only the diagonal
-        # [rows, rows] piece masked: every key left of it is visible. A
-        # [T, T] causal mask at T=8448 fails to compile on 397B-A17B ("NCC_IINAR001
-        # ... pftranspose ... 'start_addr_active_channels'"; in int32 as well as
-        # int64, and replacing just the mask with a constant compiles), while the
-        # 2048 x 2048 one does. Skipping the keys above the diagonal also roughly
-        # halves the work.
+        # Flash-style: PREFILL_ATTN_BLOCK query rows against PREFILL_ATTN_BLOCK
+        # keys at a time, up to the diagonal, with an online softmax across the
+        # key blocks, so no tensor or reduction is wider than a block. One
+        # [heads, T, T] attention fails to compile on 397B-A17B (one query head
+        # per rank) at T=8448 and 9472 ("NCC_IINAR001 ... pftranspose ...
+        # 'start_addr_active_channels'"), and so does a blocked version whose
+        # softmax spans every key up to the diagonal; at T=2048 the plain
+        # version compiles. The keys above the diagonal are skipped too.
         #
         # Every block is rank 3 ([heads, rows, keys]), which is what neuronx-cc
         # wants. ``masked_fill`` rather than ``torch.where``: the latter needs a
@@ -410,15 +410,27 @@ class Qwen3_5Attention(nn.Module):
         # [heads, 1024, 1024] float32 allocation the compiler did not accept.
         qf, kf = q.float(), k.float()
         outs = []
-        for start in range(0, tokens, PREFILL_ATTN_BLOCK):
-            end = min(start + PREFILL_ATTN_BLOCK, tokens)
-            qb = qf[:, start:end]
-            causal = torch.ones(end - start, end - start, dtype=torch.bool, device=q.device).triu(1)
-            scores = (qb @ kf[:, start:end].transpose(-1, -2)).masked_fill(causal, float("-inf"))
-            if start:
-                scores = torch.cat([qb @ kf[:, :start].transpose(-1, -2), scores], dim=-1)
-            attn = torch.softmax(scores * self.scaling, dim=-1).to(v.dtype)
-            outs.append(attn @ v[:, :end])
+        for qs in range(0, tokens, PREFILL_ATTN_BLOCK):
+            qe = min(qs + PREFILL_ATTN_BLOCK, tokens)
+            qb = qf[:, qs:qe]
+            m = l = acc = None
+            for ks in range(0, qe, PREFILL_ATTN_BLOCK):
+                ke = min(ks + PREFILL_ATTN_BLOCK, qe)
+                s = (qb @ kf[:, ks:ke].transpose(-1, -2)) * self.scaling
+                if ks == qs:  # the diagonal block
+                    causal = torch.ones(qe - qs, ke - ks, dtype=torch.bool, device=q.device).triu(1)
+                    s = s.masked_fill(causal, float("-inf"))
+                mb = s.amax(dim=-1, keepdim=True)
+                p = torch.exp(s - mb)
+                lb = p.sum(dim=-1, keepdim=True)
+                ob = (p.to(v.dtype) @ v[:, ks:ke]).float()
+                if m is None:
+                    m, l, acc = mb, lb, ob
+                else:
+                    mn = torch.maximum(m, mb)
+                    a, b = torch.exp(m - mn), torch.exp(mb - mn)
+                    m, l, acc = mn, l * a + lb * b, acc * a + ob * b
+            outs.append((acc / l).to(v.dtype))
         attn_output = outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
         attn_output = attn_output.transpose(0, 1).reshape(tokens, self.q_size)
 
