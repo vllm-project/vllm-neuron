@@ -361,8 +361,25 @@ class Qwen3_5Attention(nn.Module):
         if self.q_replicas > 1:
             # Gate first, then narrow: the gate spans the whole (replicated) head
             # and only the product is split between the head's replica ranks.
-            attn_output = attn_output[:, self.o_offset : self.o_offset + self.o_size]
+            attn_output = attn_output.index_select(1, self._o_window(attn_output.device))
         return attn_output @ self.o_proj_weight
+
+    def _o_window(self, device) -> torch.Tensor:
+        """``[o_size]`` column indices of this rank's ``o_offset`` window.
+
+        SPMD: from the TP group's stamped rank tensor rather than the Python-int
+        ``o_offset``, which as a slice bound would be baked into the graph and
+        give every rank its own graph to compile (see
+        ``Qwen3_5SparseMoeBlock._ep_rank_tensor``).
+        """
+        from vllm_neuron.parallel.neuron_parallel_state import try_get_rank_in_group_tensor
+
+        stamped = try_get_rank_in_group_tensor(self.tp_group)
+        if stamped is None:  # direct (non-SPMD) entry points, e.g. CPU tests
+            offset = torch.tensor([self.o_offset], dtype=torch.int64, device=device)
+        else:
+            offset = (stamped.reshape(1).to(torch.int64) % self.q_replicas) * self.o_size
+        return torch.arange(self.o_size, dtype=torch.int64, device=device) + offset
 
     def forward(
         self,

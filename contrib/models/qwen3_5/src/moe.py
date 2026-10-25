@@ -456,6 +456,36 @@ class Qwen3_5SparseMoeBlock(nn.Module):
 
     # ── helpers ──────────────────────────────────────────────────────────
 
+    def _ep_rank_tensor(self, device) -> torch.Tensor:
+        """This rank's EP partition index as a traced int32 ``[1]`` tensor.
+
+        SPMD: ``self.ep_rank`` is a Python int, and anything built from it in
+        the graph (a slice bound, ``torch.tensor([[ep_rank]])``) is baked in as a
+        constant, so every rank traces a different graph and the native route
+        compiles each one separately: 64 NEFFs per bucket at TP=64 instead of
+        one. The EP group's stamped ``rank_in_group_tensor`` is a graph input
+        instead. ``self.ep_rank`` stays for host-side weight loading.
+        """
+        if self.ep_degree <= 1:
+            return torch.zeros(1, dtype=torch.int32, device=device)
+        from vllm_neuron.parallel.neuron_parallel_state import (
+            get_neuron_ep_group,
+            try_get_rank_in_group_tensor,
+        )
+
+        stamped = try_get_rank_in_group_tensor(get_neuron_ep_group())
+        if stamped is None:
+            # Direct (non-SPMD) entry points, e.g. CPU component tests.
+            return torch.tensor([self.ep_rank], dtype=torch.int32, device=device)
+        return stamped.reshape(1).to(torch.int32)
+
+    def _local_expert_indices(self, device) -> torch.Tensor:
+        """``[E_local]`` int32: this rank's global expert ids, from the traced EP rank."""
+        return (
+            torch.arange(self.num_local_experts, device=device, dtype=torch.int32)
+            + self._ep_rank_tensor(device) * self.num_local_experts
+        )
+
     def _shared_expert(self, normed: torch.Tensor) -> torch.Tensor:
         """``sigmoid(gate(x)) * SwiGLU(x)``, as this rank's partial sum over I.
 
@@ -542,14 +572,8 @@ class Qwen3_5SparseMoeBlock(nn.Module):
             # columns for experts this rank does not hold. Their affinities are
             # not lost -- the rank that owns them contributes those terms, and
             # the combine below sums across ranks.
-            local_expert_indices = torch.arange(
-                self.ep_rank * self.num_local_experts,
-                (self.ep_rank + 1) * self.num_local_experts,
-                device=expert_affinities.device,
-                dtype=torch.int32,
-            )
             expert_affinities = NF.get_local_expert_affinities(
-                expert_affinities, local_expert_indices
+                expert_affinities, self._local_expert_indices(expert_affinities.device)
             )
 
         # Padding tokens still route somewhere, and blocks that hold nothing but
@@ -631,9 +655,7 @@ class Qwen3_5SparseMoeBlock(nn.Module):
         )
         rank_id = None
         if is_all_expert:
-            rank_id = torch.tensor(
-                [[self.ep_rank]], dtype=torch.int32, device=hidden_states.device
-            )
+            rank_id = self._ep_rank_tensor(hidden_states.device).reshape(1, 1)
 
         if self.top_k > MAX_KERNEL_TOP_K:
             return self._forward_decode_unfused(hidden_states, norm, rank_id)
@@ -689,21 +711,21 @@ class Qwen3_5SparseMoeBlock(nn.Module):
         top_values = top_values / top_values.sum(dim=-1, keepdim=True)
         affinities = torch.zeros_like(probs).scatter(1, top_index, top_values)
 
-        # This rank's experts' affinities, sliced here with a constant offset
-        # rather than by the kernel from ``rank_id``. On the native route the
-        # kernel's rank_id slice of the [T, E] affinities (512 experts, 64 local
-        # under EP=8) faults with "scatter/gather (indirect memory copy via
-        # scalar DGE) out-of-bound access" in the decode graph, on every rank.
-        # Unselected experts already carry affinity 0 (the scatter above), so no
-        # mask is needed.
-        lo = self.ep_rank * self.num_local_experts
+        # This rank's experts' affinities, gathered here (by the traced EP rank,
+        # see ``_ep_rank_tensor``) rather than sliced by the kernel from
+        # ``rank_id``. On the native route the kernel's rank_id slice of the
+        # [T, E] affinities (512 experts, 64 local under EP=8) faults with
+        # "scatter/gather (indirect memory copy via scalar DGE) out-of-bound
+        # access" in the decode graph, on every rank. Unselected experts already
+        # carry affinity 0 (the scatter above), so no mask is needed.
+        local_affinities = NF.get_local_expert_affinities(
+            affinities, self._local_expert_indices(normed.device)
+        )
         out = NF.moe_tkg(
             hidden_input=normed,
             expert_gate_up_weights=self.experts_gate_up_weight,
             expert_down_weights=self.experts_down_weight,
-            expert_affinities=affinities[:, lo : lo + self.num_local_experts]
-            .contiguous()
-            .to(self.dtype),
+            expert_affinities=local_affinities.contiguous().to(self.dtype),
             expert_index=top_index.to(torch.int32),
             # The kernel only takes rank_id on the all-expert path, and under EP
             # (the only way 397B-A17B fits) that path is mandatory. The slice
