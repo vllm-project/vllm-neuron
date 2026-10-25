@@ -47,21 +47,21 @@
 #                 'model*.safetensors' 'model.safetensors.index.json'
 #   MODEL=./MiMo-V2.5 bash serve_mimo.sh
 #
-# --max-num-batched-tokens must equal --max-model-len: it does NOT follow
-# --max-model-len on its own, validate_num_batched_tokens_buckets requires the
-# last num_batched_tokens_bucket to equal it, and on 0.29 any value below
-# max_model_len turns on segmented prefill by default, which this port does
-# not implement (the factory rejects it at load).
+# Prefill is segmented (chunked): each step prefills CHUNK tokens of one request
+# against the KV cache of its earlier chunks (MiMoV2Attention.
+# _forward_prefill_segment), so one prefill graph of CHUNK tokens serves every
+# prompt length. A single-shot prefill graph of SEQ tokens instead took more
+# than 11 h to compile cold for Pro at SEQ 9472.
 #
 # Defaults are sized for 8K-token inputs and 1K-token outputs at the highest
 # concurrency the KV cache holds (contrib/benchmark's 8192 / 1024 cells):
 #   SEQ=9472             an 8K input with +3% jitter (8435) + 1024 output tokens,
 #                        rounded up to a multiple of 128
 #   BS                   max_num_seqs: 12 for Pro, 20 otherwise (the KV limit)
-#   PREFILL_BUCKETS      [8448, $SEQ]: the last bucket must equal SEQ (no
-#                        segmented prefill); 8448 keeps an 8K prompt from
-#                        padding to SEQ. Add buckets for shorter prompts, e.g.
-#                        [1024, 2048, 4096, 8448, 9472]; each is a compile.
+#   CHUNK                prefill chunk (--max-num-batched-tokens and the KV
+#                        segment size), default 2048; one of 512 / 1024 / 2048 /
+#                        4096 / 8192. SEQ <= CHUNK prefills in one shot.
+#   PREFILL_BUCKETS      default [CHUNK]; the last bucket must equal CHUNK
 #   DECODE_BUCKETS       one decode graph per batch size, ending at BS
 #                        (Pro [1, 4, 8, 12], otherwise [1, 4, 8, 16, 20])
 # The server holds int(X) requests, X from its "Maximum concurrency for
@@ -69,7 +69,7 @@
 #
 # Usage:
 #   bash serve_mimo.sh
-#   BS=1 SEQ=512 PREFILL_BUCKETS='[512]' DECODE_BUCKETS='[1]' bash serve_mimo.sh
+#   BS=1 SEQ=512 DECODE_BUCKETS='[1]' bash serve_mimo.sh
 
 set -x
 
@@ -87,7 +87,13 @@ case "$MODEL" in
 esac
 BS="${BS:-$bs_default}"
 SEQ="${SEQ:-9472}"
-PREFILL_BUCKETS="${PREFILL_BUCKETS:-[8448, $SEQ]}"
+CHUNK="${CHUNK:-2048}"
+if [ "$SEQ" -le "$CHUNK" ]; then
+  CHUNK=$SEQ; segment_cfg=""
+else
+  segment_cfg="\"kv_segment_size_buckets\": [$CHUNK],"
+fi
+PREFILL_BUCKETS="${PREFILL_BUCKETS:-[$CHUNK]}"
 DECODE_BUCKETS="${DECODE_BUCKETS:-$buckets_default}"
 PORT="${PORT:-8000}"
 
@@ -111,13 +117,13 @@ export VLLM_NEURON_PARALLEL_COMPILE_WORKERS=${VLLM_NEURON_PARALLEL_COMPILE_WORKE
 export VLLM_NEURON_BARRIER_TIMEOUT=${VLLM_NEURON_BARRIER_TIMEOUT:-43200}
 export NEURON_RT_EXEC_TIMEOUT=${NEURON_RT_EXEC_TIMEOUT:-1200}
 
-echo "Starting $SERVED_NAME server: $MODEL (BS=$BS, SEQ=$SEQ, TP=64, EP=64, experts=$MIMO_V2_5_EXPERT_DTYPE)"
+echo "Starting $SERVED_NAME server: $MODEL (BS=$BS, SEQ=$SEQ, CHUNK=$CHUNK, TP=64, EP=64, experts=$MIMO_V2_5_EXPERT_DTYPE)"
 
 vllm serve "$MODEL" \
     --served-model-name "$SERVED_NAME" \
     --max-model-len "$SEQ" \
     --max-num-seqs "$BS" \
-    --max-num-batched-tokens "$SEQ" \
+    --max-num-batched-tokens "$CHUNK" \
     --tensor-parallel-size 64 \
     --enable-expert-parallel \
     --no-enable-prefix-caching \
@@ -128,7 +134,7 @@ vllm serve "$MODEL" \
         \"neuron_config\": {
             \"quantization\": \"bf16\",
             \"ep_degree\": 64,
-            \"num_batched_tokens_buckets\": $PREFILL_BUCKETS,
+            \"num_batched_tokens_buckets\": $PREFILL_BUCKETS, $segment_cfg
             \"num_seqs_buckets\": $DECODE_BUCKETS,
             \"on_device_sampling_config\": {\"all_greedy\": true}
         },

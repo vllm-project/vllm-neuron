@@ -725,18 +725,7 @@ class MiMoV2Attention(nn.Module):
         meta = attn_metadata[layer_name]
 
         if meta.get("kv_segment_size"):
-            # Chunked prefill / prefix caching would need the prior paged
-            # window spliced with the live K/V (as the decode path does).
-            # Not implemented. On 0.29 the runner defaults
-            # kv_segment_size_buckets to [max_num_batched_tokens] whenever
-            # max_num_batched_tokens < max_model_len, so keep the two equal
-            # (single-shot prefill) and leave prefix caching off.
-            raise NotImplementedError(
-                "MiMo-V2.5 does not support chunked/segmented prefill or prefix "
-                "caching yet (kv_segment_size must be 0). Set "
-                "max_num_batched_tokens == max_model_len and "
-                "enable_prefix_caching=False."
-            )
+            return self._forward_prefill_segment(hidden_states, position_embeddings, meta)
 
         q, k, v = self._project_qkv(hidden_states, position_embeddings)
 
@@ -756,6 +745,99 @@ class MiMoV2Attention(nn.Module):
         if self.world_size > 1:
             attn_out = self.tp_group.reduce_scatter(attn_out, dim=0)
         return attn_out.contiguous()
+
+    def _forward_prefill_segment(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        meta: dict,
+    ) -> torch.Tensor:
+        """Segmented (chunked) prefill: one chunk of one request.
+
+        The runner sends a prompt longer than ``max_num_batched_tokens`` as
+        consecutive chunks, one per step, and ``cached_seq_len`` tokens of the
+        request are already in the cache (earlier chunks). Each chunk attends to
+        that prefix, read from the paged cache, then causally to itself, whose
+        K/V come from this step's projections: keys are ``[prefix | chunk]``.
+        A full layer reads the whole block table; an SWA layer only the blocks
+        holding the ``sliding_window - 1`` positions before the chunk.
+
+        The prefix is gathered BEFORE this chunk's K/V is written (the order
+        ``forward_decode`` keeps): a write and an indexed read of one tensor are
+        not ordered on device. The slots the write targets are past
+        ``cached_seq_len`` and masked anyway.
+        """
+        tokens = hidden_states.shape[0]
+        block_size = meta["block_size"]
+        device = hidden_states.device
+        block_table = meta["block_table_tensor"][:1]
+        prior = meta["cached_seq_len"].reshape(1, 1).to(torch.long)
+
+        q, k, v = self._project_qkv(hidden_states, position_embeddings)
+
+        if self.sliding_window is not None:
+            # Blocks covering positions [prior - (W - 1), prior): a runtime
+            # window into the block table, so the gather does not grow with
+            # max_model_len. Indices past the table are clamped; their slots get
+            # positions past prior, so the mask drops them.
+            num_blocks = (self.sliding_window - 2) // block_size + 2
+            first_block = torch.clamp(prior - (self.sliding_window - 1), min=0) // block_size
+            idx = first_block.reshape(1) + torch.arange(num_blocks, device=device)
+            idx = torch.clamp(idx, max=block_table.shape[1] - 1)
+            block_table = block_table.index_select(1, idx)
+            first = first_block * block_size
+        else:
+            first = torch.zeros_like(prior)
+        k_ctx, v_ctx = self._gather_paged_kv(block_table, block_size)  # [1, nkh, S_ctx, d]
+        s_ctx = k_ctx.shape[2]
+
+        self._write_paged_kv_cache(k, v, meta["slot_mapping"], block_size)
+
+        keys = torch.cat([k_ctx, k.unsqueeze(0).to(k_ctx.dtype)], dim=2)
+        values = torch.cat([v_ctx, v.unsqueeze(0).to(v_ctx.dtype)], dim=2)
+        keys = _repeat_interleave_heads(keys, self.num_key_value_groups, dim=1)
+        values = _repeat_interleave_heads(values, self.num_key_value_groups, dim=1)
+
+        mask = self._segment_mask(tokens, s_ctx, prior, first, device)
+        attn_out = self._eager_attention(q.unsqueeze(0), keys, values, mask)
+        attn_out = self._out_proj(attn_out, tokens)
+
+        # >>> PARALLELISM: reduce-scatter back to SP <<<
+        if self.world_size > 1:
+            attn_out = self.tp_group.reduce_scatter(attn_out, dim=0)
+        return attn_out.contiguous()
+
+    def _segment_mask(
+        self,
+        tokens: int,
+        s_ctx: int,
+        prior: torch.Tensor,
+        first: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Additive mask for ``_forward_prefill_segment``, ``[1, 1, T, S_ctx + T]``.
+
+        Query ``i`` sits at position ``prior + i``. A cached key ``s`` sits at
+        ``first + s`` and is visible below ``prior``; a chunk key ``j`` is visible
+        for ``j <= i``. SWA layers also drop keys ``sliding_window`` or more
+        positions back. Chunk keys use sequence order, as ``_prefill_mask`` does:
+        right-padding rows repeat the last position and come after every real
+        token, so real rows never see them.
+        """
+        i = torch.arange(tokens, device=device).view(tokens, 1)
+        key_pos = first + torch.arange(s_ctx, device=device).view(1, s_ctx)
+        in_prefix = key_pos < prior
+        j = torch.arange(tokens, device=device).view(1, tokens)
+        causal = j <= i
+        if self.sliding_window is not None:
+            in_prefix = in_prefix & (key_pos > prior + i - self.sliding_window)
+            causal = causal & (j > i - self.sliding_window)
+        allowed = torch.cat([in_prefix.expand(tokens, s_ctx), causal], dim=1)
+        return torch.where(
+            allowed,
+            torch.zeros((), dtype=torch.float32, device=device),
+            torch.full((), _MASK_NEG, dtype=torch.float32, device=device),
+        ).view(1, 1, tokens, s_ctx + tokens)
 
     def _prefill_mask(self, tokens: int, device: torch.device) -> torch.Tensor:
         """Additive causal (+ sliding-window) mask, ``[1, 1, T, T]``.

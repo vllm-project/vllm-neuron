@@ -127,18 +127,6 @@ class MiMoV2ForCausalLM(nn.Module):
                 f"{quantization!r}."
             )
 
-        # Single-shot prefill only (see MiMoV2Attention.forward_prefill). Fail
-        # here, at load, rather than at the first prefill warmup.
-        segments = getattr(neuron_config, "kv_segment_size_buckets", None)
-        if segments:
-            raise ValueError(
-                f"MiMo-V2.5 does not support segmented/chunked prefill, but "
-                f"kv_segment_size_buckets={segments}. The 0.29 runner defaults "
-                f"it on when max_num_batched_tokens < max_model_len; set "
-                f"max_num_batched_tokens == max_model_len (and keep "
-                f"enable_prefix_caching=False)."
-            )
-
         # Platform detection raises on a non-Neuron host unless
         # NEURON_PLATFORM_TARGET_OVERRIDE is set; treat that as "unknown" rather
         # than an error so config-only construction still works off-instance.
