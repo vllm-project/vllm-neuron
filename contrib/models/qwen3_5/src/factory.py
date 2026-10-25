@@ -103,18 +103,6 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         """
         from .model import Qwen3_5ForCausalLM
 
-        # Single-shot prefill only: a later chunk would restart DeltaNet from a
-        # zero state and attend only to itself, with no error. The 0.29 runner
-        # turns segmented prefill on whenever max_num_batched_tokens <
-        # max_model_len, so refuse that here, at load.
-        segments = getattr(text_neuron_config, "kv_segment_size_buckets", None)
-        if segments:
-            raise ValueError(
-                f"Qwen3.5 does not support chunked prefill, but "
-                f"kv_segment_size_buckets={segments}: set max_num_batched_tokens "
-                f"== max_model_len (and keep enable_prefix_caching=False)."
-            )
-
         return Qwen3_5ForCausalLM.from_configs(
             hf_config, text_neuron_config=text_neuron_config
         )

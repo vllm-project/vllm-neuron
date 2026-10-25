@@ -892,8 +892,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         g = -self.A_log.exp() * F.softplus(a.float() + self.dt_bias)
         return qkv, z, beta, g
 
-    def _causal_conv(self, qkv: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    def _causal_conv(
+        self, qkv: torch.Tensor, num_tokens: int, prev: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Depthwise causal conv over the token dim, as a sum of shifted taps.
+
+        ``prev`` (``[kernel - 1, conv_dim]``) is the pre-conv window before the
+        first token: the cached one in a chunked prefill, zeros when None.
 
         ``out[t, c] = sum_j w[c, j] * x[t - (K - 1) + j, c]``, i.e. exactly what
         ``F.conv1d(..., groups=conv_dim, padding=K-1)[..., :T]`` computes.
@@ -905,7 +910,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         multiplies are trivially compilable, and this form also drops the two
         transposes the conv layout needed.
         """
-        padded = F.pad(qkv, (0, 0, self.conv_kernel_size - 1, 0))
+        if prev is None:
+            padded = F.pad(qkv, (0, 0, self.conv_kernel_size - 1, 0))
+        else:
+            padded = torch.cat([prev.to(qkv.dtype), qkv], dim=0)
         out = padded[:num_tokens] * self.conv1d_weight[:, 0]
         for tap in range(1, self.conv_kernel_size):
             out = out + padded[tap : tap + num_tokens] * self.conv1d_weight[:, tap]
@@ -1042,7 +1050,41 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # into the last few real positions.
         qkv = qkv * real_f32.to(qkv.dtype)
 
-        mixed = F.silu(self._causal_conv(qkv, num_tokens))
+        # The raw block id, with no live mask: a prefill always serves a real
+        # sequence. Any arithmetic on the block id or slot mapping on the way to
+        # the state write below (``state_indices``' compares, a mask multiply,
+        # even a clamp) fails neuronx-cc's DataLocalityOpt in the full prefill
+        # graph ([NCC_IDLO901]), though one layer alone compiles. A warmup
+        # prefill's padded block table points at the null block; what it leaves
+        # there is finite, which is all the dead decode rows that read it need.
+        page_idx = metadata["block_table_tensor"][:1, 0].to(torch.long)
+
+        # Chunked prefill: ``cached_seq_len`` tokens of this sequence were
+        # prefilled by earlier steps, which left their conv window and
+        # recurrent state in its page. The first chunk starts cold instead: its
+        # page still holds whatever the page's previous sequence left, so it is
+        # selected away rather than multiplied by zero.
+        conv_prev = None
+        initial_state = torch.zeros(
+            1,
+            self.num_v_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        prior = metadata.get("cached_seq_len")
+        if prior is not None:
+            cached_conv, cached_state = self._read_states(page_idx)
+            warm = prior.reshape(1) > 0
+            conv_prev = torch.where(
+                warm.view(1, 1), cached_conv[0].float(), torch.zeros_like(cached_conv[0].float())
+            )
+            initial_state = torch.where(
+                warm.view(1, 1, 1, 1), cached_state.float(), initial_state
+            )
+
+        mixed = F.silu(self._causal_conv(qkv, num_tokens, conv_prev))
 
         q, k, v = self._split_heads(mixed, (num_tokens,))
         beta = beta * real_f32
@@ -1052,14 +1094,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         def to_bht(x: torch.Tensor) -> torch.Tensor:
             return x.unsqueeze(0).transpose(1, 2).float()
 
-        initial_state = torch.zeros(
-            1,
-            self.num_v_heads,
-            self.head_k_dim,
-            self.head_v_dim,
-            dtype=torch.float32,
-            device=device,
-        )
         core, final_state = chunk_gated_delta_rule(
             l2norm(to_bht(q)),
             l2norm(to_bht(k)),
@@ -1073,18 +1107,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Persist state for the one sequence being prefilled. The conv window is
         # the *pre*-conv q/k/v at the last ``kernel - 1`` real positions; where
         # the prompt is shorter than the window the missing (negative) slots
-        # stay zero, matching a sequence that started from a cold state.
-        new_conv_state = self._tail_rows(qkv, is_real, self.conv_kernel_size - 1)
-
-        # The raw block id, with no live mask: a prefill always writes a real
-        # sequence. Any arithmetic on the block id or slot mapping on the way to
-        # this write (``state_indices``' compares, a mask multiply, even a clamp)
-        # fails neuronx-cc's DataLocalityOpt in the full prefill graph
-        # ([NCC_IDLO901]), though one layer alone compiles. A warmup prefill's
-        # padded block table points at the null block; what it leaves there is
-        # finite, which is all the dead decode rows that read it need.
-        write_idx = metadata["block_table_tensor"][:1, 0].to(torch.long)
-        self._write_states(write_idx, new_conv_state.unsqueeze(0), final_state)
+        # stay zero, matching a sequence that started from a cold state. In a
+        # chunked prefill the window continues from the cached one.
+        if conv_prev is None:
+            new_conv_state = self._tail_rows(qkv, is_real, self.conv_kernel_size - 1)
+        else:
+            ones = torch.ones(conv_prev.shape[0], dtype=is_real.dtype, device=device)
+            new_conv_state = self._tail_rows(
+                torch.cat([conv_prev.to(qkv.dtype), qkv], dim=0),
+                torch.cat([ones, is_real]),
+                self.conv_kernel_size - 1,
+            )
+        self._write_states(page_idx, new_conv_state.unsqueeze(0), final_state)
 
         output = self._output(core, z, num_tokens)
         if self.world_size > 1:

@@ -403,6 +403,8 @@ class Qwen3_5Attention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         metadata: dict,
     ) -> torch.Tensor:
+        if metadata.get("cached_seq_len") is not None:
+            return self.forward_prefill_chunk(hidden_states, position_embeddings, metadata)
         cos, sin = position_embeddings
         tokens = hidden_states.shape[0]
         q, k, v, gate = self._qkv(hidden_states, cos, sin)
@@ -449,6 +451,71 @@ class Qwen3_5Attention(nn.Module):
                     m, l, acc = mn, l * a + lb * b, acc * a + ob * b
             outs.append((acc / l).to(v.dtype))
         attn_output = outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
+        attn_output = attn_output.transpose(0, 1).reshape(tokens, self.q_size)
+
+        output = self._finish(attn_output, gate)
+        if self.world_size > 1:
+            if SEQUENCE_PARALLEL:
+                output = self.tp_group.reduce_scatter(output, dim=0)
+            else:
+                self.tp_group.all_reduce(output)
+        return output.contiguous()
+
+    def forward_prefill_chunk(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        metadata: dict,
+    ) -> torch.Tensor:
+        """Chunked prefill: one chunk of one sequence.
+
+        ``cached_seq_len`` tokens of the sequence were prefilled by earlier
+        steps. Their keys and values are read from the paged cache, the same
+        flattened ``[blocks * kv_heads, block_size, dim]`` gather as
+        ``forward_decode``, and the chunk's own come from this step's
+        projections: keys are ``[prefix | chunk]``, the prefix visible below
+        ``cached_seq_len`` and the chunk causally. The gather reads the cache as
+        it was before this step's ``index_put_`` (functionalised; see
+        ``forward_decode``).
+        """
+        cos, sin = position_embeddings
+        tokens = hidden_states.shape[0]
+        q, k, v, gate = self._qkv(hidden_states, cos, sin)
+
+        block_table = metadata["block_table_tensor"][:1].to(torch.long)
+        num_blocks, nkh, block_size = self.k_cache.shape[0], self.k_cache.shape[1], self.k_cache.shape[2]
+        # -1 (unused tail of the table) and out-of-range ids read the null block.
+        blocks = torch.where(
+            (block_table > 0) & (block_table < num_blocks), block_table, torch.zeros_like(block_table)
+        )
+        ctx_len = blocks.shape[1] * block_size
+        kv_heads = torch.arange(nkh, device=blocks.device)
+        rows = (blocks.unsqueeze(1) * nkh + kv_heads.view(1, nkh, 1)).reshape(-1)
+        k_flat = self.k_cache.reshape(num_blocks * nkh, block_size, self.head_dim)
+        v_flat = self.v_cache.reshape(num_blocks * nkh, block_size, self.head_dim)
+        k_ctx = k_flat[rows].reshape(nkh, ctx_len, self.head_dim)
+        v_ctx = v_flat[rows].reshape(nkh, ctx_len, self.head_dim)
+        prior = metadata["cached_seq_len"].reshape(1, 1).to(torch.long)
+        in_prefix = torch.arange(ctx_len, device=q.device).view(1, ctx_len) < prior
+        # A select, not a multiply: the unwritten tail of a page can hold
+        # non-finite bits (see ``forward_decode``).
+        v_ctx = torch.where(in_prefix.view(1, ctx_len, 1), v_ctx, torch.zeros_like(v_ctx))
+
+        self._write_kv(k, v, metadata)
+
+        # Query heads grouped under their KV head: [kv_heads, groups * T, dim].
+        groups = self.num_kv_groups
+        qg = q.reshape(nkh, groups * tokens, self.head_dim).float()
+        keys = torch.cat([k_ctx.float(), k.float()], dim=1)  # [kv_heads, ctx + T, dim]
+        values = torch.cat([v_ctx, v.to(v_ctx.dtype)], dim=1)
+        scores = (qg @ keys.transpose(-1, -2)) * self.scaling  # [kv_heads, groups * T, ctx + T]
+        i = torch.arange(tokens, device=q.device).view(tokens, 1)
+        j = torch.arange(tokens, device=q.device).view(1, tokens)
+        visible = torch.cat([in_prefix.expand(tokens, ctx_len), j <= i], dim=1)  # [T, ctx + T]
+        visible = visible.repeat(groups, 1).unsqueeze(0)
+        scores = scores.masked_fill(~visible, float("-inf"))
+        attn = torch.softmax(scores, dim=-1).to(values.dtype)
+        attn_output = (attn @ values).reshape(self.num_heads_per_rank, tokens, self.head_dim)
         attn_output = attn_output.transpose(0, 1).reshape(tokens, self.q_size)
 
         output = self._finish(attn_output, gate)

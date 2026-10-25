@@ -13,11 +13,15 @@
 #   MAX_MODEL_LEN     default 9472: an 8K input with +3% jitter (8435) plus 1024
 #                     output tokens, rounded up to a multiple of 128
 #   MAX_NUM_SEQS      default 32 (30 for 397B-A17B, its KV limit at 9472)
-#   PREFILL_BUCKETS   default [8448, 9472]. Prefill is single-shot (DeltaNet cannot
-#                     continue from a chunk), so the last bucket must be
-#                     MAX_MODEL_LEN; 8448 keeps an 8K prompt from being padded to it.
-#                     Add smaller buckets for shorter prompts, e.g.
-#                     [1024, 2048, 4096, 8448, 9472]; each is one more compile.
+#   CHUNK             prefill chunk, default 2048 (--max-num-batched-tokens and the
+#                     KV segment size; one of 512 / 1024 / 2048 / 4096 / 8192). A
+#                     prompt is prefilled CHUNK tokens per step, each chunk
+#                     continuing from the DeltaNet state and attending to the KV
+#                     cache of the earlier ones, so one CHUNK-token prefill graph
+#                     serves every prompt length. MAX_MODEL_LEN <= CHUNK prefills
+#                     in one shot. (Single-shot 8448 / 9472 prefill graphs of
+#                     397B-A17B fail neuronx-cc with NCC_IINAR001.)
+#   PREFILL_BUCKETS   default [CHUNK]
 #   DECODE_BUCKETS    default [1, 4, 8, 16, MAX_NUM_SEQS]: one graph per batch size
 #   TP, EP_DEGREE     tensor / expert parallel degree
 #   GMU               --gpu-memory-utilization
@@ -41,7 +45,13 @@ esac
 TP=${TP:-$tp}; EP_DEGREE=${EP_DEGREE:-$ep}; GMU=${GMU:-$gmu}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-9472}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-$seqs}
-PREFILL_BUCKETS=${PREFILL_BUCKETS:-[8448, $MAX_MODEL_LEN]}
+CHUNK=${CHUNK:-2048}
+if [ "$MAX_MODEL_LEN" -le "$CHUNK" ]; then
+  CHUNK=$MAX_MODEL_LEN; segment_cfg=""
+else
+  segment_cfg="\"kv_segment_size_buckets\": [$CHUNK],"
+fi
+PREFILL_BUCKETS=${PREFILL_BUCKETS:-[$CHUNK]}
 DECODE_BUCKETS=${DECODE_BUCKETS:-[1, 4, 8, 16, $MAX_NUM_SEQS]}
 
 export VLLM_NEURON_BACKEND=${VLLM_NEURON_BACKEND:-neuron_native}
@@ -67,13 +77,13 @@ exec vllm serve "$MODEL" \
   --tensor-parallel-size "$TP" "${ep_args[@]}" \
   --max-model-len "$MAX_MODEL_LEN" \
   --max-num-seqs "$MAX_NUM_SEQS" \
-  --max-num-batched-tokens "$MAX_MODEL_LEN" \
+  --max-num-batched-tokens "$CHUNK" \
   --no-enable-prefix-caching \
   --limit-mm-per-prompt '{"image": 0, "video": 0}' \
   "${gmu_args[@]}" \
   --additional-config "{\"neuron_config\": {$ep_cfg
       \"quantization\": \"bf16\",
-      \"num_batched_tokens_buckets\": $PREFILL_BUCKETS,
+      \"num_batched_tokens_buckets\": $PREFILL_BUCKETS, $segment_cfg
       \"num_seqs_buckets\": $DECODE_BUCKETS,
       \"on_device_sampling_config\": {\"all_greedy\": true}}}" \
   --port "${PORT:-8000}" "$@"
