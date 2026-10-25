@@ -411,6 +411,22 @@ def run_layer(model, block, stream: torch.Tensor, pre_mix: torch.Tensor, step: S
             # The candidate-block mask keeps the best `candidate_topk_blocks` blocks of
             # `candidate_block_size` groups; it only removes groups when the context
             # holds more than that, which the kernel does not model.
+            #
+            # TODO(candidate mask): implement it in the kernels to serve contexts past
+            # `candidate_topk_blocks * candidate_block_size` compressed groups (16384,
+            # i.e. ~16k tokens at the ratio-1 layers). This is a correctness feature,
+            # not a performance one: past the limit it changes which compressed
+            # positions layers 24-36 (and the consumers behind them) attend to. What
+            # the per-op path does (`model.select_candidate_blocks`, `Indexer.forward`):
+            #   1. in the `c1_source` kernel (layer 20), after the reduced, clen-masked
+            #      index scores: the max over each block of `candidate_block_size`
+            #      groups, the block holding `(clen - 1) // candidate_block_size`
+            #      forced in, a top-`candidate_topk_blocks` over blocks, and a keep mask
+            #      of the blocks whose value beats NEG_BOUND, returned to the bridge and
+            #      handed down the stack like `step.topk`;
+            #   2. in the `c1_index` kernels, the scores outside a kept block set to
+            #      NEG_BOUND before `index_topk_rows`.
+            # Until then the guard below raises rather than compute a different top-k.
             limit = int(model.config.candidate_topk_blocks) * int(model.config.candidate_block_size)
             if step.read_len(lw.ratio) > limit:
                 raise NotImplementedError(

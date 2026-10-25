@@ -106,7 +106,11 @@ eight ranks) check every kernel component by component against a CPU reference
 fed the kernel's own inputs. One thing is deliberately simpler than the per-op
 path, as on trn3: the candidate-block mask of layer 20 is assumed a no-op, which
 holds while the context reads at most `candidate_topk_blocks x
-candidate_block_size` compressed groups (16384) and is asserted.
+candidate_block_size` compressed groups (16384, ~16k tokens at the ratio-1
+layers). Past that the mask changes which compressed positions layers 24-36
+select, so it is a correctness limit, not a performance one: `mk_model.run_layer`
+raises `NotImplementedError` instead of computing a different top-k, and the TODO
+there spells out what implementing it in the `c1_source` / `c1_index` kernels takes.
 `DEEPSEEK_V41_MEGAKERNEL=0` restores the per-op path.
 
 ## Quantization
