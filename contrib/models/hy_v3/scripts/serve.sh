@@ -22,7 +22,7 @@
 #   B (long ctx):    ./serve.sh 16384 32  '[1, 4, 16, 32]'          '[4096, 8192]'
 #   C (big batch):   ./serve.sh 2048  128 '[1, 4, 16, 32, 64, 128]' '[1024]'
 #   DCP=8:     DCP=8 ./serve.sh 32768 64  '[1, 4, 16, 32, 64]'      '[4096, 8192, 16384]'
-#              (FP8 KV with DCP > 1: PREFILL_BUCKETS <= 2048; see README "DCP prefill buckets")
+#              (with DCP > 1 PREFILL_BUCKETS stop at 4096; see README "DCP prefill buckets")
 #   B+multi-bucket:  PREFILL_BUCKETS='[512, 1024, 2048, 4096, 8192]' ./serve.sh 16384 32 ...
 #
 # Requires the contrib package: pip install -e contrib/models/hy_v3

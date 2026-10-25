@@ -178,17 +178,16 @@ HY3_KV_SCALE_PROFILE=$PWD/kv_scales.safetensors KV_DTYPE=fp8 MODEL=/path/to/Hy3-
   reads directly. Decode buckets the packed kernel cannot take read through an
   unswizzled copy and write the returned K back
   (`HY3_FP8_KV_FORCE_UNPACKED_DECODE=1` forces this path).
-- **DCP prefill buckets (FP8 KV)**: with DCP > 1 use prefill buckets at or
-  below 2048. Q=8192 does not compile (`NCC_IGCA037`, see `serve_256k.sh`). In
-  our full-model runs (max_model_len 16384, 32 seqs, decode context buckets
-  `[4096, 8192]`, 8139-block pool, `--num-gpu-blocks-override`) the Q=4096
-  bucket made every rank hang in a collective once long requests ran
-  (`NRT_EXEC_HW_ERR_DMA_ABORT`; the devices then need a neuron driver reload),
-  and the same configuration with BF16 KV gave wrong output for prompts of
-  ~8k tokens and more (a Q=4096 chunk with prior KV). With buckets <= 2048
-  both KV dtypes were correct up to 15k-token prompts. This differs from the
-  needle results of `serve_256k.sh` (other buckets / pool), so the trigger may
-  be configuration-dependent.
+- **DCP prefill buckets**: Q=8192 does not compile under DCP (`NCC_IGCA037`,
+  see `serve_256k.sh`). The Q=4096 bucket works in the `serve_256k.sh`
+  configuration with both KV dtypes (FP8 KV: shared-prefix benchmark below,
+  passkey 12/12 at 16k-85k), but in one 16k configuration (max_model_len 16384,
+  32 seqs, decode context buckets `[4096, 8192]`, `--num-gpu-blocks-override
+  8139`) it gave wrong output for ~8k-token prompts with BF16 KV (chunks with
+  prior KV) and hung every rank in a collective with FP8 KV
+  (`NRT_EXEC_HW_ERR_DMA_ABORT`; the devices then need a neuron driver reload).
+  The trigger was not isolated; prefill buckets <= 2048 were correct in every
+  configuration tried.
 - **Startup**: the full-model FP8 cold compile of config B with five prefill
   buckets took ~35 min on a trn2.48xlarge; keep `VLLM_NEURON_BARRIER_TIMEOUT`
   (default 3600 s) above the cold compile time of larger configurations.
@@ -216,10 +215,26 @@ HY3_KV_SCALE_PROFILE=$PWD/kv_scales.safetensors KV_DTYPE=fp8 MODEL=/path/to/Hy3-
   Greedy MATH-500 moves by 0.4-0.8 pp between server restarts on this stack;
   across the original and the re-run (6 BF16 / FP8 pairings) FP8 scored the
   same or higher every time.
-- **85k shared-prefix D test** (customer request counts and output lengths,
-  DCP=1, max_model_len 90112, the same pool): FP8 KV lowers TPOT by 21-22% at
+- **85k shared prefix, DCP=1** (customer D test: its request counts and output
+  lengths, max_model_len 90112, the same pool): FP8 KV lowers TPOT by 21-22% at
   concurrency 2-8 (BF16 86-90 ms) and by 30% at 9-13 (141-144 ms -> 98-101 ms);
-  TTFT +1-2%.
+  TTFT +1-2%. Without DCP every rank reads the whole 85k history each decode
+  step, so halving the KV bytes shows in TPOT.
+- **85k shared prefix, DCP=8** (`serve_256k.sh` config, the same 8139-block
+  pool, `scripts/bench_prefix_fixed.sh "1 4 8"` with a new `cache_salt` per run,
+  92.2% hit rate in every cell):
+
+  | conc | TTFT med BF16 -> FP8 | TPOT med BF16 -> FP8 |
+  |---|---|---|
+  | 1 | 2.58 -> 2.59 s | 31.9 -> 32.9 ms |
+  | 4 | 6.18 -> 6.18 s | 59.1 -> 57.4 ms |
+  | 8 | 10.81 -> 10.85 s | 85.9 -> 83.8 ms |
+
+  With DCP=8 each rank reads 1/8 of the history, so FP8 KV changes latency by
+  at most 3% either way; its gain there is capacity (twice the tokens in the
+  same memory). Passkey retrieval (`needle.py`): 12/12 with FP8 KV, as with
+  BF16. The FP8 cold compile of this configuration took about 3 h (BF16 about
+  1.5 h); keep `VLLM_NEURON_BARRIER_TIMEOUT` above it.
 
 ## Compatibility Matrix
 
