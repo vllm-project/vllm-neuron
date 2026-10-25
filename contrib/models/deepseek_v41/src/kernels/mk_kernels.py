@@ -14,6 +14,10 @@ function branching on flags, and the compiled artifacts carry the name.
 `entry(kernel)` wraps one through `wrap_nki(...)[2]` + `torch.compile` the way
 `mk_model` runs every megakernel.
 
+`layer` returns an optimized kernel instead where one exists: (prefill, r2, tp64) is
+`tp64/r2_prefill/r2_prefill.py` (its own helper copies; `DEEPSEEK_V41_R2_PREFILL_OPT=0`
+falls back to the generic body).
+
 Archetypes (`arch` = `(ratio, is_kv_src, is_idx_src, has_engram, tap)`) are taken
 from the config at first use; the names spell them `r<ratio>`, `src` (kv source),
 `idx` (index source), `e` (engram), `tap`.
@@ -24,11 +28,21 @@ from __future__ import annotations
 import functools
 import inspect
 import linecache
+import os
 
 import nki
 
 from . import tp64 as _tp64
 from . import tp8pp8 as _tp8pp8
+from .tp64 import r2_prefill as _tp64_r2_prefill
+
+#: Optimized kernels that replace the generic body's specialization for one
+#: (phase, arch, scheme): same positional signature, same outputs, same entry name.
+#: `DEEPSEEK_V41_R2_PREFILL_OPT=0` runs the generic body instead (A/B, debugging).
+_OPTIMIZED = {
+    ("prefill", (2, 0, 0, 0, 0), "tp64"): _tp64_r2_prefill.r2_prefill.layer_prefill_r2_tp64,
+}
+_USE_OPTIMIZED = os.environ.get("DEEPSEEK_V41_R2_PREFILL_OPT", "1") not in ("", "0")
 
 #: The scheme's kernel package: its own block kernel, drafter and helpers.
 _PKG = {"tp64": _tp64, "tp8pp8": _tp8pp8}
@@ -80,11 +94,27 @@ def specialize(body, name: str, consts: tuple) -> object:
 
 
 def layer(phase: str, arch, scheme: str):
-    """The block kernel for `phase` x `arch` x `scheme`."""
+    """The block kernel for `phase` x `arch` x `scheme`: an optimized kernel where
+    one exists (`_OPTIMIZED`), else the generic body specialized."""
+    arch = tuple(int(v) for v in arch)
+    opt = _OPTIMIZED.get((phase, arch, scheme)) if _USE_OPTIMIZED else None
+    return opt if opt is not None else layer_generic(phase, arch, scheme)
+
+
+def layer_generic(phase: str, arch, scheme: str):
+    """The generic body specialized to `phase` x `arch` x `scheme`."""
     assert phase in PHASES and scheme in SCHEMES
     arch = tuple(int(v) for v in arch)
     return specialize(pkg(scheme).layer_kernel.layer_body, f"layer_{phase}_{arch_name(arch)}_{scheme}",
                       (("phase", phase), ("arch", arch), ("scheme", scheme)))
+
+
+def version_kind(phase: str, arch, scheme: str) -> str:
+    """The `mk_model.kernel_version` kind of the block kernel `layer` returns."""
+    arch = tuple(int(v) for v in arch)
+    if _USE_OPTIMIZED and (phase, arch, scheme) == ("prefill", (2, 0, 0, 0, 0), "tp64"):
+        return "r2_prefill"
+    return "block"
 
 
 def draft(phase: str, scheme: str):

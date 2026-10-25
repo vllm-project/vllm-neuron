@@ -180,6 +180,57 @@ class PipePlan:
 #: `stage` (see `layer_kernel`'s docstring), saves its `dbg` output from rank 0 to
 #: `DEEPSEEK_V41_DUMP_DIR/mk_layer<layer>_stage<stage>.pt` and stops the forward.
 _MK_DEBUG = os.environ.get("DEEPSEEK_V41_MK_DEBUG", "")
+#: `DEEPSEEK_V41_KCAPTURE=<dir>`: record one block kernel launch -- every argument
+#: before the launch and every output after it -- on every rank, to
+#: `<dir>/<tag>/L<layer>/rank<rank>.pt`, for standalone kernel work. Armed by
+#: `<dir>/ARM.json` (`{"tag", "layers", "phase", "start", "nth"}`, written by the
+#: driver while the server is idle): the `nth` forward of `phase` whose first span
+#: starts at position `start` after the arm is captured, at each of `layers`.
+_KCAPTURE = os.environ.get("DEEPSEEK_V41_KCAPTURE", "")
+_kcap = {"arm": None, "mtime": None, "step": None, "count": 0, "done": set()}
+
+
+def _kcapture_target(model, layer_id: int, step) -> dict | None:
+    """The arm spec when this launch is the one to record, else None."""
+    path = os.path.join(_KCAPTURE, "ARM.json")
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    if mtime != _kcap["mtime"]:
+        import json
+
+        with open(path) as fh:
+            _kcap.update(arm=json.load(fh), mtime=mtime, step=None, count=0, done=set())
+    arm = _kcap["arm"]
+    if step.phase != arm["phase"] or int(step.spans[0][2]) != int(arm["start"]):
+        return None
+    if _kcap["step"] is not step:
+        _kcap["step"] = step
+        _kcap["count"] += 1
+    if _kcap["count"] != int(arm["nth"]) or layer_id not in arm["layers"] or layer_id in _kcap["done"]:
+        return None
+    _kcap["done"].add(layer_id)
+    return arm
+
+
+def _kcapture_save(model, arm, kernel, layer_id: int, step, args, out) -> None:
+    from .kernels import mk_kernels as _mkk
+
+    names = _mkk._positional_names(_mkk.pkg(model.mk_plan.scheme).layer_kernel.layer_body)
+    rec = {
+        "kernel": kernel.func.__name__, "names": names, "args": args,
+        "outs": [o.detach().cpu() for o in out],
+        "meta": {"layer": layer_id, "rank": int(model.rank), "world": int(model.world_size),
+                 "phase": step.phase, "spans": [tuple(int(v) for v in s) for s in step.spans],
+                 "T": int(step.T), "arm": arm},
+    }
+    d = os.path.join(_KCAPTURE, arm["tag"], f"L{layer_id:02d}")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"rank{int(model.rank):02d}.pt")
+    torch.save(rec, path + ".tmp")
+    os.replace(path + ".tmp", path)
+    _mk_log.warning("kcapture: %s layer %d rank %d -> %s", kernel.func.__name__, layer_id, model.rank, d)
 
 
 @functools.lru_cache(maxsize=None)
@@ -193,17 +244,24 @@ def kernel_version(kind: str = "block", scheme: str = "tp64") -> int:
     modules; "draft": the drafter and the helpers; "pp": the stage boundary and
     the helpers it imports. Each kind leaves out the other kinds' own modules, so
     an edit to the drafter or the boundary does not invalidate the 40 block
-    kernels' NEFFs (and vice versa)."""
+    kernels' NEFFs (and vice versa). "r2_prefill": the optimized r2 prefill block
+    kernel, which has its own helper copies in `kernels/<scheme>/r2_prefill/`
+    (`mk_kernels.version_kind`)."""
     h = hashlib.sha256()
     kdir = os.path.join(_HERE, "kernels", scheme)
     own = {"block": ("layer_kernel.py",), "draft": ("draft_kernel.py",), "pp": ("pp_kernels.py",)}
-    if kind not in own:
+    if kind not in own and kind != "r2_prefill":
         raise ValueError(f"kernel_version: unknown kind {kind!r}")
     if not os.path.isdir(kdir):
         raise ValueError(f"kernel_version: no kernel package for scheme {scheme!r}")
-    files = sorted(glob.glob(os.path.join(kdir, "*.py")))
-    others = {os.path.join(kdir, name) for k, names in own.items() if k != kind for name in names}
-    files = [f for f in files if f not in others]
+    if kind == "r2_prefill":
+        files = sorted(glob.glob(os.path.join(kdir, "r2_prefill", "*.py")))
+        if not files:
+            raise ValueError(f"kernel_version: no r2_prefill package for scheme {scheme!r}")
+    else:
+        files = sorted(glob.glob(os.path.join(kdir, "*.py")))
+        others = {os.path.join(kdir, name) for k, names in own.items() if k != kind for name in names}
+        files = [f for f in files if f not in others]
     files += [os.path.join(_HERE, "mk_host.py")]
     for path in files:
         with open(path, "rb") as fh:
@@ -566,7 +624,8 @@ def run_layer(model, block, stream: torch.Tensor, pre_mix: torch.Tensor, step: S
         if dbg_layer == attn.layer_id:
             stage, debug = dbg_stage, (dbg_layer, dbg_stage)
     arch = (lw.ratio, int(lw.is_kv_src), int(lw.is_idx_src), int(in_kernel_engram), int(lw.tap))
-    flags = (lw.ratio, B, lw.window, stage, arch[1], arch[2], arch[3], arch[4], kernel_version("block", plan.scheme))
+    kver = kernel_version(mk_kernels.version_kind(step.phase, arch, plan.scheme), plan.scheme)
+    flags = (lw.ratio, B, lw.window, stage, arch[1], arch[2], arch[3], arch[4], kver)
     args = [
         stream, pre_mix, *lw.hc_attn,
         idx.row_pos, idx.write_slots, idx.win_slots, idx.cmp_slots, idx.twin, idx.wv, idx.cbase, topk_in,
@@ -579,7 +638,13 @@ def run_layer(model, block, stream: torch.Tensor, pre_mix: torch.Tensor, step: S
     if _MK_TRACE and plan.stage_rank == 0:
         _mk_log.warning("mk launch %s layer=%d T=%d B=%d spans=%s", kernel.func.__name__,
                         attn.layer_id, T, B, step.spans)
+    kcap = _kcapture_target(model, attn.layer_id, step) if _KCAPTURE else None
+    if kcap is not None:
+        # Copies taken before the launch: the kernel writes the caches in place.
+        cap_args = [a.detach().cpu().clone() if isinstance(a, torch.Tensor) else a for a in args]
     out = entry(kernel)(*args)
+    if kcap is not None:
+        _kcapture_save(model, kcap, kernel, attn.layer_id, step, cap_args, out)
     if debug is not None:
         dump_dir = os.environ.get("DEEPSEEK_V41_DUMP_DIR", ".")
         if model.rank == 0:
