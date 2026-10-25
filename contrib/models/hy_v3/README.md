@@ -341,6 +341,110 @@ loop barriers) stays, so TPOT flattens out at EP=32. The remaining batch-1
 step at EP=32 is about 48% MoE fixed cost, 27% waiting for the busiest rank's
 hits, 16% attention and 8% all-reduces.
 
+### Long context: max_model_len 256000 (DCP=8)
+
+`scripts/serve_256k.sh`: max_model_len 256000, `--decode-context-parallel-size 8`,
+prefix caching, prefill buckets 512..4096, decode context buckets
+8192 / 32768 / 65536 / 98304. Without DCP the KV holds 260,448 tokens, one
+max-length request (the scheduler admits by worst case, `max_model_len` per
+request); DCP=8 shards it to 2,083,583 tokens, 8 concurrent requests. All
+prompts are the fixed real-text ones in `bench_data/` (see its README).
+
+- Passkey retrieval (`scripts/needle.py`, 16k / 32k / 64k / 85k x depth
+  0.1 / 0.5 / 0.9): 12/12.
+- DCP limits prefill steps to 4096 tokens on neuronx-cc 2.28: the 8192 bucket
+  fails to compile (`attention_kv_parallel_segmented_cte` needs 324640 bytes
+  of SBUF per partition at a 8192-token Q, `NCC_IGCA037`). Capping the
+  kernel's Q chunk at 4096 makes 8192 compile and pass the passkey test, but
+  is only 2-5% faster (prefill time is close to linear in tokens), so it is
+  not applied.
+
+`scripts/bench_fixed.sh "1024 4096 16000 32768 65536 85000" "1 4 8"`
+(`results/bench/ctx256k_dcp8/`):
+
+| input | conc | TTFT med (s) | TTFT P99 (s) | TPOT med (ms) | ITL med (ms) | out tok/s | peak out tok/s | total tok/s |
+|---|---|---|---|---|---|---|---|---|
+| 1024 | 1 | 0.27 | 0.27 | 30.3 | 30.3 | 32 | 33 | 160 |
+| 1024 | 4 | 0.66 | 1.03 | 42.9 | 41.3 | 88 | 100 | 441 |
+| 1024 | 8 | 1.12 | 1.96 | 50.7 | 47.3 | 146 | 176 | 730 |
+| 4096 | 1 | 0.78 | 0.81 | 30.3 | 30.3 | 30 | 34 | 512 |
+| 4096 | 4 | 1.94 | 3.11 | 45.9 | 41.2 | 75 | 100 | 1275 |
+| 4096 | 8 | 3.50 | 6.20 | 57.9 | 47.3 | 112 | 176 | 1904 |
+| 16000 | 1 | 3.52 | 3.56 | 31.0 | 31.0 | 22 | 33 | 1425 |
+| 16000 | 4 | 8.70 | 14.11 | 62.7 | 42.1 | 41 | 96 | 2634 |
+| 16000 | 8 | 15.82 | 28.13 | 96.8 | 49.1 | 51 | 168 | 3213 |
+| 32768 | 1 | 7.05 | 7.35 | 31.4 | 31.5 | 17 | 32 | 2185 |
+| 32768 | 4 | 17.73 | 28.80 | 85.0 | 43.3 | 26 | 96 | 3342 |
+| 32768 | 8 | 32.22 | 57.90 | 147.5 | 50.9 | 29 | 160 | 3775 |
+| 65536 | 1 | 15.39 | 15.86 | 32.0 | 32.1 | 11 | 32 | 2784 |
+| 65536 | 4 | 38.03 | 61.59 | 134.3 | 45.1 | 14 | 92 | 3630 |
+| 65536 | 8 | 68.25 | 122.49 | 262.9 | 53.6 | 15 | 152 | 3899 |
+| 85000 | 1 | 21.29 | 21.72 | 31.9 | 32.1 | 9 | 32 | 2901 |
+| 85000 | 4 | 52.16 | 83.97 | 168.7 | 45.2 | 11 | 92 | 3582 |
+| 85000 | 8 | 94.53 | 168.76 | 340.2 | 53.6 | 11 | 152 | 3757 |
+
+- The decode step barely depends on the context: ITL 30.3 -> 32.1 ms from 1k
+  to 85k at concurrency 1, 47-54 ms at 8. The large TPOT at long inputs and
+  concurrency 4 / 8 is decode stalled behind other requests' prefills.
+- DCP=8 costs about 8 ms per decode step against config B (22.2 -> 30.3 ms
+  at 1k, concurrency 1: an LSE combine across the 8 DCP ranks in each of the
+  80 layers) and 72% prefill time (16k TTFT 2.05 -> 3.52 s; 3.37 s with
+  8192-token steps).
+- Prefill runs about 4k tokens/s and one request per step (the Neuron
+  scheduler takes at most one prefill per step, `max_prefills_per_batch = 1`);
+  at concurrency 8 the total throughput saturates at 3.6-3.9k tok/s.
+
+**Shared prefix, 85k input, 92% cached** (`scripts/bench_prefix_fixed.sh "1 4 8"`,
+`results/bench/prefix85k_dcp8/`): every request is 85000 tokens, one
+78336-token prefix (92.2%) + its own suffix, 10 x concurrency requests after
+one warm-up request; one `cache_salt` per run.
+
+| conc | requests | measured hit rate | TTFT med (s) | TTFT P99 (s) | TPOT med (ms) | ITL med (ms) | total tok/s |
+|---|---|---|---|---|---|---|---|
+| 1 | 10 | 92.2% | 2.57 (cold 21.29) | 2.61 | 32.0 (31.9) | 32.2 | 7940 |
+| 4 | 40 | 92.2% | 6.13 (cold 52.16) | 9.83 | 59.1 (168.7) | 45.2 | 16088 |
+| 8 | 80 | 92.2% | 10.77 (cold 94.53) | 19.07 | 85.9 (340.2) | 53.6 | 20880 |
+
+Each request prefills its 6664 uncached tokens (4096 + 4096 padded) while
+attending to the full 85k context. A rerun with a new salt measures 92.2% and
+the same TTFT; with the same salt the suffixes hit too (100%, TTFT 0.71 s), so
+a rerun on the same server needs a new salt.
+
+**Prefill-only / decode-only split** (`scripts/bench_pd_split.sh "1 4 8"`,
+`results/bench/pd_split_85k_dcp8/`; the same data, on the same single
+instance). Prefill only, output 1 token, 10 x concurrency requests:
+
+| conc | hit rate (incl. warm-ups) | TTFT P50 (s) | TTFT P99 (s) | requests/s |
+|---|---|---|---|---|
+| 1 | 91.5% | 2.55 | 2.57 | 0.42 |
+| 4 | 91.9% | 9.39 | 9.53 | 0.43 |
+| 8 | 92.0% | 18.74 | 18.86 | 0.43 |
+
+One request prefills at a time, so TTFT is concurrency x 2.3 s of queueing and
+the throughput stays at 0.43 requests/s; read the prefill capacity from
+requests/s. The mean TTFT at concurrency 1 (2.37 s) is below the median
+because `--num-warmups` repeats the first request, which the measured run then
+hits completely.
+
+Decode only, the same 80 requests sent twice (output 256, temperature 0.9):
+
+| conc | pass | hit rate | TTFT P50 (s) | TPOT P50 (ms) | ITL P50 (ms) |
+|---|---|---|---|---|---|
+| 1 | 1 | 91.2% | 2.60 | 31.96 | 32.14 |
+| 1 | 2 | 100% | 0.72 | 31.95 | 32.14 |
+| 4 | 1 | 91.2% | 5.25 | 59.08 | 45.34 |
+| 4 | 2 | 100% | 1.41 | 48.15 | 45.32 |
+| 8 | 1 | 91.2% | 9.91 | 85.69 | 53.55 |
+| 8 | 2 | 100% | 2.31 | 60.01 | 53.56 |
+
+The first pass equals the shared-prefix benchmark above. In the second pass
+each request still re-computes its last token as a prefill step, and on Neuron
+prefill and decode never share a step, so decode stalls on every arrival:
+TPOT is 2.8 / 6.4 ms above the ITL at concurrency 4 / 8. ITL is the decode
+step itself. (A disaggregated decode node counts that re-compute into the
+decode batch instead, see `_should_skip_prefilling_padding_in_di` in
+`vllm_neuron/vllm/core/scheduler.py`.)
+
 ### Comparison with the previous implementation (vllm-neuron 0.24, neuronx-cc 2.27)
 
 The same model code previously ran on vllm-neuron 0.24. Same benchmark, same
@@ -445,6 +549,7 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 | `scripts/bench_fixed.sh` | `vllm bench serve` matrix over the fixed real-text prompts in `bench_data/prompts` (same requests every run) |
 | `scripts/gen_bench_prompts.py` | generates `bench_data/prompts`: sglang-style ShareGPT text cut / repeated to an exact token count |
 | `scripts/bench_prefix_fixed.sh` | prefix-cache benchmark over `bench_data/prefix` (85k input, 92% shared prefix): warm-up request, one `cache_salt` per run, hit rate from `/metrics` |
+| `scripts/bench_pd_split.sh` | prefill-only (output 1) and decode-only (replay twice) split over `bench_data/prefix`, with per-cell `cache_salt` and hit rates |
 | `scripts/gen_prefix_prompts.py` | generates `bench_data/prefix`: real-text shared prefix + distinct suffixes, exact token counts |
 | `scripts/needle.py` | passkey retrieval at 16k-85k (`gen` writes `bench_data/needle.jsonl.gz`, `run` checks a server) |
 | `scripts/bench_sharegpt.sh` | `vllm bench serve` on ShareGPT (vLLM keeps prompts <= 1024 tokens only) |
