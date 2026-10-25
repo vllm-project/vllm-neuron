@@ -1424,20 +1424,18 @@ def main(argv: list[str] | None = None) -> int:
                 args.model, port, name, flags, output_len, batch, num_prompts,
                 result_dir, _cell_timeout(args, batch, output_len), server=proc,
                 server_log=log, stall_timeout=args.stall_timeout,
-                # Greedy is withheld from multi-sequence cells. It is worth
-                # ~10% of aggregate decode (acceptance 37.6% -> 43.7%) and is
-                # safe at one sequence and on a clamped engine, but measured
-                # 2026-10-21 it **hangs a cold uncapped multi-sequence
-                # engine**: identical config, 10 concurrent requests, the
-                # warm-up froze at 3 of 10 with every worker blocked in
-                # `_engram_rows` (`state=S`, `wchan=do_wait_intr_irq`) and no
-                # NEFF activity, while the same run with no temperature
-                # completed and measured 25.24 tok/s. A 10% figure is not
-                # worth a known hang in the default path.
-                temperature=(
-                    _parse_temperature(args.temperature)
-                    if min(batch, _CLAMP or batch) <= 1 else None
-                ),
+                # Every cell sends the same temperature (`--temperature`, greedy by
+                # default), so a batched cell is comparable with the one-sequence
+                # ones. Until 2026-10-25 multi-sequence cells sent none: greedy had
+                # hung a cold multi-sequence engine on 2026-10-21 (the per-op path,
+                # workers blocked in `_engram_rows`), so those cells sampled at the
+                # server's default temperature 1.0 -- through a sampler that drew
+                # only from rank 0's 2048-token vocabulary shard (letter-by-letter
+                # text, acceptance 23-38% against 46-49% greedy). The model now
+                # samples temperature rows from the full vocabulary itself
+                # (`DeepseekV41ForCausalLM._random_sampler_entry`), and the megakernel
+                # engine serves batched greedy requests (10 at once, 2026-10-25).
+                temperature=_parse_temperature(args.temperature),
                 skip_warmup_pass=args.skip_warmup_pass,
             )
             if probe_prose:

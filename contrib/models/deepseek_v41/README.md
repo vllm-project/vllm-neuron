@@ -268,10 +268,11 @@ acceptance within 0.4 points). A lone request is slower on the pipeline: it
 crosses seven stage boundaries and the sampling stage serially and uses one
 stage at a time. The exception is 8192 input tokens, where the 2048-token
 prefill chunks pipeline across the stages and TTFT halves. With ten
-concurrent requests (`DEEPSEEK_V41_MAX_NUM_SEQS=10`) the pipeline gives 55
-tok/s in aggregate at 512 input tokens and 40 at 2048, and the flat scheme 59
-and 36. Draft acceptance drops when several sequences are batched, on both
-schemes (an open item; the generated text stays exact). The report's "Round 3"
+concurrent requests (`DEEPSEEK_V41_MAX_NUM_SEQS=10`, greedy) the flat scheme reaches
+86.6 tok/s in aggregate at 512 input tokens and 43.9 at 2048, accepting 48.0% / 45.0%
+of drafts -- in line with one request at a time. (Batched cells measured before
+2026-10-25 sampled at temperature 1.0 through a sampler that only saw rank 0's slice
+of the vocabulary; both are fixed, see the report.) The report's "Round 3"
 section has the batched cells and the traces behind these explanations, and
 `test/performance/history/README.md` indexes every bench run with its report and log.
 

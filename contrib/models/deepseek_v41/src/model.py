@@ -2589,6 +2589,66 @@ def _accepted_tail(accepted):
 
 _GREEDY_TEMPERATURE_EPS = 1e-5
 
+#: The candidate window for top-k / top-p filtering on the random path (the plugin
+#: sampler's `max_top_k` is 256; a request's top-k above this is clamped to it, and a
+#: top-p set that needs more candidates keeps the whole vocabulary).
+_SAMPLE_TOPK_WINDOW = 256
+
+
+def _hash32(x: torch.Tensor) -> torch.Tensor:
+    """A 32-bit integer mix (Wellons' `lowbias32`) on int32 tensors: a bijection, so
+    distinct inputs give distinct outputs. Right shifts are masked to act as logical
+    shifts on the signed type; the multiplies wrap modulo 2**32 on both the host and
+    the device, so every rank computes the same bits."""
+    x = x ^ ((x >> 16) & 0xFFFF)
+    x = x * 2146121005                      # 0x7feb352d
+    x = x ^ ((x >> 15) & 0x1FFFF)
+    x = x * -2073254261                     # 0x846ca68b as int32
+    x = x ^ ((x >> 16) & 0xFFFF)
+    return x
+
+
+def _gumbel_noise(seeds: torch.Tensor, width: int) -> torch.Tensor:
+    """`[rows, width]` standard Gumbel noise, a deterministic function of the per-row
+    `seeds` (int32): u = (23 bits of `hash(hash(seed) ^ column)` + 0.5) / 2**23, strictly
+    inside (0, 1) in fp32 (24 bits plus the half step rounded the top value to 1.0, and
+    -log(-log(1)) = inf turned a masked -inf logit into NaN, which argmax picks: 6 of
+    20000 top-k=5 draws landed outside the top 5 on the host), g = -log(-log(u)).
+    Every rank holds the same seeds (drawn on the host) and so the same noise, which
+    is what keeps the ranks' sampled tokens identical without a broadcast."""
+    col = torch.arange(width, dtype=torch.int32, device=seeds.device).unsqueeze(0)
+    h = _hash32(_hash32(seeds.to(torch.int32)).unsqueeze(-1) ^ col)
+    u = (((h >> 9) & 0x7FFFFF).to(torch.float32) + 0.5) * (1.0 / 8388608.0)
+    return -torch.log(-torch.log(u))
+
+
+def _sample_full_vocab(full: torch.Tensor, sampling_params: torch.Tensor, seeds: torch.Tensor,
+                       filter_topk: bool) -> torch.Tensor:
+    """One token a row from the gathered, full-vocabulary logits `full` `[rows, V]`:
+    the argmax for greedy rows (temperature < eps), otherwise an exact draw from
+    softmax(logits / temperature) restricted by the row's top-k / top-p, by the
+    Gumbel-max trick (argmax of logits / T + Gumbel noise). `sampling_params` is
+    `[rows, 3]` = (top_k, top_p, temperature), one row per logits row."""
+    full = full.float()
+    temperature = sampling_params[:, 2]
+    greedy = temperature < _GREEDY_TEMPERATURE_EPS
+    greedy_ids = full.argmax(dim=-1)
+    x = full / torch.where(greedy, torch.ones_like(temperature), temperature).unsqueeze(-1)
+    if filter_topk:
+        neg = torch.full_like(x[:, :1], float("-inf"))
+        vals = torch.topk(x, _SAMPLE_TOPK_WINDOW, dim=-1).values          # sorted, descending
+        k = sampling_params[:, 0].to(torch.int64)
+        kk = k.clamp(min=1, max=_SAMPLE_TOPK_WINDOW)
+        thr_k = torch.where((k <= 0).unsqueeze(-1), neg, vals.gather(-1, (kk - 1).unsqueeze(-1)))
+        top_p = sampling_params[:, 1]
+        cum = torch.cumsum(torch.exp(vals - torch.logsumexp(x, dim=-1, keepdim=True)), dim=-1)
+        need = (cum < top_p.unsqueeze(-1)).sum(dim=-1) + 1
+        thr_p = vals.gather(-1, (need.clamp(max=_SAMPLE_TOPK_WINDOW) - 1).unsqueeze(-1))
+        thr_p = torch.where(((need > _SAMPLE_TOPK_WINDOW) | (top_p >= 1.0)).unsqueeze(-1), neg, thr_p)
+        x = torch.where(x >= torch.maximum(thr_k, thr_p), x, torch.full_like(x, float("-inf")))
+    drawn = (x + _gumbel_noise(seeds, x.shape[-1])).argmax(dim=-1)
+    return torch.where(greedy, greedy_ids, drawn).to(torch.int32)
+
 
 def _greedy_override(sampled: torch.Tensor, greedy_ids: torch.Tensor, sampling_params: torch.Tensor) -> torch.Tensor:
     """`sampled` with its greedy rows replaced by the gathered-logits argmax.
@@ -3947,6 +4007,11 @@ class DeepseekV41ForCausalLM(nn.Module):
     attention inputs of layers 37/38/39.
     """
 
+    #: The forward takes `sampling_hint` (all_greedy, no_top_k, no_top_p) from the
+    #: Neuron model runner (`NeuronModelRunner` passes it to models that set this) and
+    #: samples temperature rows from the full vocabulary (`_random_sampler_entry`).
+    accepts_sampling_hint = True
+
     def __init__(self, config: DeepseekV41Config) -> None:
         super().__init__()
         self.config = config
@@ -4835,6 +4900,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         spec_decode_metadata: object | None = None,
         logit_mask: torch.Tensor | None = None,
         rank: torch.Tensor | None = None,
+        sampling_hint: tuple | None = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """tokens -> logits, through all 40 layers and the three DSpark stages.
@@ -5019,7 +5085,15 @@ class DeepseekV41ForCausalLM(nn.Module):
                 logit_mask = torch.cat(
                     [logit_mask, logit_mask.new_zeros(pad_shape)], dim=-1
                 )
-        sampled = self._sampler_entry()(logits_shard, sampling_params, logit_mask, rank)
+        # `sampling_hint` = (all_greedy, no_top_k, no_top_p), host booleans from the
+        # runner's sampling metadata (`NeuronModelRunner`): temperature-sampled rows take
+        # the full-vocabulary sampler, an all-greedy step keeps the original graph.
+        if sampling_params is not None and sampling_hint is not None and not sampling_hint[0]:
+            filter_topk = not (sampling_hint[1] and sampling_hint[2])
+            seeds = self._sample_seeds(int(logits_shard.shape[0]), logits_shard.device)
+            sampled = self._random_sampler_entry(filter_topk)(logits_shard, sampling_params, logit_mask, seeds)
+        else:
+            sampled = self._sampler_entry()(logits_shard, sampling_params, logit_mask, rank)
         if _TRACE_INPUTS:
             self._trace_sampler(logits_shard, logits, sampled, rank, sampling_params)
         accepted = None
@@ -5304,6 +5378,40 @@ class DeepseekV41ForCausalLM(nn.Module):
         step = _DUMP_STEP[0]
         os.makedirs(_DUMP_DIR, exist_ok=True)
         torch.save(tensor[:live_rows].detach().cpu(), os.path.join(_DUMP_DIR, f"step{step}_{name}.pt"))
+
+    def _random_sampler_entry(self, filter_topk: bool):
+        """The sampler for steps with temperature-sampled rows, as one compiled graph:
+        the shards' logits gathered to the full vocabulary, then `_sample_full_vocab`.
+
+        The plugin's vocab-parallel sampler draws from rank 0's own shard only:
+        measured 2026-10-25, every one of 1280 tokens sampled at temperature 1.0 had
+        an id below 2048 (rank 0's 2048-column shard), at `max_num_seqs` 1 and 10
+        alike, and the text came out letter by letter ("S h a k e s p e a r e").
+        Greedy steps never come here (`forward`'s `sampling_hint`), so
+        their graph and cost are unchanged.
+        """
+        key = "_random_sampler_fn_topk" if filter_topk else "_random_sampler_fn"
+        fn = self.__dict__.get(key)
+        if fn is None:
+            group_name = _group_name(self.tp_group)
+
+            def sample(logits_shard, sampling_params, logit_mask, seeds):
+                full = _fc_gather_last(logits_shard, group_name)
+                if logit_mask is not None:
+                    full = full.masked_fill(~logit_mask.to(torch.bool), float("-inf"))
+                return _sample_full_vocab(full, sampling_params, seeds, filter_topk)
+
+            fn = self.__dict__[key] = _compile_fn(sample)
+        return fn
+
+    @torch._dynamo.disable
+    def _sample_seeds(self, rows: int, device) -> torch.Tensor:
+        """`[rows]` int32 seeds for the random path, from a host generator every rank
+        seeds and advances identically (all ranks run the same forwards)."""
+        gen = self.__dict__.get("_sample_generator")
+        if gen is None:
+            gen = self.__dict__["_sample_generator"] = torch.Generator().manual_seed(0x5EED)
+        return torch.randint(0, 2**31 - 1, (rows,), generator=gen, dtype=torch.int32).to(device)
 
     def _sampler_entry(self):
         """The plugin sampler plus the greedy override, as **one** compiled graph

@@ -572,24 +572,49 @@ time. Its TTFT is higher at short inputs (the hand-offs again) and lower at
 stages).
 
 Ten concurrent requests on engines built for them (`DEEPSEEK_V41_MAX_NUM_SEQS=10`,
-`--batch-sizes 10`; `bench_report.<scheme>_ms10.json`):
+`--batch-sizes 10`; `bench_report.<scheme>_ms10.json`). The flat scheme's cells are
+the 2026-10-25 rerun after the two fixes below, greedy like every other cell; the
+pipeline's cells are still the 2026-10-24 run at temperature 1.0 and are not
+comparable (not re-measured):
 
-| Cell (max_num_seqs=10) | TTFT p50 ms (tp64 / tp8pp8) | TPOT p50 ms | decode tok/s | per-stream tok/s | accept % |
-|------------------------|-----------------------------|-------------|--------------|------------------|----------|
-| in512_bs10 | 3091 / 1633 | 116.2 / 162.0 | 59.2 / 55.0 | 8.6 / 6.2 | 23 / 38 |
-| in2048_bs10 | 10805 / 6013 | 145.3 / 197.7 | 35.9 / 40.1 | 6.9 / 5.1 | 35 / 37 |
+| Cell (max_num_seqs=10) | Scheme | Temperature | TTFT p50 ms | TPOT p50 ms | decode tok/s | accept % |
+|------------------------|--------|-------------|-------------|-------------|--------------|----------|
+| in512_bs10 | tp64 | 0 (greedy) | 3071 | 81.0 | 86.6 | 48.0 |
+| in2048_bs10 | tp64 | 0 (greedy) | 10784 | 135.4 | 43.9 | 45.0 |
+| in512_bs10 | tp8pp8 | 1.0 (2026-10-24) | 1633 | 162.0 | 55.0 | 37.8 |
+| in2048_bs10 | tp8pp8 | 1.0 (2026-10-24) | 6013 | 197.7 | 40.1 | 37.2 |
 
-The flat scheme batches the ten sequences into one step and drafts them one
-after another (its drafter is unchanged): 59 tok/s at 512 input tokens, 36 at
-2048. The pipeline reaches 55 / 40 tok/s, about 3x its single-stream figure;
-as traced above, most of its batches hold one sequence padded to the 60-row
-bucket. **Open item:** with ten sequences in flight, draft acceptance drops on
-both schemes against the same prompts served one at a time (flat 23% / 35%,
-pipeline 38% / 37%, against 46-49% single-stream). The in-model counter shows
-13-27% from the first steps on the flat scheme, so a share of the drafts
-reaches the wrong request or the wrong position once several sequences are
-batched (the runner's "proposer returned 10 draft row(s) for 9 request(s)"
-warning fires at request completion). Every generated text is still exact
-(the target model verifies every draft), so this costs throughput only. This
-port could never run more than one sequence before 2026-10-24
-(`config.MAX_NUM_SEQS`), so there is no earlier batched number to compare to.
+**Batched acceptance on the flat scheme: root cause and fix (2026-10-25).** The batched
+cells first measured 23% / 35% acceptance (against 46-49% one at a time) with
+letter-split text ("l i st", "S h a k e s p e a r e"). Two bugs, neither specific to
+batching:
+
+1. `run_bench.py` sent temperature 0 to cells on a one-sequence engine but **no
+   temperature** to cells on a multi-sequence engine -- a workaround for a 2026-10-21
+   hang on the old per-op path -- so the server sampled the batched cells at its
+   default 1.0 (the checkpoint has no `generation_config.json`) while the
+   one-sequence cells were greedy. Every cell now sends the same temperature
+   (greedy by default).
+2. Temperature sampling drew only from rank 0's vocabulary shard: the plugin's
+   vocab-parallel sampler never combined the shards, so every sampled token had an
+   id below 2048 (all 1280 tokens checked, at `max_num_seqs` 1 and 10 alike); the
+   model had corrected this for greedy rows only. The model now samples
+   temperature rows itself from the gathered full-vocabulary logits
+   (`_random_sampler_entry`: Gumbel-max with per-row seeds drawn on the host, so
+   every rank draws the same token; top-k / top-p over a 256-candidate window).
+   The runner passes the step's sampling kind (`sampling_hint`), so all-greedy
+   steps keep their original graph and cost. Checked on the host: at temperature
+   1.0 the draws match multinomial sampling (total variation 0.106 against 0.106
+   for true multinomial draws, 20000 samples over 4096 tokens), top-k / top-p
+   draws stay inside their set with the right proportions, and greedy rows are
+   unchanged. Not re-measured on the device at temperature 1.0.
+
+Before settling on these, a per-step trace ruled out the batched path itself: every
+draft verified was the one proposed for that request (0 mismatches in 1773 verify
+steps) and every step's input token was the token committed for that request the
+step before. After the fixes the flat scheme's batched cells accept 48.0% / 45.0%
+of drafts (one at a time: 46.2-47.0% / 48.8-48.9%), their 128-token outputs read
+normally, and aggregate decode went up rather than down, from 59.2 to 86.6 tok/s at
+512 input tokens and from 35.9 to 43.9 at 2048. The one-sequence in512 cell is
+unchanged after the fix (TPOT 31.6 ms, 28.1 tok/s, 46.4%). Every run is indexed in
+`test/performance/history/README.md`.

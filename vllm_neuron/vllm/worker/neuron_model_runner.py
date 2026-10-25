@@ -9073,6 +9073,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if isinstance(self._async_reorder_kwargs, dict):
             model_kwargs.update(self._async_reorder_kwargs)
         model_kwargs["logit_mask"] = logit_mask
+        # Models that sample on their own full-vocabulary path (`accepts_sampling_hint`)
+        # get the batch's sampling kind as host booleans -- (all_greedy, no_top_k,
+        # no_top_p) -- so an all-greedy step needs no device read to pick its graph.
+        if sampling_params_tensor is not None and getattr(self.model, "accepts_sampling_hint", False):
+            sm = self.input_batch.sampling_metadata
+            model_kwargs["sampling_hint"] = (
+                bool(sm.all_greedy), sm.top_k is None, sm.top_p is None,
+            )
         if rotary_position_ids is not None:
             model_kwargs["rotary_position_ids"] = rotary_position_ids.to(self.device)
 
