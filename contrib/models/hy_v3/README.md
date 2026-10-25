@@ -193,20 +193,33 @@ HY3_KV_SCALE_PROFILE=$PWD/kv_scales.safetensors KV_DTYPE=fp8 MODEL=/path/to/Hy3-
   buckets took ~35 min on a trn2.48xlarge; keep `VLLM_NEURON_BARRIER_TIMEOUT`
   (default 3600 s) above the cold compile time of larger configurations.
 
-- **Full-model results** (trn2.48xlarge, config B + prefill buckets 512..8192,
-  same 8139-block / 260,448-token pool for both, profile from
-  `kv_calib/full.json`):
+- **Acceptance** (`scripts/kv_acceptance.sh` + `scripts/kv_report.py`): the gate
+  reads raw artifacts only and fails on missing evidence. It checks the run
+  manifests (`kv_manifest.py`: identical args except the KV dtype, server env,
+  commit, profile sha256), the exact persistent KV pool (`Hy3 KV pool` log line)
+  and the per-category peak device memory over the run (`kv_mem_sampler.py`),
+  MATH-500 paired per problem and re-graded (McNemar, bootstrap CI), complete
+  identical load-matrix cells, and stability runs of at least 30 minutes.
+- **Full-model results** (trn2.48xlarge, re-run passing the gate; config B +
+  prefill buckets 512..8192 for DCP=1, prefill <= 2048 for DCP=8; the same
+  8139-block pool for both KV dtypes; profile from `kv_calib/full.json`):
 
   | | BF16 KV | FP8 KV |
   |---|---|---|
-  | KV pool memory (64 ranks) | 635.9 GiB | 317.9 GiB (-50.0%) |
-  | MATH-500, greedy, no_think | 97.0% | 98.2% |
-  | load matrix 1024-16000 x c 1/4/15, worst P50 change | | TTFT +1.9%, TPOT +2.8% (TPOT -5..-8% at c=15, >= 8k) |
-  | 30 min, 900 req, c=8, 6k shared prefix | 900/0, TPOT P50 55.9 ms | 900/0, TPOT P50 49.5 ms |
+  | persistent KV pool per rank (64 ranks) | 10,667,950,080 B (635.9 GiB) | 5,333,975,040 B (317.9 GiB), x 0.5000 |
+  | peak device memory over the run, all ranks | 1219.8 GiB | 910.3 GiB (-309.6 GiB = 48.7% of the BF16 pool; FP8-only `model_code` +8.3 GiB, scratchpad unchanged) |
+  | MATH-500, 500 problems, greedy, no_think, paired | 97.4% | 97.8% (6 vs 8 discordant, 95% CI of the difference [-1.0, +1.8] pp) |
+  | MATH-500, DCP=8 | 96.8% | 97.0% |
+  | load matrix 1024-16000 x c 1/4/15, worst P50 change | | TTFT +4.6%, TPOT +4.2% (1024 / c=1); TPOT -6..-8% at c=15, >= 8k |
+  | stability, 1100 requests, c=8, 6k shared prefix | 2198 s, 0 failed, TPOT P50 55.9 ms | 1974 s, 0 failed, TPOT P50 49.4 ms |
 
-  DCP=8 (prefill buckets <= 2048): FP8 KV MATH-500 97.8%; graded GSM8K
-  questions on shared 0.2k-15k contexts (`scripts/kv_api_check.py`) 57/60 vs
-  56/60 for BF16 KV.
+  Greedy MATH-500 moves by 0.4-0.8 pp between server restarts on this stack;
+  across the original and the re-run (6 BF16 / FP8 pairings) FP8 scored the
+  same or higher every time.
+- **85k shared-prefix D test** (customer request counts and output lengths,
+  DCP=1, max_model_len 90112, the same pool): FP8 KV lowers TPOT by 21-22% at
+  concurrency 2-8 (BF16 86-90 ms) and by 30% at 9-13 (141-144 ms -> 98-101 ms);
+  TTFT +1-2%.
 
 ## Compatibility Matrix
 
@@ -644,6 +657,7 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 | `scripts/dequant_bf16.py` | BF16 copy of the full checkpoint for KV calibration |
 | `scripts/calibrate_kv_scales.py` | llm-compressor KV calibration, exports the KV scale profile (`kv_calib/*.json` data mixes) |
 | `scripts/validate_fp8_kv.py`, `compare_kv_runs.py`, `run_kv_mode.sh` | reduced-model BF16-KV vs FP8-KV runs (modes m1 / m2 / m3: full prefill, packed + prefix, DCP 8) and their comparison |
-| `scripts/kv_acceptance.sh`, `kv_report.py` | full-model acceptance (KV memory, load matrix, MATH-500, stability) and the BF16 / FP8 report |
+| `scripts/kv_acceptance.sh`, `kv_report.py` | full-model acceptance run (manifest, memory sampling, load matrix, MATH-500, >= 30 min stability) and the BF16 / FP8 gate |
+| `scripts/kv_manifest.py`, `kv_mem_sampler.py` | run manifest (args, server env, commit, profile sha256, KV pool bytes) and neuron-monitor memory time series for the gate |
 | `scripts/kv_api_check.py` | full-model functional check through the API (long multi-chunk prompts, prefix hits, partial hits, concurrency), e.g. DCP 8 vs DCP 1 |
 | `scripts/kv_cache_isolation.sh` | compile-cache isolation of the KV scale profile (same profile reuses NEFFs; another profile does not reuse stale decode NEFFs) |
