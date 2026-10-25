@@ -22,6 +22,9 @@ def register() -> None:
     # Every process vllm serve starts validates the config, so the relaxation has
     # to be applied here too, not only in scripts/run.py.
     relax_head_divisibility()
+    from .spmd_compile import install_leader_compile
+
+    install_leader_compile()
 
 
 def relax_head_divisibility() -> None:
