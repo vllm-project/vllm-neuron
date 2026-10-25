@@ -42,6 +42,15 @@ from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
 
 from .config import DeepseekV41Config
+from . import mk_host, mk_model
+
+#: Run every backbone block and the DSpark drafter as NKI kernels -- one per layer
+#: archetype and phase (`kernels/layer_kernel.py`, `kernels/draft_kernel.py`,
+#: bridged by `mk_model`). Decided once, at load: `mk_model.prepare` re-lays the
+#: fp8 weights for the kernels and releases the per-op layout, so
+#: `DEEPSEEK_V41_MEGAKERNEL=0` (the per-op path) has to be chosen before the engine
+#: starts.
+_MEGAKERNEL = os.environ.get("DEEPSEEK_V41_MEGAKERNEL", "1") == "1"
 
 logger = logging.getLogger(__name__)
 
@@ -1721,6 +1730,8 @@ class PagedSpan:
         "at_zero",
         "read_lens",
         "group_counts",
+        "host_table",
+        "host_slots",
     )
 
     def __init__(
@@ -1755,6 +1766,10 @@ class PagedSpan:
             counts[ratio] = compress_len - start_pos // ratio
         self.read_lens = tuple(read_lens)
         self.group_counts = tuple(counts)
+        #: Host copies of `block_table` and `slot_mapping`, set by `_paged_spans` for
+        #: the megakernel bridge's index arithmetic (`mk_model.StepIndices`).
+        self.host_table = None
+        self.host_slots = None
 
     def slots(self, positions: torch.Tensor) -> torch.Tensor:
         """Flat cache rows for absolute `positions` in this sequence."""
@@ -1851,13 +1866,20 @@ class Compressor(nn.Module):
         self.register_buffer("pool_score", None, persistent=False)
 
     def allocate_state(self, device, num_slots: int) -> None:
-        """Allocate the per-slot pooling inputs."""
+        """Allocate the per-slot pooling inputs.
+
+        fp32 on the megakernel path, as the reference keeps its `kv_state` /
+        `score_state`: the layer kernels project and pool in fp32
+        (`kernels/mk_compress.pool_groups`), and a bf16 pooling input moved the
+        fp4-quantized latent ~1.5% off the reference (measured on the trn3 port).
+        """
         if self.compress_ratio > 1:
+            dtype = torch.float32 if _MEGAKERNEL else torch.bfloat16
             self.pool_kv = torch.zeros(
-                num_slots, self.head_dim, dtype=torch.bfloat16, device=device
+                num_slots, self.head_dim, dtype=dtype, device=device
             )
             self.pool_score = torch.zeros(
-                num_slots, self.head_dim, dtype=torch.bfloat16, device=device
+                num_slots, self.head_dim, dtype=dtype, device=device
             )
 
     def forward(
@@ -5179,6 +5201,20 @@ class DeepseekV41ForCausalLM(nn.Module):
             self.ngram_hash = self._build_ngram_hash(device)
             self.ngram_hash.allocate_state(device, num_slots)
 
+        # The vocabulary-pad bias, built once here rather than through
+        # `_vocab_pad_slots` inside the traced `logits_shard`. Only the last
+        # rank's shard has pad columns, so only that rank reads the dict there,
+        # and the dict guard of the first graph it traces (taken while the dict
+        # was still empty) fails on a later step of the same shape: that rank
+        # alone then compiles a new graph, whose collectives wait for the other
+        # 63 ranks to load it too -- they never do, and the step hangs (measured
+        # 2026-10-25: rank 63 parked in `socketRecv` under `_lite_execute`
+        # on the second prompt of a bench cell, every other rank in `.to("cpu")`).
+        if self.vocab_pad:
+            bias = torch.zeros(self.part_vocab_size, dtype=torch.float32)
+            bias[self.part_vocab_size - self.vocab_pad :] = _NEG_BOUND
+            self.__dict__["_vocab_pad_bias_t"] = bias.to(device)
+
         logger.info(
             "deepseek_v41: %d KV slots — vLLM's window caches are "
             "%.2f GiB over %d layers, this model's own per-slot caches "
@@ -5328,7 +5364,8 @@ class DeepseekV41ForCausalLM(nn.Module):
         """This rank's columns of the logits: `[T, part_vocab_size]`."""
         logits = nki_linear(hidden_states, self.head_weight, None, "bf16").float()
         if self.vocab_pad:
-            logits = logits + self._vocab_pad_bias(logits)
+            bias = self.__dict__.get("_vocab_pad_bias_t")
+            logits = logits + (self._vocab_pad_bias(logits) if bias is None else bias)
         return logits
 
     def _vocab_pad_bias(self, like: torch.Tensor) -> torch.Tensor:
@@ -5435,7 +5472,25 @@ class DeepseekV41ForCausalLM(nn.Module):
 
         _MOE_LIVE_ROWS[0] = live_rows if live_rows != bucket_rows else None
 
-        for layer_id, block in enumerate(self.layers):
+        if _MEGAKERNEL:
+            # One layer kernel a block (its archetype's, its phase's): the engram
+            # read-out, the DSpark tap and every collective happen inside it.
+            if self.pp_size != 1:
+                raise NotImplementedError("the megakernel path serves pp_size == 1")
+            if bucket_rows != int(stream.shape[0]):
+                raise NotImplementedError(
+                    f"the megakernel path wants the spans to tile the {int(stream.shape[0])} "
+                    f"rows of the step, got {bucket_rows}"
+                )
+            # The whole block loop is one dynamo-disabled call: the per-step host
+            # bookkeeping (block tables, slot lists, span positions) is Python data
+            # that changes every step, and touched from the traced forward it would
+            # key a new graph each step.
+            stream, pre_mix, main_hiddens = mk_model.run_layers(
+                self, stream, pre_mix, spans, paged, hashes, live_rows
+            )
+
+        for layer_id, block in enumerate([] if _MEGAKERNEL else self.layers):
             if layer_id % _HEAP_TRIM_EVERY == 0:
                 host_heap_trim(f"layer {layer_id}", self.world_size)
             # `owns` is True for every block when pp_size == 1, which is the
@@ -5622,7 +5677,8 @@ class DeepseekV41ForCausalLM(nn.Module):
         # that passes today. Via the host rather than `clamp_min(0)` on the
         # device, for the reason `_bucket_rows` spells the same way: this runs
         # outside every compiled region, and the payload is a few kB.
-        block_table = block_table.cpu().clamp_min(0).to(block_table.device)
+        host_table = block_table.cpu().clamp_min(0)
+        block_table = host_table.to(block_table.device)
         slot_mapping = meta["slot_mapping"]
         device = slot_mapping.device
         starts = torch.tensor(
@@ -5668,7 +5724,10 @@ class DeepseekV41ForCausalLM(nn.Module):
             torch.zeros_like(block_table[0])
             for _ in range(max(0, len(spans) - live_spans))
         ]
-        return [
+        host_slots = (
+            slot_mapping.reshape(-1).cpu().tolist() if _MEGAKERNEL else None
+        )
+        out = [
             PagedSpan(
                 block_table=(
                     block_table[row]
@@ -5684,6 +5743,14 @@ class DeepseekV41ForCausalLM(nn.Module):
             )
             for row, (begin, length, start_pos) in enumerate(spans)
         ]
+        if _MEGAKERNEL:
+            for row, (span, (begin, length, _)) in enumerate(zip(out, spans)):
+                span.host_table = (
+                    host_table[row] if row < live_spans
+                    else torch.zeros_like(host_table[0])
+                )
+                span.host_slots = host_slots[begin : begin + length]
+        return out
 
     @torch._dynamo.disable
     def _bucket_rows(
@@ -6008,6 +6075,8 @@ class DeepseekV41ForCausalLM(nn.Module):
                 f"{list(self.config.dspark_target_layer_ids)}; forward() "
                 "collected none, so the target-layer tap did not run"
             )
+        if _MEGAKERNEL:
+            return mk_model.run_draft(self, seed_ids, tap, main_hidden, span, paged)
         begin, length, _ = span
         main = main_hidden[begin : begin + length].unsqueeze(0)
 
@@ -6049,6 +6118,71 @@ class DeepseekV41ForCausalLM(nn.Module):
         self._allow_request_time_compilation()
         self._cap_kv_cache_blocks()
         _load_weights(self, checkpoint_path, device, cache_dir)
+        if _MEGAKERNEL:
+            mk_model.prepare(self)
+
+    # ---- megakernel bridge (see mk_model) ---------------------------------------
+    _mk_freqs_: dict | None = None
+    _mk_groups_attn_ = None
+
+    def _mk_freqs(self, attn) -> torch.Tensor:
+        """`[max_pos, 64]` fp32 (cos | sin) of this attention's RoPE table; the
+        compressed layers share one table and the others another."""
+        if self._mk_freqs_ is None:
+            self._mk_freqs_ = {}
+        key = bool(attn.compress_ratio)
+        t = self._mk_freqs_.get(key)
+        if t is None:
+            if attn.freqs_cis is None:
+                raise RuntimeError("bind_kv_cache() must run before the megakernel path")
+            t = mk_model._freqs_table(attn, self.norm.weight.device)
+            self._mk_freqs_[key] = t
+        return t
+
+    @property
+    def _mk_groups_world(self):
+        return mk_host.replica_groups(self.world_size, self.world_size)
+
+    @property
+    def _mk_groups_attn(self):
+        """Consecutive `attn_tp`-rank groups, checked against the group the plugin
+        gave the attention reduction."""
+        if self._mk_groups_attn_ is None:
+            if self.attn_group_is_world:
+                if self.attn_replicas > 1:
+                    raise NotImplementedError(
+                        "the attention is replicated but reduces over the world; the "
+                        "megakernels want an attention group of attn_tp ranks"
+                    )
+                self._mk_groups_attn_ = self._mk_groups_world
+            else:
+                # The kernels name every group of the partition, not just this rank's.
+                # On Trn2 at 64 ranks the plugin's attention (EP-TP) groups are its
+                # 8x8 device mesh -- (0..3, 12..15), (4..11), ... -- not consecutive
+                # ranks, so the partition is taken from the plugin's own builder and
+                # checked against the group this rank was given.
+                ranks = tuple(sorted(int(r) for r in self.attn_tp_group.ranks))
+                groups = mk_host.replica_groups(self.world_size, self.attn_tp)
+                try:
+                    from vllm_neuron.parallel.neuron_parallel_state import (
+                        _build_ep_group_ranks,
+                    )
+
+                    rows, _ = _build_ep_group_ranks(
+                        self.world_size, self.world_size // self.attn_tp
+                    )
+                    mesh = tuple(tuple(sorted(int(r) for r in row)) for row in rows)
+                    if ranks in mesh:
+                        groups = mesh
+                except ImportError:
+                    pass
+                if ranks not in groups:
+                    raise NotImplementedError(
+                        f"rank {self.rank}: the attention group is {ranks}, which is in "
+                        f"neither the plugin's mesh nor the consecutive partition {groups}"
+                    )
+                self._mk_groups_attn_ = groups
+        return self._mk_groups_attn_
 
     @staticmethod
     def _cap_kv_cache_blocks() -> None:

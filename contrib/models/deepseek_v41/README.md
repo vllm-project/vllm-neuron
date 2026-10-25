@@ -182,13 +182,20 @@ SDK 2.32 compiles at `-O1`, the level its platform defaults to.
 >
 > * **Speculative decoding needs the plugin-core change on both stacks**; see
 >   [Speculative decoding needs one plugin change](#speculative-decoding-needs-one-plugin-change).
-> * **SDK 2.33 is slower.** See [Speed (performance)](#speed-performance) for
->   both stacks' numbers. Device traces of one decode step put the gap inside
->   the SDK's execution path, not this model's code: the per-layer graph runs
->   ~25% longer on the device, and the device idles longer between graph
->   submissions. The compiler version, `nki` version, optimization level
->   (`-O1`/`-O2`), backend route (native/XLA), IO ring cache size and lite's
->   index bound checks were each ruled out by measurement.
+> * **The model runs as NKI megakernels by default** -- one kernel a block a
+>   step, one per layer archetype and phase, and one for the DSpark drafter
+>   (see [`src/README.md`](src/README.md#megakernels)). Measured on SDK 2.33,
+>   that path decodes 1.4-2.2x faster than the per-op path on SDK 2.32 and
+>   2.1-3.8x faster than the per-op path on SDK 2.33 ([Speed](#speed-performance)).
+>   `DEEPSEEK_V41_MEGAKERNEL=0`, set before the engine starts, restores the
+>   per-op path.
+> * **On the per-op path, SDK 2.33 is slower than SDK 2.32.** Device traces of
+>   one decode step put that gap inside the SDK's execution path, not this
+>   model's code: the per-layer graph runs ~25% longer on the device, and the
+>   device idles longer between graph submissions. The compiler version, `nki`
+>   version, optimization level (`-O1`/`-O2`), backend route (native/XLA), IO
+>   ring cache size and lite's index bound checks were each ruled out by
+>   measurement.
 > * **Segmented prefill at an untested shape fails on both stacks.** A
 >   1215-token prompt served with `max_model_len=1599` and
 >   `max_num_batched_tokens=1024` (two prefill segments) hit a `neuronx-cc`
@@ -282,7 +289,26 @@ Measured on a `trn2.48xlarge` with the plugin-core change,
 `DEEPSEEK_V41_MAX_NUM_SEQS=10`, 128 output tokens, warm process. Acceptance is
 DSpark's, from vLLM's own counters over the cell.
 
-**Neuron SDK 2.32** (`vllm-neuron` 0.24.0.1.1.0, `-O1`), 2026-10-23:
+**Neuron SDK 2.33, megakernel path** (the default; `vllm-neuron` 0.29.0.1.2.0,
+`-O2`), 2026-10-25:
+
+| cell | TTFT p50 (ms) | TPOT p50 (ms) | decode (tok/s, aggregate) | acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| in512 bs1 | 548.2 | 37.9 | 24.48 | 43% |
+| in512 bs10 | 3030.0 | 99.5 | 77.12 | 44% |
+| in1024 bs1 | 1016.7 | 36.6 | 22.39 | 44% |
+| in1024 bs10 | 5648.5 | 120.9 | 46.58 | 42% |
+| in8192 bs1 | 8849.2 | 39.4 | 9.27 | 41% |
+| in8192 bs4 | 13373.9 | 161.8 | 11.89 | 41% |
+
+A decode-step layer kernel runs in ~4 ms and a 512-row prefill one in ~14 ms
+(`DEEPSEEK_V41_MK_SYNC=1` times each kernel). The `in1024 bs10` window carries
+dynamo retraces (192) of the forward's glue as the live sequence count steps
+down through new values; no kernel recompiles (`neff_misses=0`).
+
+The per-op path (`DEEPSEEK_V41_MEGAKERNEL=0`), for comparison:
+
+**Neuron SDK 2.32, per-op** (`vllm-neuron` 0.24.0.1.1.0, `-O1`), 2026-10-23:
 
 | cell | TTFT p50 (ms) | TPOT p50 (ms) | decode (tok/s, aggregate) | acceptance |
 | --- | ---: | ---: | ---: | ---: |
@@ -293,7 +319,7 @@ DSpark's, from vLLM's own counters over the cell.
 | in8192 bs1 | 11261.9 | 95.4 | 5.50 | 43% |
 | in8192 bs4 | 17141.4 | 326.6 | 7.94 | 41% |
 
-**Neuron SDK 2.33** (`vllm-neuron` 0.29.0.1.2.0, `-O2`), 2026-10-24:
+**Neuron SDK 2.33, per-op** (`vllm-neuron` 0.29.0.1.2.0, `-O2`), 2026-10-24:
 
 | cell | TTFT p50 (ms) | TPOT p50 (ms) | decode (tok/s, aggregate) | acceptance |
 | --- | ---: | ---: | ---: | ---: |
@@ -304,8 +330,8 @@ DSpark's, from vLLM's own counters over the cell.
 | in8192 bs1 | 11900.1 | 139.1 | 4.32 | 41% |
 | in8192 bs4 | 24203.8 | 505.3 | 5.68 | 40% |
 
-SDK 2.33 costs 5-12% on prefill and 21-44% on decode, worst at batch 10, where
-a step runs the most graphs. A rank-0 system trace of one in512 bs1 decode step
+On the per-op path SDK 2.33 costs 5-12% on prefill and 21-44% on decode, worst
+at batch 10, where a step runs the most graphs. A rank-0 system trace of one in512 bs1 decode step
 on each SDK puts it below this model: per-graph device time is up (the per-layer
 graph runs 2.1 → 2.7 ms) and the device idles longer between graph
 submissions, while the work submitted is the same and acceptance matches. The
@@ -321,8 +347,23 @@ mean TPOT are the stable figures.
 
 ### Optional: unit and module tests
 
-None are contributed yet — `test/unit/` and `test/module/` are placeholders. The
-port's component-level checking was done against a private reference
-implementation that cannot be redistributed, so re-deriving it against a public
-reference is left as follow-up work. The accuracy test above is the gate that
-runs today.
+`test/unit/` checks the megakernels against a CPU reference on a few cores,
+component by component, from random weights in the checkpoint's formats:
+
+```bash
+cd contrib/models/deepseek_v41/test/unit
+python test_gemm.py                      # the Trn2 GEMMs, both partitionings
+python test_moe.py --T 300               # the token-grouped fp4 experts
+python kharness_mp.py 8 test_layer.py --arch c2_source --phase prefill --T 1024 --stage 41
+python kharness_mp.py 8 test_draft.py --L 6 --start 200 --stage 18
+```
+
+`test_layer.py` takes any archetype (`--arch`, see `layer_kernel.ARCH`) and phase;
+`--stage` returns early at a sublayer (`layer_kernel`'s docstring lists them), and
+stages 41 / 82 compare the attention and the MoE against a reference fed the
+kernel's own inputs -- on random weights a full-layer comparison is dominated by
+rows whose top-6 experts differ after an fp8 re-quantization flip, so the
+components are the exact check. `probe_*.py` are the device probes of the
+hardware features the kernels rely on (dynamic loops, `nonzero_with_count`,
+`dma_compute`, in-kernel collectives over rank groups, the GpSimd top-k).
+`test/module/` is a placeholder; the accuracy test above is the gate.

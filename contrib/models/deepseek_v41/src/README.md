@@ -15,7 +15,9 @@ supports.
 | `model.py` | The implementation: attention, MoE, hyper-connections, engram, the DSpark stages, `forward`, `get_kv_spec`, `bind_kv_cache`, `load_weights`. |
 | `weight_loader.py` | Checkpoint-to-parameter mapping and sharding. Module names are the checkpoint's own paths, so "is this the weight the reference uses here" is a string comparison against `model.safetensors.index.json`. |
 | `drafter.py` | `DSparkProposer`, the in-model speculative proposer registered with `vllm_neuron.vllm.spec_decode`. |
-| `kernels/` | The NKI kernels. `kernels/__init__.py` maps each kernel entry point to its call site in `model.py`. |
+| `kernels/` | The NKI kernels. `kernels/__init__.py` maps each kernel entry point to its call site. `layer_kernel.py` (one `@nki.jit` per layer archetype and phase) and `draft_kernel.py` (the drafter's prefill and decode kernels) are the megakernels; `mk_gemm.py` (Trn2 GEMMs), `mk_moe.py` (token-grouped fp4 experts), `mk_common.py` / `mk_compress.py` are their helpers. |
+| `mk_model.py` | The bridge from the modules to the megakernels: re-lays the weights once at load, builds the per-step index columns, and runs the kernels. |
+| `mk_host.py` | The host-side index arithmetic (window and compressed slot tables, compression groups) over the scheduler's block tables. |
 | `chat_template.jinja` | The checkpoint's chat template, applied to cases with `role=user`. |
 | `verifier/` | The accuracy harness the integration test drives. Lives here rather than under `test/` because its modules import the model with package-relative imports (`from ..config`), so it has to sit inside the same package. |
 
@@ -53,6 +55,60 @@ engram     5.7 GiB    by row, ~6.0M of 384M a table
          ~13.9 GiB
 ```
 
+## Megakernels
+
+Every backbone block runs as **one** NKI kernel a step and the whole DSpark
+draft path as another (`DEEPSEEK_V41_MEGAKERNEL=1`, the default). It is a port of
+the Trainium3 megakernels (branch `deepseek_v41_trn3`) to Trainium2, with two
+splits that branch does not make:
+
+- **One `@nki.jit` per layer archetype.** The 40 blocks are nine kinds --
+  `window` (0), `window_engram` (1), `c2_source` (2, 8), `c2_source_engram` (14),
+  `c2` (the other ratio-2 layers), `c1_source` (20), `c1_index` (24, 28, 32, 36),
+  `c1` (the other ratio-1 layers) and `c1_tap` (37-39) -- and each kernel takes
+  only the tensors its kind reads (`kernels/layer_kernel.py`, `ARCH`).
+- **One kernel per phase.** `*_decode` serves a step of at most 128 rows (B
+  sequences x `1 + num_speculative_tokens`) and splits every GEMM across the two
+  physical cores by output columns, because a decode step is a weight read;
+  `*_prefill` serves a prefill chunk, splits the GEMMs by row tiles (each weight
+  tile reused over up to four of them) and scores and selects the index top-k in
+  512-token chunks so its scratch does not grow with the prompt. The drafter has
+  `draft_prefill` (the first step: the stages only seed their window caches, then
+  the head) and `draft_decode` (the three full stages).
+
+Each kernel runs on both physical cores of the logical core and does its own
+all-reduces (over the plugin's 8-rank attention mesh and the 64-rank world), so
+a layer is one graph execution and the stream, the caches and the index state
+never leave HBM between sublayers. `mk_model.py` is the bridge: at load it
+re-lays every fp8 linear the kernels read as its dequantized bf16 transpose
+(the per-op GEMMs compute the same bf16 values on every call; the kernels read
+them as plain DMAs) and stacks the resident fp4 experts on an expert axis; per
+step it turns the scheduler's block tables into the kernels' index columns
+(`mk_host.py`).
+
+What NeuronCore-v3 does not have, and what replaces it: the trn3 kernels'
+block-scaled MX matmul (`nc_matmul_mx` / `quantize_mx`) becomes bf16 matmuls on
+the k-major weights with the activations round-tripped through fp8 as they are
+staged (`kernels/mk_gemm.py`, peak 224 as in `blockquant`); the routed experts
+decode their fp4 weights in SBUF with `kernels/moe_expert.py`'s pipeline inside
+a token-grouped, runtime-bounded loop per expert (`kernels/mk_moe.py`); the trn3
+tensor-indirection key selection becomes the per-token gather-and-transpose
+attention body (`mk_common.attn_token_body`). The values written to the window
+KV cache keep the reference's own fp8 round trip (peak 448, rounded
+arithmetically: `mk_compress.fp8_qdq_exact_tile`).
+
+The kernels' arithmetic is the reference's where the trn3 port found the per-op
+path drifting from it (fp32 router and hyper-connection projections, fp32
+compressor projections and pooling caches, fp8 rounding of the attention output
+before `wo_a`, fp32 `wo_b` partials into the all-reduce). The unit tests
+(`test/unit/test_layer.py`, `test_draft.py`, `test_moe.py`, `test_gemm.py`, on
+eight ranks) check every kernel component by component against a CPU reference
+fed the kernel's own inputs. One thing is deliberately simpler than the per-op
+path, as on trn3: the candidate-block mask of layer 20 is assumed a no-op, which
+holds while the context reads at most `candidate_topk_blocks x
+candidate_block_size` compressed groups (16384) and is asserted.
+`DEEPSEEK_V41_MEGAKERNEL=0` restores the per-op path.
+
 ## Quantization
 
 The checkpoint declares `quant_method: fp8`, `activation_scheme: dynamic`,
@@ -62,6 +118,10 @@ routed experts are fp4. `kernels/blockquant.py` implements the fp4, fp8 and bf16
 GEMMs, including a two-core column split — for fp8 the scale row for a split
 starting at weight row `lo` has to be read from `lo // 32`, which
 `_fp8_2core_span` handles.
+
+The megakernels read the same fp8 weights decoded once, at load, to bf16 in the
+tensor engine's moving-operand layout, and the fp4 experts as the per-op expert
+kernel does; see [Megakernels](#megakernels).
 
 Pass `quantization="fp8"` or leave it unset. Anything else is rejected by
 `factory.py`.
@@ -79,7 +139,8 @@ Pass `quantization="fp8"` or leave it unset. Anything else is rejected by
 | Concurrency (`max_num_seqs > 1`) | **Not supported** | Kept at 1. Uncapped runs stalled mid-decode in the measured pass; the span and `num_seqs` graph axes are bucketed, but the ragged-draft axis is not yet bounded. |
 | Vision tower | **Not supported** | The checkpoint carries one; it is off the tokens-to-logits path and not placed by the floorplan. `factory.py` rejects `mm_encoder_only`. |
 | `--runner generate` | **Not supported** | Rejected by the factory. |
-| Trn3 | **Not tested** | Kernels target Trainium2. |
+| Megakernels | **Working**, the default | Every block and the drafter as NKI kernels, one per layer archetype and phase; see [Megakernels](#megakernels). `DEEPSEEK_V41_MEGAKERNEL=0` restores the per-op path (choose before the engine starts). |
+| Trn3 | **Not tested** | Kernels target Trainium2 (the trn3 megakernels live on branch `deepseek_v41_trn3`). |
 
 ## A note on the comments
 
