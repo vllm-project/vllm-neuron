@@ -22,3 +22,6 @@ def register() -> None:
     from vllm import ModelRegistry
 
     ModelRegistry.register_model(ARCHITECTURE, FACTORY)
+    from .spmd_compile import install_leader_compile
+
+    install_leader_compile()
