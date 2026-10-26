@@ -7,10 +7,10 @@ from nkilib.experimental.transformer.attention_block_tkg_sharding import (
 )
 
 # GQA (kv_heads > 1): the kernel infers kv_heads from the K/V-cache shape (no
-# kv_heads argument) — see _infer_kv_heads for the cache-layout convention. The
-# caller's only GQA obligation is a 4D cache + a per-head 3D block table
-# [B, kv_heads, num_blocks]; a 2D-table GQA request routes to the torch fallback
-# (see _can_use_attention_block_kernel).
+# kv_heads argument). See _infer_kv_heads for the cache layout. The caller gives a
+# 4D cache and a block table. A 2D shared table also reaches the kernel, because
+# attention_decode converts it to the per-head mapping (_to_kernel_kv_mapping).
+# GQA with flat KV (no table) uses the torch fallback.
 
 from typing import Optional, Tuple
 
@@ -29,6 +29,10 @@ from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from vllm_neuron import envs
 from vllm_neuron.utils.hardware_config import get_logical_nc_config
 from vllm_neuron.utils.neuron_utils import can_run_kernel
+from vllm_neuron.model.kv_cache import (
+    build_per_head_block_table,
+    build_per_head_slot_mapping,
+)
 
 
 def _pv_swapped_layout_admit_d128(atp, cfg, sbm, fa_ctx, TC):
@@ -1359,6 +1363,66 @@ def _infer_kv_heads(V_cache: Tensor) -> int:
     return 1 if V_cache.dim() == 3 else V_cache.shape[1]
 
 
+def _to_kernel_kv_mapping(
+    active_blocks_table: Optional[Tensor],
+    kv_cache_update_idx: Optional[Tensor],
+    V_cache: Tensor,
+    update_cache: bool,
+) -> tuple[Optional[Tensor], Optional[Tensor]]:
+    """Convert the shared vLLM KV mapping to the per-head mapping of the kernel.
+
+    The kernel folds a 4D cache ``[num_blocks, kv_heads, block_len, d_head]`` into a
+    ``[num_blocks * kv_heads]`` pool. At ``kv_heads > 1`` it reads the cache through a
+    per-head block table and writes it through per-head slots, both in the pool
+    numbering ``base_block * kv_heads + h``. vLLM gives one block number for all
+    heads. This function builds the table and the slots together, so they agree.
+
+    Nothing changes at ``kv_heads == 1``. A per-head 3D table from a caller that
+    builds the mapping itself is passed through; with ``update_cache`` it needs
+    per-head slots ``[B, kv_heads, S_tkg]`` too.
+
+    Example:
+        >>> import torch
+        >>> v_cache = torch.zeros(8, 2, 4, 2)  # 8 blocks, 2 KV heads, block_len 4
+        >>> table = torch.tensor([[2, 5]])  # one request on base blocks 2 and 5
+        >>> slots = torch.tensor([[2 * 4 + 3]])
+        >>> t, s = _to_kernel_kv_mapping(table, slots, v_cache, update_cache=True)
+        >>> t.tolist(), s.tolist()
+        ([[[4, 10], [5, 11]]], [[[19], [23]]])
+    """
+    if active_blocks_table is None:
+        return active_blocks_table, kv_cache_update_idx
+    kv_heads = _infer_kv_heads(V_cache)
+    if kv_heads == 1 or active_blocks_table.dim() == 3:
+        if kv_heads > 1 and update_cache:
+            assert kv_cache_update_idx is not None and kv_cache_update_idx.dim() == 3, (
+                "A per-head block table needs per-head KV write slots "
+                "[B, kv_heads, S_tkg]. Pass the shared 2D table and slots instead."
+            )
+        return active_blocks_table, kv_cache_update_idx
+    assert active_blocks_table.dim() == 2, (
+        "active_blocks_table must be 2D [B, num_blocks] or 3D "
+        f"[B, kv_heads, num_blocks], got {tuple(active_blocks_table.shape)}."
+    )
+    per_head_table = build_per_head_block_table(active_blocks_table, kv_heads).to(
+        active_blocks_table.dtype
+    )
+    if not update_cache:
+        return per_head_table, kv_cache_update_idx
+    assert kv_cache_update_idx is not None and kv_cache_update_idx.dim() == 2, (
+        "A shared 2D block table needs shared KV write slots [B, S_tkg]."
+    )
+    slot_dtype = kv_cache_update_idx.dtype
+    slots = kv_cache_update_idx
+    if slots.dtype == torch.uint32:
+        # Pad slots are -1 as uint32; reinterpret so they stay negative per head.
+        slots = slots.view(torch.int32)
+    per_head_slots = build_per_head_slot_mapping(
+        slots.reshape(-1), V_cache.shape[-2], kv_heads, kv_cache_update_idx.shape[0]
+    ).to(slot_dtype)
+    return per_head_table, per_head_slots
+
+
 def _can_use_attention_block_kernel(
     X: Tensor,
     V_cache: Optional[Tensor],
@@ -1386,20 +1450,12 @@ def _can_use_attention_block_kernel(
     if H % _PMAX != 0:
         return False
 
-    # GQA (kv_heads > 1) routes to the kernel only when the caller passes a per-head
-    # (3D [B, kv_heads, num_blocks]) block table. The kernel infers kv_heads from the
-    # 4D cache but still folds kv_heads into the batch dim and reshapes the table to
-    # [B*kv_heads, num_blocks] (attention_block_tkg.py), which a 2D [B, num_blocks]
-    # pool table cannot satisfy.
-    #   - The BF16 GQA decoders (qwen3_vl model_bf16) pass a 2D table +
-    #     4D cache, so they stay on the torch fallback (its 4D-cache gather handles it).
-    #   - The native-MX decoder (Qwen3VLTextAttentionMX) builds a per-head 3D table
-    #     (build_per_head_block_table) and DOES reach the kernel — the only production
-    #     GQA caller that does.
+    # GQA (kv_heads > 1) with block KV can use the kernel with either table form:
+    # attention_decode converts a shared 2D table to the per-head mapping
+    # (_to_kernel_kv_mapping). GQA with flat KV (no table) uses the torch fallback.
     kv_heads = _infer_kv_heads(V_cache)
-    if kv_heads > 1:
-        if active_blocks_table is None or active_blocks_table.dim() < 3:
-            return False
+    if kv_heads > 1 and active_blocks_table is None:
+        return False
 
     d_head = V_cache.shape[-1]
 
@@ -1521,8 +1577,8 @@ def attention_decode(
         q_heads: Number of query heads
         kv_heads: Number of key/value heads (≥1). Not a parameter — the NKI kernel
                  infers it from the K/V-cache shape (4D cache → dim 1; 3D → 1). GQA
-                 (kv_heads > 1) reaches the kernel only with a per-head 3D block
-                 table; otherwise it routes to the torch fallback.
+                 (kv_heads > 1) with block KV reaches the kernel with a 2D or a 3D
+                 block table. GQA with flat KV uses the torch fallback.
 
     Args:
         X:                  [B, S_tkg, H]  Input hidden states.
@@ -1547,10 +1603,12 @@ def attention_decode(
         rmsnorm_QK_post_rope_W_Q:     [1, d_head]  Q gamma.
         rmsnorm_QK_post_rope_W_K:     [1, d_head]  K gamma.
         K_cache_transposed: K-cache layout flag (NKI kernel only).
-        active_blocks_table: int32 block indices (block KV). [B, num_blocks] for
-                            a single shared KV-head table; the GQA per-head
-                            variant [B, kv_heads, num_blocks] is also accepted
-                            (required to route GQA to the NKI kernel).
+        active_blocks_table: int32 block indices (block KV). [B, num_blocks] is
+                            the shared vLLM table. At kv_heads > 1 the kernel
+                            path converts it to the per-head table. A per-head
+                            table [B, kv_heads, num_blocks] is also accepted; it
+                            needs per-head slots [B, kv_heads, S_tkg] when
+                            update_cache=True.
         K_cache:            Key cache in HBM.
             - 3D: [num_blocks, block_len, d_head]
             - 4D: [num_blocks, kv_heads, block_len, d_head]
@@ -1747,10 +1805,12 @@ def attention_decode(
         attention_dp=attention_dp,
     )
 
-    # 2D-table GQA is already routed to the torch fallback by
-    # _can_use_attention_block_kernel.
-
     if can_use_kernel:
+        # Build the kernel's per-head KV mapping from the shared one. The torch
+        # fallback below keeps the shared mapping, which is the form it supports.
+        active_blocks_table, kv_cache_update_idx = _to_kernel_kv_mapping(
+            active_blocks_table, kv_cache_update_idx, V_cache, update_cache
+        )
         if pos_ids is None and dcp_size == 1:
             attention_mask = _fold_gqa_block_kv_mask(
                 attention_mask, X, W_qkv, V_cache, active_blocks_table
