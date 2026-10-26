@@ -69,8 +69,10 @@ tencent/Hy3-FP8: ~295B-parameter MoE decoder with a static per-tensor FP8 checkp
     `scripts/calibrate_kv_scales.py`, validated against the checkpoint's
     attention weights and the 240 FP8 range); else the checkpoint's
     `self_attn.k_scale` / `v_scale` (the upstream convention), rescaled from
-    the e4m3fn range 448 they are calibrated for to 240; else 1.0 with a
-    warning. tencent/Hy3-FP8 ships no KV scales.
+    the e4m3fn range 448 they are calibrated for to 240; else an error
+    (`HY3_KV_SCALE_ALLOW_DEFAULT=1`: 1.0 with a warning). tencent/Hy3-FP8 ships
+    no KV scales; `kv_profiles/Hy3-FP8_neuron.safetensors` is a calibrated
+    profile (`scripts/calibrate_kv_scales_neuron.py`).
   - K is stored packed (`neuron_config.fp8_packed_kv`, two positions per slot,
     `fp8_kv_layout.py`), required with prefix caching or DCP. Decode reads it
     in the `attention_block_tkg` megakernel (scales as compile-time values;

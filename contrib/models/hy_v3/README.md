@@ -148,7 +148,31 @@ print(outputs[0].outputs[0].text)
 `--kv-cache-dtype fp8` stores K and V as FP8 E4M3 with one static scale per
 layer for K and one for V, halving KV bytes per token. The W8A8 checkpoint is
 unchanged; the scales come from a separate **KV scale profile**
-(`src/kv_scales.py`), produced with llm-compressor:
+(`src/kv_scales.py`). `kv_profiles/Hy3-FP8_neuron.safetensors` is a calibrated
+profile for tencent/Hy3-FP8 (fingerprinted against its attention weights):
+
+```bash
+HY3_KV_SCALE_PROFILE=$PWD/contrib/models/hy_v3/kv_profiles/Hy3-FP8_neuron.safetensors \
+    KV_DTYPE=fp8 MODEL=/path/to/Hy3-FP8 \
+    PREFILL_BUCKETS='[512, 1024, 2048, 4096, 8192]' scripts/serve.sh 16384 32 '[1, 4, 16, 32]' '[4096, 8192]'
+```
+
+To calibrate a profile on Neuron (`scripts/calibrate_kv_scales_neuron.py`):
+the served W8A8 model runs the calibration mix with a BF16 KV cache, prefill
+only, and the per-layer absmax is read from the cache slots the run wrote --
+the values an FP8 cache quantizes. The 75 samples of `kv_calib/full.json`
+(72,458 tokens) are in `bench_data/kv_calib_full_samples.json.gz`, so no
+datasets download is needed; the prefill takes ~16 s after the model compile:
+
+```bash
+python scripts/calibrate_kv_scales_neuron.py calibrate /path/to/Hy3-FP8 \
+    bench_data/kv_calib_full_samples.json.gz kv_scales.safetensors
+```
+
+Or with llm-compressor on a BF16 copy (HF forward on CPU: 27 min for the
+4-layer reduced model on a trn2.48xlarge host, so several hours for the full
+model). On the reduced model the two methods agree to <= 4.5% per layer
+(layers 0-3, K and V; W8A8 vs BF16 weights):
 
 ```bash
 # 1. BF16 copy for the HF forward (calibration only; ~550 GB)
@@ -169,13 +193,14 @@ HY3_KV_SCALE_PROFILE=$PWD/kv_scales.safetensors KV_DTYPE=fp8 MODEL=/path/to/Hy3-
 - **Loading** (`_load_kv_cache_scales`, `kv_scales.resolve_kv_scales`): a
   profile from `HY3_KV_SCALE_PROFILE` (or `<ckpt>/kv_scales.safetensors`);
   else the checkpoint's own `self_attn.k_scale` / `v_scale`, the upstream
-  convention, rescaled by 448 / 240 (they are calibrated for e4m3fn); else 1.0
-  for every layer, with a warning, as in the upstream models. For a profile the
+  convention, rescaled by 448 / 240 (they are calibrated for e4m3fn); else an
+  error. `HY3_KV_SCALE_ALLOW_DEFAULT=1` gives the upstream default instead (1.0
+  for every layer, with a warning), which Hy3 cannot use: its early-layer V is
+  ~0.1-0.2, in the FP8 subnormal range at scale 1. For a profile the
   loader checks the format, direction, the platform FP8 range and per-layer
   fingerprints of the attention weights (`load_weights_lite` reads the scales
-  too). The server log line `Hy3 FP8 KV scales (80 layers) from ...` names the
-  source. tencent/Hy3-FP8 ships no KV scales, so without a profile it runs at
-  scale 1.0. Decode passes
+  too). The server log line `Hy3 FP8 KV scales: source=... layers=80 ...` names
+  the source. tencent/Hy3-FP8 ships no KV scales, so it needs a profile. Decode passes
   the scales to the megakernel as compile-time values, so a new profile
   compiles new decode NEFFs; prefill reads them from a per-layer runtime tensor
   (`kv_scale_t`), so the prefill NEFFs do not depend on the profile and all 80
@@ -208,7 +233,10 @@ HY3_KV_SCALE_PROFILE=$PWD/kv_scales.safetensors KV_DTYPE=fp8 MODEL=/path/to/Hy3-
   prior KV) and hung every rank in a collective with FP8 KV
   (`NRT_EXEC_HW_ERR_DMA_ABORT`; the devices then need a neuron driver reload).
   The trigger was not isolated; prefill buckets <= 2048 were correct in every
-  configuration tried.
+  configuration tried. In the `serve_256k.sh` configuration (BF16 KV) the 16
+  prompts of `bench_data/prompts/in8192_c4` (8192 tokens, two 4096 chunks, the
+  second with prior KV) give 64-token greedy continuations identical to config
+  B without DCP, and the 8k passkey test passes 3/3.
 - **Startup**: the full-model FP8 cold compile of config B with five prefill
   buckets took ~35 min on a trn2.48xlarge; keep `VLLM_NEURON_BARRIER_TIMEOUT`
   (default 3600 s) above the cold compile time of larger configurations.
@@ -256,6 +284,25 @@ HY3_KV_SCALE_PROFILE=$PWD/kv_scales.safetensors KV_DTYPE=fp8 MODEL=/path/to/Hy3-
   same memory). Passkey retrieval (`needle.py`): 12/12 with FP8 KV, as with
   BF16. The FP8 cold compile of this configuration took about 3 h (BF16 about
   1.5 h); keep `VLLM_NEURON_BARRIER_TIMEOUT` above it.
+- **Reproduction on a second trn2.48xlarge** (`results/bench/kv_fp8_configB/`;
+  config B + prefill 512..8192, DCP=1, the same 8139-block pool, profile
+  `kv_profiles/Hy3-FP8_neuron.safetensors` calibrated on Neuron as above; load
+  matrix with the fixed real-text prompts, `bench_fixed.sh "1024 4096 8192
+  16000" "1 4 15"`):
+
+  | | BF16 KV | FP8 KV |
+  |---|---|---|
+  | persistent KV pool per rank | 10,667,950,080 B | 5,333,975,040 B (x 0.5000) |
+  | peak device memory over the run, all ranks | 1201.7 GiB | 893.7 GiB (-308.0 GiB = 48.4% of the BF16 pool; `model_code` +9.9 GiB) |
+  | MATH-500, 500 problems, greedy, no_think, paired | 97.0% | 96.8% (6 vs 5 discordant, exact McNemar p = 1.0) |
+  | 16 x 8192-token prompts, 64-token greedy continuation | | identical to BF16 KV (16/16) |
+  | passkey at 8k (3 depths) | 3/3 | 3/3 |
+  | load matrix, worst P50 change | | TTFT +5% (1024 / c=1, 0.20 -> 0.21 s), TPOT +2.7% (4096 / c=1) |
+  | load matrix, concurrency 15 | | TPOT -2.4..-8.5% (8192: 75.0 -> 68.6 ms), ITL -12.5% at 8k / 16k |
+
+  This run is on commit 55772b8 of the change; the later commits (local copies
+  of the private helpers, the scale-source order) passed the unit, module and
+  integration tests (4/4, two with FP8 KV, the same profile).
 
 ## Compatibility Matrix
 
@@ -674,7 +721,7 @@ HY3_CKPT=/path/to/Hy3-FP8 pytest contrib/models/hy_v3/test/module/ -v -s
 CPU only: FP8 weight transforms (halving, scale layout, padding, expert
 packing), the router against the HuggingFace `HYV3TopKRouter`, the KV scale
 sources (profile validation, checkpoint `k_scale` / `v_scale` with the 448 ->
-240 rescale, the 1.0 default), the packed-K layout and the drift guards that
+240 rescale, the error without scales and the opt-in 1.0 default), the packed-K layout and the drift guards that
 compare the local copies in `src/fp8_kv_layout.py` and
 `src/kernels/moe_tkg_common.py` with the plugin / nkilib originals (skipped when
 those are not importable).
@@ -707,6 +754,7 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 | `scripts/validate_features.py` | segmented prefill, prefix-cache hits, batch-128 vs batch-4 consistency (optionally with DCP) |
 | `scripts/dequant_bf16.py` | BF16 copy of the full checkpoint for KV calibration |
 | `scripts/calibrate_kv_scales.py` | llm-compressor KV calibration, exports the KV scale profile (`kv_calib/*.json` data mixes) |
+| `scripts/calibrate_kv_scales_neuron.py` | KV calibration on Neuron: absmax of the BF16 KV cache slots a prefill-only run writes (`samples` builds the token ids of a `kv_calib/*.json` mix, `calibrate` writes the profile) |
 | `scripts/validate_fp8_kv.py`, `compare_kv_runs.py`, `run_kv_mode.sh` | reduced-model BF16-KV vs FP8-KV runs (modes m1 / m2 / m3: full prefill, packed + prefix, DCP 8) and their comparison |
 | `scripts/kv_acceptance.sh`, `kv_report.py` | full-model acceptance run (manifest, memory sampling, load matrix, MATH-500, >= 30 min stability) and the BF16 / FP8 gate |
 | `scripts/kv_manifest.py`, `kv_mem_sampler.py` | run manifest (args, server env, commit, profile sha256, KV pool bytes) and neuron-monitor memory time series for the gate |

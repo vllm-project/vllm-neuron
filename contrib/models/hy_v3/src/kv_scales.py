@@ -9,10 +9,14 @@
    compressed-tensors / llm-compressor convention the upstream models load),
    rescaled from the OCP e4m3fn range they are calibrated for (448) to this
    platform's clamp;
-3. otherwise 1.0 for every layer (the upstream default), with a warning.
+3. otherwise an error, unless ``$HY3_KV_SCALE_ALLOW_DEFAULT=1`` asks for the
+   upstream default (1.0 for every layer, logged as a warning).
 
 tencent/Hy3-FP8 declares ``kv_cache_scheme: static`` but ships no K/V scales,
-so without a profile it gets case 3.
+so without a profile it gets case 3. Scale 1.0 is not usable for it: V is
+~0.1-0.2 in the early layers, which a direct cast puts in the FP8 subnormal
+range. ``kv_profiles/Hy3-FP8_neuron.safetensors`` is a calibrated profile for
+it (``scripts/calibrate_kv_scales_neuron.py``).
 
 Profile file: one safetensors file with, per decoder layer ``i``,
 
@@ -49,6 +53,7 @@ PROFILE_FORMAT = "hy3-kv-scale-profile/v1"
 # FP8 max of the OCP e4m3fn format that checkpoint KV scales are calibrated for.
 CHECKPOINT_FP8_MAX = 448.0
 PROFILE_ENV = "HY3_KV_SCALE_PROFILE"
+ALLOW_DEFAULT_ENV = "HY3_KV_SCALE_ALLOW_DEFAULT"
 _KEY = "model.layers.{layer}.self_attn.{name}"
 # Small per-layer tensors that identify the attention weights a profile was
 # calibrated for (identical in the full checkpoint and reduced copies of it).
@@ -239,6 +244,15 @@ def resolve_kv_scales(ckpt_dir: str, num_layers: int, target_fp8_max: float) -> 
         r = CHECKPOINT_FP8_MAX / target_fp8_max
         q_k, q_v = ([1.0 / (d * r) for d in ds] for ds in stored)
         return KVScales(q_k, q_v, "checkpoint", f"rescale={r:.4g}")
+    if os.environ.get(ALLOW_DEFAULT_ENV) != "1":
+        raise ValueError(
+            f"FP8 KV cache: no KV scales for {ckpt_dir} (no ${PROFILE_ENV}, no "
+            "<ckpt>/kv_scales.safetensors, no self_attn.k_scale / v_scale in the "
+            "checkpoint). Hy3's V is too small for scale 1.0 (FP8 subnormals): set "
+            f"{PROFILE_ENV} to a calibrated profile, e.g. contrib/models/hy_v3/"
+            "kv_profiles/Hy3-FP8_neuron.safetensors, or calibrate one with "
+            f"scripts/calibrate_kv_scales_neuron.py; {ALLOW_DEFAULT_ENV}=1 forces 1.0."
+        )
     return KVScales([1.0] * num_layers, [1.0] * num_layers, "default", "")
 
 

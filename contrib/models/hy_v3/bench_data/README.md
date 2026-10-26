@@ -10,6 +10,7 @@ time them representatively.
 |---|---|---|
 | `prompts/in{L}_c{C}.jsonl.gz` | `max(8, 4 x C)` prompts of exactly `L` tokens (Hy3 tokenizer, no chat template); L = 1024 / 4096 / 8192 / 16000 / 32768 / 65536 / 85000, C = 1 / 4 / 8 / 15 | `scripts/bench_fixed.sh "<L...>" "<C...>"` |
 | `prefix/in85000_p78336_c{C}.jsonl.gz` | shared-prefix prompts: 85000 tokens = one 78336-token prefix (92.2%, a multiple of the 256-token DCP=8 cache block) + a distinct suffix; 1 warm-up + 10 x C requests, C = 1 / 4 / 8; line 0 holds the prefix, each request stores only its suffix | `scripts/bench_prefix_fixed.sh "<C...>"` |
+| `kv_calib_full_samples.json.gz` | token ids of the 75 FP8 KV calibration samples of `scripts/kv_calib/full.json` (72,458 tokens), as built by `calibrate_kv_scales.build_samples` | `scripts/calibrate_kv_scales_neuron.py calibrate` |
 | `needle.jsonl.gz` | 12 passkey prompts: 16000 / 32768 / 65536 / 85000 tokens (chat-templated, +-16) x depth 0.1 / 0.5 / 0.9 | `scripts/needle.py run bench_data/needle.jsonl.gz` |
 
 `prompts/` follows sglang's `random` dataset: the first user turn of ShareGPT

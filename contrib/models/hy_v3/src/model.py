@@ -1892,8 +1892,8 @@ class HYV3ForCausalLM(nn.Module):
 
         No-op for a BF16 KV cache. Otherwise a KV scale profile, else the
         checkpoint's ``self_attn.k_scale`` / ``v_scale`` (rescaled to this
-        platform's FP8 range), else 1.0 with a warning, as in the upstream
-        models.
+        platform's FP8 range), else an error (1.0 with a warning, as in the
+        upstream models, only with ``HY3_KV_SCALE_ALLOW_DEFAULT=1``).
         """
         from vllm.config import get_current_vllm_config
 

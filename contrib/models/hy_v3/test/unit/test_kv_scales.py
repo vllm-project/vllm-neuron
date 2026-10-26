@@ -126,8 +126,16 @@ def _add_ckpt_kv_scales(ckpt, k, v):
     idx.write_text(json.dumps({"weight_map": {k: f.name for k in t}}))
 
 
-def test_resolve_default_is_one(ckpt, monkeypatch):
+def test_resolve_without_scales_raises(ckpt, monkeypatch):
     monkeypatch.delenv(kv_scales.PROFILE_ENV, raising=False)
+    monkeypatch.delenv(kv_scales.ALLOW_DEFAULT_ENV, raising=False)
+    with pytest.raises(ValueError, match="no KV scales"):
+        kv_scales.resolve_kv_scales(ckpt, N, 240.0)
+
+
+def test_resolve_default_is_one_when_allowed(ckpt, monkeypatch):
+    monkeypatch.delenv(kv_scales.PROFILE_ENV, raising=False)
+    monkeypatch.setenv(kv_scales.ALLOW_DEFAULT_ENV, "1")
     s = kv_scales.resolve_kv_scales(ckpt, N, 240.0)
     assert s.q_k == [1.0] * N and s.q_v == [1.0] * N
     assert s.source == "default"
