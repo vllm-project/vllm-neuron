@@ -31,10 +31,25 @@ pip install -e contrib/models/hy_v3     # imports as `hy_v3_neuron`
 ```
 
 After that, both `vllm serve` and the offline `LLM(...)` API pick up the Neuron
-implementation with no further code. The plugin also adds `"fp8"` (the
-checkpoint's `quant_method`) to the Neuron platform's supported quantizations;
-the model consumes the FP8 weights and scales itself. Nothing outside this
-folder is modified.
+implementation with no further code; the integration test relies on it too
+(`from hy_v3_neuron import register`). No file outside this folder is changed.
+
+How this differs from [contrib/README.md](../../README.md):
+
+- It is neither Option 1 (`ModelRegistry.register_model` in your own script)
+  nor Option 2 (adding the model to `vllm_neuron/model/registry.py`). Option 1
+  is not enough here: the call only registers the architecture in the calling
+  process, vLLM's own GPU `HYV3ForCausalLM` stays registered under the same
+  name, and the engine core and the Neuron workers are spawned processes. The
+  entry point is the "register from your own plugin" route the guidelines
+  allow, run by vLLM in every process. `register()` is the single function to
+  call if you copy `src/` into your own package instead.
+- Besides the `ModelRegistry` entry, `register()` appends `"fp8"` (the
+  checkpoint's `quant_method`) to `NeuronPlatform.supported_quantization` at
+  runtime, because vLLM rejects a checkpoint whose quantization the platform
+  does not list and the plugin has no public hook for adding one. vLLM's own
+  FP8 linear methods are never used: the model consumes the FP8 weights and
+  scales itself. This is the one runtime touch-point beyond the registry.
 
 ### Serve with the OpenAI-compatible server
 
@@ -244,14 +259,15 @@ HY3_KV_SCALE_PROFILE=$PWD/kv_scales.safetensors KV_DTYPE=fp8 MODEL=/path/to/Hy3-
 
 ## Compatibility Matrix
 
-| Instance / software | vllm-neuron 0.29.0.1.2.0 (vLLM 0.29.0) | earlier |
-| ------------------- | -------------------------------------- | ------- |
-| Trn3                | Not tested                             | Not tested |
-| Trn2 (trn2.48xlarge) | Working                               | Not tested with this folder |
+| Instance / Neuron SDK version | 2.33.0      | 2.32 and earlier |
+| ----------------------------- | ----------- | ---------------- |
+| Trn3                          | Not tested  | Not tested       |
+| Trn2 (trn2.48xlarge)          | Working     | Not tested with this folder |
 
-Tested component versions: neuronx-cc 2.28.7631, nki 0.7.0,
-libtorch-neuronx-lite 2.13.0.1.0, Neuron runtime 2.35.30, collectives 2.35.43,
-driver 2.31.7, torch 2.13.0, transformers 5.17.0, Python 3.12.
+Tested with vllm-neuron 0.29.0.1.2.0 (vLLM 0.29.0). Neuron SDK 2.33.0 component
+versions: neuronx-cc 2.28.7631, nki 0.7.0, Neuron runtime 2.35.30, collectives
+2.35.43, tools 2.33.38, driver 2.31.7; also libtorch-neuronx-lite 2.13.0.1.0,
+torch 2.13.0, transformers 5.17.0, Python 3.12.
 
 ## Example Checkpoints
 
@@ -615,30 +631,39 @@ Install the package first (`pip install -e contrib/models/hy_v3`).
 The full model is too large for an FP32 HuggingFace reference, so the test
 builds a 4-layer checkpoint from the real weights (`scripts/make_mini.py`,
 FP8 for vLLM plus a dequantized BF16 copy for HF) and runs the template's
-three-way logit validation, once with flash-attention prefill and once with
-prefix caching (segmented prefill) and batch-4 decode. It needs the whole
-trn2.48xlarge and takes about 12 minutes.
+three-way logit validation in four cases: flash-attention prefill, and prefix
+caching (segmented prefill) with batch-4 decode, each with a BF16 KV cache and
+with an FP8 KV cache (packed K). The FP8-KV cases need a KV scale profile in
+`HY3_KV_SCALE_PROFILE` (a full-model profile also covers the 4-layer model) and
+are skipped without one. It needs the whole trn2.48xlarge and takes about 32
+minutes for the four cases (Neuron SDK 2.33.0: 4 passed).
 
 Two settings differ from the template, because the model runs FP8 activations
 against a BF16 golden: the top-K bounds are 0.1 / 0.12 / 0.15 / 0.15
 (measured <= 0.06), and the argmax divergence tolerance is 0.25 logits instead
 of 1 BF16 ULP. On the flat 4-layer distribution FP8 rounding flips near-ties
 whose golden top-1 / top-2 gap is 0.06-0.125; a real defect shows gaps of
-several logits.
+several logits. The FP8-KV cases pass with the same bounds.
 
 ```bash
-HY3_CKPT=/path/to/Hy3-FP8 pytest contrib/models/hy_v3/test/integration/test_model.py \
-    -v -s --timeout=7200
+HY3_CKPT=/path/to/Hy3-FP8 HY3_KV_SCALE_PROFILE=/path/to/kv_scales.safetensors \
+    pytest contrib/models/hy_v3/test/integration/test_model.py -v -s --timeout=7200
 ```
+
+`HY3_MINI_CKPT` sets where the 4-layer checkpoint is built and cached
+(default `/tmp/hy3_mini4`).
 
 ### Module tests
 
 Single-NeuronCore tests of the FP8 MLP (dense layer, shared expert, 8-way decode
 copy; CTE and TKG paths) and the routed experts (`moe_cte` hybrid, `moe_tkg`,
-`moe_tkg_hits` with 0-3 local hits, `moe_tkg_hits_batch` with 2 / 4 tokens).
-They build the kernel inputs from the real checkpoint (rank-0 shard) through
-the model's own weight loaders and compare against an FP32 fake-quant
-reference.
+`moe_tkg_hits` with 0-3 local hits, `moe_tkg_hits_batch` with 2 / 4 tokens),
+and the FP8 KV attention of layer 0 (`test_fp8_kv_attention.py`: cache writes
+in flash and segmented prefill, two decode steps on the standard, packed and
+packed-fallback layouts, calibrated and unit scales, plus wrong-scale-contract
+controls that must miss). They build the kernel inputs from the real
+checkpoint (rank-0 shard) through the model's own weight loaders and compare
+against an FP32 fake-quant reference.
 
 ```bash
 HY3_CKPT=/path/to/Hy3-FP8 pytest contrib/models/hy_v3/test/module/ -v -s
@@ -647,7 +672,12 @@ HY3_CKPT=/path/to/Hy3-FP8 pytest contrib/models/hy_v3/test/module/ -v -s
 ### Unit tests
 
 CPU only: FP8 weight transforms (halving, scale layout, padding, expert
-packing) and the router against the HuggingFace `HYV3TopKRouter`.
+packing), the router against the HuggingFace `HYV3TopKRouter`, the KV scale
+sources (profile validation, checkpoint `k_scale` / `v_scale` with the 448 ->
+240 rescale, the 1.0 default), the packed-K layout and the drift guards that
+compare the local copies in `src/fp8_kv_layout.py` and
+`src/kernels/moe_tkg_common.py` with the plugin / nkilib originals (skipped when
+those are not importable).
 
 ```bash
 VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
