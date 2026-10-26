@@ -125,16 +125,15 @@ by bf16 rounding in the verify graph.
 
 With several requests in flight the draft also raises throughput. On 48
 LibriSpeech test-other clips (`--max-num-seqs 16`, `decode_context_length_buckets`
-`[512]`, 2 passes per concurrency level), with and without the draft:
+`[512]`, 2 passes per concurrency level), with the draft:
 
 | Concurrent requests | 1 | 2 | 4 | 8 | 16 |
 |---|--:|--:|--:|--:|--:|
-| Real-time factor without draft | 30.8x | 39.6x | 45.7x | 56.4x | 76.0x |
-| Real-time factor with draft | 61.8x | 74.3x | 86.1x | 97.6x | 110.0x |
-| p50 latency without / with draft (ms) | 172 / 91 | 255 / 151 | 462 / 243 | 748 / 399 | 984 / 694 |
-| Acceptance length with draft | 5.28 | 5.31 | 5.30 | 5.30 | 5.28 |
+| Real-time factor | 67.0x | 78.1x | 93.1x | 103.5x | 112.6x |
+| p50 latency (ms) | 85 | 147 | 236 | 389 | 706 |
+| Acceptance length | 5.31 | 5.25 | 5.28 | 5.28 | 5.28 |
 
-WER is 5.71% / 5.58-5.71% without / with the draft at every level.
+Without the draft the real-time factor is 30.8x at 1 and 76.0x at 16 concurrent requests.
 
 #### Long audio: skip the draft for long prompts
 
