@@ -110,3 +110,59 @@ def test_resolve_profile_path(tmp_path, ckpt, monkeypatch):
     assert kv_scales.resolve_profile_path(ckpt).endswith("kv_scales.safetensors")
     monkeypatch.setenv(kv_scales.PROFILE_ENV, "/x/y.safetensors")
     assert kv_scales.resolve_profile_path(ckpt) == "/x/y.safetensors"
+
+
+def _add_ckpt_kv_scales(ckpt, k, v):
+    """Add per-layer self_attn.k_scale / v_scale tensors (checkpoint convention)."""
+    f = Path(ckpt, "model-00000.safetensors")
+    from safetensors.torch import load_file
+
+    t = load_file(str(f))
+    for i, (dk, dv) in enumerate(zip(k, v)):
+        t[kv_scales.scale_key(i, "k_scale")] = torch.tensor(dk)
+        t[kv_scales.scale_key(i, "v_scale")] = torch.tensor(dv)
+    save_file(t, str(f))
+    idx = Path(ckpt, "model.safetensors.index.json")
+    idx.write_text(json.dumps({"weight_map": {k: f.name for k in t}}))
+
+
+def test_resolve_default_is_one(ckpt, monkeypatch):
+    monkeypatch.delenv(kv_scales.PROFILE_ENV, raising=False)
+    s = kv_scales.resolve_kv_scales(ckpt, N, 240.0)
+    assert s.q_k == [1.0] * N and s.q_v == [1.0] * N
+    assert s.source == "default"
+
+
+def test_resolve_checkpoint_scales_rescaled_to_target(ckpt, monkeypatch):
+    # A checkpoint scale d is for e4m3fn (448); at a 240 clamp it becomes d * 448 / 240.
+    monkeypatch.delenv(kv_scales.PROFILE_ENV, raising=False)
+    _add_ckpt_kv_scales(ckpt, [0.01, 0.02, 0.04], [0.001, 0.002, 0.004])
+    s = kv_scales.resolve_kv_scales(ckpt, N, 240.0)
+    assert s.q_k == pytest.approx([240.0 / (448.0 * d) for d in (0.01, 0.02, 0.04)])
+    assert s.q_v == pytest.approx([240.0 / (448.0 * d) for d in (0.001, 0.002, 0.004)])
+    assert s.source == "checkpoint"
+    # Same range: no rescale.
+    assert kv_scales.resolve_kv_scales(ckpt, N, 448.0).q_k == pytest.approx([100.0, 50.0, 25.0])
+
+
+def test_resolve_profile_overrides_checkpoint(tmp_path, ckpt, monkeypatch):
+    p = _profile(tmp_path, ckpt)
+    _add_ckpt_kv_scales(ckpt, [1.0] * N, [1.0] * N)
+    monkeypatch.setenv(kv_scales.PROFILE_ENV, p)
+    s = kv_scales.resolve_kv_scales(ckpt, N, 240.0)
+    assert s.q_k == pytest.approx([20.0, 10.0, 5.0])
+    assert s.source == "profile" and f"path={p} sha256=" in s.detail
+
+
+def test_partial_checkpoint_scales_rejected(ckpt, monkeypatch):
+    monkeypatch.delenv(kv_scales.PROFILE_ENV, raising=False)
+    _add_ckpt_kv_scales(ckpt, [0.01, 0.02], [0.001, 0.002])  # layer 2 missing
+    with pytest.raises(KeyError, match="some layers only"):
+        kv_scales.resolve_kv_scales(ckpt, N, 240.0)
+
+
+def test_non_positive_checkpoint_scale_rejected(ckpt, monkeypatch):
+    monkeypatch.delenv(kv_scales.PROFILE_ENV, raising=False)
+    _add_ckpt_kv_scales(ckpt, [0.01, 0.0, 0.04], [0.001, 0.002, 0.004])
+    with pytest.raises(ValueError, match="finite and positive"):
+        kv_scales.resolve_kv_scales(ckpt, N, 240.0)

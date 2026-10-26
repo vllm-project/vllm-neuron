@@ -77,12 +77,12 @@ class HYV3ForCausalLM(nn.Module):
         cache_dtype = vllm_config.cache_config.cache_dtype
         if cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
             raise ValueError(
-                "Hy3 supports a BF16 KV cache or an FP8 (E4M3) KV cache with a "
-                f"calibrated KV scale profile; got kv_cache_dtype={cache_dtype!r}."
+                "Hy3 supports a BF16 KV cache or an FP8 (E4M3) KV cache; "
+                f"got kv_cache_dtype={cache_dtype!r}."
             )
         if cache_dtype in ("fp8", "fp8_e4m3"):
-            # The checkpoint ships no KV scales: they come from a calibrated
-            # profile (HY3_KV_SCALE_PROFILE), loaded and validated by the model.
+            # KV scales: a profile, the checkpoint's k_scale / v_scale, or 1.0
+            # (see kv_scales.resolve_kv_scales), loaded by the model.
             packed = bool(neuron_config is not None and neuron_config.fp8_packed_kv)
             dcp = getattr(parallel, "decode_context_parallel_size", 1)
             prefix = bool(vllm_config.cache_config.enable_prefix_caching)

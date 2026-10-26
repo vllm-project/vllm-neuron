@@ -1,8 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Hy3 FP8 KV-cache scale profile: format, fingerprint, load and validation.
+"""Hy3 FP8 KV-cache scales: where they come from, the profile format and validation.
+
+``resolve_kv_scales`` picks, in order:
+
+1. a KV scale profile (``$HY3_KV_SCALE_PROFILE``, else
+   ``<ckpt>/kv_scales.safetensors``), the format below;
+2. per-layer ``self_attn.k_scale`` / ``v_scale`` in the checkpoint itself (the
+   compressed-tensors / llm-compressor convention the upstream models load),
+   rescaled from the OCP e4m3fn range they are calibrated for (448) to this
+   platform's clamp;
+3. otherwise 1.0 for every layer (the upstream default), with a warning.
 
 tencent/Hy3-FP8 declares ``kv_cache_scheme: static`` but ships no K/V scales,
-so FP8 KV needs a calibrated profile next to the (unchanged) W8A8 checkpoint.
+so without a profile it gets case 3.
 
 Profile file: one safetensors file with, per decoder layer ``i``,
 
@@ -29,12 +39,15 @@ import json
 import math
 import os
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
 PROFILE_FORMAT = "hy3-kv-scale-profile/v1"
+# FP8 max of the OCP e4m3fn format that checkpoint KV scales are calibrated for.
+CHECKPOINT_FP8_MAX = 448.0
 PROFILE_ENV = "HY3_KV_SCALE_PROFILE"
 _KEY = "model.layers.{layer}.self_attn.{name}"
 # Small per-layer tensors that identify the attention weights a profile was
@@ -53,11 +66,23 @@ def scale_key(layer: int, name: str) -> str:
 
 
 class _Index:
+    """Tensor lookup in a sharded (index.json) or single-file checkpoint."""
+
     def __init__(self, ckpt_dir: str):
         self.root = ckpt_dir
-        index = json.loads(Path(ckpt_dir, "model.safetensors.index.json").read_text())
-        self.weight_map = index["weight_map"]
+        index = Path(ckpt_dir, "model.safetensors.index.json")
+        single = Path(ckpt_dir, "model.safetensors")
+        if index.exists():
+            self.weight_map = json.loads(index.read_text())["weight_map"]
+        elif single.exists():
+            with safe_open(str(single), "pt") as f:
+                self.weight_map = dict.fromkeys(f.keys(), single.name)
+        else:
+            self.weight_map = {}
         self._handles = {}
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.weight_map
 
     def get(self, key: str) -> torch.Tensor:
         f = self.weight_map[key]
@@ -73,11 +98,17 @@ def attn_fingerprints(ckpt_dir: str, num_layers: int) -> list[str]:
     for i in range(num_layers):
         h = hashlib.sha256()
         for k in _FINGERPRINT_KEYS:
-            t = idx.get(f"model.layers.{i}.self_attn.{k}").to(torch.float32)
+            t = idx.get(scale_key(i, k)).to(torch.float32)
             h.update(k.encode())
             h.update(t.contiguous().numpy().tobytes())
         out.append(h.hexdigest()[:16])
     return out
+
+
+def _positive(what: str, d: float) -> float:
+    if not (math.isfinite(d) and d > 0):
+        raise ValueError(f"{what}={d} is not finite and positive")
+    return d
 
 
 def save_profile(
@@ -92,8 +123,7 @@ def save_profile(
     tensors = {}
     for i, (dk, dv) in enumerate(zip(k_dequant, v_dequant)):
         for name, d in (("k_scale", dk), ("v_scale", dv)):
-            if not (math.isfinite(d) and d > 0):
-                raise ValueError(f"layer {i} {name}={d} is not finite and positive")
+            _positive(f"layer {i} {name}", d)
             tensors[scale_key(i, name)] = torch.tensor(d, dtype=torch.float32)
     meta = {k: v if isinstance(v, str) else json.dumps(v) for k, v in metadata.items()}
     meta["format"] = PROFILE_FORMAT
@@ -144,9 +174,7 @@ def load_profile(
                 key = scale_key(i, name)
                 if key not in keys:
                     raise KeyError(f"{path}: missing {key}")
-                d = float(f.get_tensor(key).float().reshape(()))
-                if not (math.isfinite(d) and d > 0):
-                    raise ValueError(f"{path}: {key}={d} is not finite and positive")
+                d = _positive(f"{path}: {key}", float(f.get_tensor(key).float().reshape(())))
                 dst.append(1.0 / d)
     if check_fingerprint:
         want = json.loads(meta.get("attn_fingerprints", "[]"))
@@ -162,6 +190,56 @@ def load_profile(
     meta = dict(meta)
     meta["sha256"] = file_sha256(path)
     return q_k, q_v, meta
+
+
+def checkpoint_kv_dequant(
+    ckpt_dir: str, num_layers: int
+) -> tuple[list[float], list[float]] | None:
+    """Per-layer DEQUANT K/V scales stored in the checkpoint, or None if it has none.
+
+    Keys ``model.layers.{i}.self_attn.k_scale`` / ``v_scale`` (one fp32 scalar
+    each), for an FP8 range of ``CHECKPOINT_FP8_MAX``. Some layers having them
+    and others not is an error.
+    """
+    idx = _Index(ckpt_dir)
+    keys = [scale_key(i, n) for i in range(num_layers) for n in ("k_scale", "v_scale")]
+    missing = [k for k in keys if k not in idx]
+    if len(missing) == len(keys):
+        return None
+    if missing:
+        raise KeyError(f"{ckpt_dir}: has KV scales for some layers only; missing {missing[:4]}")
+    vals = [_positive(f"{ckpt_dir}: {k}", float(idx.get(k).float().reshape(()))) for k in keys]
+    return vals[0::2], vals[1::2]
+
+
+class KVScales(NamedTuple):
+    """Per-layer QUANT scales and where they came from (``source``: profile /
+    checkpoint / default; ``detail``: ``key=value`` text for the log)."""
+
+    q_k: list[float]
+    q_v: list[float]
+    source: str
+    detail: str
+
+
+def resolve_kv_scales(ckpt_dir: str, num_layers: int, target_fp8_max: float) -> KVScales:
+    """Per-layer K/V QUANT scales, from the first source that has them.
+
+    See the module docstring for the order. A checkpoint scale ``d`` maps
+    ``CHECKPOINT_FP8_MAX`` to the activation range; on a platform that clamps
+    at ``target_fp8_max`` the same range needs ``d * CHECKPOINT_FP8_MAX /
+    target_fp8_max``, otherwise everything above ``target_fp8_max * d`` clips.
+    """
+    path = resolve_profile_path(ckpt_dir)
+    if path is not None:
+        q_k, q_v, meta = load_profile(path, ckpt_dir, num_layers, target_fp8_max)
+        return KVScales(q_k, q_v, "profile", f"path={path} sha256={meta['sha256'][:16]}")
+    stored = checkpoint_kv_dequant(ckpt_dir, num_layers)
+    if stored is not None:
+        r = CHECKPOINT_FP8_MAX / target_fp8_max
+        q_k, q_v = ([1.0 / (d * r) for d in ds] for ds in stored)
+        return KVScales(q_k, q_v, "checkpoint", f"rescale={r:.4g}")
+    return KVScales([1.0] * num_layers, [1.0] * num_layers, "default", "")
 
 
 def resolve_profile_path(ckpt_dir: str) -> str | None:

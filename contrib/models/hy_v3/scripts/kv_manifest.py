@@ -3,7 +3,7 @@
 Usage: python kv_manifest.py <serve_log> <out.json> [--repo <vllm-neuron checkout>]
 
 Reads the server log (vLLM non-default args, engine version, KV pool size, the
-Hy3 KV scale profile and KV pool lines) and, if a `vllm serve` process is
+Hy3 FP8 KV scales (source, profile) and KV pool lines) and, if a `vllm serve` process is
 running, its command line and the NEURON_* / VLLM_* / HY3_* / KV_* / *_BUCKETS
 environment. Adds the repo commit and a hash of its uncommitted diff, the
 sha256 of the KV scale profile file and the installed package versions.
@@ -63,8 +63,11 @@ def parse_log(path):
     m["vllm_engine"] = v.group(1) if v else None
     p = re.search(r"GPU KV cache size: ([\d,]+) tokens", text)
     m["kv_cache_tokens"] = int(p.group(1).replace(",", "")) if p else None
-    pr = sorted(set(re.findall(r"Hy3 FP8 KV scale profile (\S+) \(sha256 ([0-9a-f]+), (\d+) layers\)", text)))
-    m["kv_scale_profile"] = [{"path": x[0], "sha256_prefix": x[1], "layers": int(x[2])} for x in pr]
+    # src/model.py _load_kv_cache_scales: "Hy3 FP8 KV scales: source=<s> layers=<n> [path=<p> sha256=<h>] ..."
+    sc = sorted(set(re.findall(
+        r"Hy3 FP8 KV scales: source=(\w+) layers=(\d+)(?: path=(\S+) sha256=([0-9a-f]+))?", text)))
+    m["kv_scale_source"] = sorted({s for s, *_ in sc})
+    m["kv_scale_profile"] = [{"path": p, "sha256_prefix": h, "layers": int(n)} for s, n, p, h in sc if s == "profile"]
     pools = sorted(set(re.findall(r"Hy3 KV pool: (.*) on this rank", text)))
     m["kv_pool_per_rank"] = pools
     b = [int(x) for x in re.findall(r"Hy3 KV pool: .*?, (\d+) bytes on this rank", text)]

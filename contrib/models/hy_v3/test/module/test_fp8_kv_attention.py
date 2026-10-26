@@ -30,11 +30,8 @@ import torch
 from conftest import TRN2_FP8_MAX, fake_quant, rel_err, rmsnorm
 from hy_v3_neuron import model as hy_model
 from hy_v3_neuron.config import HYV3Config
+from hy_v3_neuron.fp8_kv_layout import swizzle_packed_k, unswizzle_packed_k
 
-from vllm_neuron.functional.attention.attention_decode import (
-    _swizzle_packed_k,
-    _unswizzle_packed_k,
-)
 from vllm_neuron.utils.weight_loader import get_weight_loader
 
 FP8 = torch.float8_e4m3fn
@@ -51,7 +48,7 @@ WRONG_MIN = 0.2
 def _check(err, kind):
     """``unit`` (scale 1, i.e. a direct cast) is reported, not held to OUT_TOL:
     Hy3's V is ~0.1-0.2 in magnitude, so a direct cast lands it in the FP8
-    subnormal range -- the reason the model requires a calibrated profile."""
+    subnormal range (what the model gets without a KV scale profile)."""
     assert err == err, "NaN output"
     if kind != "unit":
         assert err < OUT_TOL
@@ -195,7 +192,7 @@ def _codes(x_fp32, qscale):
 
 
 def _bind(attn, k_u8, v_u8, packed):
-    k = _swizzle_packed_k(k_u8) if packed else k_u8
+    k = swizzle_packed_k(k_u8) if packed else k_u8
     attn.k_cache = k.contiguous().view(FP8).to(DEVICE)
     attn.v_cache = v_u8.contiguous().view(FP8).to(DEVICE)
     attn.fp8_packed = packed
@@ -205,7 +202,7 @@ def _host_caches(attn):
     """Device caches -> standard-layout uint8 K, V."""
     k = attn.k_cache.cpu().view(torch.uint8)
     if k.dim() == 5:
-        k = _unswizzle_packed_k(k)
+        k = unswizzle_packed_k(k)
     return k, attn.v_cache.cpu().view(torch.uint8)
 
 

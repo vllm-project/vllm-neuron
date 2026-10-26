@@ -43,7 +43,7 @@ MPID=$!
 for ph in $PHASES; do
   case $ph in
   mem)
-    grep -a -E "KV cache size|Maximum concurrency|num_gpu_blocks|KV scale profile|kv_cache_dtype|fp8_packed" \
+    grep -a -E "KV cache size|Maximum concurrency|num_gpu_blocks|Hy3 FP8 KV scales|kv_cache_dtype|fp8_packed" \
       "$SERVE_LOG" | sort -u > "$OUT/kv_pool_log.txt"
     timeout 30 neuron-monitor 2>/dev/null | head -n 2 > "$OUT/neuron_monitor.json"
     log "mem: $(grep -a -m1 'KV cache size' "$OUT/kv_pool_log.txt")"

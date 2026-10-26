@@ -151,10 +151,16 @@ HY3_KV_SCALE_PROFILE=$PWD/kv_scales.safetensors KV_DTYPE=fp8 MODEL=/path/to/Hy3-
   the per-head q/k-norm and RoPE, V after `v_proj`, before the GQA repeat --
   what the Neuron cache stores. The exported scale is the DEQUANT scale for the
   Trn2 range, `absmax / 240` (llm-compressor's own scale is `absmax / 448`).
-- **Loading**: `HY3_KV_SCALE_PROFILE` (or `<ckpt>/kv_scales.safetensors`).
-  A missing profile is an error (no silent scale 1.0). The loader checks the
-  format, direction, the platform FP8 range and per-layer fingerprints of the
-  attention weights (`load_weights_lite` reads the profile too). Decode passes
+- **Loading** (`_load_kv_cache_scales`, `kv_scales.resolve_kv_scales`): a
+  profile from `HY3_KV_SCALE_PROFILE` (or `<ckpt>/kv_scales.safetensors`);
+  else the checkpoint's own `self_attn.k_scale` / `v_scale`, the upstream
+  convention, rescaled by 448 / 240 (they are calibrated for e4m3fn); else 1.0
+  for every layer, with a warning, as in the upstream models. For a profile the
+  loader checks the format, direction, the platform FP8 range and per-layer
+  fingerprints of the attention weights (`load_weights_lite` reads the scales
+  too). The server log line `Hy3 FP8 KV scales (80 layers) from ...` names the
+  source. tencent/Hy3-FP8 ships no KV scales, so without a profile it runs at
+  scale 1.0. Decode passes
   the scales to the megakernel as compile-time values, so a new profile
   compiles new decode NEFFs; prefill reads them from a per-layer runtime tensor
   (`kv_scale_t`), so the prefill NEFFs do not depend on the profile and all 80
@@ -171,8 +177,8 @@ HY3_KV_SCALE_PROFILE=$PWD/kv_scales.safetensors KV_DTYPE=fp8 MODEL=/path/to/Hy3-
   segmented kernels, folding `1 / q_k` into the softmax scale and dividing the
   output by `q_v`. Under DCP this is required: the KV-parallel kernel returns
   wrong results for chunks with prior KV when it reads the packed FP8 cache.
-  For non-DCP prefill `HY3_FP8_KV_PREFILL_READ=packed` keeps the in-kernel
-  packed read (validated on the reduced model only).
+  Without DCP the in-kernel packed read is correct but makes the full-model
+  prefill NEFFs 10-16x larger, so the BF16 copy is used there too.
 - **Layouts**: prefix caching / DCP need the packed K layout
   (`"fp8_packed_kv": true`, set by `serve.sh` for FP8), which the decode kernel
   reads directly. Decode buckets the packed kernel cannot take read through an

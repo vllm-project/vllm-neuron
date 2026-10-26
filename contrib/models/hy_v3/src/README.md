@@ -61,7 +61,28 @@ tencent/Hy3-FP8: ~295B-parameter MoE decoder with a static per-tensor FP8 checkp
   On vllm-neuron 0.24 the CTE MLP kernel gave wrong results otherwise; on
   0.29 the unpadded shape is correct too, the padding is kept as the
   validated path.
-- KV cache is BF16 only (the checkpoint has no KV scales).
+- KV cache: BF16 (default) or FP8 E4M3 (`--kv-cache-dtype fp8`), one static
+  scale per layer for K and one for V; the cache write is
+  `fp8(clamp(x * q, +-240))`, q = 1 / dequant scale.
+  - Scales (`kv_scales.resolve_kv_scales`, in this order): a KV scale profile
+    (`$HY3_KV_SCALE_PROFILE` or `<ckpt>/kv_scales.safetensors`, made by
+    `scripts/calibrate_kv_scales.py`, validated against the checkpoint's
+    attention weights and the 240 FP8 range); else the checkpoint's
+    `self_attn.k_scale` / `v_scale` (the upstream convention), rescaled from
+    the e4m3fn range 448 they are calibrated for to 240; else 1.0 with a
+    warning. tencent/Hy3-FP8 ships no KV scales.
+  - K is stored packed (`neuron_config.fp8_packed_kv`, two positions per slot,
+    `fp8_kv_layout.py`), required with prefix caching or DCP. Decode reads it
+    in the `attention_block_tkg` megakernel (scales as compile-time values;
+    buckets whose per-rank context is too small for the packed kernel go
+    through an un-swizzled copy). Prefill writes the FP8 cache and reads a
+    BF16 copy of the request's blocks; its scales are a graph input
+    (`kv_scale_t`) so all 80 layers stay one module for the compiler.
+  - Decode folds the V scale into the O-projection's static input scale (and
+    its inverse into the weight scale), so the FP8 input keeps its range;
+    prefill rescales the attention output explicitly.
+  - With DCP > 1, keep prefill (Q) buckets <= 2048 (see `../README.md`, "DCP
+    prefill buckets").
 
 ## Feature Status
 
@@ -73,7 +94,7 @@ tencent/Hy3-FP8: ~295B-parameter MoE decoder with a static per-tensor FP8 checkp
 | DCP (decode context parallel) | ✅ | `--decode-context-parallel-size 8 --cp-kv-cache-interleave-size <block_size>`; 8x KV capacity at TP=64. On 0.29 validated on the 4-layer model (cos >= 0.9988 incl. prefix-cache hits); full-model performance only measured on 0.24 |
 | DP / attention DP / MLP DP | ❌ | rejected at startup |
 | MTP / Eagle3 spec decode | ❌ | |
-| FP8 KV cache       | ❌ | |
+| FP8 KV cache       | ✅ | `--kv-cache-dtype fp8` + `"fp8_packed_kv": true`, scales from a KV scale profile (else the checkpoint's, else 1.0; Hy3-FP8 has none); half the KV bytes per token (2x KV capacity). Full model on 0.29: MATH-500 within run-to-run noise of BF16 KV at DCP 1 and 8, KV pool x0.500 exactly; at 85k context TPOT -22% at DCP 1 (see `../README.md`, "FP8 KV cache"). 4-layer logits: `test/integration/test_model.py` |
 | On-device sampling | ✅ | |
 | Prefix caching (segmented prefill) | ✅ | several prefill buckets can share one `kv_segment_size` |
 
@@ -85,6 +106,17 @@ vllm serve tencent/Hy3-FP8 \
     --enable-expert-parallel \
     --max-model-len 4096 \
     --max-num-seqs 4
+
+# FP8 KV cache (2x KV capacity); scales from a calibrated profile
+HY3_KV_SCALE_PROFILE=/path/to/kv_scales.safetensors \
+vllm serve tencent/Hy3-FP8 \
+    --tensor-parallel-size 64 \
+    --enable-expert-parallel \
+    --block-size 32 \
+    --kv-cache-dtype fp8 \
+    --max-model-len 16384 \
+    --max-num-seqs 32 \
+    --additional-config '{"neuron_config": {"fp8_packed_kv": true}}'
 
 # Many long-context requests: shard the replicated KV cache 8 ways
 vllm serve tencent/Hy3-FP8 \

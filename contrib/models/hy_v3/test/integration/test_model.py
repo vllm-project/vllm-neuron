@@ -20,6 +20,10 @@ Environment:
                  HY3_MINI_CKPT already holds a reduced checkpoint).
   HY3_MINI_CKPT  Where the reduced checkpoint is built / cached
                  (default: /tmp/hy3_mini<NUM_LAYERS>).
+  HY3_KV_SCALE_PROFILE  KV scale profile for the FP8-KV cases (the checkpoint
+                 ships no KV scales; scripts/calibrate_kv_scales.py makes one, a
+                 full-model profile also covers the reduced model). Without it
+                 the FP8-KV cases are skipped.
 
 Run on a trn2.48xlarge (TP=64, full EP):
 
@@ -93,16 +97,25 @@ def mini_ckpt() -> Path:
 
 @pytest.mark.integration
 @pytest.mark.parametrize(
-    "batch_size, seq_len, prefix_caching",
+    "batch_size, seq_len, prefix_caching, kv_cache_dtype",
     [
-        (1, 2048, False),  # flash-attention prefill
-        (4, 2048, True),  # segmented prefill (prefix caching), batch-4 decode
+        (1, 2048, False, "auto"),  # flash-attention prefill
+        (4, 2048, True, "auto"),  # segmented prefill (prefix caching), batch-4 decode
+        # FP8 KV cache (packed K, as served): the same two prefill paths
+        (1, 2048, False, "fp8"),
+        (4, 2048, True, "fp8"),
     ],
 )
 def test_model_accuracy(
-    mini_ckpt: Path, batch_size: int, seq_len: int, prefix_caching: bool
+    mini_ckpt: Path,
+    batch_size: int,
+    seq_len: int,
+    prefix_caching: bool,
+    kv_cache_dtype: str,
 ) -> None:
     """Serve the reduced Hy3 checkpoint through vLLM and validate its logits."""
+    if kv_cache_dtype == "fp8" and not os.environ.get("HY3_KV_SCALE_PROFILE"):
+        pytest.skip("set HY3_KV_SCALE_PROFILE to a KV scale profile for the FP8-KV cases")
     from transformers import AutoConfig, AutoTokenizer
     from vllm import LLM
 
@@ -121,7 +134,8 @@ def test_model_accuracy(
     register()
 
     fp8_path, bf16_path = str(mini_ckpt / "fp8"), str(mini_ckpt / "bf16")
-    print(f"Testing Hy3 with {batch_size=}, {seq_len=}, {prefix_caching=}")
+    case = f"{batch_size=}, {seq_len=}, {prefix_caching=}, {kv_cache_dtype=}"
+    print(f"Testing Hy3 with {case}")
 
     model_config = AutoConfig.from_pretrained(bf16_path)
     tokenizer = AutoTokenizer.from_pretrained(bf16_path)
@@ -143,6 +157,8 @@ def test_model_accuracy(
     }
     if prefix_caching:
         neuron_config["kv_segment_size_buckets"] = [seq_len]
+    if kv_cache_dtype == "fp8":
+        neuron_config["fp8_packed_kv"] = True
 
     # max_logprobs / logprobs_mode / async_scheduling / all_greedy are required
     # by the logit validation (see contrib/models/template).
@@ -157,6 +173,7 @@ def test_model_accuracy(
         max_logprobs=-1,
         logprobs_mode="raw_logits",
         enable_prefix_caching=prefix_caching,
+        kv_cache_dtype=kv_cache_dtype,
         async_scheduling=False,
         additional_config={"neuron_config": neuron_config},
     )
@@ -176,10 +193,8 @@ def test_model_accuracy(
             divergence_n_ulps=None,
             divergence_difference_tol=DIVERGENCE_TOL,
         )
-        assert result.passed, (
-            f"Logit validation failed for {batch_size=}, {seq_len=}, {prefix_caching=}"
-        )
+        assert result.passed, f"Logit validation failed for {case}"
     finally:
         llm.llm_engine.engine_core.shutdown()
 
-    print(f"Test passed for {batch_size=}, {seq_len=}, {prefix_caching=}")
+    print(f"Test passed for {case}")

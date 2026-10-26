@@ -33,7 +33,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "src"))
 import kv_scales  # noqa: E402  (src/kv_scales.py: torch + safetensors only)
 
-TORCH_FP8_MAX = 448.0  # torch.finfo(torch.float8_e4m3fn).max, llm-compressor's range
+TORCH_FP8_MAX = kv_scales.CHECKPOINT_FP8_MAX  # e4m3fn max, llm-compressor's range
 
 
 # ── calibration data ──────────────────────────────────────────────────────

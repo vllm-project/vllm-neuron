@@ -11,8 +11,8 @@
 #   KV_CAP           VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION (default: 0.45)
 #   PORT             API port (default: 8000)
 #   EP               neuron_config.ep_degree (default: full EP=64)
-#   KV_DTYPE         --kv-cache-dtype: auto (BF16, default) or fp8. FP8 needs a KV scale
-#                    profile (HY3_KV_SCALE_PROFILE, see calibrate_kv_scales.py) and uses
+#   KV_DTYPE         --kv-cache-dtype: auto (BF16, default) or fp8. FP8 takes its KV scales
+#                    from HY3_KV_SCALE_PROFILE (see calibrate_kv_scales.py; else 1.0) and uses
 #                    the packed K layout ("fp8_packed_kv"; FP8_PACKED=0 turns it off)
 #   NUM_BLOCKS       --num-gpu-blocks-override (e.g. the same KV token count for BF16/FP8)
 #   EXTRA_ARGS       appended to the vllm serve command line (e.g. --no-async-scheduling)
