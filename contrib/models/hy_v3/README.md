@@ -31,10 +31,25 @@ pip install -e contrib/models/hy_v3     # imports as `hy_v3_neuron`
 ```
 
 After that, both `vllm serve` and the offline `LLM(...)` API pick up the Neuron
-implementation with no further code. The plugin also adds `"fp8"` (the
-checkpoint's `quant_method`) to the Neuron platform's supported quantizations;
-the model consumes the FP8 weights and scales itself. Nothing outside this
-folder is modified.
+implementation with no further code; the integration test relies on it too
+(`from hy_v3_neuron import register`). No file outside this folder is changed.
+
+How this differs from [contrib/README.md](../../README.md):
+
+- It is neither Option 1 (`ModelRegistry.register_model` in your own script)
+  nor Option 2 (adding the model to `vllm_neuron/model/registry.py`). Option 1
+  is not enough here: the call only registers the architecture in the calling
+  process, vLLM's own GPU `HYV3ForCausalLM` stays registered under the same
+  name, and the engine core and the Neuron workers are spawned processes. The
+  entry point is the "register from your own plugin" route the guidelines
+  allow, run by vLLM in every process. `register()` is the single function to
+  call if you copy `src/` into your own package instead.
+- Besides the `ModelRegistry` entry, `register()` appends `"fp8"` (the
+  checkpoint's `quant_method`) to `NeuronPlatform.supported_quantization` at
+  runtime, because vLLM rejects a checkpoint whose quantization the platform
+  does not list and the plugin has no public hook for adding one. vLLM's own
+  FP8 linear methods are never used: the model consumes the FP8 weights and
+  scales itself. This is the one runtime touch-point beyond the registry.
 
 ### Serve with the OpenAI-compatible server
 
@@ -99,8 +114,9 @@ print(outputs[0].outputs[0].text)
   whatever the request's real length (vllm-neuron 0.21+ makes this opt-in;
   the NxDI-based 0.2.x bucketed decode by sequence length by default). The
   configs below all set it.
-- Not supported: data parallel / attention DP, MTP speculative decoding, FP8
-  KV cache (the checkpoint has no KV scales). They are rejected at startup.
+- Not supported: data parallel / attention DP, MTP speculative decoding.
+  They are rejected at startup. FP8 KV cache needs a calibrated KV scale
+  profile (the checkpoint ships none); see "FP8 KV cache" below.
 - `--decode-context-parallel-size 8 --cp-kv-cache-interleave-size 32` shards
   the replicated KV heads 8 ways (8x KV capacity) for many concurrent
   long-context requests. On 0.29 it is validated on the 4-layer model
@@ -127,16 +143,131 @@ print(outputs[0].outputs[0].text)
   sampler for an argmax and saves about 0.5 ms per token; requests that set
   a temperature are then decoded greedily too.
 
+## FP8 KV cache
+
+`--kv-cache-dtype fp8` stores K and V as FP8 E4M3 with one static scale per
+layer for K and one for V, halving KV bytes per token. The W8A8 checkpoint is
+unchanged; the scales come from a separate **KV scale profile**
+(`src/kv_scales.py`), produced with llm-compressor:
+
+```bash
+# 1. BF16 copy for the HF forward (calibration only; ~550 GB)
+python -I scripts/dequant_bf16.py /path/to/Hy3-FP8 /path/to/hy3_bf16
+# 2. llm-compressor KV calibration -> profile (CPU, ~3 h for the full model)
+python -I scripts/calibrate_kv_scales.py --model /path/to/hy3_bf16 --fp8-ckpt /path/to/Hy3-FP8 \
+    --config scripts/kv_calib/full.json --out kv_scales.safetensors --report kv_scales.report.json
+# 3. serve (same flags as BF16 KV plus the profile and the packed K layout)
+HY3_KV_SCALE_PROFILE=$PWD/kv_scales.safetensors KV_DTYPE=fp8 MODEL=/path/to/Hy3-FP8 \
+    PREFILL_BUCKETS='[512, 1024, 2048, 4096, 8192]' scripts/serve.sh 16384 32 '[1, 4, 16, 32]' '[4096, 8192]'
+```
+
+- **Statistics**: `QuantizationModifier(kv_cache_scheme=...)` only (no weight or
+  activation scheme), `static_minmax` observer, per-tensor. K is observed after
+  the per-head q/k-norm and RoPE, V after `v_proj`, before the GQA repeat --
+  what the Neuron cache stores. The exported scale is the DEQUANT scale for the
+  Trn2 range, `absmax / 240` (llm-compressor's own scale is `absmax / 448`).
+- **Loading** (`_load_kv_cache_scales`, `kv_scales.resolve_kv_scales`): a
+  profile from `HY3_KV_SCALE_PROFILE` (or `<ckpt>/kv_scales.safetensors`);
+  else the checkpoint's own `self_attn.k_scale` / `v_scale`, the upstream
+  convention, rescaled by 448 / 240 (they are calibrated for e4m3fn); else 1.0
+  for every layer, with a warning, as in the upstream models. For a profile the
+  loader checks the format, direction, the platform FP8 range and per-layer
+  fingerprints of the attention weights (`load_weights_lite` reads the scales
+  too). The server log line `Hy3 FP8 KV scales (80 layers) from ...` names the
+  source. tencent/Hy3-FP8 ships no KV scales, so without a profile it runs at
+  scale 1.0. Decode passes
+  the scales to the megakernel as compile-time values, so a new profile
+  compiles new decode NEFFs; prefill reads them from a per-layer runtime tensor
+  (`kv_scale_t`), so the prefill NEFFs do not depend on the profile and all 80
+  prefill layers stay identical (per-layer constants there kept the compiler
+  from reusing one layer for the others: full-model prefill NEFFs 10-16x larger
+  and a cold compile of hours).
+- **Kernel contract** (installed nkilib, nki 0.7.0): the decode megakernel takes
+  QUANT scales and reads the history undequantized, so the softmax scale carries
+  `1 / q_k` and the STATIC O-projection gets `input_scale * q_v` and
+  `weight_scale / q_v` (scaling only the weight scale, as the kernel docstring
+  suggests, clips the O-proj input at `240 / q_v` of its range).
+- **Prefill read**: segmented prefill (prefix caching, chunking, DCP) reads a
+  BF16 copy of the request's own blocks (exact for FP8 codes) with the BF16
+  segmented kernels, folding `1 / q_k` into the softmax scale and dividing the
+  output by `q_v`. Under DCP this is required: the KV-parallel kernel returns
+  wrong results for chunks with prior KV when it reads the packed FP8 cache.
+  Without DCP the in-kernel packed read is correct but makes the full-model
+  prefill NEFFs 10-16x larger, so the BF16 copy is used there too.
+- **Layouts**: prefix caching / DCP need the packed K layout
+  (`"fp8_packed_kv": true`, set by `serve.sh` for FP8), which the decode kernel
+  reads directly. Decode buckets the packed kernel cannot take read through an
+  unswizzled copy and write the returned K back
+  (`HY3_FP8_KV_FORCE_UNPACKED_DECODE=1` forces this path).
+- **DCP prefill buckets**: Q=8192 does not compile under DCP (`NCC_IGCA037`,
+  see `serve_256k.sh`). The Q=4096 bucket works in the `serve_256k.sh`
+  configuration with both KV dtypes (FP8 KV: shared-prefix benchmark below,
+  passkey 12/12 at 16k-85k), but in one 16k configuration (max_model_len 16384,
+  32 seqs, decode context buckets `[4096, 8192]`, `--num-gpu-blocks-override
+  8139`) it gave wrong output for ~8k-token prompts with BF16 KV (chunks with
+  prior KV) and hung every rank in a collective with FP8 KV
+  (`NRT_EXEC_HW_ERR_DMA_ABORT`; the devices then need a neuron driver reload).
+  The trigger was not isolated; prefill buckets <= 2048 were correct in every
+  configuration tried.
+- **Startup**: the full-model FP8 cold compile of config B with five prefill
+  buckets took ~35 min on a trn2.48xlarge; keep `VLLM_NEURON_BARRIER_TIMEOUT`
+  (default 3600 s) above the cold compile time of larger configurations.
+
+- **Acceptance** (`scripts/kv_acceptance.sh` + `scripts/kv_report.py`): the gate
+  reads raw artifacts only and fails on missing evidence. It checks the run
+  manifests (`kv_manifest.py`: identical args except the KV dtype, server env,
+  commit, profile sha256), the exact persistent KV pool (`Hy3 KV pool` log line)
+  and the per-category peak device memory over the run (`kv_mem_sampler.py`),
+  MATH-500 paired per problem and re-graded (McNemar, bootstrap CI), complete
+  identical load-matrix cells, and stability runs of at least 30 minutes.
+- **Full-model results** (trn2.48xlarge, re-run passing the gate; config B +
+  prefill buckets 512..8192 for DCP=1, prefill <= 2048 for DCP=8; the same
+  8139-block pool for both KV dtypes; profile from `kv_calib/full.json`):
+
+  | | BF16 KV | FP8 KV |
+  |---|---|---|
+  | persistent KV pool per rank (64 ranks) | 10,667,950,080 B (635.9 GiB) | 5,333,975,040 B (317.9 GiB), x 0.5000 |
+  | peak device memory over the run, all ranks | 1219.8 GiB | 910.3 GiB (-309.6 GiB = 48.7% of the BF16 pool; FP8-only `model_code` +8.3 GiB, scratchpad unchanged) |
+  | MATH-500, 500 problems, greedy, no_think, paired | 97.4% | 97.8% (6 vs 8 discordant, 95% CI of the difference [-1.0, +1.8] pp) |
+  | MATH-500, DCP=8 | 96.8% | 97.0% |
+  | load matrix 1024-16000 x c 1/4/15, worst P50 change | | TTFT +4.6%, TPOT +4.2% (1024 / c=1); TPOT -6..-8% at c=15, >= 8k |
+  | stability, 1100 requests, c=8, 6k shared prefix | 2198 s, 0 failed, TPOT P50 55.9 ms | 1974 s, 0 failed, TPOT P50 49.4 ms |
+
+  Greedy MATH-500 moves by 0.4-0.8 pp between server restarts on this stack;
+  across the original and the re-run (6 BF16 / FP8 pairings) FP8 scored the
+  same or higher every time.
+- **85k shared prefix, DCP=1** (customer D test: its request counts and output
+  lengths, max_model_len 90112, the same pool): FP8 KV lowers TPOT by 21-22% at
+  concurrency 2-8 (BF16 86-90 ms) and by 30% at 9-13 (141-144 ms -> 98-101 ms);
+  TTFT +1-2%. Without DCP every rank reads the whole 85k history each decode
+  step, so halving the KV bytes shows in TPOT.
+- **85k shared prefix, DCP=8** (`serve_256k.sh` config, the same 8139-block
+  pool, `scripts/bench_prefix_fixed.sh "1 4 8"` with a new `cache_salt` per run,
+  92.2% hit rate in every cell):
+
+  | conc | TTFT med BF16 -> FP8 | TPOT med BF16 -> FP8 |
+  |---|---|---|
+  | 1 | 2.58 -> 2.59 s | 31.9 -> 32.9 ms |
+  | 4 | 6.18 -> 6.18 s | 59.1 -> 57.4 ms |
+  | 8 | 10.81 -> 10.85 s | 85.9 -> 83.8 ms |
+
+  With DCP=8 each rank reads 1/8 of the history, so FP8 KV changes latency by
+  at most 3% either way; its gain there is capacity (twice the tokens in the
+  same memory). Passkey retrieval (`needle.py`): 12/12 with FP8 KV, as with
+  BF16. The FP8 cold compile of this configuration took about 3 h (BF16 about
+  1.5 h); keep `VLLM_NEURON_BARRIER_TIMEOUT` above it.
+
 ## Compatibility Matrix
 
-| Instance / software | vllm-neuron 0.29.0.1.2.0 (vLLM 0.29.0) | earlier |
-| ------------------- | -------------------------------------- | ------- |
-| Trn3                | Not tested                             | Not tested |
-| Trn2 (trn2.48xlarge) | Working                               | Not tested with this folder |
+| Instance / Neuron SDK version | 2.33.0      | 2.32 and earlier |
+| ----------------------------- | ----------- | ---------------- |
+| Trn3                          | Not tested  | Not tested       |
+| Trn2 (trn2.48xlarge)          | Working     | Not tested with this folder |
 
-Tested component versions: neuronx-cc 2.28.7631, nki 0.7.0,
-libtorch-neuronx-lite 2.13.0.1.0, Neuron runtime 2.35.30, collectives 2.35.43,
-driver 2.31.7, torch 2.13.0, transformers 5.17.0, Python 3.12.
+Tested with vllm-neuron 0.29.0.1.2.0 (vLLM 0.29.0). Neuron SDK 2.33.0 component
+versions: neuronx-cc 2.28.7631, nki 0.7.0, Neuron runtime 2.35.30, collectives
+2.35.43, tools 2.33.38, driver 2.31.7; also libtorch-neuronx-lite 2.13.0.1.0,
+torch 2.13.0, transformers 5.17.0, Python 3.12.
 
 ## Example Checkpoints
 
@@ -500,30 +631,39 @@ Install the package first (`pip install -e contrib/models/hy_v3`).
 The full model is too large for an FP32 HuggingFace reference, so the test
 builds a 4-layer checkpoint from the real weights (`scripts/make_mini.py`,
 FP8 for vLLM plus a dequantized BF16 copy for HF) and runs the template's
-three-way logit validation, once with flash-attention prefill and once with
-prefix caching (segmented prefill) and batch-4 decode. It needs the whole
-trn2.48xlarge and takes about 12 minutes.
+three-way logit validation in four cases: flash-attention prefill, and prefix
+caching (segmented prefill) with batch-4 decode, each with a BF16 KV cache and
+with an FP8 KV cache (packed K). The FP8-KV cases need a KV scale profile in
+`HY3_KV_SCALE_PROFILE` (a full-model profile also covers the 4-layer model) and
+are skipped without one. It needs the whole trn2.48xlarge and takes about 32
+minutes for the four cases (Neuron SDK 2.33.0: 4 passed).
 
 Two settings differ from the template, because the model runs FP8 activations
 against a BF16 golden: the top-K bounds are 0.1 / 0.12 / 0.15 / 0.15
 (measured <= 0.06), and the argmax divergence tolerance is 0.25 logits instead
 of 1 BF16 ULP. On the flat 4-layer distribution FP8 rounding flips near-ties
 whose golden top-1 / top-2 gap is 0.06-0.125; a real defect shows gaps of
-several logits.
+several logits. The FP8-KV cases pass with the same bounds.
 
 ```bash
-HY3_CKPT=/path/to/Hy3-FP8 pytest contrib/models/hy_v3/test/integration/test_model.py \
-    -v -s --timeout=7200
+HY3_CKPT=/path/to/Hy3-FP8 HY3_KV_SCALE_PROFILE=/path/to/kv_scales.safetensors \
+    pytest contrib/models/hy_v3/test/integration/test_model.py -v -s --timeout=7200
 ```
+
+`HY3_MINI_CKPT` sets where the 4-layer checkpoint is built and cached
+(default `/tmp/hy3_mini4`).
 
 ### Module tests
 
 Single-NeuronCore tests of the FP8 MLP (dense layer, shared expert, 8-way decode
 copy; CTE and TKG paths) and the routed experts (`moe_cte` hybrid, `moe_tkg`,
-`moe_tkg_hits` with 0-3 local hits, `moe_tkg_hits_batch` with 2 / 4 tokens).
-They build the kernel inputs from the real checkpoint (rank-0 shard) through
-the model's own weight loaders and compare against an FP32 fake-quant
-reference.
+`moe_tkg_hits` with 0-3 local hits, `moe_tkg_hits_batch` with 2 / 4 tokens),
+and the FP8 KV attention of layer 0 (`test_fp8_kv_attention.py`: cache writes
+in flash and segmented prefill, two decode steps on the standard, packed and
+packed-fallback layouts, calibrated and unit scales, plus wrong-scale-contract
+controls that must miss). They build the kernel inputs from the real
+checkpoint (rank-0 shard) through the model's own weight loaders and compare
+against an FP32 fake-quant reference.
 
 ```bash
 HY3_CKPT=/path/to/Hy3-FP8 pytest contrib/models/hy_v3/test/module/ -v -s
@@ -532,7 +672,12 @@ HY3_CKPT=/path/to/Hy3-FP8 pytest contrib/models/hy_v3/test/module/ -v -s
 ### Unit tests
 
 CPU only: FP8 weight transforms (halving, scale layout, padding, expert
-packing) and the router against the HuggingFace `HYV3TopKRouter`.
+packing), the router against the HuggingFace `HYV3TopKRouter`, the KV scale
+sources (profile validation, checkpoint `k_scale` / `v_scale` with the 448 ->
+240 rescale, the 1.0 default), the packed-K layout and the drift guards that
+compare the local copies in `src/fp8_kv_layout.py` and
+`src/kernels/moe_tkg_common.py` with the plugin / nkilib originals (skipped when
+those are not importable).
 
 ```bash
 VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
@@ -560,3 +705,10 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 | `scripts/hf_reference.py` | HF CPU reference logits for the BF16 reduced checkpoint |
 | `scripts/compare_hf_logits.py` | vLLM Neuron vs the HF reference, per-step logits |
 | `scripts/validate_features.py` | segmented prefill, prefix-cache hits, batch-128 vs batch-4 consistency (optionally with DCP) |
+| `scripts/dequant_bf16.py` | BF16 copy of the full checkpoint for KV calibration |
+| `scripts/calibrate_kv_scales.py` | llm-compressor KV calibration, exports the KV scale profile (`kv_calib/*.json` data mixes) |
+| `scripts/validate_fp8_kv.py`, `compare_kv_runs.py`, `run_kv_mode.sh` | reduced-model BF16-KV vs FP8-KV runs (modes m1 / m2 / m3: full prefill, packed + prefix, DCP 8) and their comparison |
+| `scripts/kv_acceptance.sh`, `kv_report.py` | full-model acceptance run (manifest, memory sampling, load matrix, MATH-500, >= 30 min stability) and the BF16 / FP8 gate |
+| `scripts/kv_manifest.py`, `kv_mem_sampler.py` | run manifest (args, server env, commit, profile sha256, KV pool bytes) and neuron-monitor memory time series for the gate |
+| `scripts/kv_api_check.py` | full-model functional check through the API (long multi-chunk prompts, prefix hits, partial hits, concurrency), e.g. DCP 8 vs DCP 1 |
+| `scripts/kv_cache_isolation.sh` | compile-cache isolation of the KV scale profile (same profile reuses NEFFs; another profile does not reuse stale decode NEFFs) |

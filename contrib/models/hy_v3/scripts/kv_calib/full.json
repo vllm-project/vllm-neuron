@@ -1,0 +1,49 @@
+{
+  "description": "Hy3 FP8 KV calibration mix (full 80-layer model): English chat, Chinese instructions, math word problems, code (<=2048 tokens each) and long packed conversations of 8192/12288/16000 tokens (target max_model_len 16384). Sized for a CPU run (~77k tokens, ~0.1 s/token on the trn2 host); the statistic is a per-layer absmax.",
+  "seed": 20261023,
+  "max_seq_len": 2048,
+  "sources": [
+    {
+      "name": "ultrachat_en",
+      "hf": "HuggingFaceH4/ultrachat_200k",
+      "split": "train_sft",
+      "n": 24,
+      "format": "messages"
+    },
+    {
+      "name": "alpaca_zh",
+      "hf": "llamafactory/alpaca_gpt4_zh",
+      "split": "train",
+      "n": 16,
+      "format": "alpaca"
+    },
+    {
+      "name": "gsm8k",
+      "hf": "openai/gsm8k",
+      "config": "main",
+      "split": "train",
+      "n": 16,
+      "format": "qa"
+    },
+    {
+      "name": "code_alpaca",
+      "hf": "sahil2801/CodeAlpaca-20k",
+      "split": "train",
+      "n": 16,
+      "format": "alpaca"
+    }
+  ],
+  "long": {
+    "n": 3,
+    "lengths": [
+      8192,
+      12288,
+      16000
+    ],
+    "from": [
+      "ultrachat_en",
+      "alpaca_zh",
+      "ultrachat_en"
+    ]
+  }
+}

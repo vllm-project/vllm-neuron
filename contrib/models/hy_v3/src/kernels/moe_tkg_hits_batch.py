@@ -44,10 +44,8 @@ from nkilib.core.moe.moe_tkg.mlp_parameters import (
 from nkilib.core.moe.moe_tkg.mlp_tkg_constants import MLPTKGConstants
 from nkilib.core.moe.moe_tkg.mlp_tkg_down_projection import process_down_projection
 from nkilib.core.moe.moe_tkg.mlp_tkg_gate_up_projection import process_gate_up_projection
-from nkilib.core.moe.moe_tkg.moe_tkg import _extract_quantization_type
 from nkilib.core.moe.moe_tkg.moe_tkg_utils import broadcast_all_expert_affinity
 from nkilib.core.moe.moe_tkg.projection_utils import input_norm_load, transpose_store
-from nkilib.core.moe.moe_tkg.selective_expert_impl import _select_quant_scales
 from nkilib.core.utils.allocator import SbufManager
 from nkilib.core.utils.common_types import (
     ActFnType,
@@ -59,6 +57,8 @@ from nkilib.core.utils.common_types import (
 from nkilib.core.utils.kernel_helpers import div_ceil
 from nkilib.core.utils.logging import get_logger
 from nkilib.core.utils.stream_shuffle_broadcast import stream_shuffle_broadcast
+
+from .moe_tkg_common import quantization_type, select_quant_scales
 
 
 @nki.jit
@@ -91,14 +91,13 @@ def moe_tkg_hits_batch(
         [T, H] in HBM: for each token, the sum over the hit experts of
         affinity * expert(hidden).
     """
-    quant_type, is_mx = _extract_quantization_type(
+    quant_type = quantization_type(
         expert_gate_up_weights=expert_gate_up_weights,
         expert_gate_up_weights_scale=expert_gate_up_weights_scale,
         expert_down_weights_scale=expert_down_weights_scale,
         expert_gate_up_input_scale=expert_gate_up_input_scale,
         expert_down_input_scale=expert_down_input_scale,
     )
-    assert not is_mx, "moe_tkg_hits_batch: MX weights are not supported"
     assert hidden_input.shape[0] <= 128, "moe_tkg_hits_batch: at most 128 tokens"
     assert num_hits.dtype == nl.int32, "moe_tkg_hits_batch: num_hits must be int32"
     assert expert_index.dtype == nl.int32, "moe_tkg_hits_batch: expert_index must be int32"
@@ -185,13 +184,13 @@ def _hit_expert_batch(params: MLPParameters, num_hits: nl.NkiTensor, output: nl.
         )
         params.up_proj_weights_tensor = initial_up.select(dim=0, index=slot0).select(dim=1, index=GateUpDim.UP.value)
         params.down_proj_weights_tensor = initial_down.select(dim=0, index=slot0)
-        params.quant_params = _select_quant_scales(initial_quant, slot0)
+        params.quant_params = select_quant_scales(initial_quant, slot0)
 
         if initial_quant.quantization_type == QuantizationType.STATIC:
             # Per-expert scalar scales: load to partition 0, broadcast on chip (as selective_expert_impl).
-            gate_w_dq = nl.ndarray((dims._pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
-            up_w_dq = nl.ndarray((dims._pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
-            down_w_dq = nl.ndarray((dims._pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
+            gate_w_dq = nl.ndarray((nl.tile_size.pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
+            up_w_dq = nl.ndarray((nl.tile_size.pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
+            down_w_dq = nl.ndarray((nl.tile_size.pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
             nisa.dma_copy(dst=gate_w_dq[0:1, 0:1], src=params.quant_params.gate_w_scale.slice(dim=0, start=0, end=1))
             stream_shuffle_broadcast(gate_w_dq, gate_w_dq)
             nisa.dma_copy(dst=up_w_dq[0:1, 0:1], src=params.quant_params.up_w_scale.slice(dim=0, start=0, end=1))
