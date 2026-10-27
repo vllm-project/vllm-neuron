@@ -183,9 +183,11 @@ _MK_DEBUG = os.environ.get("DEEPSEEK_V41_MK_DEBUG", "")
 #: `DEEPSEEK_V41_KCAPTURE=<dir>`: record one block kernel launch -- every argument
 #: before the launch and every output after it -- on every rank, to
 #: `<dir>/<tag>/L<layer>/rank<rank>.pt`, for standalone kernel work. Armed by
-#: `<dir>/ARM.json` (`{"tag", "layers", "phase", "start", "nth"}`, written by the
-#: driver while the server is idle): the `nth` forward of `phase` whose first span
-#: starts at position `start` after the arm is captured, at each of `layers`.
+#: `<dir>/ARM.json` (`{"tag", "layers", "phase", "nth"}` plus any of `"start"`,
+#: `"min_start"`, `"nspans"`, written by the driver while the server is idle): the
+#: `nth` forward of `phase` after the arm whose first span starts at position `start`,
+#: whose every span starts at or after `min_start` and which has `nspans` spans (each
+#: filter only when given) is captured, at each of `layers`.
 _KCAPTURE = os.environ.get("DEEPSEEK_V41_KCAPTURE", "")
 _kcap = {"arm": None, "mtime": None, "step": None, "count": 0, "done": set()}
 
@@ -203,7 +205,11 @@ def _kcapture_target(model, layer_id: int, step) -> dict | None:
         with open(path) as fh:
             _kcap.update(arm=json.load(fh), mtime=mtime, step=None, count=0, done=set())
     arm = _kcap["arm"]
-    if step.phase != arm["phase"] or int(step.spans[0][2]) != int(arm["start"]):
+    starts = [int(s[2]) for s in step.spans]
+    if (step.phase != arm["phase"]
+            or (arm.get("start") is not None and starts[0] != int(arm["start"]))
+            or (arm.get("min_start") is not None and min(starts) < int(arm["min_start"]))
+            or (arm.get("nspans") is not None and len(starts) != int(arm["nspans"]))):
         return None
     if _kcap["step"] is not step:
         _kcap["step"] = step
@@ -244,20 +250,21 @@ def kernel_version(kind: str = "block", scheme: str = "tp64") -> int:
     modules; "draft": the drafter and the helpers; "pp": the stage boundary and
     the helpers it imports. Each kind leaves out the other kinds' own modules, so
     an edit to the drafter or the boundary does not invalidate the 40 block
-    kernels' NEFFs (and vice versa). "r2_prefill": the optimized r2 prefill block
-    kernel, which has its own helper copies in `kernels/<scheme>/r2_prefill/`
-    (`mk_kernels.version_kind`)."""
+    kernels' NEFFs (and vice versa). An optimized block kernel's kind is its package
+    ("r2_prefill", "r2_decode", "r1_prefill", "r1_decode": `mk_kernels.OPTIMIZED_KINDS`),
+    which has its own helper copies in `kernels/<scheme>/<kind>/`; the hash covers that
+    package only (`mk_kernels.version_kind`)."""
     h = hashlib.sha256()
     kdir = os.path.join(_HERE, "kernels", scheme)
     own = {"block": ("layer_kernel.py",), "draft": ("draft_kernel.py",), "pp": ("pp_kernels.py",)}
-    if kind not in own and kind != "r2_prefill":
+    if kind not in own and kind not in mk_kernels.OPTIMIZED_KINDS:
         raise ValueError(f"kernel_version: unknown kind {kind!r}")
     if not os.path.isdir(kdir):
         raise ValueError(f"kernel_version: no kernel package for scheme {scheme!r}")
-    if kind == "r2_prefill":
-        files = sorted(glob.glob(os.path.join(kdir, "r2_prefill", "*.py")))
+    if kind not in own:
+        files = sorted(glob.glob(os.path.join(kdir, kind, "*.py")))
         if not files:
-            raise ValueError(f"kernel_version: no r2_prefill package for scheme {scheme!r}")
+            raise ValueError(f"kernel_version: no {kind} package for scheme {scheme!r}")
     else:
         files = sorted(glob.glob(os.path.join(kdir, "*.py")))
         others = {os.path.join(kdir, name) for k, names in own.items() if k != kind for name in names}

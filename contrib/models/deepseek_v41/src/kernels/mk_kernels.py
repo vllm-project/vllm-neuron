@@ -14,9 +14,11 @@ function branching on flags, and the compiled artifacts carry the name.
 `entry(kernel)` wraps one through `wrap_nki(...)[2]` + `torch.compile` the way
 `mk_model` runs every megakernel.
 
-`layer` returns an optimized kernel instead where one exists: (prefill, r2, tp64) is
-`tp64/r2_prefill/r2_prefill.py` (its own helper copies; `DEEPSEEK_V41_R2_PREFILL_OPT=0`
-falls back to the generic body).
+`layer` returns an optimized kernel instead where one exists, each a package of its own
+under `tp64/` with its own helper copies: (prefill, r2) `r2_prefill`, (decode, r2)
+`r2_decode`, (prefill, r1) `r1_prefill`, (decode, r1) `r1_decode` -- the plain r2 / r1
+blocks of the flat scheme (no kv / index source, engram or tap). `DEEPSEEK_V41_OPT_KERNELS`
+selects which of them run (see `_enabled`); the others fall back to the generic body.
 
 Archetypes (`arch` = `(ratio, is_kv_src, is_idx_src, has_engram, tap)`) are taken
 from the config at first use; the names spell them `r<ratio>`, `src` (kv source),
@@ -34,15 +36,52 @@ import nki
 
 from . import tp64 as _tp64
 from . import tp8pp8 as _tp8pp8
+from .tp64 import r1_decode as _tp64_r1_decode
+from .tp64 import r1_prefill as _tp64_r1_prefill
+from .tp64 import r2_decode as _tp64_r2_decode
 from .tp64 import r2_prefill as _tp64_r2_prefill
 
 #: Optimized kernels that replace the generic body's specialization for one
 #: (phase, arch, scheme): same positional signature, same outputs, same entry name.
-#: `DEEPSEEK_V41_R2_PREFILL_OPT=0` runs the generic body instead (A/B, debugging).
 _OPTIMIZED = {
     ("prefill", (2, 0, 0, 0, 0), "tp64"): _tp64_r2_prefill.r2_prefill.layer_prefill_r2_tp64,
+    ("decode", (2, 0, 0, 0, 0), "tp64"): _tp64_r2_decode.r2_decode.layer_decode_r2_tp64,
+    ("prefill", (1, 0, 0, 0, 0), "tp64"): _tp64_r1_prefill.r1_prefill.layer_prefill_r1_tp64,
+    ("decode", (1, 0, 0, 0, 0), "tp64"): _tp64_r1_decode.r1_decode.layer_decode_r1_tp64,
 }
-_USE_OPTIMIZED = os.environ.get("DEEPSEEK_V41_R2_PREFILL_OPT", "1") not in ("", "0")
+#: The package each optimized kernel lives in (`kernels/<scheme>/<kind>/`), which is also
+#: its `mk_model.kernel_version` kind: the hash covers that package's own files only.
+_KIND = {
+    ("prefill", (2, 0, 0, 0, 0), "tp64"): "r2_prefill",
+    ("decode", (2, 0, 0, 0, 0), "tp64"): "r2_decode",
+    ("prefill", (1, 0, 0, 0, 0), "tp64"): "r1_prefill",
+    ("decode", (1, 0, 0, 0, 0), "tp64"): "r1_decode",
+}
+OPTIMIZED_KINDS = tuple(sorted(set(_KIND.values())))
+
+
+def _enabled() -> frozenset:
+    """The optimized kernels in use. `DEEPSEEK_V41_OPT_KERNELS`: unset or "all" -> every
+    one, "none" / "0" -> none (the generic body everywhere: A/B, debugging), else a comma
+    list of kinds (`r2_prefill,r1_decode`). `DEEPSEEK_V41_R2_PREFILL_OPT=0` (the original
+    switch) additionally drops `r2_prefill`."""
+    spec = os.environ.get("DEEPSEEK_V41_OPT_KERNELS", "all").strip().lower()
+    if spec in ("", "all", "1"):
+        kinds = set(OPTIMIZED_KINDS)
+    elif spec in ("none", "0"):
+        kinds = set()
+    else:
+        kinds = {k.strip() for k in spec.split(",") if k.strip()}
+        unknown = kinds - set(OPTIMIZED_KINDS)
+        if unknown:
+            raise ValueError(f"DEEPSEEK_V41_OPT_KERNELS: unknown kernels {sorted(unknown)}; "
+                             f"known: {', '.join(OPTIMIZED_KINDS)}")
+    if os.environ.get("DEEPSEEK_V41_R2_PREFILL_OPT", "1") in ("", "0"):
+        kinds.discard("r2_prefill")
+    return frozenset(kinds)
+
+
+_ENABLED = _enabled()
 
 #: The scheme's kernel package: its own block kernel, drafter and helpers.
 _PKG = {"tp64": _tp64, "tp8pp8": _tp8pp8}
@@ -96,9 +135,10 @@ def specialize(body, name: str, consts: tuple) -> object:
 def layer(phase: str, arch, scheme: str):
     """The block kernel for `phase` x `arch` x `scheme`: an optimized kernel where
     one exists (`_OPTIMIZED`), else the generic body specialized."""
-    arch = tuple(int(v) for v in arch)
-    opt = _OPTIMIZED.get((phase, arch, scheme)) if _USE_OPTIMIZED else None
-    return opt if opt is not None else layer_generic(phase, arch, scheme)
+    key = (phase, tuple(int(v) for v in arch), scheme)
+    if _KIND.get(key) in _ENABLED:
+        return _OPTIMIZED[key]
+    return layer_generic(*key)
 
 
 def layer_generic(phase: str, arch, scheme: str):
@@ -111,10 +151,8 @@ def layer_generic(phase: str, arch, scheme: str):
 
 def version_kind(phase: str, arch, scheme: str) -> str:
     """The `mk_model.kernel_version` kind of the block kernel `layer` returns."""
-    arch = tuple(int(v) for v in arch)
-    if _USE_OPTIMIZED and (phase, arch, scheme) == ("prefill", (2, 0, 0, 0, 0), "tp64"):
-        return "r2_prefill"
-    return "block"
+    kind = _KIND.get((phase, tuple(int(v) for v in arch), scheme))
+    return kind if kind in _ENABLED else "block"
 
 
 def draft(phase: str, scheme: str):

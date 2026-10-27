@@ -165,6 +165,25 @@ DSpark tap)`; the eight that occur are traced on first use. The scheme is
   primitive that would carry the payload once instead of summing it, and is
   the next step for this seam.
 
+**Optimized block kernels (flat scheme).** The plain r2 and r1 blocks (r2: 3-7,
+9-13, 15-19; r1: 21-23, 25-27, 29-31, 33-35 -- no kv / index source, engram or
+tap) run hand-optimized kernels instead of the generic body's specialization,
+one package each under `kernels/tp64/` with its own helper copies:
+`r2_prefill`, `r2_decode`, `r1_prefill`, `r1_decode`. Each was produced in a
+standalone workspace (the live server's recorded kernel inputs and golden
+outputs on all 64 ranks, an AutoHelix loop) and computes what the generic body
+computes: same arithmetic, only scheduling and data movement changed, bit-identical
+on the recorded cases. The one exception is a summation order: at bs1 the decode
+kernels send only the T real rows through their all-reduces instead of 128
+(`CC2_T_ROWS_MAX`, `CC_SMALL_BYTES`), and the collective's order depends on the
+message size, so a few fp32 sums can differ by an ulp -- enough to change greedy
+text after some tokens (the verifier's short cases), not its quality.
+`mk_kernels.layer` routes them, `mk_model.kernel_version` hashes each package
+on its own, `DEEPSEEK_V41_OPT_KERNELS` (`all` by default, `none`, or a comma
+list of the four) selects which run, and `test/unit/test_opt_kernels_diff.py`
+checks every one against the generic body on 8 ranks over shapes the recorded
+cases do not cover.
+
 Three parts of the kernels are written for the Trainium3 hardware directly:
 
 * **Native block-scaled matmuls** (`kernels/mk_mx.py`). The checkpoint's fp8 /
