@@ -5335,7 +5335,14 @@ class DeepseekV41ForCausalLM(nn.Module):
         """
         if self.world_size <= 1 or total_rows <= 0:
             return spans, meta
-        if len(spans) > 1:
+        # A decode step pads with whole `rows_per_seq` spans even when only one sequence is
+        # left in a multi-sequence bucket. Rounding that lone 6-row span up to the bucket
+        # (60 rows at `max_num_seqs=10`) as a prefill chunk would run it through the prefill
+        # graphs and give its 54 padded rows positions `start_pos + 6 ..`, past the
+        # sequence's end: within 60 positions of `max_model_len` the n-gram hash then
+        # indexed past its block table (IndexError in `NgramHashState.forward`, measured
+        # 2026-10-27 at 1024 + 240 tokens, context 1280).
+        if len(spans) > 1 or rows_per_seq:
             return self._bucket_spans(spans, meta, total_rows, rows_per_seq)
         if len(spans) != 1:
             return spans, meta
