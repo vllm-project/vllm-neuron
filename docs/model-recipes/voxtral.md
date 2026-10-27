@@ -132,13 +132,13 @@ by bf16 rounding in the verify graph.
 
 With several requests in flight the draft also raises throughput. On 48
 LibriSpeech test-other clips (`--max-num-seqs 16`, `decode_context_length_buckets`
-`[512]`, 2 passes per concurrency level), with the draft:
+`[512]`, `num_batched_tokens_buckets` `[384, 1024]`, 2 passes per concurrency level), with the draft:
 
 | Concurrent requests | 1 | 2 | 4 | 8 | 16 |
 |---|--:|--:|--:|--:|--:|
-| Real-time factor | 67.0x | 78.1x | 93.1x | 103.5x | 112.6x |
-| p50 latency (ms) | 85 | 147 | 236 | 389 | 706 |
-| Acceptance length | 5.31 | 5.25 | 5.28 | 5.28 | 5.28 |
+| Real-time factor | 68.8x | 80.1x | 94.9x | 105.5x | 114.6x |
+| p50 latency (ms) | 82 | 139 | 232 | 381 | 677 |
+| Acceptance length | 5.35 | 5.35 | 5.31 | 5.31 | 5.33 |
 
 Without the draft the real-time factor is 30.8x at 1 and 76.0x at 16 concurrent requests.
 
