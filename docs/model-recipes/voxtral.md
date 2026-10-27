@@ -63,6 +63,13 @@ audio tokens, and each encoder cache block holds one window. Set these values in
 | `tp_size` | `4` on `trn2.3xlarge` | The encoder has 20 attention heads, so `tp_size` must divide 20. |
 | `encoder_cache_num_blocks` | `max(num_encoder_input_buckets) * max_num_seqs + 2` | Set it when `max_num_seqs > 1`. One clip uses one block for each 30 s window. |
 
+A clip of up to 30 s gives a 383-token prompt (375 audio tokens and 8 text tokens), so a
+`384` token bucket holds every single-window prompt without padding. With a `512` bucket the
+prefill computes about 25% padding (on trn2.3xlarge, TP=4, one request at a time:
+mean latency 87.4 -> 86.0 ms at LNC=2 and 121.7 -> 116.7 ms at LNC=1 when the 512 bucket is
+replaced by 384; LibriSpeech test-other, same transcripts). Keep a larger bucket for longer
+audio and for batched prefill.
+
 For batched serving, also set `neuron_config.decode_context_length_buckets` (for example
 `[512, 1024]` with `--max-model-len 2048`). Short transcripts then decode with a smaller attention
 context.
@@ -77,7 +84,7 @@ vllm serve mistralai/Voxtral-Mini-3B-2507 \
     --limit-mm-per-prompt '{"audio": 1}' \
     --additional-config '{
         "neuron_config": {
-            "num_batched_tokens_buckets": [512, 2048],
+            "num_batched_tokens_buckets": [384, 2048],
             "on_device_sampling_config": {"all_greedy": true}
         },
         "encoder_neuron_config": {
