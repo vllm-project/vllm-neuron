@@ -14,11 +14,15 @@ function branching on flags, and the compiled artifacts carry the name.
 `entry(kernel)` wraps one through `wrap_nki(...)[2]` + `torch.compile` the way
 `mk_model` runs every megakernel.
 
-`layer` returns an optimized kernel instead where one exists, each a package of its own
-under `tp64/` with its own helper copies: (prefill, r2) `r2_prefill`, (decode, r2)
-`r2_decode`, (prefill, r1) `r1_prefill`, (decode, r1) `r1_decode` -- the plain r2 / r1
-blocks of the flat scheme (no kv / index source, engram or tap). `DEEPSEEK_V41_OPT_KERNELS`
-selects which of them run (see `_enabled`); the others fall back to the generic body.
+`layer` returns an optimized kernel instead where one exists: every (phase, archetype) of
+the flat scheme has one, each a package of its own under `tp64/` named `<archetype>_<phase>`
+with its own helper copies. The plain r2 / r1 blocks' (`r2_prefill`, `r2_decode`,
+`r1_prefill`, `r1_decode`) came out of their workspaces' AutoHelix loops; every other
+archetype's kernel is the nearest of those -- r1_prefill (which carries r2_prefill's
+optimizations) for prefill, r2_decode for the r0 / r2 archetypes' decode, r1_decode for the r1
+ones' -- with the generic body's sections that archetype has (engram, tap, compressor, index
+scores / top-k, ratio 0). `DEEPSEEK_V41_OPT_KERNELS` selects which of them run (see
+`_enabled`); the others fall back to the generic body.
 
 Archetypes (`arch` = `(ratio, is_kv_src, is_idx_src, has_engram, tap)`) are taken
 from the config at first use; the names spell them `r<ratio>`, `src` (kv source),
@@ -28,6 +32,7 @@ from the config at first use; the names spell them `r<ratio>`, `src` (kv source)
 from __future__ import annotations
 
 import functools
+import importlib
 import inspect
 import linecache
 import os
@@ -36,52 +41,6 @@ import nki
 
 from . import tp64 as _tp64
 from . import tp8pp8 as _tp8pp8
-from .tp64 import r1_decode as _tp64_r1_decode
-from .tp64 import r1_prefill as _tp64_r1_prefill
-from .tp64 import r2_decode as _tp64_r2_decode
-from .tp64 import r2_prefill as _tp64_r2_prefill
-
-#: Optimized kernels that replace the generic body's specialization for one
-#: (phase, arch, scheme): same positional signature, same outputs, same entry name.
-_OPTIMIZED = {
-    ("prefill", (2, 0, 0, 0, 0), "tp64"): _tp64_r2_prefill.r2_prefill.layer_prefill_r2_tp64,
-    ("decode", (2, 0, 0, 0, 0), "tp64"): _tp64_r2_decode.r2_decode.layer_decode_r2_tp64,
-    ("prefill", (1, 0, 0, 0, 0), "tp64"): _tp64_r1_prefill.r1_prefill.layer_prefill_r1_tp64,
-    ("decode", (1, 0, 0, 0, 0), "tp64"): _tp64_r1_decode.r1_decode.layer_decode_r1_tp64,
-}
-#: The package each optimized kernel lives in (`kernels/<scheme>/<kind>/`), which is also
-#: its `mk_model.kernel_version` kind: the hash covers that package's own files only.
-_KIND = {
-    ("prefill", (2, 0, 0, 0, 0), "tp64"): "r2_prefill",
-    ("decode", (2, 0, 0, 0, 0), "tp64"): "r2_decode",
-    ("prefill", (1, 0, 0, 0, 0), "tp64"): "r1_prefill",
-    ("decode", (1, 0, 0, 0, 0), "tp64"): "r1_decode",
-}
-OPTIMIZED_KINDS = tuple(sorted(set(_KIND.values())))
-
-
-def _enabled() -> frozenset:
-    """The optimized kernels in use. `DEEPSEEK_V41_OPT_KERNELS`: unset or "all" -> every
-    one, "none" / "0" -> none (the generic body everywhere: A/B, debugging), else a comma
-    list of kinds (`r2_prefill,r1_decode`). `DEEPSEEK_V41_R2_PREFILL_OPT=0` (the original
-    switch) additionally drops `r2_prefill`."""
-    spec = os.environ.get("DEEPSEEK_V41_OPT_KERNELS", "all").strip().lower()
-    if spec in ("", "all", "1"):
-        kinds = set(OPTIMIZED_KINDS)
-    elif spec in ("none", "0"):
-        kinds = set()
-    else:
-        kinds = {k.strip() for k in spec.split(",") if k.strip()}
-        unknown = kinds - set(OPTIMIZED_KINDS)
-        if unknown:
-            raise ValueError(f"DEEPSEEK_V41_OPT_KERNELS: unknown kernels {sorted(unknown)}; "
-                             f"known: {', '.join(OPTIMIZED_KINDS)}")
-    if os.environ.get("DEEPSEEK_V41_R2_PREFILL_OPT", "1") in ("", "0"):
-        kinds.discard("r2_prefill")
-    return frozenset(kinds)
-
-
-_ENABLED = _enabled()
 
 #: The scheme's kernel package: its own block kernel, drafter and helpers.
 _PKG = {"tp64": _tp64, "tp8pp8": _tp8pp8}
@@ -107,6 +66,63 @@ def arch_name(arch) -> str:
     if tap:
         parts.append("tap")
     return "_".join(parts)
+
+
+#: The flat scheme's optimized block kernels: (phase, arch, scheme) -> the package (its
+#: `kernels/tp64/<kind>/` directory, which is also its `mk_model.kernel_version` kind: the hash
+#: covers that package's own files only). Each package's `<kind>.py` defines the kernel
+#: `layer_<phase>_<archetype>_tp64`: the generic body's positional signature and outputs.
+_KIND = {
+    ("prefill", (0, 0, 0, 0, 0), "tp64"): "r0_prefill",
+    ("prefill", (0, 0, 0, 1, 0), "tp64"): "r0_e_prefill",
+    ("prefill", (2, 1, 1, 0, 0), "tp64"): "r2_src_idx_prefill",
+    ("prefill", (2, 0, 0, 0, 0), "tp64"): "r2_prefill",
+    ("prefill", (2, 1, 1, 1, 0), "tp64"): "r2_src_idx_e_prefill",
+    ("prefill", (1, 1, 1, 0, 0), "tp64"): "r1_src_idx_prefill",
+    ("prefill", (1, 0, 0, 0, 0), "tp64"): "r1_prefill",
+    ("prefill", (1, 0, 1, 0, 0), "tp64"): "r1_idx_prefill",
+    ("prefill", (1, 0, 0, 0, 1), "tp64"): "r1_tap_prefill",
+    ("decode", (0, 0, 0, 0, 0), "tp64"): "r0_decode",
+    ("decode", (0, 0, 0, 1, 0), "tp64"): "r0_e_decode",
+    ("decode", (2, 1, 1, 0, 0), "tp64"): "r2_src_idx_decode",
+    ("decode", (2, 0, 0, 0, 0), "tp64"): "r2_decode",
+    ("decode", (2, 1, 1, 1, 0), "tp64"): "r2_src_idx_e_decode",
+    ("decode", (1, 1, 1, 0, 0), "tp64"): "r1_src_idx_decode",
+    ("decode", (1, 0, 0, 0, 0), "tp64"): "r1_decode",
+    ("decode", (1, 0, 1, 0, 0), "tp64"): "r1_idx_decode",
+    ("decode", (1, 0, 0, 0, 1), "tp64"): "r1_tap_decode",
+}
+OPTIMIZED_KINDS = tuple(sorted(set(_KIND.values())))
+#: (phase, arch, scheme) -> the optimized kernel (`@nki.jit`)
+_OPTIMIZED = {
+    key: getattr(importlib.import_module(f".{key[2]}.{kind}.{kind}", __package__),
+                 f"layer_{key[0]}_{arch_name(key[1])}_{key[2]}")
+    for key, kind in _KIND.items()
+}
+
+
+def _enabled() -> frozenset:
+    """The optimized kernels in use. `DEEPSEEK_V41_OPT_KERNELS`: unset or "all" -> every
+    one, "none" / "0" -> none (the generic body everywhere: A/B, debugging), else a comma
+    list of kinds (`r2_prefill,r1_decode`). `DEEPSEEK_V41_R2_PREFILL_OPT=0` (the original
+    switch) additionally drops `r2_prefill`."""
+    spec = os.environ.get("DEEPSEEK_V41_OPT_KERNELS", "all").strip().lower()
+    if spec in ("", "all", "1"):
+        kinds = set(OPTIMIZED_KINDS)
+    elif spec in ("none", "0"):
+        kinds = set()
+    else:
+        kinds = {k.strip() for k in spec.split(",") if k.strip()}
+        unknown = kinds - set(OPTIMIZED_KINDS)
+        if unknown:
+            raise ValueError(f"DEEPSEEK_V41_OPT_KERNELS: unknown kernels {sorted(unknown)}; "
+                             f"known: {', '.join(OPTIMIZED_KINDS)}")
+    if os.environ.get("DEEPSEEK_V41_R2_PREFILL_OPT", "1") in ("", "0"):
+        kinds.discard("r2_prefill")
+    return frozenset(kinds)
+
+
+_ENABLED = _enabled()
 
 
 def _positional_names(body) -> list[str]:

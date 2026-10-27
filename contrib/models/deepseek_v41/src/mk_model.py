@@ -643,8 +643,10 @@ def run_layer(model, block, stream: torch.Tensor, pre_mix: torch.Tensor, step: S
     ]
     kernel = mk_kernels.layer(step.phase, arch, plan.scheme)
     if _MK_TRACE and plan.stage_rank == 0:
-        _mk_log.warning("mk launch %s layer=%d T=%d B=%d spans=%s", kernel.func.__name__,
-                        attn.layer_id, T, B, step.spans)
+        # (the kind tells an optimized kernel from the generic body's entry of the same name)
+        _mk_log.warning("mk launch %s [%s] layer=%d T=%d B=%d spans=%s", kernel.func.__name__,
+                        mk_kernels.version_kind(step.phase, arch, plan.scheme), attn.layer_id, T, B,
+                        step.spans)
     kcap = _kcapture_target(model, attn.layer_id, step) if _KCAPTURE else None
     if kcap is not None:
         # Copies taken before the launch: the kernel writes the caches in place.

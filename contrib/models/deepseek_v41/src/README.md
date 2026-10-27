@@ -165,24 +165,32 @@ DSpark tap)`; the eight that occur are traced on first use. The scheme is
   primitive that would carry the payload once instead of summing it, and is
   the next step for this seam.
 
-**Optimized block kernels (flat scheme).** The plain r2 and r1 blocks (r2: 3-7,
-9-13, 15-19; r1: 21-23, 25-27, 29-31, 33-35 -- no kv / index source, engram or
-tap) run hand-optimized kernels instead of the generic body's specialization,
-one package each under `kernels/tp64/` with its own helper copies:
-`r2_prefill`, `r2_decode`, `r1_prefill`, `r1_decode`. Each was produced in a
-standalone workspace (the live server's recorded kernel inputs and golden
-outputs on all 64 ranks, an AutoHelix loop) and computes what the generic body
-computes: same arithmetic, only scheduling and data movement changed, bit-identical
-on the recorded cases. The one exception is a summation order: at bs1 the decode
-kernels send only the T real rows through their all-reduces instead of 128
-(`CC2_T_ROWS_MAX`, `CC_SMALL_BYTES`), and the collective's order depends on the
-message size, so a few fp32 sums can differ by an ulp -- enough to change greedy
-text after some tokens (the verifier's short cases), not its quality.
-`mk_kernels.layer` routes them, `mk_model.kernel_version` hashes each package
-on its own, `DEEPSEEK_V41_OPT_KERNELS` (`all` by default, `none`, or a comma
-list of the four) selects which run, and `test/unit/test_opt_kernels_diff.py`
-checks every one against the generic body on 8 ranks over shapes the recorded
-cases do not cover.
+**Optimized block kernels (flat scheme).** Every (phase, archetype) of the flat
+scheme runs a hand-optimized kernel instead of the generic body's specialization,
+one package each under `kernels/tp64/`, named `<archetype>_<phase>`, with its own
+helper copies (18 in all). The plain r2 and r1 blocks' four (r2: 3-7, 9-13, 15-19;
+r1: 21-23, 25-27, 29-31, 33-35 -- `r2_prefill`, `r2_decode`, `r1_prefill`,
+`r1_decode`) were each produced in a standalone workspace (the live server's
+recorded kernel inputs and golden outputs on all 64 ranks, an AutoHelix loop). The
+other archetypes' kernels (`r0`, `r0_e`, `r2_src_idx`, `r2_src_idx_e`,
+`r1_src_idx`, `r1_idx`, `r1_tap`; blocks 0, 1, 2 and 8, 14, 20, 24/28/32/36,
+37-39) are the nearest of those four with the generic body's sections that
+archetype has, at the same points of the dataflow -- the engram read-out, the
+DSpark tap, a kv source's compressor, an index source's scores / all-reduce /
+top-k, window-only attention at ratio 0: r1_prefill (which carries r2_prefill's
+optimizations) for every prefill kernel, r2_decode for the r0 / r2 archetypes'
+decode, r1_decode for the r1 ones' (its compact top-k slot table matters most at
+ratio 1). All compute what the generic body computes: same arithmetic, only
+scheduling and data movement changed. The one exception is a summation order: at
+bs1 the decode kernels send only the T real rows through their all-reduces instead
+of 128 (`CC2_T_ROWS_MAX`, `CC_SMALL_BYTES`), and the collective's order depends on
+the message size, so a few fp32 sums can differ by an ulp -- enough to change
+greedy text after some tokens (the verifier's short cases), not its quality.
+`mk_kernels.layer` routes them (`_KIND`), `mk_model.kernel_version` hashes each
+package on its own, `DEEPSEEK_V41_OPT_KERNELS` (`all` by default, `none`, or a
+comma list of packages) selects which run, and `test/unit/test_opt_kernels_diff.py`
+checks every one against the generic body on 8 ranks (shapes the recorded cases do
+not cover, every archetype).
 
 Three parts of the kernels are written for the Trainium3 hardware directly:
 
