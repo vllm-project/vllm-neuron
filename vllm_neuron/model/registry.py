@@ -9,6 +9,31 @@ from .qwen3_vl import Qwen3VLForConditionalGeneration
 from .qwen3_asr import Qwen3ASRForConditionalGeneration
 
 
+# Models registered at runtime by plugins (``vllm.general_plugins`` entry
+# points), e.g. contrib models and their speculative-decoding draft models.
+_EXTERNAL_MODELS: dict[str, type] = {}
+
+
+def register_neuron_model(architecture: str, model_cls: type) -> None:
+    """Register an out-of-tree Neuron model class under an architecture name.
+
+    ``get_models()`` returns it alongside the built-in models, so the Neuron
+    worker registers it with vLLM's ``ModelRegistry`` and the speculative
+    decoding proposers can resolve it as a draft model. Call it from a
+    ``vllm.general_plugins`` hook so it runs in every process; later calls for
+    the same architecture replace the class.
+
+    Args:
+        architecture: The ``architectures`` entry of the (draft) model's HF
+            config, for example ``"HYV3MTPModel"``.
+        model_cls: The model class. It must provide ``from_configs``.
+
+    Example:
+        >>> register_neuron_model("MyDraftModel", MyDraftModel)  # doctest: +SKIP
+    """
+    _EXTERNAL_MODELS[architecture] = model_cls
+
+
 def get_models() -> list[tuple[str, type]]:
     """Return a list of available model classes.
 
@@ -28,6 +53,8 @@ def get_models() -> list[tuple[str, type]]:
         ("Qwen3VLForConditionalGeneration", Qwen3VLForConditionalGeneration),
         ("Qwen3ASRForConditionalGeneration", Qwen3ASRForConditionalGeneration),
     ]
+
+    models.extend(_EXTERNAL_MODELS.items())
 
     # SyntheticNeuronModel is a testing-only model that replaces real neural
     # network computation with deterministic KV cache fill/verify. Useful for
