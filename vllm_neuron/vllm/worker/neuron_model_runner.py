@@ -3969,7 +3969,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 and self._local_step_forces_nonspec(scheduler_output)
             )
             local_max_decode_ctx_len = (
-                int(self.input_batch.num_computed_tokens_cpu[:padded_num_reqs].max())
+                int(self.input_batch.num_computed_tokens_cpu[:num_reqs].max())
                 if padded_num_reqs > 0
                 and self.neuron_config.decode_context_length_buckets is not None
                 else 0
