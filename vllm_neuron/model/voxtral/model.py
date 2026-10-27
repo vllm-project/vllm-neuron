@@ -38,7 +38,10 @@ from vllm_neuron.model.interfaces import SupportsEncoderBudget
 from vllm_neuron.model.llama3.model import LlamaForCausalLM
 from vllm_neuron.model.neuron_config import EncoderNeuronConfig, NeuronConfig
 from vllm_neuron.model.voxtral.config import VoxtralAudioConfig, VoxtralConfig
-from vllm_neuron.parallel.neuron_parallel_state import get_neuron_encoder_tp_group
+from vllm_neuron.parallel.neuron_parallel_state import (
+    get_neuron_encoder_tp_group,
+    shard_select,
+)
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.weight_loader import (
     SafetensorsWeightLoader,
@@ -257,6 +260,7 @@ class VoxtralEncoderLayer(nn.Module):
         return x
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """Tensor-parallel layer on full rows ``[windows, seq, d_model]``."""
         windows, seq, _ = h.shape
         hd = self.heads_per_rank * self.head_dim
         qkv = self.self_attn_layer_norm(h) @ self.qkv_weight + self.qkv_bias
@@ -289,6 +293,49 @@ class VoxtralEncoderLayer(nn.Module):
         h = h + self._all_reduce(attn @ self.out_proj_weight) + self.out_proj_bias
         x = _gelu(self.final_layer_norm(h) @ self.fc1_weight + self.fc1_bias)
         return h + self._all_reduce(x @ self.fc2_weight) + self.fc2_bias
+
+    def forward_sp(self, h: torch.Tensor, windows: int) -> torch.Tensor:
+        """Sequence-parallel layer on this rank's ``[windows * seq / tp, d_model]`` rows.
+
+        >>> PARALLELISM: the layer norms, biases and residual adds run on 1/tp of
+        the rows. Each sublayer all-gathers its normed input before the
+        column-parallel projection and reduce-scatters after the row-parallel
+        projection, in place of one all-reduce on every row. <<<
+        """
+        tp = self.tp_group
+        hd = self.heads_per_rank * self.head_dim
+        x = tp.all_gather(self.self_attn_layer_norm(h), dim=0)  # [windows * seq, d]
+        rows = x.shape[0]
+        seq = rows // windows
+        qkv = x @ self.qkv_weight + self.qkv_bias
+        q, k, v = qkv[:, :hd], qkv[:, hd : 2 * hd], qkv[:, 2 * hd :]
+
+        def heads(t):
+            return (
+                t.view(windows, seq, self.heads_per_rank, self.head_dim)
+                .permute(0, 2, 1, 3)
+                .reshape(windows * self.heads_per_rank, seq, self.head_dim)
+            )
+
+        # <-- MODEL-SPECIFIC: bidirectional attention inside each 30 s window.
+        attn = NF.flash_attention(
+            heads(q),
+            heads(k),
+            heads(v),
+            scale=self.head_dim**-0.5,
+            causal_mask=False,
+            tp_q=True,
+            tp_k=True,
+            tp_out=False,
+        )
+        attn = (
+            attn.view(windows, self.heads_per_rank, seq, self.head_dim)
+            .permute(0, 2, 1, 3)
+            .reshape(rows, hd)
+        )
+        h = h + tp.reduce_scatter(attn @ self.out_proj_weight, dim=0) + self.out_proj_bias
+        x = _gelu(tp.all_gather(self.final_layer_norm(h), dim=0) @ self.fc1_weight + self.fc1_bias)
+        return h + tp.reduce_scatter(x @ self.fc2_weight, dim=0) + self.fc2_bias
 
 
 class VoxtralAudioLanguageAdapter(nn.Module):
@@ -408,8 +455,19 @@ class VoxtralAudioTower(nn.Module):
         x = _gelu(F.conv1d(x, self.conv1_weight, self.conv1_bias, padding=1))
         x = _gelu(F.conv1d(x, self.conv2_weight, self.conv2_bias, stride=2, padding=1))
         h = x.permute(0, 2, 1) + self.embed_positions
-        for layer in self.layers:
-            h = layer(h)
+        windows, seq, d = h.shape
+        tp = self.tp_group
+        if tp.world_size > 1 and (windows * seq) % tp.world_size == 0:
+            # >>> PARALLELISM: sequence-parallel encoder layers. Each rank keeps
+            # 1/tp of the rows between layers, which halves the collective bytes
+            # of the two per-layer all-reduces and shrinks the elementwise work. <<<
+            h = shard_select(h.reshape(windows * seq, d), 0, tp)
+            for layer in self.layers:
+                h = layer.forward_sp(h, windows)
+            h = tp.all_gather(h, dim=0).view(windows, seq, d)
+        else:
+            for layer in self.layers:
+                h = layer(h)
         h = self.layer_norm(h)
         # <-- MODEL-SPECIFIC: stack downsample_factor adjacent frames per token.
         h = h.reshape(
