@@ -60,8 +60,9 @@ engram     5.7 GiB    by row, ~6.0M of 384M a table
 Every backbone block runs as **one** NKI kernel
 (`kernels/<scheme>/layer_kernel.py:layer_forward`) and the whole DSpark draft
 path as another (`kernels/<scheme>/draft_kernel.py:draft_forward`). The flat
-scheme's drafter runs once per sequence, as it always has; the pipeline
-scheme's copy drafts **every sequence of the step in one launch** (the B
+scheme's own drafter runs once per sequence; the pipeline scheme's copy -- which
+the flat scheme also launches for a step of several sequences (below) -- drafts
+**every sequence of the step in one launch** (the B
 sequences' draft blocks are B x 5 rows of one tile, each with its own window in
 the kernel's slot table, and the token loop drafts the i-th token of all of them
 at once, so a step's drafting on the last stage costs one kernel's collectives
@@ -191,6 +192,57 @@ package on its own, `DEEPSEEK_V41_OPT_KERNELS` (`all` by default, `none`, or a
 comma list of packages) selects which run, and `test/unit/test_opt_kernels_diff.py`
 checks every one against the generic body on 8 ranks (shapes the recorded cases do
 not cover, every archetype).
+
+**A decode step is a handful of launches (flat scheme).** A decode block runs in well
+under a millisecond on the device, while every NEFF execution with collectives costs
+~1.5 ms of host submission at the least -- more the more IO tensors it has (~5 ms for an
+8-block launch's ~500, with the runtime's IO ring rebuilt every time,
+`NEURON_RT_IO_RING_CACHE_SIZE`; a larger ring cache does not help the engine, whose
+per-step tensors are new every step). One launch per block made the step host-bound, so
+the step is built from as few launches as keep the device fed:
+
+* `DEEPSEEK_V41_FUSE_DECODE=8` (default; 0 or 1 is one launch a block): each run of 8
+  consecutive blocks is one `@nki.jit` launch (`mk_kernels.fused`: the members' own
+  kernels called in sequence, their named scratch tensors prefixed per member and
+  their unnamed shared-HBM outputs named -- left to the compiler, two index sources'
+  same-shape top-k were not kept apart -- and their cache copies off). Five launches
+  a step instead of 40; larger groups cost more submission than they save, since the
+  step's first block waits for the first launch's submission (20-block groups were
+  slower). Prefill keeps one launch a block (device-bound).
+* The first launch opens with the token embedding and the hyper-connection expand
+  (`tp64/head_kernel.embed_expand_body`, `DEEPSEEK_V41_FUSE_EMBED`), the last closes
+  with the greedy head (`head_greedy_body`, `DEEPSEEK_V41_FUSE_HEAD`): collapse,
+  final norm, the vocab-parallel head and the argmax over the full vocabulary without
+  gathering the logits (each rank's (max, index), all-gathered; ties go to the lowest
+  index, as `argmax`'s do). An all-greedy speculative step's tokens come out of the
+  blocks' last launch; the separate tail's two `[T, vocab]` fp32 all-gathers and the
+  plugin sampler's collectives are gone. Any other step -- a sampled row, a prefill, no
+  drafts -- keeps the separate tail, which no longer gathers logits a speculative step
+  never reads.
+* A fused launch's arguments (~500) are planned once per (blocks, phase, T, B)
+  (`mk_model.FusedPlan`); a step refills only its own tensors -- the index columns, the
+  n-gram ids, the incoming stream / top-k. `DEEPSEEK_V41_FUSED_PLAN_CHECK=1` rebuilds
+  the plan every step and checks the cached one against it.
+* The drafter drafts every sequence of a step of several in one launch
+  (`mk_kernels.draft_batched`: the pipeline scheme's batched body specialized for the
+  world; `DEEPSEEK_V41_DRAFT_BATCHED=0` for one launch per sequence), one sequence
+  with the per-sequence kernel. Its int32 ids reach the scheduler in one read-back:
+  `DSparkProposer.propose` slices them on the host (stacking device slices was two
+  eager device ops a step, no int64 cast graph).
+* One RPC a step (`VLLM_NEURON_ONE_RPC_STEP`, set by `require_dspark_speculation`;
+  `DEEPSEEK_V41_ONE_RPC_STEP=0` keeps vLLM's three): the runner samples inside
+  `execute_model` when no scheduled request needs a grammar, so the engine skips its
+  `sample_tokens` RPC, and the drafts ride in the step's own output as they do under
+  pipeline parallelism (`neuron_pp_drafts`; `pp_draft_patch` skips
+  `take_draft_token_ids`).
+
+`DEEPSEEK_V41_HOST_PROF=1` logs each forward's host time by part and the runner's RPCs
+with the waits between them (`DEEPSEEK_V41_HOST_PROF_SYNC=1` waits for the device at
+every mark, so a part is its host and device time; `DEEPSEEK_V41_CPROFILE=<start>:<count>`
+puts rank 0's worker under cProfile). `test/unit/test_fused_decode.py` checks a fused
+launch bit for bit against the same kernels launched one by one (`--embed`, `--head`,
+`--time` for the host cost per launch), `test/unit/test_head_kernel.py` the head
+against a CPU reference (vocabulary padding, ties across ranks).
 
 Three parts of the kernels are written for the Trainium3 hardware directly:
 

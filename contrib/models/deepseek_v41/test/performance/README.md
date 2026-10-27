@@ -2,13 +2,60 @@
 
 Forward-inference speed, by the method the onboarding guide's "Benchmark and
 tune performance" section prescribes: serve the model, then drive it with
-`vllm bench serve --dataset-name random`.
+`vllm bench serve` (`--dataset-name sonnet`: real English at a target length, see
+"The matrix" below).
 
 ```bash
 # from the vllm-neuron repo root
-.venv/bin/python contrib/models/deepseek_v41/test/performance/run_bench.py \
-    --model <checkpoint-dir>
+python contrib/models/deepseek_v41/test/performance/run_bench.py \
+    --model <checkpoint-dir> \
+    --dataset-path contrib/models/deepseek_v41/test/performance/sonnet.txt
 ```
+
+`--dataset-path` is required unless the sonnet text sits at the default
+`/mnt/nvme/datasets/sonnet.txt`; a copy ships in this folder. The batch-10 cells need
+an engine that admits ten sequences (`DEEPSEEK_V41_MAX_NUM_SEQS=10`), so the
+reported numbers come from two runs -- see "Reproducing the reported numbers".
+
+## Reproducing the reported numbers
+
+The current reference reports are `bench_report.opt6.json` (batch 1) and
+`bench_report.opt6_ms10.json` (batch 10), measured 2026-10-27 on a trn3.48xlarge
+with the DLAMI venv `aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0` and the
+checkpoint at `/mnt/nvme/hf`. Run them one after the other, each with the devices to
+itself:
+
+```bash
+source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0/bin/activate
+cd <vllm-neuron repo root>
+
+# batch 1: the four input lengths (the default matrix), one-sequence engines
+DEEPSEEK_V41_SCHEME=tp64 \
+python contrib/models/deepseek_v41/test/performance/run_bench.py --model /mnt/nvme/hf \
+    --dataset-path contrib/models/deepseek_v41/test/performance/sonnet.txt \
+    --report contrib/models/deepseek_v41/test/performance/bench_report.opt6.json \
+    --bench-timeout 7200 --batch-sizes 1
+
+# batch 10: the same input lengths on ten-sequence engines
+DEEPSEEK_V41_SCHEME=tp64 DEEPSEEK_V41_MAX_NUM_SEQS=10 \
+python contrib/models/deepseek_v41/test/performance/run_bench.py --model /mnt/nvme/hf \
+    --dataset-path contrib/models/deepseek_v41/test/performance/sonnet.txt \
+    --report contrib/models/deepseek_v41/test/performance/bench_report.opt6_ms10.json \
+    --bench-timeout 7200 --input-lens 512,1024,2048,8192 --batch-sizes 10
+```
+
+Nothing else is set: every optimization in the reports is the default
+(`DEEPSEEK_V41_SCHEME=tp64` is too, spelled out for clarity). The knobs, each `1` by
+default unless noted, are `DEEPSEEK_V41_OPT_KERNELS` (`all`), `DEEPSEEK_V41_FUSE_DECODE`
+(`8` blocks a decode launch), `DEEPSEEK_V41_FUSE_EMBED`, `DEEPSEEK_V41_FUSE_HEAD`,
+`DEEPSEEK_V41_DRAFT_BATCHED` and `DEEPSEEK_V41_ONE_RPC_STEP`; `src/README.md`
+("A decode step is a handful of launches") says what each does. `--bench-timeout`
+only bounds a wedged run. Without `DEEPSEEK_V41_MAX_NUM_SEQS=10` the port clamps the
+engine to one sequence and a batch-10 cell queues its ten requests one at a time.
+A first run against a cold compile cache spends tens of minutes compiling on the
+way up and in each cell's warm-up; the measured figures are the same.
+`DEEPSEEK_V41_HOST_PROF=1` adds a per-step host-time breakdown to the server logs
+(`cells/server_*.log`) without changing the figures materially.
 
 The script puts its own folder's parent (`contrib/models/deepseek_v41/test/`) on
 `sys.path` and in `PYTHONPATH`, then imports the model package from the sibling
@@ -32,11 +79,14 @@ different model. A speed number against the wrong weights is worse than none.
 | output | 128 tokens |
 | batch | 1, 10 |
 
-Random input, with `--random-range-ratio 0` so the lengths are exact: a cell
-measures the shape it is named for, rather than whatever a corpus tokenized to.
-No two requests share a prefix, so nothing can be served out of the prefix
-cache instead of computed — and prefix caching is off on the server for the same
-reason.
+Sonnet verse (`--dataset-name sonnet`, `--sonnet-prefix-len 0`): real English,
+sampled whole lines up to the cell's input length, so the length is approximate and
+the report records each cell's `mean_input_tokens`. Until 2026-10-25 the matrix was
+random token ids (exact lengths), on which the drafter has nothing to predict --
+11-15% acceptance against ~41% on prose -- so every throughput figure was a lower
+bound (`run_bench._sonnet_flags` has the measurement). No two requests share a
+prefix, so nothing can be served out of the prefix cache instead of computed — and
+prefix caching is off on the server for the same reason.
 
 `--ignore-eos`, so every request emits exactly 128 tokens. Without it a request
 that stops early shortens its own TPOT sample and under-counts the token total.
@@ -115,9 +165,10 @@ and one column that is not a speed figure but conditions every speed figure:
 
 ## The prose acceptance probe
 
-The matrix is random-token input, and that very nearly switches speculation off:
-a drafter predicts the next token, and there is nothing to predict in noise. So
-acceptance gets its own measurement, on real text.
+Acceptance also gets a measurement of its own, on text that is not the matrix's:
+the matrix used to be random-token input, which very nearly switches speculation
+off (a drafter predicts the next token, and there is nothing to predict in noise),
+and the probe keeps a fixed prose reference across matrix changes.
 
 It is a **probe, not a cell**. After the widest-context cell's measurement, and
 before that server is torn down, the bench sends the verifier's own cases to
@@ -135,18 +186,14 @@ available: `CustomDataset` reads its JSONL through pandas, which is absent from
 this environment and resolves to a `PlaceholderModule` that raises on use.
 
 **Read the acceptance column before comparing throughput to anything.** A decode
-step emits `1 + accepted` tokens, so acceptance is a first-order term here — and
-on `--dataset-name random` it very nearly switches itself off. Random input is
-random *token ids*; a drafter predicts the next token, there is nothing to
-predict in noise, and DSpark's Markov/n-gram head leans on real language
+step emits `1 + accepted` tokens, so acceptance is a first-order term here. On
+`--dataset-name random` it very nearly switched itself off: random *token ids* give a
+drafter nothing to predict, and DSpark's Markov/n-gram head leans on real language
 statistics hardest of all. Measured on this port: **49% on the verifier's prose
 against 16-18% on the random dataset**, where 49% is in line with the
-single-device ancestor's 52% / 40%.
-
-That is not a fault and not a reason to abandon random input — exact lengths are
-worth more to a benchmark than realistic token statistics. It does mean the
-throughput here is a **lower bound** on what real traffic would see, and a
-reader who cannot see the acceptance rate cannot know that.
+single-device ancestor's 52% / 40%. That is why the matrix is sonnet verse now
+(42-51% acceptance per cell), and why reports from before 2026-10-25 (random input)
+are lower bounds that do not compare with later ones.
 
 Medians, not means: one slow request — a cold bucket, a compile — otherwise
 moves the figure more than the change being measured. p99 for TTFT and TPOT,

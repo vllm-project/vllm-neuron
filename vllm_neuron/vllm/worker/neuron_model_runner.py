@@ -7610,7 +7610,32 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         )
 
         self.kv_connector_output = kv_connector_output
+        if self._one_rpc_step() and not self._has_structured_output(scheduler_output):
+            # `VLLM_NEURON_ONE_RPC_STEP`: no grammar to wait for, so sample now; the
+            # engine calls `sample_tokens` only when this returns None.
+            return self.sample_tokens(None)
         return None
+
+    def _one_rpc_step(self) -> bool:
+        """`VLLM_NEURON_ONE_RPC_STEP=1` (synchronous scheduling, no pipeline): a step is
+        one `execute_model` RPC -- sampling inside it when no request needs a grammar,
+        the drafts inside its output (`_attach_pp_drafts`) instead of a
+        `take_draft_token_ids` RPC (`pp_draft_patch` skips that call)."""
+        return (
+            os.environ.get("VLLM_NEURON_ONE_RPC_STEP") == "1"
+            and not self.use_async_scheduling
+            and get_pp_group().world_size == 1
+        )
+
+    def _has_structured_output(self, scheduler_output) -> bool:
+        """Whether a scheduled request samples under a grammar (the engine then
+        computes a bitmask for `sample_tokens`)."""
+        for req_id in scheduler_output.num_scheduled_tokens:
+            state = self.requests.get(req_id)
+            params = getattr(state, "sampling_params", None)
+            if params is not None and getattr(params, "structured_outputs", None) is not None:
+                return True
+        return False
 
     def sample_tokens(
         self,
@@ -7972,9 +7997,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         if not self.use_async_scheduling:
             logger.debug(f"Model runner output: {output}")
-            if get_pp_group().world_size > 1:
+            if get_pp_group().world_size > 1 or self._one_rpc_step():
                 # Pipeline stages run under the batch queue: this step's drafts
-                # travel inside its own output (see `_attach_pp_drafts`).
+                # travel inside its own output (see `_attach_pp_drafts`); so do
+                # they with one RPC a step (`_one_rpc_step`).
                 self._attach_pp_drafts(output, scheduler_output)
             if _PP_TRACE and get_tp_group().rank_in_group == 0:
                 logger.warning(
@@ -10719,7 +10745,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         output.neuron_pp_drafts = rows
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
-        if get_pp_group().world_size > 1 and not self.use_async_scheduling:
+        if (get_pp_group().world_size > 1 or self._one_rpc_step()) and not self.use_async_scheduling:
             # The drafts ride in the step's output (`_attach_pp_drafts`);
             # `pp_draft_patch` keeps the engine from issuing this RPC at all.
             return None

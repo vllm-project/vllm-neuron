@@ -161,13 +161,19 @@ class DSparkProposer:
             )
 
         k = self.num_speculative_tokens
-        rows, tails = [], []
-        for output_ids, _logits, _confidence in drafts:
-            flat = output_ids.reshape(-1)
-            rows.append(flat[: k + 1])
-            tails.append(flat[1 : k + 1])
-        draft_token_ids = torch.stack(rows, dim=0)
-        drafts_only = torch.stack(tails, dim=0)
+        # One read-back of the drafted ids (a batched drafter's `[B, k+1]`, else one row
+        # per sequence), sliced on the host: stacking device slices was two eager device
+        # ops a step. Host tensors are what the synchronous runner wants anyway (it reads
+        # `drafts_only` back with `.cpu()`); the port runs the scheduler synchronously
+        # (`require_dspark_speculation`).
+        batched = getattr(target, "last_draft_ids", None)
+        if batched is not None and int(batched.shape[0]) == len(drafts):
+            ids = batched.cpu()
+        else:
+            ids = torch.cat([output_ids.reshape(1, -1)[:, : k + 1].cpu() for output_ids, _l, _c in drafts])
+        ids = ids.to(torch.int64)
+        draft_token_ids = ids[:, : k + 1].contiguous()
+        drafts_only = ids[:, 1 : k + 1].contiguous()
 
         self._report_acceptance(raw_sampled_token_ids)
 

@@ -25,6 +25,8 @@ step. The same module sizes the executor's RPC ring for a full pipeline of
 steps in flight (``apply_pp_mq_depth_patch``, below).
 """
 
+import os
+
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -34,10 +36,13 @@ _original_post_step = None
 
 
 def pp_sync_scheduling(vllm_config) -> bool:
-    """True when drafts travel in the step outputs: PP > 1, sync scheduling."""
+    """True when drafts travel in the step outputs: PP > 1, sync scheduling -- or
+    one RPC a step (`VLLM_NEURON_ONE_RPC_STEP=1`, `NeuronModelRunner._one_rpc_step`)."""
+    if vllm_config.scheduler_config.async_scheduling:
+        return False
     return bool(
         vllm_config.parallel_config.pipeline_parallel_size > 1
-        and not vllm_config.scheduler_config.async_scheduling
+        or os.environ.get("VLLM_NEURON_ONE_RPC_STEP") == "1"
     )
 
 

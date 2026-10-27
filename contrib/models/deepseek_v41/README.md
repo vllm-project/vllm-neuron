@@ -276,6 +276,41 @@ of the vocabulary; both are fixed, see the report.) The report's "Round 3"
 section has the batched cells and the traces behind these explanations, and
 `test/performance/history/README.md` indexes every bench run with its report and log.
 
+**Optimized kernels and a fused decode step (2026-10-25 to 2026-10-27, flat scheme).**
+Every block of the flat scheme now runs a hand-optimized kernel for its phase and
+archetype (`src/kernels/tp64/<archetype>_<phase>/`, 18 packages), and a decode step is
+five launches instead of one per block: each run of 8 blocks is one fused kernel, the
+first of them also embeds the step's tokens and the last also runs the greedy head
+and the argmax over the full vocabulary (no logits gather), the drafter drafts every
+sequence of a multi-sequence step in one launch, and a step is one RPC from the
+engine to the workers instead of three. `src/README.md` ("Optimized block kernels",
+"A decode step is a handful of launches") has the design and the switches; the
+integration test passes with the verifier's texts unchanged. Measured 2026-10-27 on
+the trn3.48xlarge stack named at the top of this section (the DLAMI venv
+`aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0`, vLLM 0.29.0;
+`test/performance/bench_report.opt6.json` and `.opt6_ms10.json`; sonnet input, so the
+input lengths are approximate; greedy; the commands are under "Testing" below):
+
+| Cell | TTFT p50 ms | TPOT p50 ms | decode tok/s | accept % |
+|------|-------------|-------------|--------------|----------|
+| in512_bs1 | 165 | 14.8 | 64.0 | 51 |
+| in1024_bs1 | 300 | 13.3 | 63.8 | 48 |
+| in2048_bs1 | 587 | 14.8 | 51.2 | 42 |
+| in8192_bs1 | 3323 | 15.2 | 24.1 | 46 |
+| in512_bs10 | 880 | 34.0 | 225.5 | 46 |
+| in1024_bs10 | 1613 | 43.2 | 154.5 | 49 |
+| in2048_bs10 | 3186 | 64.9 | 100.1 | 45 |
+| in8192_bs10 | 18307 | 156.2 | 33.3 | 44 |
+
+The batch-10 rows are ten concurrent requests on engines built for ten
+(`DEEPSEEK_V41_MAX_NUM_SEQS=10`); `decode tok/s` is their aggregate. Against the same
+kernels with one launch per decode block (earlier the same day,
+`bench_report.opt4*.json`), batch-1 TPOT is 47-49% lower and batch-10 TPOT 13-43%
+lower; TTFT is unchanged (prefill was already device-bound). The one-RPC step needs
+the runner change in this branch's plugin (`vllm_neuron/vllm/worker/neuron_model_runner.py`,
+`vllm_neuron/vllm/patches/pp_draft_patch.py`); on a plugin without it the port still
+serves, with vLLM's three RPCs a step.
+
 > **Read this before you deploy.** Every number in this contribution was
 > measured on `vllm-neuron` **0.24.0.1.1.0**, which is the branch the model was
 > developed against. The code is contributed on top of `main`, and the port's
@@ -311,13 +346,19 @@ hf download deepseek-ai/DeepSeek-V4.1-Flash \
 ### Accuracy (integration)
 
 Serves the model through vLLM on all 64 cores and checks the generated text.
-Needs the devices to itself.
+Needs the devices to itself. From the repository root, in the DLAMI venv the numbers
+above were measured in:
 
 ```bash
-DEEPSEEK_V41_CHECKPOINT=/mnt/nvme/hf \
-pytest contrib/models/deepseek_v41/test/integration/test_model.py \
+source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0/bin/activate
+DEEPSEEK_V41_SCHEME=tp64 DEEPSEEK_V41_CHECKPOINT=/mnt/nvme/hf \
+python -m pytest contrib/models/deepseek_v41/test/integration/test_model.py \
     -v -s --timeout=14400
 ```
+
+`DEEPSEEK_V41_SCHEME=tp64` is the default (`tp8pp8` runs the pipeline scheme); no other
+variable is needed -- every optimization above is on by default. The run takes about
+15 minutes against a warm compile cache.
 
 `-s` is not optional in practice: 64 workers log progress, and a cold compile
 takes tens of minutes during which captured output makes a live run look hung.
@@ -347,26 +388,57 @@ docstring explains the substitution in full.
 ### Speed (performance)
 
 The port's benchmark harness. It serves the model and drives it with
-`vllm bench serve --dataset-name random` over a matrix of input lengths and
+`vllm bench serve --dataset-name sonnet` over a matrix of input lengths and
 batch sizes, reporting TTFT, TPOT and aggregate decode throughput per cell.
+The table above comes from two runs, batch 1 and batch 10, one after the other, from
+the repository root:
 
 ```bash
-python contrib/models/deepseek_v41/test/performance/run_bench.py \
-    --model /mnt/nvme/hf
+source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0/bin/activate
+
+# batch 1, input 512 / 1024 / 2048 / 8192 (the default lengths)
+DEEPSEEK_V41_SCHEME=tp64 \
+python contrib/models/deepseek_v41/test/performance/run_bench.py --model /mnt/nvme/hf \
+    --dataset-path contrib/models/deepseek_v41/test/performance/sonnet.txt \
+    --report contrib/models/deepseek_v41/test/performance/bench_report.opt6.json \
+    --bench-timeout 7200 --batch-sizes 1
+
+# batch 10, on engines that admit ten sequences
+DEEPSEEK_V41_SCHEME=tp64 DEEPSEEK_V41_MAX_NUM_SEQS=10 \
+python contrib/models/deepseek_v41/test/performance/run_bench.py --model /mnt/nvme/hf \
+    --dataset-path contrib/models/deepseek_v41/test/performance/sonnet.txt \
+    --report contrib/models/deepseek_v41/test/performance/bench_report.opt6_ms10.json \
+    --bench-timeout 7200 --input-lens 512,1024,2048,8192 --batch-sizes 10
 ```
 
-Random input is deliberate: it fixes the token count exactly, so a cell measures
-the shape it names, and no two requests share a prefix the prefix cache could
-serve instead of computing. See
+`--dataset-path` is needed unless the sonnet text is at the default
+`/mnt/nvme/datasets/sonnet.txt` (a copy ships in `test/performance/`), and
+`DEEPSEEK_V41_MAX_NUM_SEQS=10` is what makes the batch-10 cells batch 10: without it
+the port clamps the engine to one sequence and the cell's ten requests queue.
+`--report` names the output (default `test/performance/bench_report.json`) and
+`--bench-timeout` only bounds a wedged run. Each cell gets its own server, sized to
+its context, and is warmed before it is measured; the batch-1 run takes about 35
+minutes and the batch-10 run about 45 against a warm compile cache.
+
+Sonnet input is deliberate: real English gives the drafter something to predict
+(random token ids held acceptance to 11-18% against 41-49% on prose, which made
+every throughput figure a lower bound), and with `--sonnet-prefix-len 0` no two requests
+share a prefix the prefix cache could serve instead of computing. See
 [`test/performance/README.md`](test/performance/README.md) for the matrix, the
-flags and how to read the output. A full eight-cell run takes hours;
-`--input-lens` and `--batch-sizes` narrow it to the cells you care about.
+flags and how to read the output; `--input-lens` and `--batch-sizes` narrow a run
+to the cells you care about.
 
 ### Optional: unit and module tests
 
 `test/unit/` holds the megakernels' component tests against a CPU reference
-(`test_layer.py`, `test_draft.py`, `test_pp.py`, run on N cores through
-`kharness_mp.py`), the hardware probes that established the kernels' conventions
+(`test_layer.py`, `test_draft.py`, `test_pp.py`; the optimized kernels against
+the generic body, `test_opt_kernels_diff.py`; a fused decode launch against its
+members launched one by one, `test_fused_decode.py`; the fused greedy head,
+`test_head_kernel.py`; all run on N cores through `kharness_mp.py` from `test/unit/`,
+e.g. `python kharness_mp.py 8 test_head_kernel.py`,
+`python kharness_mp.py 8 test_fused_decode.py --embed --groups r0,r0_e,r2_src_idx,r2,r2,r2,r2,r2`
+for the step's first launch and `--head --groups r1_idx,r1,r1,r1,r1_idx,r1_tap,r1_tap,r1_tap`
+for its last), the hardware probes that established the kernels' conventions
 (`probe_*.py`) and `compile_entries.py`, which traces every specialized kernel
 entry without a device; `test/unit/EQUIVALENCE_REPORT.md` is the write-up. The
 accuracy test above remains the gate.

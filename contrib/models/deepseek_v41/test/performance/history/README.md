@@ -6,9 +6,14 @@ engine above one rank was clamped to 1, and a `bs10` cell on such an engine queu
 The top-level `bench_report*.json` files are the current reference per scheme; `history/reports/`
 keeps the intermediate runs and `history/logs/` the console output of every run (its
 summary table is at the end of each log). `cells/` holds the raw per-cell output of the last run
-of each cell: the `ms1` server logs and the bs1 / in1024 / in8192 cells from r3_13 (tp8pp8), the
-in512_bs10 and in2048_bs10 cells and the `ms10` server logs from r3_21 (tp64, greedy; each cell's
-`generated_texts` holds its outputs).
+of each cell -- since 2026-10-27 all eight from r4_09 / r4_10 (tp64, greedy), with the server logs;
+each cell's `generated_texts` holds its outputs.
+
+**Input.** From 2026-10-25 (r3_19 on) the matrix is sonnet verse (`--dataset-name sonnet`), real
+English at an approximate length; before that it was random token ids, on which the drafter accepts
+far less (see `../README.md`), so earlier throughput rows are not comparable with later ones.
+Since r4_01 every run is two invocations, batch 1 on one-sequence engines and batch 10 on
+ten-sequence ones; `../README.md` ("Reproducing the reported numbers") has the commands.
 
 Per cell: TPOT p50 / decode tok/s / vLLM draft acceptance.
 
@@ -46,3 +51,13 @@ requests from the full vocabulary itself.
 | r3_19 | 2026-10-25 01:22-01:37 | tp64 | 10 | **greedy** batched cells (the bench fix), with the full-vocabulary sampler fix and the trace still in the tree | `reports/r3_19_tp64_ms10_0122_greedy.json` | `logs/r3_19_tp64_ms10_0122_greedy.log` | in512_bs10 96.8 ms / 77.2 tok/s / 47%; in2048_bs10 143.6 ms / 41.8 tok/s / 45% |
 | r3_20 | 2026-10-25 01:37-01:49 | tp64 | 1 | in512 regression check after the sampler fix (unchanged from round 2) | `reports/r3_20_tp64_0137_in512_regression.json` | `logs/r3_20_tp64_0137_in512_regression.log` | in512_bs1 31.6 ms / 28.1 tok/s / 46%; in512_bs10 30.6 ms / 28.5 tok/s / 46% |
 | r3_21 | 2026-10-25 01:50-02:05 | tp64 | 10 | **final**: both fixes, probing code removed; greedy | `../bench_report.tp64_ms10.json` | `logs/r3_21_tp64_ms10_0150_fixed.log` | in512_bs10 81.0 ms / 86.6 tok/s / 48%; in2048_bs10 135.4 ms / 43.9 tok/s / 45% |
+| r4_01 | 2026-10-25 20:52-21:31 | tp64 | 1 | the AutoHelix-optimized r2 prefill kernel (blocks 3-7, 9-13, 15-19) | `../bench_report.r2opt.json` | `logs/r4_01_tp64_1025_2052_r2opt.log` | in512_bs1 31.8 ms / 29.1 tok/s / 46%; in1024_bs1 31.3 ms / 27.3 tok/s / 47%; in2048_bs1 30.1 ms / 24.4 tok/s / 49%; in8192_bs1 33.7 ms / 11.8 tok/s / 42% |
+| r4_02 | 2026-10-25 21:32-22:18 | tp64 | 10 | as r4_01 | `../bench_report.r2opt_ms10.json` | `logs/r4_02_tp64_ms10_1025_2132_r2opt.log` | in512_bs10 80.5 ms / 96.1 tok/s / 47%; in1024_bs10 111.4 ms / 57.0 tok/s / 48%; in2048_bs10 118.4 ms / 54.3 tok/s / 47%; in8192_bs10 311.3 ms / 16.6 tok/s / 45% |
+| r4_03 | 2026-10-27 02:48-03:29 | tp64 | 1 | + the optimized r1 prefill, r2 decode and r1 decode kernels | `../bench_report.opt3.json` | `logs/r4_03_tp64_1027_0248_opt3.log` | in512_bs1 28.2 ms / 32.8 tok/s / 45%; in1024_bs1 27.2 ms / 32.2 tok/s / 46%; in2048_bs1 29.4 ms / 27.3 tok/s / 44%; in8192_bs1 28.8 ms / 14.8 tok/s / 47% |
+| r4_04 | 2026-10-27 03:29-04:15 | tp64 | 10 | as r4_03 | `../bench_report.opt3_ms10.json` | `logs/r4_04_tp64_ms10_1027_0329_opt3.log` | in512_bs10 60.8 ms / 127.2 tok/s / 47%; in1024_bs10 73.1 ms / 90.2 tok/s / 48%; in2048_bs10 87.2 ms / 73.1 tok/s / 47%; in8192_bs10 235.0 ms / 21.9 tok/s / 45% |
+| r4_05 | 2026-10-27 05:18-06:02 | tp64 | 1 | every phase x archetype its own optimized kernel (18 packages under `kernels/tp64/`) | `../bench_report.opt4.json` | `logs/r4_05_tp64_1027_0518_opt4.log` | in512_bs1 28.3 ms / 34.6 tok/s / 50%; in1024_bs1 25.7 ms / 35.5 tok/s / 48%; in2048_bs1 28.7 ms / 29.6 tok/s / 43%; in8192_bs1 28.8 ms / 18.0 tok/s / 46% |
+| r4_06 | 2026-10-27 06:03-06:50 | tp64 | 10 | as r4_05 | `../bench_report.opt4_ms10.json` | `logs/r4_06_tp64_ms10_1027_0603_opt4.log` | in512_bs10 60.0 ms / 128.8 tok/s / 47%; in1024_bs10 76.0 ms / 107.8 tok/s / 47%; in2048_bs10 80.8 ms / 87.5 tok/s / 45%; in8192_bs10 179.6 ms / 29.8 tok/s / 45% |
+| r4_07 | 2026-10-27 08:33-09:11 | tp64 | 1 | + decode blocks fused 8 to a launch (`DEEPSEEK_V41_FUSE_DECODE`) | `../bench_report.opt5.json` | `logs/r4_07_tp64_1027_0833_opt5.log` | in512_bs1 17.7 ms / 53.7 tok/s / 50%; in1024_bs1 16.2 ms / 54.0 tok/s / 49%; in2048_bs1 18.0 ms / 44.0 tok/s / 42%; in8192_bs1 17.9 ms / 22.5 tok/s / 46% |
+| r4_08 | 2026-10-27 09:11-10:04 | tp64 | 10 | as r4_07 | `../bench_report.opt5_ms10.json` | `logs/r4_08_tp64_ms10_1027_0911_opt5.log` | in512_bs10 49.5 ms / 125.5 tok/s / 44%; in1024_bs10 69.1 ms / 109.0 tok/s / 46%; in2048_bs10 68.4 ms / 92.9 tok/s / 45%; in8192_bs10 172.2 ms / 31.5 tok/s / 44% |
+| r4_09 | 2026-10-27 12:52-13:29 | tp64 | 1 | **current**: + the step's embedding and greedy head inside its first / last fused launch, cached launch plans, one read-back of the drafts, one RPC a step, the batched drafter for steps of several sequences | `../bench_report.opt6.json` | `logs/r4_09_tp64_1027_1252_opt6.log` | in512_bs1 14.8 ms / 64.0 tok/s / 51%; in1024_bs1 13.3 ms / 63.8 tok/s / 48%; in2048_bs1 14.8 ms / 51.2 tok/s / 42%; in8192_bs1 15.2 ms / 24.1 tok/s / 46% |
+| r4_10 | 2026-10-27 13:29-14:14 | tp64 | 10 | **current**: as r4_09 | `../bench_report.opt6_ms10.json` | `logs/r4_10_tp64_ms10_1027_1329_opt6.log` | in512_bs10 34.0 ms / 225.5 tok/s / 46%; in1024_bs10 43.2 ms / 154.5 tok/s / 49%; in2048_bs10 64.9 ms / 100.1 tok/s / 45%; in8192_bs10 156.2 ms / 33.3 tok/s / 44% |

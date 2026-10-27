@@ -23,6 +23,8 @@ import glob
 import hashlib
 import logging
 import os
+import statistics
+import time
 from dataclasses import dataclass, field
 
 import torch
@@ -32,6 +34,181 @@ from .kernels import mk_kernels
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _mk_log = logging.getLogger(__name__)
+#: `DEEPSEEK_V41_HOST_PROF=1`: time the host side of every forward (`HostProf`) and log a
+#: summary on rank 0 every `DEEPSEEK_V41_HOST_PROF_EVERY` forwards (default 32).
+_HOST_PROF = os.environ.get("DEEPSEEK_V41_HOST_PROF", "") not in ("", "0")
+_HOST_PROF_SYNC = os.environ.get("DEEPSEEK_V41_HOST_PROF_SYNC", "") not in ("", "0")
+_CPROFILE = os.environ.get("DEEPSEEK_V41_CPROFILE", "")
+
+
+class HostProf:
+    """Host time of each forward, by part (perf_counter, ms): `gap` since the previous
+    forward returned (the engine's scheduling / output processing / input preparation),
+    `pre` until the blocks start (span / slot metadata, index math, hashes, embedding),
+    `blocks` the block loop -- `args` (each launch's arguments), `entry` (the compiled
+    entry's call: dynamo's guards and the runtime's submission) and `post` (after it) --
+    and `tail` after it (collapse, head, sampling, the drafter)."""
+
+    def __init__(self, every: int):
+        self.every, self.rows, self.cur, self.last_end = every, [], None, None
+
+    def begin(self) -> None:
+        t = time.perf_counter()
+        gap = (t - self.last_end) * 1e3 if self.last_end is not None else float("nan")
+        self.cur = {"t0": t, "gap": gap, "args": 0.0, "entry": 0.0, "post": 0.0, "launches": 0}
+
+    def add(self, key: str, seconds: float) -> None:
+        if self.cur is not None:
+            self.cur[key] = self.cur.get(key, 0.0) + seconds * 1e3
+
+    @torch._dynamo.disable
+    def mark(self, key: str, sync=None) -> None:
+        if self.cur is not None:
+            if _HOST_PROF_SYNC and sync is not None:
+                sync.cpu()
+            self.cur[key] = (time.perf_counter() - self.cur["t0"]) * 1e3
+
+    def end(self, step, rank: int) -> None:
+        if self.cur is None:
+            return
+        t = time.perf_counter()
+        c, self.cur, self.last_end = self.cur, None, t
+        c["total"] = (t - c["t0"]) * 1e3
+        c["phase"] = getattr(step, "phase", "?")
+        c["T"] = getattr(step, "T", 0)
+        if "blocks0" in c and "blocks1" in c:
+            c["pre"], c["blocks"], c["tail"] = c["blocks0"], c["blocks1"] - c["blocks0"], c["total"] - c["blocks1"]
+            if "head" in c and "sampled" in c:
+                c["t_head"], c["t_sample"] = c["head"] - c["blocks1"], c["sampled"] - c["head"]
+                c["t_draft"] = c["total"] - c["sampled"]
+                if "collapsed" in c and "lshard" in c:
+                    c["t_collapse"], c["t_lshard"] = c["collapsed"] - c["blocks1"], c["lshard"] - c["collapsed"]
+                    c["t_gather"] = c["head"] - c["lshard"]
+        self.rows.append(c)
+        if len(self.rows) < self.every:
+            return
+        rows, self.rows = self.rows, []
+        if rank != 0:
+            return
+        for phase in sorted({r["phase"] for r in rows}):
+            rs = [r for r in rows if r["phase"] == phase]
+
+            def med(k):
+                v = [r[k] for r in rs if k in r and r[k] == r[k]]
+                return statistics.median(v) if v else float("nan")
+
+            _mk_log.warning(
+                "host prof %s x%d (T=%s): gap %.2f | forward %.2f = pre %.2f + blocks %.2f (args %.2f, "
+                "entry %.2f, post %.2f over %d launches) + tail %.2f (head %.2f, sampling %.2f, "
+                "draft %.2f) ms (medians)",
+                phase, len(rs), sorted({r["T"] for r in rs}), med("gap"), med("total"), med("pre"),
+                med("blocks"), med("args"), med("entry"), med("post"), int(med("launches")), med("tail"),
+                med("t_head"), med("t_sample"), med("t_draft"))
+            if any("t_collapse" in r for r in rs):    # (the separate tail ran)
+                _mk_log.warning("host prof %s head = collapse %.2f + head matmul %.2f + logits gather %.2f ms%s",
+                                phase, med("t_collapse"), med("t_lshard"), med("t_gather"),
+                                " (marks synced to the device)" if _HOST_PROF_SYNC else "")
+
+
+PROF = HostProf(int(os.environ.get("DEEPSEEK_V41_HOST_PROF_EVERY", "32"))) if _HOST_PROF else None
+
+
+class RpcProf:
+    """`DEEPSEEK_V41_HOST_PROF`: the model runner's per-step calls (ms): how long each runs
+    and how long the worker waits between them (the engine's scheduling and the RPC to the
+    64 workers), summarized with `HostProf` on rank 0."""
+
+    CALLS = ("execute_model", "sample_tokens", "take_draft_token_ids")
+
+    def __init__(self, every: int):
+        self.every, self.rows, self.cur, self.last_end = every, [], {}, None
+
+    def wrap(self, cls, rank: int) -> None:
+        self.rank = rank
+        for name in self.CALLS:
+            fn = getattr(cls, name, None)
+            if fn is None or getattr(fn, "_rpc_prof", False):
+                continue
+
+            def timed(runner, *args, _fn=fn, _name=name, **kwargs):
+                if _name == "execute_model" and _CPROFILE and self.rank == 0:
+                    self.cprofile_tick()
+                t0 = time.perf_counter()
+                if _name == "execute_model" and self.cur:
+                    # a new step: close the previous one
+                    self.flush(self.cur)
+                    self.cur = {}
+                if self.last_end is not None:
+                    key = f"idle>{_name}"
+                    self.cur[key] = self.cur.get(key, 0.0) + (t0 - self.last_end) * 1e3
+                try:
+                    return _fn(runner, *args, **kwargs)
+                finally:
+                    t1 = time.perf_counter()
+                    self.cur[_name] = self.cur.get(_name, 0.0) + (t1 - t0) * 1e3
+                    self.last_end = t1
+
+            timed._rpc_prof = True
+            setattr(cls, name, timed)
+
+    calls = 0
+    cprof = None
+
+    def cprofile_tick(self) -> None:
+        """`DEEPSEEK_V41_CPROFILE=<start>:<count>`: profile execute_model calls
+        start .. start + count - 1 and everything between them, then report."""
+        import cProfile
+        import io
+        import pstats
+
+        start, count = (int(v) for v in _CPROFILE.split(":"))
+        self.calls += 1
+        if self.calls == start:
+            self.cprof = cProfile.Profile()
+            self.cprof.enable()
+        elif self.calls == start + count and self.cprof is not None:
+            self.cprof.disable()
+            self.cprof.dump_stats("/mnt/nvme/ds41_cprof_rank0.prof")
+            for key in ("tottime", "cumulative"):
+                buf = io.StringIO()
+                pstats.Stats(self.cprof, stream=buf).sort_stats(key).print_stats(45)
+                _mk_log.warning("cprofile over %d steps by %s:\n%s", count, key, buf.getvalue())
+            self.cprof = None
+
+    def flush(self, row) -> None:
+        self.rows.append(row)
+        if len(self.rows) < self.every:
+            return
+        rows, self.rows = self.rows, []
+        if getattr(self, "rank", 0) != 0:
+            return
+        keys = sorted({k for r in rows for k in r})
+
+        def med(k):
+            v = [r[k] for r in rows if k in r]
+            return statistics.median(v) if v else float("nan")
+
+        _mk_log.warning("rpc prof x%d: %s (medians, ms)", len(rows),
+                        " | ".join(f"{k} {med(k):.2f}" for k in keys))
+
+
+RPC_PROF = RpcProf(int(os.environ.get("DEEPSEEK_V41_HOST_PROF_EVERY", "32"))) if _HOST_PROF else None
+
+
+#: Zero tensors the launches read but no kernel writes (the top-k placeholder of a step's
+#: first compressed layers, a ratio-0 block's 1-column top-k), one per shape: a fresh
+#: `torch.zeros` on the device per launch was a device op of its own.
+_ZEROS: dict = {}
+
+
+def _zeros(shape: tuple, device) -> torch.Tensor:
+    key = (shape, str(device))
+    t = _ZEROS.get(key)
+    if t is None:
+        t = _ZEROS[key] = torch.zeros(*shape, dtype=torch.int32, device=device)
+    return t
+
+
 _IN_FLIGHT = int(os.environ.get("DEEPSEEK_V41_MK_IN_FLIGHT", "12"))
 #: Small outputs of the megakernel launches submitted by this process and not yet
 #: known complete, oldest first, **across forwards**: the runtime's submission queue
@@ -256,7 +433,8 @@ def kernel_version(kind: str = "block", scheme: str = "tp64") -> int:
     package only (`mk_kernels.version_kind`)."""
     h = hashlib.sha256()
     kdir = os.path.join(_HERE, "kernels", scheme)
-    own = {"block": ("layer_kernel.py",), "draft": ("draft_kernel.py",), "pp": ("pp_kernels.py",)}
+    own = {"block": ("layer_kernel.py",), "draft": ("draft_kernel.py",), "pp": ("pp_kernels.py",),
+           "head": ("head_kernel.py",)}
     if kind not in own and kind not in mk_kernels.OPTIMIZED_KINDS:
         raise ValueError(f"kernel_version: unknown kind {kind!r}")
     if not os.path.isdir(kdir):
@@ -507,6 +685,10 @@ class StepIndices:
     compress_cache: torch.Tensor | None = None
     index_cache: torch.Tensor | None = None
     taps: list = field(default_factory=list)
+    #: `[T, 1]` int32: the step's greedy tokens, when its last fused launch ran the head
+    greedy_ids: torch.Tensor | None = None
+    #: `[T, 1]` int32: the step's input tokens, when its first fused launch embeds them
+    embed_ids: torch.Tensor | None = None
 
     def __post_init__(self):
         self.T = sum(length for _, length, _ in self.spans)
@@ -569,25 +751,35 @@ def make_step(spans, paged, device, hashes, decode_rows=6) -> StepIndices:
     return StepIndices(spans, paged, device, hashes, decode_rows=decode_rows)
 
 
-@torch._dynamo.disable
-def run_layer(model, block, stream: torch.Tensor, pre_mix: torch.Tensor, step: StepIndices):
-    """One backbone block through `layer_forward`. Returns `(stream, ffn_pre)`.
+#: layer id -> (window cache, its `[slots, head_dim]` view): the view, made once per cache
+_WIN_VIEWS: dict = {}
 
-    Outside dynamo (`torch._dynamo.disable`, as `MoE.forward` is): the index
-    columns are host work, and the kernel entry is its own `torch.compile`d
-    function, which compiles from here as the per-op steps do."""
+
+def _window_view(attn) -> torch.Tensor:
+    cache = attn.window_kv_cache
+    got = _WIN_VIEWS.get(attn.layer_id)
+    if got is None or got[0] is not cache:
+        got = _WIN_VIEWS[attn.layer_id] = (cache, cache.view(-1, attn.head_dim))
+    return got[1]
+
+
+def layer_args(model, block, stream, pre_mix, step: StepIndices, stage: int = 9):
+    """`(kernel, args, lw, arch)` of one block's launch: its kernel (`mk_kernels.layer`) and
+    positional arguments. `stream` / `pre_mix` / `step.topk` are put in as given (a fused
+    launch passes placeholders for the ones an earlier member makes). Records the kv
+    source's caches in `step` for the blocks after it."""
     lw = model._mk_layer(block)
     d = model._mk_dummies
-    T = int(stream.shape[0])
+    T = int(step.T)
     B = len(step.spans)
     idx = step.for_ratio(lw.ratio, lw.window)
     attn = block.attn
     if lw.ratio:
         if step.topk is None:
-            step.topk = torch.zeros(T, int(model.config.index_topk), dtype=torch.int32, device=step.device)
+            step.topk = _zeros((T, int(model.config.index_topk)), step.device)
         topk_in = step.topk
     else:
-        topk_in = torch.zeros(T, 1, dtype=torch.int32, device=step.device)
+        topk_in = _zeros((T, 1), step.device)
     if lw.is_kv_src:
         step.compress_cache = attn.compress_kv_cache
         step.index_cache = attn.index_k_cache
@@ -624,24 +816,39 @@ def run_layer(model, block, stream: torch.Tensor, pre_mix: torch.Tensor, step: S
                                   int(block.engram.row_start))
     else:
         engram = [d.bf16, d.i32, d.u8, d.u8, d.f32]
-    stage = 9
-    debug = None
-    if _MK_DEBUG:
-        dbg_layer, dbg_stage = (int(v) for v in _MK_DEBUG.split(":"))
-        if dbg_layer == attn.layer_id:
-            stage, debug = dbg_stage, (dbg_layer, dbg_stage)
     arch = (lw.ratio, int(lw.is_kv_src), int(lw.is_idx_src), int(in_kernel_engram), int(lw.tap))
     kver = kernel_version(mk_kernels.version_kind(step.phase, arch, plan.scheme), plan.scheme)
     flags = (lw.ratio, B, lw.window, stage, arch[1], arch[2], arch[3], arch[4], kver)
     args = [
         stream, pre_mix, *lw.hc_attn,
         idx.row_pos, idx.write_slots, idx.win_slots, idx.cmp_slots, idx.twin, idx.wv, idx.cbase, topk_in,
-        attn.window_kv_cache.view(-1, attn.head_dim), compress_cache, pool_kv, pool_score, index_cache,
+        _window_view(attn), compress_cache, pool_kv, pool_score, index_cache,
         *lw.compress[:4], *grp, *lw.compress[4:], idx.clen if lw.ratio else d.i32,
         hash_ids, *engram, *lw.moe,
         model._mk_groups_attn, model._mk_groups_world, flags,
     ]
     kernel = mk_kernels.layer(step.phase, arch, plan.scheme)
+    return kernel, args, lw, arch
+
+
+@torch._dynamo.disable
+def run_layer(model, block, stream: torch.Tensor, pre_mix: torch.Tensor, step: StepIndices):
+    """One backbone block through `layer_forward`. Returns `(stream, ffn_pre)`.
+
+    Outside dynamo (`torch._dynamo.disable`, as `MoE.forward` is): the index
+    columns are host work, and the kernel entry is its own `torch.compile`d
+    function, which compiles from here as the per-op steps do."""
+    t0 = time.perf_counter() if PROF is not None else 0.0
+    attn = block.attn
+    stage = 9
+    debug = None
+    if _MK_DEBUG:
+        dbg_layer, dbg_stage = (int(v) for v in _MK_DEBUG.split(":"))
+        if dbg_layer == attn.layer_id:
+            stage, debug = dbg_stage, (dbg_layer, dbg_stage)
+    kernel, args, lw, arch = layer_args(model, block, stream, pre_mix, step, stage)
+    plan = model.mk_plan
+    T, B = int(step.T), len(step.spans)
     if _MK_TRACE and plan.stage_rank == 0:
         # (the kind tells an optimized kernel from the generic body's entry of the same name)
         _mk_log.warning("mk launch %s [%s] layer=%d T=%d B=%d spans=%s", kernel.func.__name__,
@@ -651,7 +858,14 @@ def run_layer(model, block, stream: torch.Tensor, pre_mix: torch.Tensor, step: S
     if kcap is not None:
         # Copies taken before the launch: the kernel writes the caches in place.
         cap_args = [a.detach().cpu().clone() if isinstance(a, torch.Tensor) else a for a in args]
+    if PROF is not None:
+        t1 = time.perf_counter()
+        PROF.add("args", t1 - t0)
     out = entry(kernel)(*args)
+    if PROF is not None:
+        t2 = time.perf_counter()
+        PROF.add("entry", t2 - t1)
+        PROF.add("launches", 1e-3)
     if kcap is not None:
         _kcapture_save(model, kcap, kernel, attn.layer_id, step, cap_args, out)
     if debug is not None:
@@ -670,7 +884,288 @@ def run_layer(model, block, stream: torch.Tensor, pre_mix: torch.Tensor, step: S
         step.topk = topk_out
     if lw.tap:
         step.taps.append(tap_out)
+    if PROF is not None:
+        PROF.add("post", time.perf_counter() - t2)
     return out_stream, ffn_pre
+
+
+#: `DEEPSEEK_V41_FUSE_DECODE=<n>` (default 8): a decode step of the flat scheme launches each
+#: run of n consecutive blocks as ONE fused kernel (`mk_kernels.fused`: the blocks'
+#: optimized kernels in sequence) instead of one launch per block. Every launch of a NEFF
+#: with collectives costs ~1.5 ms of host time in the runtime's submission, whatever its
+#: size (measured: 1.5-1.8 ms with 1-16 all-reduces and 74-300 arguments, 0.25 ms without a
+#: collective), and a block's decode kernel runs in ~0.6-0.9 ms: one launch per block made
+#: the decode step host-bound (40 launches ~62 ms of a ~95 ms bs1 step). 0 or 1: one launch
+#: a block. Prefill keeps one launch a block (device-bound; fusing would multiply compiles).
+_FUSE_DECODE = int(os.environ.get("DEEPSEEK_V41_FUSE_DECODE", "8"))
+#: `DEEPSEEK_V41_FUSE_HEAD` (default 1): an all-greedy speculative decode step runs the
+#: head -- collapse, final norm, vocab-parallel head and the argmax -- as the last member
+#: of its last fused launch (`mk_kernels.head_greedy`) instead of five separate launches,
+#: two `[T, vocab]` all-gathers and the plugin sampler's own collectives. 0: separately.
+_FUSE_HEAD = os.environ.get("DEEPSEEK_V41_FUSE_HEAD", "1") not in ("", "0")
+
+
+def head_args(model) -> list:
+    """The fused head's arguments after the stream / pre_mix: the final norm's row, this
+    rank's head rows, its first vocabulary column, the world's groups and the flags."""
+    got = model.__dict__.get("_mk_head_args")
+    if got is None:
+        device = model.head_weight.device
+        got = model.__dict__["_mk_head_args"] = [
+            _row(model.norm.weight, device), model.head_weight,
+            torch.tensor([[int(model.rank * model.part_vocab_size)]], dtype=torch.int32, device=device),
+            model._mk_groups_full, (int(model.config.vocab_size), kernel_version("head", "tp64")),
+        ]
+    return got
+
+
+#: `DEEPSEEK_V41_FUSE_EMBED` (default 1): a decode step's first fused launch embeds the
+#: step's tokens and expands them to the hyper-connection copies itself
+#: (`mk_kernels.embed_expand`) instead of the embedding's all-reduce graph and the
+#: `hc_expand` launch, both between the step's start and its first block. 0: separately.
+_FUSE_EMBED = os.environ.get("DEEPSEEK_V41_FUSE_EMBED", "1") not in ("", "0")
+
+
+def fuses_embed(model, spans) -> bool:
+    """Whether this step's first fused launch embeds its tokens (`run_blocks`): a decode
+    step of the flat scheme (`StepIndices.phase`'s rule, from the spans)."""
+    lengths = {length for _, length, _ in spans}
+    if len(lengths) != 1:
+        return False
+    length = lengths.pop()
+    return (_FUSE_EMBED and _FUSE_DECODE > 1 and length <= 1 + int(model.config.dspark_block_size)
+            and length * len(spans) <= 128 and model.mk_plan.scheme == "tp64"
+            and not _MK_DEBUG and not _KCAPTURE)
+
+
+@torch._dynamo.disable
+def embed_ids(input_ids: torch.Tensor) -> torch.Tensor:
+    """The step's tokens as the `[T, 1]` int32 column the fused embedding reads (through
+    the host: the device is idle at a step's start, and a dtype cast on it would be a
+    graph of its own)."""
+    return input_ids.detach().reshape(-1).cpu().to(torch.int32).reshape(-1, 1).contiguous().to(input_ids.device)
+
+
+def embed_args(model) -> list:
+    """The fused embedding's arguments after the ids: this rank's embedding rows, its
+    first vocabulary row, the world's groups and the flags."""
+    got = model.__dict__.get("_mk_embed_args")
+    if got is None:
+        got = model.__dict__["_mk_embed_args"] = [
+            model.embed_weight, head_args(model)[2], model._mk_groups_full,
+            (int(model.config.hc_mult), kernel_version("head", "tp64")),
+        ]
+    return got
+
+
+def fuses_head(model, step) -> bool:
+    """Whether this step's blocks can end with the fused greedy head (`run_blocks`)."""
+    return (_FUSE_HEAD and _FUSE_DECODE > 1 and step.phase == "decode" and step.T <= 128
+            and model.mk_plan.scheme == "tp64" and not _MK_DEBUG and not _KCAPTURE)
+
+
+class _Out:
+    """Output `k` of member `m` of a fused launch being planned (`("o", m, k)`)."""
+
+    __slots__ = ("m", "k")
+
+    def __init__(self, m: int, k: int):
+        self.m, self.k = m, k
+
+
+#: the `StepIndices.for_ratio` columns a launch can read (`mk_host.AttnIndices`)
+_IDX_FIELDS = ("row_pos", "write_slots", "win_slots", "cmp_slots", "twin", "wv", "cbase",
+               "clen", "grp_pos", "grp_mslots", "grp_wslots")
+_PLAN_CHECK = os.environ.get("DEEPSEEK_V41_FUSED_PLAN_CHECK", "") not in ("", "0")
+
+
+@dataclass
+class FusedPlan:
+    """A fused launch as `run_fused` planned it once: the kernel, its parameters with the
+    step's own tensors as `slots` (`(index, kind, key)`: "in" the incoming stream (0) /
+    pre_mix (1), "topk" the step's top-k so far, "idx" a `for_ratio(*key[0])` column,
+    "hash" a `hash_cols(*key)` table), what the launch returns, and the step state the
+    blocks leave for later launches (the kv source's caches, a placeholder top-k)."""
+
+    fk: object
+    name: str
+    params: list
+    slots: list
+    ntaps: int
+    idx_member: int | None
+    head: bool
+    after: tuple
+    trace: str
+
+
+#: (layer ids, phase, T, B, head) -> FusedPlan
+_FUSED_PLANS: dict = {}
+
+
+def _plan_fused(model, blocks, stream, pre_mix, step: StepIndices, head: bool,
+                embed: bool = False) -> FusedPlan:
+    """`run_fused`'s plan, from `layer_args` (see `FusedPlan`). With `embed` member 0 is
+    the embedding (the blocks are members 1..), which makes the first block's stream."""
+    plan = model.mk_plan
+    zeros = {id(z) for z in _ZEROS.values()}
+    topk0 = step.topk if isinstance(step.topk, torch.Tensor) and id(step.topk) not in zeros else None
+    kernels, plans, params, pidx = [], [], [], {}
+    taps_at, idx_member = [], None
+    s, pm = stream, pre_mix
+    off = 0
+    if embed:
+        srcs = []
+        for x in [step.embed_ids, *embed_args(model)]:
+            key = ("t", id(x)) if isinstance(x, torch.Tensor) else ("c", x)
+            if key not in pidx:
+                pidx[key] = len(params)
+                params.append(x)
+            srcs.append(("p", pidx[key]))
+        kernels.append(mk_kernels.embed_expand())
+        plans.append(tuple(srcs))
+        s, pm, off = _Out(0, 0), _Out(0, 1), 1
+    for m0, block in enumerate(blocks):
+        m = m0 + off
+        kernel, args, lw, arch = layer_args(model, block, s, pm, step)
+        srcs = []
+        for x in args:
+            if isinstance(x, _Out):
+                srcs.append(("o", x.m, x.k))
+                continue
+            key = ("t", id(x)) if isinstance(x, torch.Tensor) else ("c", x)
+            if key not in pidx:
+                pidx[key] = len(params)
+                params.append(x)
+            srcs.append(("p", pidx[key]))
+        kernels.append(kernel)
+        plans.append(tuple(srcs))
+        if lw.is_idx_src:
+            step.topk = _Out(m, 2)
+            idx_member = m
+        if lw.tap:
+            taps_at.append(m)
+        s, pm = _Out(m, 0), _Out(m, 1)
+    n = len(blocks) + off          # (the members so far; the last block is member n - 1)
+    if head:
+        srcs = [("o", n - 1, 0), ("o", n - 1, 1)]
+        for x in head_args(model):
+            key = ("t", id(x)) if isinstance(x, torch.Tensor) else ("c", x)
+            if key not in pidx:
+                pidx[key] = len(params)
+                params.append(x)
+            srcs.append(("p", pidx[key]))
+        kernels.append(mk_kernels.head_greedy())
+        plans.append(tuple(srcs))
+    returns = [("o", n - 1, 0), ("o", n - 1, 1)] + [("o", m, 3) for m in taps_at]
+    if idx_member is not None:
+        returns.append(("o", idx_member, 2))
+    if head:
+        returns.append(("o", n, 0))
+    ids = [b.attn.layer_id for b in blocks]
+    name = (f"layers_{step.phase}{'_embed' if embed else ''}_L{ids[0]:02d}_L{ids[-1]:02d}"
+            f"{'_head' if head else ''}_{plan.scheme}")
+    fk = mk_kernels.fused(name, tuple(kernels), tuple(plans), len(params), tuple(returns))
+    # the step's own tensors: refilled every step
+    dyn = {}
+    if embed:
+        dyn[id(step.embed_ids)] = ("ids", None)
+    else:
+        dyn.update({id(stream): ("in", 0), id(pre_mix): ("in", 1)})
+    if topk0 is not None:
+        dyn[id(topk0)] = ("topk", None)
+    for rkey, idx in step._by_ratio.items():
+        for f in _IDX_FIELDS:
+            t = getattr(idx, f)
+            if t is not None:
+                dyn.setdefault(id(t), ("idx", (rkey, f)))
+    for hkey, t in step._hash_cols.items():
+        dyn.setdefault(id(t), ("hash", hkey))
+    slots = [(j, *dyn[id(x)]) for j, x in enumerate(params) if isinstance(x, torch.Tensor) and id(x) in dyn]
+    static = [None if isinstance(x, torch.Tensor) and id(x) in dyn else x for x in params]
+    zeros = {id(z) for z in _ZEROS.values()}       # (the blocks may have made one)
+    after = (step.compress_cache, step.index_cache,
+             step.topk if isinstance(step.topk, torch.Tensor) and id(step.topk) in zeros else None)
+    trace = ",".join(k.func.__module__.rsplit(".", 2)[-2] for k in kernels)
+    return FusedPlan(fk, name, static, slots, len(taps_at), idx_member, head, after, trace)
+
+
+def _fill_fused(fp: FusedPlan, stream, pre_mix, step: StepIndices):
+    """`fp`'s parameters for this step, or None when a slot has nothing this step."""
+    params = list(fp.params)
+    for j, kind, key in fp.slots:
+        if kind == "in":
+            x = stream if key == 0 else pre_mix
+        elif kind == "ids":
+            x = step.embed_ids
+        elif kind == "topk":
+            x = step.topk
+        elif kind == "idx":
+            x = getattr(step.for_ratio(*key[0]), key[1])
+        else:
+            x = step.hash_cols(*key)
+        if not isinstance(x, torch.Tensor):
+            return None
+        params[j] = x
+    return params
+
+
+@torch._dynamo.disable
+def run_fused(model, blocks, stream: torch.Tensor, pre_mix: torch.Tensor, step: StepIndices,
+              head: bool = False, embed: bool = False):
+    """`blocks` (consecutive) as one fused launch. Returns `(stream, ffn_pre)` of the last;
+    with `head`, the greedy head runs after them in the same launch (`step.greedy_ids`).
+
+    Each block's arguments are `layer_args`' with the stream / pre_mix / top-k an earlier
+    member makes as that member's output; every distinct tensor is one parameter (a kv
+    source's caches, the step's index columns and the dummies are shared), so a write in
+    one member is ordered before the reads in the next. The launch returns the last
+    stream / pre_mix, the taps and the last index source's top-k. The plan is made once
+    per (blocks, phase, T, B, head) (`FusedPlan`); a step refills the step's own tensors."""
+    t0 = time.perf_counter() if PROF is not None else 0.0
+    plan = model.mk_plan
+    key = (tuple(b.attn.layer_id for b in blocks), step.phase, int(step.T), len(step.spans), bool(head),
+           bool(embed))
+    fp = _FUSED_PLANS.get(key)
+    params = None if fp is None else _fill_fused(fp, stream, pre_mix, step)
+    if params is None or _PLAN_CHECK:
+        topk_in = step.topk
+        built = _plan_fused(model, blocks, stream, pre_mix, step, head, embed)
+        step.topk = topk_in              # (the plan left its members' placeholders there)
+        fresh = _fill_fused(built, stream, pre_mix, step)
+        if params is not None:
+            same = (len(params) == len(fresh) and built.fk is fp.fk
+                    and all(a is b or (not isinstance(a, torch.Tensor) and not isinstance(b, torch.Tensor)
+                                       and a == b) for a, b in zip(params, fresh)))
+            if not same:
+                raise RuntimeError(f"DEEPSEEK_V41_FUSED_PLAN_CHECK: the cached plan of {fp.name} "
+                                   f"differs from this step's ({len(params)} vs {len(fresh)} parameters)")
+        fp, params = built, fresh
+        _FUSED_PLANS[key] = fp
+    cc, ic, zt = fp.after
+    step.compress_cache, step.index_cache = cc, ic
+    if zt is not None and step.topk is None:
+        step.topk = zt
+    if _MK_TRACE and plan.stage_rank == 0:
+        _mk_log.warning("mk launch %s [%s] T=%d B=%d spans=%s", fp.name, fp.trace, step.T,
+                        len(step.spans), step.spans)
+    if PROF is not None:
+        t1 = time.perf_counter()
+        PROF.add("args", t1 - t0)
+    out = entry(fp.fk)(*params)
+    if PROF is not None:
+        t2 = time.perf_counter()
+        PROF.add("entry", t2 - t1)
+        PROF.add("launches", 1e-3)
+    stream, pre_mix = out[0], out[1]
+    step.taps.extend(out[2 : 2 + fp.ntaps])
+    if fp.idx_member is not None:
+        step.topk = out[2 + fp.ntaps]
+    if fp.head:
+        step.greedy_ids = out[-1]
+    _track(pre_mix)
+    if PROF is not None:
+        PROF.add("post", time.perf_counter() - t2)
+    return stream, pre_mix
 
 
 def _draft_meta(seeds, taps, pos):
@@ -687,12 +1182,6 @@ def draft_consts(B: int, K: int, ntab_p: int) -> torch.Tensor:
     r = torch.arange(B * K)
     i, b = r % K, r // K
     return torch.stack([i, b, b * ntab_p, i * B + b], dim=-1).to(torch.int32).contiguous()
-
-
-def _ids_i64(ids):
-    """The drafted ids as int64, as a compiled step: a dtype cast is the one
-    thing the backend's eager fallback does not implement (see `_moe_narrow`)."""
-    return ids.to(torch.int64)
 
 
 def draft_weights(model) -> list:
@@ -788,15 +1277,24 @@ def _run_draft_seq(model, seed_ids, tap, main_hidden, span, paged):
     out = entry(kernel)(*args)
     output_ids, confidence = out[0], out[1]
     _track(confidence)
-    ids = M._compiled(_ids_i64)(output_ids)
-    _track(ids)
-    return ids, None, confidence.reshape(1, K)
+    return output_ids, None, confidence.reshape(1, K)
+
+
+#: `DEEPSEEK_V41_DRAFT_BATCHED` (default 1): the flat scheme drafts every sequence of a step
+#: of several in one launch (`mk_kernels.draft_batched`) instead of one launch per sequence
+#: -- ten drafter launches a step at bs10, each its own NEFF execution (~1.5 ms of host
+#: submission with collectives) and its own collective-bound device time. A step of one
+#: sequence keeps the per-sequence kernel (measured 2026-10-27: bs10 TPOT 49.5 -> 41.1 ms
+#: batched, bs1 17.7 -> 18.1 ms). 0: one launch per sequence always.
+_DRAFT_BATCHED = os.environ.get("DEEPSEEK_V41_DRAFT_BATCHED", "1") not in ("", "0")
 
 
 @torch._dynamo.disable
 def run_draft(model, seeds, taps, main_hidden, spans, paged):
-    """`_draft` for every sequence of the step: `[(output_ids [1, K+1] int64, None,
-    confidence [1, K] fp32)]`, one per span. The flat scheme launches its drafter
+    """`_draft` for every sequence of the step: `[(output_ids [1, K+1] int32, None,
+    confidence [1, K] fp32)]`, one per span; a batched launch also leaves its
+    `[B, K+1]` ids in `model.last_draft_ids` (what `DSparkProposer.propose` reads back
+    in one copy), the per-sequence launches None there. The flat scheme launches its drafter
     once per sequence (`_run_draft_seq`, the path as before); the pipeline scheme
     drafts all of them in one launch (below).
 
@@ -805,7 +1303,9 @@ def run_draft(model, seeds, taps, main_hidden, spans, paged):
     tile), so a step's drafting costs one kernel's collectives however many
     sequences it has -- a 10-sequence batch on the pipeline's last stage drafted
     one sequence after another at ~15 ms each before (2026-10-24)."""
-    if model.mk_plan.scheme == "tp64":
+    batched_tp64 = model.mk_plan.scheme == "tp64" and _DRAFT_BATCHED and len(spans) > 1
+    model.last_draft_ids = None
+    if model.mk_plan.scheme == "tp64" and not batched_tp64:
         return [
             _run_draft_seq(model, seeds.reshape(-1)[b : b + 1], taps.reshape(-1)[b : b + 1],
                            main_hidden, span, pg)
@@ -844,7 +1344,8 @@ def run_draft(model, seeds, taps, main_hidden, spans, paged):
         rows_c = consts[(B, K, ntab_p)] = draft_consts(B, K, ntab_p).to(device)
     weights, tail = model._mk_draft()
     at_zero = int(paged[0].at_zero)
-    flags = (at_zero, K, win, 9, kernel_version("draft", model.mk_plan.scheme),
+    kscheme = "tp8pp8" if batched_tp64 else model.mk_plan.scheme   # the drafter body's package
+    flags = (at_zero, K, win, 9, kernel_version("draft", kscheme),
              int(cfg.dspark_noise_token_id), int(cfg.vocab_size), int(cfg.dspark_num_experts_per_tok),
              int(paged[0].block_size))
     caches = [s.attn.window_kv_cache.view(-1, s.attn.head_dim) for s in stages]
@@ -854,16 +1355,16 @@ def run_draft(model, seeds, taps, main_hidden, spans, paged):
     # world under tp64, the last stage under tp8pp8 (`_mk_groups_full` is that
     # stage's groups); it is a distinct entry per scheme, `draft_<phase>_<scheme>`,
     # as every other kernel is.
-    kernel = mk_kernels.draft("prefill" if at_zero else "decode", model.mk_plan.scheme)
+    dphase = "prefill" if at_zero else "decode"
+    kernel = mk_kernels.draft_batched(dphase) if batched_tp64 else mk_kernels.draft(dphase, model.mk_plan.scheme)
     if _MK_TRACE and model.mk_plan.stage_rank == 0:
         _mk_log.warning("mk launch %s B=%d spans=%s", kernel.func.__name__, B, spans)
     out = entry(kernel)(*args)
     output_ids, confidence = out[0], out[1]
     _track(confidence)
-    ids = M._compiled(_ids_i64)(output_ids)
-    _track(ids)
+    model.last_draft_ids = output_ids
     conf = confidence.reshape(B, K)
-    return [(ids[b : b + 1], None, conf[b : b + 1]) for b in range(B)]
+    return [(output_ids[b : b + 1], None, conf[b : b + 1]) for b in range(B)]
 
 
 @torch._dynamo.disable
@@ -991,13 +1492,29 @@ def _role_tensor(model, value: float) -> torch.Tensor:
     return t
 
 
-def run_blocks(model, stream, pre_mix, step, dump=None):
+def run_blocks(model, stream, pre_mix, step, dump=None, head=False, embed=False):
     """This rank's backbone blocks through the megakernels (every block under tp64,
     the stage's five under tp8pp8). Returns `(stream, pre_mix)`; `step.taps` holds
-    the DSpark taps on the stage that owns the tapped blocks."""
-    for layer_id, block in zip(model.block_ids, model.layers.values()):
+    the DSpark taps on the stage that owns the tapped blocks. `head` (an all-greedy
+    step, `fuses_head`): the last fused launch also runs the greedy head and
+    `step.greedy_ids` holds its tokens. `embed` (`fuses_embed`): the first fused launch
+    embeds `step.embed_ids` itself (`stream` / `pre_mix` are None)."""
+    if PROF is not None:
+        PROF.mark("blocks0", pre_mix)
+    fuse = (_FUSE_DECODE > 1 and step.phase == "decode" and model.mk_plan.scheme == "tp64"
+            and dump is None and not _MK_DEBUG and not _KCAPTURE)
+    blocks = list(model.layers.values())
+    if embed and not fuse:
+        raise RuntimeError("run_blocks: the step's embedding was left to the fused launch, "
+                           "but this step does not fuse (`fuses_embed` and `run_blocks` disagree)")
+    for g in range(0, len(blocks), _FUSE_DECODE) if fuse else ():
+        stream, pre_mix = run_fused(model, blocks[g : g + _FUSE_DECODE], stream, pre_mix, step,
+                                    head=head and g + _FUSE_DECODE >= len(blocks), embed=embed and g == 0)
+    for layer_id, block in () if fuse else zip(model.block_ids, model.layers.values()):
         stream, pre_mix = run_layer(model, block, stream, pre_mix, step)
         if dump is not None:
             dump(f"layer{layer_id}", stream)
             dump(f"premix{layer_id}", pre_mix)
+    if PROF is not None:
+        PROF.mark("blocks1", pre_mix)
     return stream, pre_mix

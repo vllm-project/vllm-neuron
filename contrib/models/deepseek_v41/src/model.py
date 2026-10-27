@@ -4025,6 +4025,27 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.tp_group = tp_group
         self.world_size = tp_group.world_size
         self.rank = tp_group.rank_in_group
+        if mk_model.PROF is not None:
+            # `DEEPSEEK_V41_HOST_PROF`: every forward timed by part (`mk_model.HostProf`)
+            inner = self.forward
+
+            def _timed_forward(*args, **kwargs):
+                mk_model.PROF.begin()
+                try:
+                    return inner(*args, **kwargs)
+                finally:
+                    drafts = getattr(self, "last_draft", None)
+                    if mk_model._HOST_PROF_SYNC and drafts:
+                        mk_model.PROF.mark("drafted", drafts[-1][0])
+                    mk_model.PROF.end(getattr(self, "_mk_step", None), self.rank)
+
+            self.forward = _timed_forward
+            try:
+                from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
+
+                mk_model.RPC_PROF.wrap(NeuronModelRunner, self.rank)
+            except ImportError:  # pragma: no cover - the plugin is always there when serving
+                pass
 
         from .config import ATTENTION_TENSOR_PARALLEL_SIZE
 
@@ -4946,7 +4967,11 @@ class DeepseekV41ForCausalLM(nn.Module):
         if _DUMP_DIR:
             _DUMP_LIVE[0] = live_rows
             _DUMP_STEP[0] += 1
-        if plan.is_first:
+        # A decode step of the flat scheme embeds its tokens in its first fused launch
+        # (`mk_model.fuses_embed`).
+        fuse_embed = (_MEGAKERNEL and plan.is_first and inputs_embeds is None and not _DUMP_DIR
+                      and mk_model.fuses_embed(self, spans))
+        if plan.is_first and not fuse_embed:
             hidden = self.embed_input_ids(input_ids)
             hidden = NF.merge_prompt_embeds(hidden, inputs_embeds, is_token_ids)
             if _DUMP_DIR:
@@ -4955,7 +4980,7 @@ class DeepseekV41ForCausalLM(nn.Module):
             stream, pre_mix = stream.squeeze(0), pre_mix.squeeze(0)
         else:
             # A later pipeline stage: the stream arrives from the previous stage
-            # (`mk_model.run_recv`, below).
+            # (`mk_model.run_recv`, below); or the first fused launch embeds.
             stream = pre_mix = None
 
         # The n-gram ids of the engram blocks this rank holds (the hash state is
@@ -4987,7 +5012,17 @@ class DeepseekV41ForCausalLM(nn.Module):
             dump = (lambda name, t: self._dump(name, t, live_rows)) if _DUMP_DIR else None
             if not plan.is_first:
                 stream, pre_mix = mk_model.run_recv(self, step, T)
-            stream, pre_mix = mk_model.run_blocks(self, stream, pre_mix, step, dump=dump)
+            # An all-greedy speculative decode step: the last fused launch also runs the
+            # head and the argmax (`mk_model.fuses_head`); its logits are never read
+            # (the step returns the rejection sampler's tokens).
+            head = (dump is None and not _TRACE_INPUTS and self.sampler is not None
+                    and sampling_params is not None and sampling_hint is not None
+                    and bool(sampling_hint[0]) and spec_decode_metadata is not None
+                    and plan.is_last and mk_model.fuses_head(self, step))
+            if fuse_embed:
+                step.embed_ids = mk_model.embed_ids(input_ids)
+            stream, pre_mix = mk_model.run_blocks(self, stream, pre_mix, step, dump=dump, head=head,
+                                                  embed=fuse_embed)
             if not plan.is_last:
                 # Hand off to the next stage; nothing to sample here (the runner's
                 # non-last-stage path ignores the value, which completes with the
@@ -5053,8 +5088,21 @@ class DeepseekV41ForCausalLM(nn.Module):
                 )
         _MOE_LIVE_ROWS[0] = None
 
+        greedy_ids = getattr(self._mk_step, "greedy_ids", None) if _MEGAKERNEL else None
+        if greedy_ids is not None:
+            sampled = greedy_ids.reshape(-1)
+            if sampling_positions is not None:
+                sampled = _compiled(_select_rows)(sampled, sampling_positions)
+            return self._finish_spec_step(
+                sampled, spec_decode_metadata, spans, paged, shared,
+                _compiled(_concat_last)(main_hiddens) if main_hiddens else None,
+                sampling_positions is not None, live_lengths,
+            )
+
         collapsed = HyperConnections.pre(stream.unsqueeze(0), pre_mix.unsqueeze(0))
         collapsed = self.norm(collapsed).squeeze(0)
+        if mk_model.PROF is not None:
+            mk_model.PROF.mark("collapsed", collapsed)
         if _DUMP_DIR:
             self._dump("final_normed", collapsed, live_rows)
             self._dump("input_ids", input_ids, live_rows)
@@ -5063,7 +5111,14 @@ class DeepseekV41ForCausalLM(nn.Module):
         if sampling_positions is not None:
             selected = _compiled(_select_rows)(collapsed, sampling_positions)
         logits_shard = self.logits_shard(selected)
-        logits = self.gather_logits(logits_shard)
+        if mk_model.PROF is not None:
+            mk_model.PROF.mark("lshard", logits_shard)
+        # A speculative step returns the rejection sampler's tokens, never the gathered
+        # logits (`[T, vocab]` fp32 across the world): only gather what is read.
+        logits = (self.gather_logits(logits_shard)
+                  if spec_decode_metadata is None or self.sampler is None or _TRACE_INPUTS else None)
+        if mk_model.PROF is not None:
+            mk_model.PROF.mark("head", logits_shard)
 
         main_hidden = (
             _compiled(_concat_last)(main_hiddens) if main_hiddens else None
@@ -5105,6 +5160,8 @@ class DeepseekV41ForCausalLM(nn.Module):
                 max(spec_decode_metadata.num_draft_tokens),
             )
 
+        if mk_model.PROF is not None:
+            mk_model.PROF.mark("sampled", sampled if accepted is None else accepted)
         self.last_draft = self._draft(
             sampled, accepted, spans, paged, shared, main_hidden,
             sampling_positions is not None, live_lengths,
@@ -5113,6 +5170,23 @@ class DeepseekV41ForCausalLM(nn.Module):
             return accepted
         return sampled, logits
 
+
+    def _finish_spec_step(self, sampled, spec_decode_metadata, spans, paged, shared, main_hidden,
+                          gathered, live_lengths):
+        """A speculative step's end from its target tokens: verify the drafts, draft the
+        next block, return the accepted tokens (`forward`'s own tail, after sampling)."""
+        accepted = _compiled(_rejection_sample)(
+            sampled,
+            spec_decode_metadata.draft_token_ids,
+            spec_decode_metadata.cu_num_draft_tokens,
+            max(spec_decode_metadata.num_draft_tokens),
+        )
+        if mk_model.PROF is not None:
+            mk_model.PROF.mark("sampled", accepted)
+        self.last_draft = self._draft(
+            sampled, accepted, spans, paged, shared, main_hidden, gathered, live_lengths,
+        )
+        return accepted
 
     @torch._dynamo.disable
     def _engram_rows(

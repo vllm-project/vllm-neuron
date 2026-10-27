@@ -31,13 +31,16 @@ from the config at first use; the names spell them `r<ratio>`, `src` (kv source)
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import importlib
 import inspect
 import linecache
 import os
+import sys
 
 import nki
+import nki.language as _nl
 
 from . import tp64 as _tp64
 from . import tp8pp8 as _tp8pp8
@@ -180,8 +183,113 @@ def draft(phase: str, scheme: str):
                       (("phase", phase), ("scheme", scheme)))
 
 
+def draft_batched(phase: str):
+    """The flat scheme's drafter for every sequence of a step in one launch: the batched
+    body (`tp8pp8/draft_kernel.draft_body`, whose groups are the ranks the head and sampler
+    run on -- the world here) specialized for tp64. `mk_model.run_draft` launches it
+    unless `DEEPSEEK_V41_DRAFT_BATCHED=0` (one launch per sequence: `draft(phase, "tp64")`).
+    Its `mk_model.kernel_version` is `kernel_version("draft", "tp8pp8")`, the package it is
+    built from."""
+    assert phase in PHASES
+    return specialize(_tp8pp8.draft_kernel.draft_body, f"draft_{phase}_batched_tp64",
+                      (("phase", phase), ("scheme", "tp64")))
+
+
+@functools.lru_cache(maxsize=None)
+def head_greedy():
+    """The flat scheme's greedy head (`tp64/head_kernel.head_greedy_body`: collapse, final
+    norm, vocab-parallel head, the global argmax) as a member of a decode step's last
+    fused launch (`mk_model.run_fused`)."""
+    from .tp64 import head_kernel
+
+    return specialize(head_kernel.head_greedy_body, "head_greedy_decode_tp64", ())
+
+
+@functools.lru_cache(maxsize=None)
+def embed_expand():
+    """The flat scheme's token embedding and hyper-connection expand
+    (`tp64/head_kernel.embed_expand_body`) as the first member of a decode step's first
+    fused launch (`mk_model.run_fused`)."""
+    from .tp64 import head_kernel
+
+    return specialize(head_kernel.embed_expand_body, "embed_expand_decode_tp64", ())
+
+
 def boundary(parity: int):
     """The stage-boundary kernel of the even / odd sending-stage pair layout. One
     program for both sides of a boundary: the role is a runtime input."""
     return specialize(_tp8pp8.pp_kernels.boundary_body,
                       f"pp_boundary_{'even' if parity == 0 else 'odd'}", ())
+
+
+#: The module flags that make a decode kernel return copies of the caches it was given
+#: (the r2_decode-based kernels' / the r1_decode-based ones'): off inside a fused launch,
+#: where a member's returned caches are not outputs (the caches are updated in place).
+_CACHE_COPY_FLAGS = ("CACHE_COPY_EARLY", "CACHE_COPY_AT_AR")
+
+
+@contextlib.contextmanager
+def _fused_member(index: int, kernel):
+    """Trace member `index` of a fused launch: its named scratch tensors prefixed
+    `L<index>_` (a kernel's scratch names are unique only within one block), its unnamed
+    shared-HBM ones named `L<index>_out<n>`, and its cache copies off."""
+    mod = sys.modules[kernel.func.__module__]
+    saved = {f: getattr(mod, f) for f in _CACHE_COPY_FLAGS if hasattr(mod, f)}
+    for f in saved:
+        setattr(mod, f, False)
+    orig = _nl.ndarray
+    anon = [0]
+
+    def ndarray(*args, **kwargs):
+        if kwargs.get("name"):
+            kwargs = dict(kwargs, name=f"L{index}_{kwargs['name']}")
+        elif kwargs.get("buffer") is _nl.shared_hbm:
+            # an unnamed shared-HBM tensor (a member's outputs: its stream, top-k, tap) is
+            # named too: left to the compiler, two members' same-shape ones (two index
+            # sources' top-k) were not kept apart (wrong top-k, measured at T=60, 8k)
+            anon[0] += 1
+            kwargs = dict(kwargs, name=f"L{index}_out{anon[0]}")
+        return orig(*args, **kwargs)
+
+    _nl.ndarray = ndarray
+    try:
+        yield
+    finally:
+        _nl.ndarray = orig
+        for f, v in saved.items():
+            setattr(mod, f, v)
+
+
+@functools.lru_cache(maxsize=None)
+def fused(name: str, kernels: tuple, plan: tuple, nparams: int, returns: tuple):
+    """One `@nki.jit` launch of several block kernels in sequence (`name(p0 .. p<n-1>)`).
+
+    `kernels[m]` is member m's kernel (an optimized block kernel); `plan[m]` its
+    positional arguments, each `("p", j)` (the launch's parameter j) or `("o", i, k)`
+    (output k of an earlier member i: the stream / pre_mix a block hands the next, an
+    index source's top-k). A tensor several members read (a kv source's caches, the
+    dummies) is one parameter, so a write to it in one member is ordered before the
+    reads in the next. `returns` are the launch's outputs, `("o", i, k)` each. The
+    members' own outputs stay internal: their cache copies are off (`_fused_member`)."""
+    params = [f"p{j}" for j in range(nparams)]
+
+    def ref(src):
+        return f"p{src[1]}" if src[0] == "p" else f"o{src[1]}[{src[2]}]"
+
+    # (the members' kernels named in the source: the compile caches key a kernel on it)
+    members = ", ".join(f"{k.func.__module__}.{k.func.__name__}" for k in kernels)
+    lines = [f"def {name}({', '.join(params)}):", f'    """fused: {members}"""']
+    for m, srcs in enumerate(plan):
+        lines.append(f"    with _member({m}, _k{m}):")
+        lines.append(f"        o{m} = _k{m}.func({', '.join(ref(s) for s in srcs)})")
+    lines.append(f"    return {', '.join(ref(r) for r in returns)}")
+    src = "\n".join(lines) + "\n"
+    filename = f"<deepseek_v41.kernels.mk_kernels/{name}>"
+    linecache.cache[filename] = (len(src), None, src.splitlines(True), filename)
+    ns = {"_member": _fused_member, **{f"_k{m}": k for m, k in enumerate(kernels)}}
+    exec(compile(src, filename, "exec"), ns)
+    fn = ns[name]
+    fn.__module__ = __name__
+    fn.__qualname__ = name
+    return nki.jit(fn)
+
