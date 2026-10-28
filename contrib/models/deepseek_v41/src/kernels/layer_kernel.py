@@ -58,6 +58,8 @@ intermediate tensor in the first output slot, for staged validation:
   6 stream2 | 7 normed2 | 8 ffn_out (reduced, bf16) | 9 full layer
 """
 
+import os
+
 import nki
 import nki.collectives as ncc
 import nki.isa as nisa
@@ -860,6 +862,23 @@ KERNELS = {
     ("c1_tap", "decode"): c1_tap_decode,
     ("c1_tap", "prefill"): c1_tap_prefill,
 }
+
+#: The consumer layers -- c2 and c1, 27 of the 40 blocks and ~60% of every step's layer
+#: time -- run the versions in `tuned/`, each optimized on its own against inputs and
+#: outputs recorded from this model at TP=64 (bit-exact on every compared row; see each
+#: package's docstring for what changed). `DEEPSEEK_V41_MK_TUNED`, read before the engine
+#: starts: unset or `1` routes all four, `0` none (the versions above), or a comma list of
+#: the ones to route (`c2_prefill,c1_decode`).
+_TUNED_ALL = ("c2_prefill", "c2_decode", "c1_prefill", "c1_decode")
+_tuned_env = os.environ.get("DEEPSEEK_V41_MK_TUNED", "1").strip()
+TUNED = (_TUNED_ALL if _tuned_env in ("", "1") else () if _tuned_env == "0"
+         else tuple(n.strip() for n in _tuned_env.split(",") if n.strip()))
+for _name in TUNED:
+    if _name not in _TUNED_ALL:
+        raise ValueError(f"DEEPSEEK_V41_MK_TUNED: unknown kernel {_name!r}; known: {_TUNED_ALL}")
+    _arch, _phase = _name.split("_")
+    _mod = __import__(f"{__package__}.tuned.{_name}.layer_kernel", fromlist=["layer_kernel"])
+    KERNELS[(_arch, _phase)] = getattr(_mod, _name)
 
 
 def archetype(ratio, kv_src, idx_src, engram, tap):

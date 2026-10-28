@@ -65,7 +65,7 @@ def kernel_version() -> int:
     `flags`: the NKI compile caches key a kernel on its *own* function source,
     so an edit to a helper module would otherwise be served a stale NEFF."""
     h = hashlib.sha256()
-    files = sorted(glob.glob(os.path.join(_HERE, "kernels", "*.py")))
+    files = sorted(glob.glob(os.path.join(_HERE, "kernels", "**", "*.py"), recursive=True))
     files += [os.path.join(_HERE, "mk_host.py")]
     for path in files:
         with open(path, "rb") as fh:
