@@ -7,6 +7,7 @@ sharded tensors in a tensor-parallel setting.
 """
 
 import logging
+import math
 from typing import Optional
 
 import torch
@@ -108,6 +109,11 @@ def argmax(
             return torch.argmax(tensor, dim=dim, keepdim=keepdim)
 
         _, local_index = _compute_local_max(tensor.to(torch.float32), dim)
+        # Read the index through a gather on the size-1 reduced dim. The gather
+        # is a no-op, but without it the compiler fails at batch size 2 or more
+        # with NCC_IDDT901: a DRAM-to-DRAM copy changes the kernel uint32 index
+        # to int64. The TP > 1 path below has the same gather, so it compiles.
+        local_index = torch.gather(local_index, dim, torch.zeros_like(local_index))
         if keepdim:
             return local_index
         return local_index.squeeze(dim)
@@ -176,6 +182,7 @@ def _can_use_nki_max(tensor: Tensor, dim: int) -> bool:
     - Tensor must be 2D or 3D with shape[0] == 1
     - Reduction dimension must have at least 128 elements
     - Partition dimension (shape[-2]) must be <= nl.tile_size.pmax * grid
+    - The stage free size of the kernel must be <= _NKI_MAX_STAGE_FREE_SIZE
     """
     if not can_run_kernel(tensor):
         return False
@@ -201,7 +208,44 @@ def _can_use_nki_max(tensor: Tensor, dim: int) -> bool:
     if shape[-2] > nl.tile_size.pmax * grid:
         return False
 
+    # Check the stage free size. The kernel folds the reduction dim into
+    # n_stages partition stages. A large BxS gives fewer stages, so each stage
+    # holds more elements. nc_find_index8 accepts a maximum of
+    # _NKI_MAX_STAGE_FREE_SIZE elements per partition. This copies the stage
+    # math of nkilib cascaded_max (CascadedMaxConfig).
+    if _nki_max_stage_free_size(shape[-2], shape[-1], grid) > _NKI_MAX_STAGE_FREE_SIZE:
+        return False
+
     return True
+
+
+# Maximum free elements per partition that nisa.nc_find_index8 accepts.
+_NKI_MAX_STAGE_FREE_SIZE = 16384
+
+
+def _nki_max_stage_free_size(bxs: int, vocab_size: int, grid: int) -> int:
+    """Return the per-partition free size that cascaded_max uses for one stage.
+
+    Args:
+        bxs: Partition dimension of the input (rows).
+        vocab_size: Reduction dimension of the input.
+        grid: Launch grid (LNC degree).
+
+    Returns:
+        The number of reduction elements in one partition of one stage.
+
+    Example:
+        >>> _nki_max_stage_free_size(48, 75968, 2)
+        15194
+        >>> _nki_max_stage_free_size(64, 75968, 2)
+        18992
+    """
+    pmax = int(nl.tile_size.pmax)
+    num_programs = 1 if bxs == 1 else grid
+    per_program_bxs = math.ceil(bxs / num_programs)
+    max_n_stages = pmax // per_program_bxs
+    n_stages = max(1, min(max_n_stages, vocab_size // pmax))
+    return math.ceil(vocab_size / n_stages)
 
 
 def _apply_sharding_offset(
