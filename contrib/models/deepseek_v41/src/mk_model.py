@@ -99,11 +99,11 @@ class HostProf:
 
             _mk_log.warning(
                 "host prof %s x%d (T=%s): gap %.2f | forward %.2f = pre %.2f + blocks %.2f (args %.2f, "
-                "entry %.2f, post %.2f over %d launches) + tail %.2f (head %.2f, sampling %.2f, "
-                "draft %.2f) ms (medians)",
+                "entry %.2f (first launch %.2f), post %.2f over %d launches) + tail %.2f (head %.2f, "
+                "sampling %.2f, draft %.2f) ms (medians)",
                 phase, len(rs), sorted({r["T"] for r in rs}), med("gap"), med("total"), med("pre"),
-                med("blocks"), med("args"), med("entry"), med("post"), int(med("launches")), med("tail"),
-                med("t_head"), med("t_sample"), med("t_draft"))
+                med("blocks"), med("args"), med("entry"), med("entry_first"), med("post"),
+                int(med("launches")), med("tail"), med("t_head"), med("t_sample"), med("t_draft"))
             if any("t_collapse" in r for r in rs):    # (the separate tail ran)
                 _mk_log.warning("host prof %s head = collapse %.2f + head matmul %.2f + logits gather %.2f ms%s",
                                 phase, med("t_collapse"), med("t_lshard"), med("t_gather"),
@@ -472,8 +472,124 @@ def entry(kernel):
     return torch.compile(run, backend=M._compile_backend(), fullgraph=True, options=M._COMPILE_OPTIONS)
 
 
+#: `DEEPSEEK_V41_DIRECT_LAUNCH` (default 1): a fused decode launch of the flat scheme
+#: (`run_fused`) calls its NEFF's executor itself, with the same output tensors every step,
+#: instead of going through the compiled entry (Dynamo's guards, AOTAutograd's runtime
+#: wrapper and `_lite_execute`, which allocates fresh outputs). With the step's own inputs
+#: in `_step_buf`s too, every IO tensor of the launch is where it was the step before, and
+#: the runtime reuses the launch's DMA ring (`NEURON_RT_IO_RING_CACHE_SIZE=1` keeps one per
+#: NEFF) instead of rebuilding it in `kbl_exec_pre`. Measured 2026-10-27 on 8 ranks, the
+#: first fused launch (embedding + blocks 0-7, 492 IO tensors) with the same inputs every
+#: call: 3.0 ms of host time a launch through the entry, 2.15 ms on the executor with fresh
+#: outputs, 1.85 ms with the same outputs. 0: through the compiled entry.
+_DIRECT = os.environ.get("DEEPSEEK_V41_DIRECT_LAUNCH", "1") not in ("", "0")
+
+
+@dataclass
+class _DirectLaunch:
+    """A launch's NEFF executor, the parameter each NEFF input is, and the outputs every
+    launch of it writes."""
+
+    ex: object
+    pmap: list
+    outs: list
+
+
+_UNSET = object()
+
+
+def _calibrate(kernel, params):
+    """Launch `kernel` through its compiled entry while watching the one executor call it
+    makes (`native_backend._lite_execute`, swapped for the call). Returns `(out, direct)`:
+    `direct` is None unless every NEFF input is one of `params` and the entry returns the
+    executor's own outputs in order (no FX-pass IO mutation, no aliased output)."""
+    from libtorch_neuronx_lite.compile import native_backend as NB
+
+    seen = []
+    lite_execute = NB._lite_execute
+
+    def watch(artifact, inputs):
+        out = lite_execute(artifact, inputs)
+        seen.append((artifact, list(inputs), out))
+        return out
+
+    NB._lite_execute = watch
+    try:
+        out = entry(kernel)(*params)
+    finally:
+        NB._lite_execute = lite_execute
+    if len(seen) != 1:
+        return out, None
+    art, ins, louts = seen[0]
+    at = {id(x): j for j, x in enumerate(params) if isinstance(x, torch.Tensor)}
+    pmap = [at.get(id(t)) for t in ins]
+    if (not ins or None in pmap or getattr(art, "pass_mutations", None) or art.io_spec.aliases
+            or len(out) != len(louts) or any(a is not b for a, b in zip(out, louts))):
+        return out, None
+    outs = [torch.empty(tuple(o.shape), dtype=o.dtype, device=ins[0].device) for o in art.io_spec.outputs]
+    return out, _DirectLaunch(NB._executor_for(art), pmap, outs)
+
+
+def _launch(kernel, launches: dict, slots, params):
+    """`entry(kernel)(*params)`, or the same launch straight on its executor (`_DIRECT`):
+    `launches` holds the plan's `_DirectLaunch`es (None: stays on the entry) by the shapes
+    of the `params` the step fills (`slots`, `(index, ...)`), which pick the NEFF. The
+    first launch of each goes through the entry (`_calibrate`). Returns `(outputs, direct)`."""
+    dkey = tuple(tuple(params[j].shape) for j, *_ in slots)
+    d = launches.get(dkey, _UNSET)
+    if d is _UNSET:
+        out, launches[dkey] = _calibrate(kernel, params)
+        return out, False
+    if d is None:
+        return entry(kernel)(*params), False
+    d.ex.execute([params[j] for j in d.pmap], d.outs)
+    return d.outs, True
+
+
 def _host(t: torch.Tensor) -> torch.Tensor:
     return t.detach().cpu()
+
+
+def _execute_context():
+    """The execution hooks installed in libtorch_neuronx_lite (None normally): a direct
+    launch would skip them, so `run_fused` keeps the entry while there are any."""
+    from libtorch_neuronx_lite.compile.execute_context import get_execute_context
+
+    return get_execute_context()
+
+
+def _host_table(p) -> torch.Tensor:
+    """A span's block table on the host: the copy `_paged_spans` kept, else read back."""
+    return p.host_table if getattr(p, "host_table", None) is not None else _host(p.block_table)
+
+
+def _host_slots(p) -> torch.Tensor:
+    """A span's slots on the host: the copy `_paged_spans` kept, else read back."""
+    return p.host_slots if getattr(p, "host_slots", None) is not None else _host(p.slot_mapping)
+
+
+#: (name, shape, dtype, device) -> the device tensor a decode step's own host-built input
+#: (an index column, an engram layer's hash ids, the token ids) is written into: the same
+#: tensor every step, so a launch's IO tensors are where they were the step before and the
+#: runtime can reuse the launch's DMA ring (see `_DIRECT`). Rewriting one in place is safe
+#: under the flat scheme: a step starts after the previous one's launches completed (rank 0
+#: read its tokens back, and every rank's launches finished before the drafter's collectives
+#: on rank 0 could), and within a step each is written once, before the first launch that
+#: reads it is submitted (`for_ratio` / `hash_cols` build a column on first use). Not under
+#: the pipeline scheme, which keeps several batches in flight.
+_STEP_BUFS: dict = {}
+
+
+def _step_buf(name, t: torch.Tensor, device) -> torch.Tensor:
+    """`t` (host) in its `_STEP_BUFS` tensor on `device`."""
+    t = t.contiguous()
+    key = (name, tuple(t.shape), t.dtype, str(device))
+    buf = _STEP_BUFS.get(key)
+    if buf is None:
+        buf = _STEP_BUFS[key] = t.to(device)
+    else:
+        buf.copy_(t)
+    return buf
 
 
 def _dev(t: torch.Tensor, device) -> torch.Tensor:
@@ -677,6 +793,8 @@ class StepIndices:
     hashes: torch.Tensor | None = None
     #: rows a span of a decode step has (1 committed + the draft block)
     decode_rows: int = 6
+    #: a decode step writes its own device inputs into `_step_buf`s (the flat scheme's)
+    stable: bool = False
     T: int = 0
     phase: str = "prefill"
     _by_ratio: dict = field(default_factory=dict)
@@ -693,8 +811,8 @@ class StepIndices:
     def __post_init__(self):
         self.T = sum(length for _, length, _ in self.spans)
         self.block_size = int(self.paged[0].block_size)
-        self.tables = [_host(p.block_table).to(torch.int64) for p in self.paged]
-        self.slot_mapping = torch.cat([_host(p.slot_mapping).reshape(-1) for p in self.paged]).to(torch.int64)
+        self.tables = [_host_table(p).to(torch.int64) for p in self.paged]
+        self.slot_mapping = torch.cat([_host_slots(p).reshape(-1) for p in self.paged]).to(torch.int64)
         lengths = {length for _, length, _ in self.spans}
         if len(lengths) != 1:
             raise NotImplementedError(
@@ -702,6 +820,7 @@ class StepIndices:
                 f"{sorted(lengths)} (a mixed prefill/decode step). Serve with max_num_seqs=1."
             )
         self.phase = "decode" if lengths.pop() <= self.decode_rows else "prefill"
+        self.stable = self.stable and self.phase == "decode"
 
     def read_len(self, ratio: int) -> int:
         if not ratio:
@@ -723,7 +842,8 @@ class StepIndices:
                          "clen", "grp_pos", "grp_mslots", "grp_wslots"):
                 t = getattr(idx, name)
                 if t is not None:
-                    setattr(idx, name, t.to(self.device))
+                    setattr(idx, name, _step_buf(("idx", key, name), t, self.device) if self.stable
+                            else t.to(self.device))
             self._by_ratio[key] = idx
         return idx
 
@@ -739,16 +859,18 @@ class StepIndices:
             if self.hashes is None:
                 raise RuntimeError("an engram layer ran but the step has no n-gram hashes")
             t = (_host(self.hashes)[0, :, index, :].to(torch.int64) - int(row_start)).to(torch.int32)
-            t = t.contiguous().to(self.device)
+            t = _step_buf(("hash", key), t, self.device) if self.stable else t.contiguous().to(self.device)
             self._hash_cols[key] = t
         return t
 
 
 @torch._dynamo.disable
-def make_step(spans, paged, device, hashes, decode_rows=6) -> StepIndices:
+def make_step(spans, paged, device, hashes, decode_rows=6, stable=False) -> StepIndices:
     """`StepIndices` for this forward, built outside the frame dynamo traces
-    (the index math is host work on CPU copies of the block tables)."""
-    return StepIndices(spans, paged, device, hashes, decode_rows=decode_rows)
+    (the index math is host work on CPU copies of the block tables). `stable`: the
+    deployment runs one batch at a time (the flat scheme), so a decode step may write
+    its own inputs into the `_step_buf`s."""
+    return StepIndices(spans, paged, device, hashes, decode_rows=decode_rows, stable=stable)
 
 
 #: layer id -> (window cache, its `[slots, head_dim]` view): the view, made once per cache
@@ -898,6 +1020,28 @@ def run_layer(model, block, stream: torch.Tensor, pre_mix: torch.Tensor, step: S
 #: the decode step host-bound (40 launches ~62 ms of a ~95 ms bs1 step). 0 or 1: one launch
 #: a block. Prefill keeps one launch a block (device-bound; fusing would multiply compiles).
 _FUSE_DECODE = int(os.environ.get("DEEPSEEK_V41_FUSE_DECODE", "8"))
+#: `DEEPSEEK_V41_FUSE_GROUPS=<n1>,<n2>,...` (default empty): the first fused launches of a
+#: decode step take n1, n2, ... blocks, the rest `_FUSE_DECODE` each. Only the first launch's
+#: submission delays the device (the later ones are submitted while it runs), so a smaller
+#: first launch starts the device sooner, as long as the second is submitted before the
+#: first finishes. Each grouping is its own set of fused NEFFs.
+_FUSE_GROUPS = tuple(int(v) for v in os.environ.get("DEEPSEEK_V41_FUSE_GROUPS", "").split(",") if v.strip())
+
+
+def _fuse_groups(n: int) -> list:
+    """`[(start, end))` of each fused launch of a decode step's `n` blocks."""
+    out, g = [], 0
+    for size in _FUSE_GROUPS:
+        if g >= n:
+            break
+        out.append((g, min(n, g + size)))
+        g += size
+    while g < n:
+        out.append((g, min(n, g + _FUSE_DECODE)))
+        g += _FUSE_DECODE
+    return out
+
+
 #: `DEEPSEEK_V41_FUSE_HEAD` (default 1): an all-greedy speculative decode step runs the
 #: head -- collapse, final norm, vocab-parallel head and the argmax -- as the last member
 #: of its last fused launch (`mk_kernels.head_greedy`) instead of five separate launches,
@@ -939,11 +1083,21 @@ def fuses_embed(model, spans) -> bool:
 
 
 @torch._dynamo.disable
-def embed_ids(input_ids: torch.Tensor) -> torch.Tensor:
+def host_ids(input_ids: torch.Tensor) -> torch.Tensor:
+    """The step's `[T]` token ids read back to the host (outside dynamo: traced, the copy
+    would be part of a graph and stay on the device)."""
+    return input_ids.detach().reshape(-1).cpu()
+
+
+@torch._dynamo.disable
+def embed_ids(input_ids: torch.Tensor, host: torch.Tensor | None = None) -> torch.Tensor:
     """The step's tokens as the `[T, 1]` int32 column the fused embedding reads (through
     the host: the device is idle at a step's start, and a dtype cast on it would be a
-    graph of its own)."""
-    return input_ids.detach().reshape(-1).cpu().to(torch.int32).reshape(-1, 1).contiguous().to(input_ids.device)
+    graph of its own), in its `_step_buf` (a fused decode step of the flat scheme is the
+    only caller). `host`: the tokens already read back."""
+    if host is None:
+        host = host_ids(input_ids)
+    return _step_buf(("ids",), host.reshape(-1).to(torch.int32).reshape(-1, 1), input_ids.device)
 
 
 def embed_args(model) -> list:
@@ -996,6 +1150,8 @@ class FusedPlan:
     head: bool
     after: tuple
     trace: str
+    #: the shapes of the step's own tensors -> `_DirectLaunch` / None (`_launch`)
+    direct: dict = field(default_factory=dict)
 
 
 #: (layer ids, phase, T, B, head) -> FusedPlan
@@ -1151,18 +1307,27 @@ def run_fused(model, blocks, stream: torch.Tensor, pre_mix: torch.Tensor, step: 
     if PROF is not None:
         t1 = time.perf_counter()
         PROF.add("args", t1 - t0)
-    out = entry(fp.fk)(*params)
+    if _DIRECT and step.stable and _execute_context() is None:
+        out, direct = _launch(fp.fk, fp.direct, fp.slots, params)
+    else:
+        out, direct = entry(fp.fk)(*params), False
     if PROF is not None:
         t2 = time.perf_counter()
         PROF.add("entry", t2 - t1)
         PROF.add("launches", 1e-3)
+        if embed:
+            PROF.add("entry_first", t2 - t1)
     stream, pre_mix = out[0], out[1]
     step.taps.extend(out[2 : 2 + fp.ntaps])
     if fp.idx_member is not None:
         step.topk = out[2 + fp.ntaps]
     if fp.head:
         step.greedy_ids = out[-1]
-    _track(pre_mix)
+    if not direct:
+        # (a direct launch writes the same outputs every step: reading one back later
+        # would wait for whichever launch wrote it last; the step's own read-back of its
+        # tokens bounds those launches)
+        _track(pre_mix)
     if PROF is not None:
         PROF.add("post", time.perf_counter() - t2)
     return stream, pre_mix
@@ -1259,9 +1424,9 @@ def _run_draft_seq(model, seed_ids, tap, main_hidden, span, paged):
     main = main_hidden[begin : begin + length]
     meta = M._compiled(_draft_meta_seq)(seed_ids, tap, paged.pos)
     _track(meta)
-    table = _host(paged.block_table).to(torch.int32).reshape(-1, 1).contiguous().to(device)
+    table = _host_table(paged).to(torch.int32).reshape(-1, 1).contiguous().to(device)
     row_pos = (start_pos + torch.arange(length)).to(torch.int32).reshape(-1, 1).to(device)
-    write_slots = _host(paged.slot_mapping).reshape(-1)[:length].to(torch.int32).reshape(-1, 1).contiguous().to(device)
+    write_slots = _host_slots(paged).reshape(-1)[:length].to(torch.int32).reshape(-1, 1).contiguous().to(device)
     weights, tail = model._mk_draft()
     K = int(cfg.dspark_block_size)
     stages = list(model.mtp)
@@ -1323,19 +1488,27 @@ def run_draft(model, seeds, taps, main_hidden, spans, paged):
     stages = list(model.mtp)
     win = int(stages[0].attn.window_size)
     ntab_p = -(-(win + K) // 128) * 128          # the kernel's slot-table rows per sequence (128-row tiles)
-    pieces = [main_hidden[begin : begin + length] for begin, length, _ in spans]
-    main = pieces[0] if B == 1 else torch.cat(pieces)
+    # The spans tile the step's rows in order (`_sequence_spans` / `_bucket_spans`), so the
+    # rows the drafter reads are one slice of `main_hidden`; a `torch.cat` of the spans'
+    # slices ran through the host (~12 ms at bs10, measured 2026-10-27).
+    first = spans[0][0]
+    if all(begin == first + b * length for b, (begin, length, _) in enumerate(spans)):
+        rows = B * spans[0][1]
+        main = main_hidden if first == 0 and rows == int(main_hidden.shape[0]) else main_hidden[first : first + rows]
+    else:
+        main = torch.cat([main_hidden[begin : begin + length] for begin, length, _ in spans])
     row_pos = torch.cat([start_pos + torch.arange(length) for _, length, start_pos in spans])
     row_pos = row_pos.to(torch.int32).reshape(-1, 1).contiguous().to(device)
     write_slots = torch.cat([
-        _host(p.slot_mapping).reshape(-1)[:length] for p, (_, length, _) in zip(paged, spans)
+        _host_slots(p).reshape(-1)[:length] for p, (_, length, _) in zip(paged, spans)
     ]).to(torch.int32).reshape(-1, 1).contiguous().to(device)
-    tables = [_host(p.block_table).to(torch.int32).reshape(-1) for p in paged]
+    tables = [_host_table(p).to(torch.int32).reshape(-1) for p in paged]
     nblk = max(int(t.numel()) for t in tables)
     table = torch.stack([
         torch.nn.functional.pad(t, (0, nblk - int(t.numel()))) for t in tables
     ]).reshape(-1, 1).contiguous().to(device)
-    pos = paged[0].pos.reshape(-1)[:1] if B == 1 else torch.cat([p.pos.reshape(-1)[:1] for p in paged])
+    # (from the spans' start positions on the host, not a `torch.cat` of their device copies)
+    pos = torch.tensor([int(p.start_pos) for p in paged], dtype=paged[0].pos.dtype).to(device)
     meta = M._compiled(_draft_meta)(seeds.reshape(-1)[:B], taps.reshape(-1)[:B], pos)
     _track(meta)
     consts = model.__dict__.setdefault("_mk_draft_consts", {})
@@ -1507,9 +1680,9 @@ def run_blocks(model, stream, pre_mix, step, dump=None, head=False, embed=False)
     if embed and not fuse:
         raise RuntimeError("run_blocks: the step's embedding was left to the fused launch, "
                            "but this step does not fuse (`fuses_embed` and `run_blocks` disagree)")
-    for g in range(0, len(blocks), _FUSE_DECODE) if fuse else ():
-        stream, pre_mix = run_fused(model, blocks[g : g + _FUSE_DECODE], stream, pre_mix, step,
-                                    head=head and g + _FUSE_DECODE >= len(blocks), embed=embed and g == 0)
+    for g, end in _fuse_groups(len(blocks)) if fuse else ():
+        stream, pre_mix = run_fused(model, blocks[g:end], stream, pre_mix, step,
+                                    head=head and end >= len(blocks), embed=embed and g == 0)
     for layer_id, block in () if fuse else zip(model.block_ids, model.layers.values()):
         stream, pre_mix = run_layer(model, block, stream, pre_mix, step)
         if dump is not None:

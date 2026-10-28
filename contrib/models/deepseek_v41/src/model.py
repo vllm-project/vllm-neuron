@@ -1397,6 +1397,8 @@ class PagedSpan:
         "at_zero",
         "read_lens",
         "group_counts",
+        "host_table",
+        "host_slots",
     )
 
     def __init__(
@@ -1408,10 +1410,16 @@ class PagedSpan:
         length: int,
         pos: torch.Tensor | None = None,
         begin: int = 0,
+        host_table: torch.Tensor | None = None,
+        host_slots: torch.Tensor | None = None,
     ) -> None:
         self.block_table = block_table
         self.block_size = block_size
         self.slot_mapping = slot_mapping
+        #: Host copies of `block_table` / `slot_mapping` (`_paged_spans` has them before it
+        #: moves the table to the device), so the host index work reads neither back.
+        self.host_table = host_table
+        self.host_slots = host_slots
         self.start_pos = start_pos
         self.length = length
         #: Where this sequence's tokens start in the flat `[T]` token axis.
@@ -3356,6 +3364,66 @@ class NgramHashState(nn.Module):
             hashes.append(rolling.unsqueeze(-1) % host["primes"][:, i - 1])
         return (torch.cat(hashes, dim=-1) + host["offsets"]).to(device)
 
+    @torch._dynamo.disable
+    @torch.no_grad()
+    def hash_spans(self, ids: torch.Tensor, paged: list[PagedSpan]) -> torch.Tensor:
+        """`forward` for every span of a step in one pass: `ids` is the step's flat `[T]`
+        token ids **on the host**, each span reads its rows `[begin, begin + length)`, and
+        the result is `[1, rows, n_engram_layers, n_hash_cols]` on the host, the spans'
+        rows in order (what `_engram_hashes` concatenated from one `forward` a span).
+
+        The spans' tokens all go into the history before any is read, where `forward`
+        writes a span's and reads it before the next span writes. That can only differ
+        where one span reads a slot a later one writes, and sequences own disjoint
+        pages: only the padded spans (`_paged_spans` points them all at block 0) share
+        slots, and their rows are discarded. Uses the spans' host copies of the block
+        table and slots (`PagedSpan.host_table` / `host_slots`), so nothing is read back
+        from the device."""
+        if self.cache is None:
+            raise RuntimeError(
+                "the n-gram hash state has no slot cache; "
+                "allocate_state() must run before forward()"
+            )
+        host = self._host
+        block_size = paged[0].block_size
+        if len(paged) == 1:
+            span = paged[0]
+            rows = ids.reshape(-1)[span.begin : span.begin + span.length]
+            slot_mapping = span.host_slots.reshape(-1)[: span.length]
+            positions = span.start_pos + torch.arange(span.length)
+            tables = span.host_table.reshape(1, -1)
+            row_span = torch.zeros(span.length, dtype=torch.int64)
+        else:
+            flat = ids.reshape(-1)
+            rows = torch.cat([flat[p.begin : p.begin + p.length] for p in paged])
+            slot_mapping = torch.cat([p.host_slots.reshape(-1)[: p.length] for p in paged])
+            positions = torch.cat([p.start_pos + torch.arange(p.length) for p in paged])
+            width = max(int(p.host_table.numel()) for p in paged)
+            tables = torch.stack([
+                F.pad(p.host_table.reshape(-1), (0, width - int(p.host_table.numel())))
+                for p in paged
+            ])
+            row_span = torch.repeat_interleave(
+                torch.arange(len(paged)), torch.tensor([p.length for p in paged])
+            )
+        compressed = host["token_map"][rows]
+        self.cache.index_copy_(0, slot_mapping.to(torch.int64), compressed)
+
+        tokens, blocked = [], torch.zeros_like(positions, dtype=torch.bool)
+        for shift in range(self.max_ngram_size):
+            pos = (positions - shift).clamp_min(0)
+            source = self.cache[tables[row_span, pos // block_size] * block_size + pos % block_size]
+            blocked = blocked | (positions < shift) | (source == self.DEAD)
+            tokens.append(torch.where(blocked, self.pad_id, source))
+        stacked = torch.stack(tokens, dim=-1).unsqueeze(0)
+
+        products = stacked.unsqueeze(2) * host["multipliers"]
+        rolling, hashes = products[..., 0], []
+        for i in range(1, self.max_ngram_size):
+            rolling = torch.bitwise_xor(rolling, products[..., i])
+            hashes.append(rolling.unsqueeze(-1) % host["primes"][:, i - 1])
+        return torch.cat(hashes, dim=-1) + host["offsets"]
+
 
 def _engram_gather(
     hashes: torch.Tensor,
@@ -4983,9 +5051,14 @@ class DeepseekV41ForCausalLM(nn.Module):
             # (`mk_model.run_recv`, below); or the first fused launch embeds.
             stream = pre_mix = None
 
+        # The step's tokens on the host, read back once: the n-gram hash and the fused
+        # embedding's id column are both host work on them.
+        ids_host = (mk_model.host_ids(input_ids)
+                    if _MEGAKERNEL and (self.ngram_hash is not None or fuse_embed) else None)
         # The n-gram ids of the engram blocks this rank holds (the hash state is
         # only built on stages with one).
-        hashes = self._engram_hashes(input_ids, paged) if self.ngram_hash is not None else None
+        hashes = (self._engram_hashes(input_ids, paged, ids_host)
+                  if self.ngram_hash is not None else None)
 
         shared = [SharedAttentionState() for _ in paged]
         main_hiddens: list[torch.Tensor] = []
@@ -5006,7 +5079,8 @@ class DeepseekV41ForCausalLM(nn.Module):
                     f"rows of the step, got {bucket_rows}"
                 )
             step = mk_model.make_step(spans, paged, self.device, hashes,
-                                      decode_rows=1 + int(self.config.dspark_block_size))
+                                      decode_rows=1 + int(self.config.dspark_block_size),
+                                      stable=plan.scheme == "tp64")
             self._mk_step = step
             host_heap_trim("layers", self.world_size)
             dump = (lambda name, t: self._dump(name, t, live_rows)) if _DUMP_DIR else None
@@ -5020,7 +5094,7 @@ class DeepseekV41ForCausalLM(nn.Module):
                     and bool(sampling_hint[0]) and spec_decode_metadata is not None
                     and plan.is_last and mk_model.fuses_head(self, step))
             if fuse_embed:
-                step.embed_ids = mk_model.embed_ids(input_ids)
+                step.embed_ids = mk_model.embed_ids(input_ids, ids_host)
             stream, pre_mix = mk_model.run_blocks(self, stream, pre_mix, step, dump=dump, head=head,
                                                   embed=fuse_embed)
             if not plan.is_last:
@@ -5278,8 +5352,10 @@ class DeepseekV41ForCausalLM(nn.Module):
         # that passes today. Via the host rather than `clamp_min(0)` on the
         # device, for the reason `_bucket_rows` spells the same way: this runs
         # outside every compiled region, and the payload is a few kB.
-        block_table = block_table.cpu().clamp_min(0).to(block_table.device)
+        host_table = block_table.cpu().clamp_min(0)
+        block_table = host_table.to(block_table.device)
         slot_mapping = meta["slot_mapping"]
+        host_slots = slot_mapping.cpu()
         device = slot_mapping.device
         starts = torch.tensor(
             [start_pos for _, _, start_pos in spans], dtype=torch.int64
@@ -5305,6 +5381,7 @@ class DeepseekV41ForCausalLM(nn.Module):
             if live_spans < len(spans)
             else None
         )
+        host_blank = torch.zeros_like(host_table[0]) if blank is not None else None
         return [
             PagedSpan(
                 block_table=block_table[row] if row < live_spans else blank,
@@ -5314,6 +5391,8 @@ class DeepseekV41ForCausalLM(nn.Module):
                 length=length,
                 pos=starts[row : row + 1],
                 begin=begin,
+                host_table=host_table[row] if row < live_spans else host_blank,
+                host_slots=host_slots[begin : begin + length],
             )
             for row, (begin, length, start_pos) in enumerate(spans)
         ]
@@ -5639,22 +5718,27 @@ class DeepseekV41ForCausalLM(nn.Module):
                 split.append((begin + off, rows_per_seq, start_pos + off))
         return split
 
+    @torch._dynamo.disable
     def _engram_hashes(
-        self, input_ids: torch.Tensor, paged: list[PagedSpan]
+        self, input_ids: torch.Tensor, paged: list[PagedSpan],
+        ids_host: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """n-gram row indices for every token, `[1, T, n_engram_layers, 24]`."""
+        """n-gram row indices for every token, `[1, T, n_engram_layers, 24]`: on the
+        host for the megakernel path (`StepIndices.hash_cols` cuts each layer's columns
+        from it), on the device otherwise. One pass over every span
+        (`NgramHashState.hash_spans`) from the step's host token ids `ids_host` (read
+        back here when not given); one `forward` a span read each span's ids, table and
+        slots back from the device and concatenated the spans' rows on it."""
         if self.ngram_hash is None:
             raise RuntimeError(
                 "engram layers "
                 f"{list(self.config.engram_layer_ids)} need the n-gram hash "
                 "state; bind_kv_cache builds it from the tokenizer."
             )
-        per_span = []
-        for span in paged:
-            length, begin = span.length, span.begin
-            ids = input_ids[begin : begin + length].reshape(1, length)
-            per_span.append(self.ngram_hash(ids, span))
-        return torch.cat(per_span, dim=1)
+        if ids_host is None:
+            ids_host = mk_model.host_ids(input_ids)
+        hashes = self.ngram_hash.hash_spans(ids_host, paged)
+        return hashes if _MEGAKERNEL else hashes.to(input_ids.device)
 
     @torch._dynamo.disable
     def _layer_io(
