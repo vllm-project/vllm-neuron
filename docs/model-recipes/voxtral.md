@@ -255,3 +255,13 @@ drops the acceptance length to about 1.
   larger largest encoder bucket. If warmup fails with `nrt_tensor_allocate
   status=4`, raise `VLLM_NEURON_RESERVED_HEADROOM_GIB` (8 worked for 5-minute
   clips with `--max-model-len 8192`).
+- **Workers fail at start with `No EFA device found at /sys/bus/pci/devices/.../infiniband`.**
+  The plugin pins each worker's CPU affinity to the NUMA node of the EFA network
+  device next to its NeuronCores. On an instance where that device is not visible
+  (no EFA driver, or no EFA interface), worker start fails. The pinning is a CPU
+  performance optimization, not a correctness requirement. Set
+  `NEURON_SKIP_EFA_AFFINITY=1` before `vllm serve` to skip it. This happened on a
+  `trn2.3xlarge` with the SDK 2.33 DLAMI at both LNC=1 and LNC=2.
+- **The LNC=1 two-replica server fails with `Timed out waiting for engine core
+  processes to start`.** The first start compiles for both replicas and takes longer
+  than vLLM's default 600 s. Set `VLLM_ENGINE_READY_TIMEOUT_S=3600`.
