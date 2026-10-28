@@ -1415,8 +1415,15 @@ def _to_kernel_kv_mapping(
     slot_dtype = kv_cache_update_idx.dtype
     slots = kv_cache_update_idx
     if slots.dtype == torch.uint32:
-        # Pad slots are -1 as uint32; reinterpret so they stay negative per head.
-        slots = slots.view(torch.int32)
+        # A pad slot (-1) arrives as 0xFFFFFFFF and must stay negative on every
+        # head. Widen to int64 and map each value above the int32 maximum to -1:
+        # only a pad slot is that large, because a KV pool has fewer than 2**31
+        # slots. Do not bitcast with view(torch.int32): torch_xla cannot lower a
+        # uint32 -> int32 bitcast, so the graph would not compile there.
+        wide = slots.to(torch.int64)
+        slots = torch.where(wide > 2**31 - 1, torch.full_like(wide, -1), wide).to(
+            torch.int32
+        )
     per_head_slots = build_per_head_slot_mapping(
         slots.reshape(-1), V_cache.shape[-2], kv_heads, kv_cache_update_idx.shape[0]
     ).to(slot_dtype)
