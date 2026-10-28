@@ -289,8 +289,29 @@ Measured on a `trn2.48xlarge` with the plugin-core change,
 `DEEPSEEK_V41_MAX_NUM_SEQS=10`, 128 output tokens, warm process. Acceptance is
 DSpark's, from vLLM's own counters over the cell.
 
-**Neuron SDK 2.33, megakernel path** (the default; `vllm-neuron` 0.29.0.1.2.0,
-`-O2`), 2026-10-25:
+**Neuron SDK 2.33, megakernel path with the tuned c2 / c1 kernels** (the default;
+`kernels/tuned/`, `DEEPSEEK_V41_MK_TUNED=0` restores the table after it), 2026-10-28:
+
+| cell | TTFT p50 (ms) | TPOT p50 (ms) | decode (tok/s, aggregate) | acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| in512 bs1 | 352.3 | 28.5 | 32.17 | 45% |
+| in512 bs10 | 1955.0 | 79.3 | 100.71 | 49% |
+| in1024 bs1 | 630.4 | 29.4 | 29.44 | 42% |
+| in1024 bs10 | 3481.3 | 86.6 | 83.06 | 44% |
+| in8192 bs1 | 5961.2 | 28.6 | 13.28 | 42% |
+| in8192 bs4 | 8997.2 | 138.8 | 17.19 | 39% |
+
+The c2 and c1 consumer blocks (27 of the 40 layers) run 2.6-2.9x faster in
+prefill and 1.6-1.9x in decode, kernel for kernel, and the step moves by what
+the [profile](test/performance/PROFILE_REPORT.md)'s breakdown predicts from that:
+a 1k prefill 997 -> 632 ms, a 2048-token 8k chunk 2204 -> 1480 ms, a decode step
+117 -> 91 ms (bs1), 239 -> 203 ms (1k bs10) and 177 -> 142 ms (8k bs4). The
+batch-10 cells' reported pass is the clean one this time; the earlier table's
+`in1024 bs10` row is the pass with retraces in its window (its clean pass was
+61.3 tok/s).
+
+**Neuron SDK 2.33, megakernel path** (`vllm-neuron` 0.29.0.1.2.0, `-O2`),
+2026-10-25:
 
 | cell | TTFT p50 (ms) | TPOT p50 (ms) | decode (tok/s, aggregate) | acceptance |
 | --- | ---: | ---: | ---: | ---: |
