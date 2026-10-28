@@ -1,0 +1,19 @@
+# Installs this folder's src/ as the ``glm_dsa`` package and registers the
+# architecture with vLLM through a general-plugin entry point:
+#     pip install -e contrib/models/glm_dsa
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-neuron-contrib-glm-dsa"
+version = "0.1.0"
+description = "GLM-5.x (GlmMoeDsaForCausalLM) on vllm-neuron (contrib)"
+requires-python = ">=3.11"
+
+[project.entry-points."vllm.general_plugins"]
+glm_dsa = "glm_dsa.plugin:register"
+
+[tool.setuptools]
+package-dir = {"glm_dsa" = "src"}
+packages = ["glm_dsa", "glm_dsa.hy_v4"]
