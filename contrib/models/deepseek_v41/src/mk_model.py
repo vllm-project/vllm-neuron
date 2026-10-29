@@ -74,6 +74,18 @@ def kernel_version() -> int:
 
 
 @functools.lru_cache(maxsize=None)
+def kernel_key(kernel) -> int:
+    """`kernel_version()` folded with the kernel's module: lite's NKI cache keys a kernel on
+    its file's basename, its name and its own function source, which a `tuned/` entry and
+    the shared-module one of the same (arch, phase) have in common -- without this a cache
+    built by one would serve the other."""
+    import zlib
+
+    module = (kernel.func if hasattr(kernel, "func") else kernel).__module__
+    return (kernel_version() ^ zlib.crc32(module.encode())) & 0x7FFFFFFF
+
+
+@functools.lru_cache(maxsize=None)
 def entry(kernel):
     """The compiled entry point of one kernel, launched on both physical cores."""
     from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
@@ -396,7 +408,7 @@ def run_layer(model, block, stream: torch.Tensor, pre_mix: torch.Tensor, step: S
         win_slots=idx.win_slots, twin=idx.twin, wv=idx.wv,
         window_kv_cache=attn.window_kv_cache.view(-1, hd), live=step.live,
         groups_attn=model._mk_groups_attn, groups_world=model._mk_groups_world,
-        flags=(B, lw.window, 9, kernel_version()),
+        flags=(B, lw.window, 9, kernel_key(layer_kernel.KERNELS[(lw.arch, phase)])),
     )
     if lw.kv_src:
         step.compress_cache = attn.compress_kv_cache.view(-1, hd)

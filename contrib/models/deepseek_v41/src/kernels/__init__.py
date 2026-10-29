@@ -49,11 +49,10 @@ per layer archetype and phase -- 9 archetypes x {decode, prefill} for the blocks
       `moe_expert`, `dma_compute`
       scatter-adds)               mk_moe                       (imported by both)
     shared helpers                mk_common, mk_compress       (imported by both)
-    the consumer blocks (c2, c1)
-      prefill and decode, each
-      tuned on its own against
-      recorded TP=64 inputs       tuned/<arch>_<phase>/        layer_kernel.KERNELS
-                                  layer_kernel.<arch>_<phase>  (DEEPSEEK_V41_MK_TUNED)
+    every block, from the
+      packages tuned against
+      recorded TP=64 inputs       tuned/<pkg>/layer_kernel     layer_kernel.TUNED_ROUTES
+                                    .<arch>_<phase>            (DEEPSEEK_V41_MK_TUNED)
     the per-step index columns    ../mk_host.py                mk_model.StepIndices
 
 Ported from the Trainium3 megakernels (`origin/deepseek_v41_trn3`); what NeuronCore-v3

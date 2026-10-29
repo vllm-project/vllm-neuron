@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The c2 / c1 consumer blocks' kernels as tuned one by one (one subpackage per
-`<arch>_<phase>`, each a self-contained copy of the layer modules); routed by
-`..layer_kernel.KERNELS`, see `DEEPSEEK_V41_MK_TUNED` there."""
+"""Layer-kernel packages in which one kernel was optimized on its own against recorded
+TP=64 inputs (one subpackage per `<arch>_<phase>` tuned; each a self-contained copy of the
+layer modules defining every archetype). `..layer_kernel.TUNED_ROUTES` serves every
+archetype from one of them; see `DEEPSEEK_V41_MK_TUNED` there."""

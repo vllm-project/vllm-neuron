@@ -863,22 +863,54 @@ KERNELS = {
     ("c1_tap", "prefill"): c1_tap_prefill,
 }
 
-#: The consumer layers -- c2 and c1, 27 of the 40 blocks and ~60% of every step's layer
-#: time -- run the versions in `tuned/`, each optimized on its own against inputs and
-#: outputs recorded from this model at TP=64 (bit-exact on every compared row; see each
-#: package's docstring for what changed). `DEEPSEEK_V41_MK_TUNED`, read before the engine
-#: starts: unset or `1` routes all four, `0` none (the versions above), or a comma list of
-#: the ones to route (`c2_prefill,c1_decode`).
-_TUNED_ALL = ("c2_prefill", "c2_decode", "c1_prefill", "c1_decode")
-_tuned_env = os.environ.get("DEEPSEEK_V41_MK_TUNED", "1").strip()
-TUNED = (_TUNED_ALL if _tuned_env in ("", "1") else () if _tuned_env == "0"
-         else tuple(n.strip() for n in _tuned_env.split(",") if n.strip()))
-for _name in TUNED:
-    if _name not in _TUNED_ALL:
-        raise ValueError(f"DEEPSEEK_V41_MK_TUNED: unknown kernel {_name!r}; known: {_TUNED_ALL}")
-    _arch, _phase = _name.split("_")
-    _mod = __import__(f"{__package__}.tuned.{_name}.layer_kernel", fromlist=["layer_kernel"])
-    KERNELS[(_arch, _phase)] = getattr(_mod, _name)
+#: `tuned/` holds packages in which one kernel was optimized against inputs and outputs
+#: recorded from this model at TP=64 (bit-exact on every compared row; see each package's
+#: docstring): c1_prefill, c1_decode and c2_decode (the c1 / c2 consumer blocks). Every
+#: package still defines all nine archetypes' entries over its own helpers, so each
+#: archetype is served by the package whose entry was fastest while bit-exact on that
+#: archetype's own recorded cases (2026-10-29: every archetype and phase, four configs
+#: each). `(arch, phase) -> package`:
+TUNED_ROUTES = {
+    **{(arch, "prefill"): "c1_prefill" for arch in ARCH},
+    **{(arch, "decode"): "c1_decode" for arch in ARCH},
+    ("c2", "decode"): "c2_decode",
+    ("c2_source_engram", "decode"): "c2_decode",
+    ("c1_source", "decode"): "c2_decode",
+}
+TUNED_PACKAGES = tuple(sorted(
+    d for d in os.listdir(os.path.join(os.path.dirname(__file__), "tuned"))
+    if os.path.isfile(os.path.join(os.path.dirname(__file__), "tuned", d, "layer_kernel.py"))))
+
+
+def _parse_tuned(env: str) -> dict:
+    """`DEEPSEEK_V41_MK_TUNED`, read before the engine starts: unset or `1` serves every
+    route above, `0` none (the shared-module kernels above), or a comma list of
+    `<arch>_<phase>` (that route) / `<arch>_<phase>=<package>` (that kernel from another
+    package), e.g. `c1_index_prefill,window_decode=c2_decode`."""
+    env = env.strip()
+    if env in ("", "1"):
+        return dict(TUNED_ROUTES)
+    if env == "0":
+        return {}
+    routes = {}
+    for item in (x.strip() for x in env.split(",")):
+        if not item:
+            continue
+        name, _, pkg = item.partition("=")
+        arch, _, phase = name.rpartition("_")
+        if (arch, phase) not in KERNELS:
+            raise ValueError(f"DEEPSEEK_V41_MK_TUNED: unknown kernel {name!r}")
+        pkg = pkg or TUNED_ROUTES.get((arch, phase))
+        if pkg not in TUNED_PACKAGES:
+            raise ValueError(f"DEEPSEEK_V41_MK_TUNED: {item!r} names no package of {TUNED_PACKAGES}")
+        routes[(arch, phase)] = pkg
+    return routes
+
+
+TUNED = _parse_tuned(os.environ.get("DEEPSEEK_V41_MK_TUNED", "1"))
+for (_arch, _phase), _pkg in TUNED.items():
+    _mod = __import__(f"{__package__}.tuned.{_pkg}.layer_kernel", fromlist=["layer_kernel"])
+    KERNELS[(_arch, _phase)] = getattr(_mod, f"{_arch}_{_phase}")
 
 
 def archetype(ratio, kv_src, idx_src, engram, tap):

@@ -687,8 +687,13 @@ def _layer(a, arch, phase):
     # for both gathers at their entry.)
     nsl = inter // PT
     ncol2 = dim // PT
-    shard_sh = (decode and inter % PT == 0 and n_experts == world * n_local
-                and max(nsl, ncol2) <= world)
+    # OFF: on recorded bs1 decode steps of the index / source / tap / engram layers the
+    # sharded path loses routed-expert contributions on some ranks (12 of 30 in one case,
+    # out_stream rel. L2 4.9e-3 vs the unsplit kernel) -- bisected to this change; the
+    # unsplit path is exact on every recorded case of every archetype.
+    SHARD_SHARED_EXPERT = False
+    shard_sh = (SHARD_SHARED_EXPERT and decode and inter % PT == 0
+                and n_experts == world * n_local and max(nsl, ncol2) <= world)
 
     def rank_slot(n):
         """`(sidx, onehot)`: this rank's slot clamped to `n - 1` as an int32 `[1, 1]`

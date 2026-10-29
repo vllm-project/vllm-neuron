@@ -1,7 +1,7 @@
 """`c1_prefill` as tuned by its autohelix loop (`~/ds41_mk_c1_prefill` @ 57ec40e).
 
-A self-contained copy of the layer-kernel modules, routed only for ('c1', 'prefill') by
-`..layer_kernel.KERNELS`; every other archetype keeps the shared modules. Shared from the
+A self-contained copy of the layer-kernel modules, optimized for ('c1', 'prefill'); `..layer_kernel.TUNED_ROUTES`
+says which archetypes' entries it serves. Shared from the
 parent package unchanged: blockquant.
 
 Commits on the folder's main branch (newest first; the autohelix-accepted iterations plus
