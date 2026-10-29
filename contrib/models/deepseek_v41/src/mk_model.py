@@ -416,6 +416,100 @@ def _kcapture_save(model, arm, kernel, layer_id: int, step, args, out) -> None:
     _mk_log.warning("kcapture: %s layer %d rank %d -> %s", kernel.func.__name__, layer_id, model.rank, d)
 
 
+#: `DEEPSEEK_V41_FCAPTURE=<dir>`: record fused decode launches (`run_fused`) on every rank,
+#: for standalone work on a fused megakernel -- the launch's parameters before it, its outputs,
+#: and the rows it wrote into the caches it updates in place -- to
+#: `<dir>/<tag>/<launch>/rank<rank>.pt` (with the launch's generated source and its members).
+#: Armed by `<dir>/ARM.json` (`{"tag", "launches", "phase", "nth"}` plus any of `"min_start"`,
+#: `"nspans"`, as for `_KCAPTURE`): the `nth` matching forward after the arm is captured at
+#: each launch named in `launches`. Unlike `_KCAPTURE`, the decode step stays fused. Unset,
+#: a launch only tests the flag.
+_FCAPTURE = os.environ.get("DEEPSEEK_V41_FCAPTURE", "")
+_fcap = {"arm": None, "mtime": None, "step": None, "count": 0, "done": set()}
+#: The kernel arguments a block updates in place (its caches): their written rows are recorded.
+_FCAPTURE_INPLACE = ("window_kv_cache", "compress_kv_cache", "index_k_cache", "pool_kv", "pool_score")
+
+
+def _fcapture_target(fp, step) -> dict | None:
+    """The arm spec when this fused launch is one to record, else None."""
+    path = os.path.join(_FCAPTURE, "ARM.json")
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    if mtime != _fcap["mtime"]:
+        import json
+
+        with open(path) as fh:
+            _fcap.update(arm=json.load(fh), mtime=mtime, step=None, count=0, done=set())
+    arm = _fcap["arm"]
+    starts = [int(s[2]) for s in step.spans]
+    if (step.phase != arm["phase"]
+            or (arm.get("min_start") is not None and min(starts) < int(arm["min_start"]))
+            or (arm.get("nspans") is not None and len(starts) != int(arm["nspans"]))):
+        return None
+    if _fcap["step"] is not step:
+        _fcap["step"] = step
+        _fcap["count"] += 1
+    if _fcap["count"] != int(arm["nth"]) or fp.name not in arm["launches"] or fp.name in _fcap["done"]:
+        return None
+    _fcap["done"].add(fp.name)
+    return arm
+
+
+def _fcapture_members(fp) -> list:
+    """`[(module, kernel name, positional names, [param index or ("o", m, k)] ...)]` of each
+    member of the fused launch, from its generated source (`mk_kernels.fused`)."""
+    import linecache
+    import re
+
+    g = fp.fk.func.__globals__
+    lines = linecache.getlines(fp.fk.func.__code__.co_filename)
+    members = []
+    for line in lines:
+        m = re.match(r"\s+o(\d+) = _k(\d+)\.func\((.*)\)\s*$", line)
+        if not m:
+            continue
+        k = g[f"_k{m.group(2)}"]
+        srcs = []
+        for a in (x.strip() for x in m.group(3).split(",") if x.strip()):
+            o = re.match(r"o(\d+)\[(\d+)\]", a)
+            srcs.append(("o", int(o.group(1)), int(o.group(2))) if o else int(a[1:]))
+        members.append((k.func.__module__, k.func.__name__, mk_kernels._positional_names(k.func), srcs))
+    return members
+
+
+def _fcapture_save(model, arm, fp, step, params, before, out) -> None:
+    """Write this rank's record of the launch (see `_FCAPTURE`)."""
+    import linecache
+
+    members = _fcapture_members(fp)
+    inplace = sorted({srcs[i] for _, _, names, srcs in members for i, n in enumerate(names)
+                      if n in _FCAPTURE_INPLACE and isinstance(srcs[i], int)})
+    # (the outputs first: their read-back waits for the launch, which updates the caches in place)
+    outs = [o.detach().cpu() for o in out]
+    written = {}
+    for j in inplace:
+        after = params[j].detach().cpu()
+        rows = (after != before[j]).reshape(after.shape[0], -1).any(dim=1).nonzero().reshape(-1)
+        written[j] = {"rows": rows, "values": after[rows].clone()}
+    rec = {
+        "launch": fp.name, "source": "".join(linecache.getlines(fp.fk.func.__code__.co_filename)),
+        "members": members, "params": before, "outs": outs,
+        "written": written,
+        "meta": {"rank": int(model.rank), "world": int(model.world_size), "phase": step.phase,
+                 "spans": [tuple(int(v) for v in s) for s in step.spans], "T": int(step.T),
+                 "ntaps": fp.ntaps, "idx_member": fp.idx_member, "head": fp.head, "arm": arm},
+    }
+    d = os.path.join(_FCAPTURE, arm["tag"], fp.name)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"rank{int(model.rank):02d}.pt")
+    torch.save(rec, path + ".tmp")
+    os.replace(path + ".tmp", path)
+    _mk_log.warning("fcapture: %s rank %d -> %s (%d params, %d in-place)", fp.name, model.rank, d,
+                    len(params), len(inplace))
+
+
 @functools.lru_cache(maxsize=None)
 def kernel_version(kind: str = "block", scheme: str = "tp64") -> int:
     """A hash of the kernel source files a kernel is built from, folded into its
@@ -1307,6 +1401,9 @@ def run_fused(model, blocks, stream: torch.Tensor, pre_mix: torch.Tensor, step: 
     if PROF is not None:
         t1 = time.perf_counter()
         PROF.add("args", t1 - t0)
+    fcap = _fcapture_target(fp, step) if _FCAPTURE else None
+    if fcap is not None:
+        before = [x.detach().cpu().clone() if isinstance(x, torch.Tensor) else x for x in params]
     if _DIRECT and step.stable and _execute_context() is None:
         out, direct = _launch(fp.fk, fp.direct, fp.slots, params)
     else:
@@ -1323,6 +1420,8 @@ def run_fused(model, blocks, stream: torch.Tensor, pre_mix: torch.Tensor, step: 
         step.topk = out[2 + fp.ntaps]
     if fp.head:
         step.greedy_ids = out[-1]
+    if fcap is not None:
+        _fcapture_save(model, fcap, fp, step, params, before, out)
     if not direct:
         # (a direct launch writes the same outputs every step: reading one back later
         # would wait for whichever launch wrote it last; the step's own read-back of its
