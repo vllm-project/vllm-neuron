@@ -44,3 +44,39 @@ def get_models() -> list[tuple[str, type]]:
         models.append(("SyntheticStackedNeuronModel", SyntheticStackedNeuronModel))
 
     return models
+
+
+def get_model_cls(architectures) -> type | None:
+    """Return the Neuron model class registered for the first known architecture, or None.
+
+    Looks in ``get_models()`` first, then in vLLM's ``ModelRegistry`` for models
+    registered out of tree (for example contrib models, through
+    ``ModelRegistry.register_model``). The plugin core reads model capabilities
+    (``vllm_neuron.model.interfaces``) from this class before the model is built.
+
+    Args:
+        architectures: Architecture name, or list of names (``hf_config.architectures``).
+
+    Returns:
+        The model (factory) class, or None when no architecture is registered or the
+        registered class cannot be imported here.
+    """
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    architectures = list(architectures or [])
+    models = dict(get_models())
+    for arch in architectures:
+        if arch in models:
+            return models[arch]
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    for arch in architectures:
+        registered = ModelRegistry.models.get(arch)
+        if registered is None:
+            continue
+        # An entry that cannot be imported here (e.g. a GPU-only model) is not a Neuron model.
+        try:
+            return registered.load_model_cls()
+        except Exception:
+            return None
+    return None
