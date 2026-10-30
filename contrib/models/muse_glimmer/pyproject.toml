@@ -1,0 +1,23 @@
+# Installs this folder's src/ as the ``muse_glimmer_neuron`` package and registers
+# MuseGlimmerForConditionalGeneration with vLLM in every process (front-end,
+# engine core, Neuron workers) through a general-plugin entry point:
+#     pip install -e contrib/models/muse_glimmer
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-neuron-contrib-muse-glimmer"
+version = "0.1.0"
+description = "MuseGlimmer (MuseGlimmerForConditionalGeneration) contrib model for vllm-neuron"
+requires-python = ">=3.11"
+
+[project.entry-points."vllm.general_plugins"]
+muse_glimmer_neuron = "muse_glimmer_neuron:register"
+
+[tool.setuptools]
+packages = ["muse_glimmer_neuron", "muse_glimmer_neuron.kernels", "muse_glimmer_neuron.utils"]
+package-dir = { "muse_glimmer_neuron" = "src", "muse_glimmer_neuron.kernels" = "src/kernels", "muse_glimmer_neuron.utils" = "src/utils" }
+
+[tool.setuptools.package-data]
+muse_glimmer_neuron = ["README.md"]
