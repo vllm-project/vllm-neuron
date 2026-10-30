@@ -463,8 +463,8 @@ def _fcapture_members(fp) -> list:
     import linecache
     import re
 
-    g = fp.fk.func.__globals__
-    lines = linecache.getlines(fp.fk.func.__code__.co_filename)
+    g = fp.gen.func.__globals__
+    lines = linecache.getlines(fp.gen.func.__code__.co_filename)
     members = []
     for line in lines:
         m = re.match(r"\s+o(\d+) = _k(\d+)\.func\((.*)\)\s*$", line)
@@ -494,7 +494,7 @@ def _fcapture_save(model, arm, fp, step, params, before, out) -> None:
         rows = (after != before[j]).reshape(after.shape[0], -1).any(dim=1).nonzero().reshape(-1)
         written[j] = {"rows": rows, "values": after[rows].clone()}
     rec = {
-        "launch": fp.name, "source": "".join(linecache.getlines(fp.fk.func.__code__.co_filename)),
+        "launch": fp.name, "source": "".join(linecache.getlines(fp.gen.func.__code__.co_filename)),
         "members": members, "params": before, "outs": outs,
         "written": written,
         "meta": {"rank": int(model.rank), "world": int(model.world_size), "phase": step.phase,
@@ -1236,6 +1236,10 @@ class FusedPlan:
     blocks leave for later launches (the kv source's caches, a placeholder top-k)."""
 
     fk: object
+    #: the generated launch (`mk_kernels.fused`) of the plan: `fk` itself, or the one the
+    #: optimized launch `fk` replaces (`mk_kernels.optimized_fused`); its source spells the
+    #: members (`_fcapture_members`)
+    gen: object
     name: str
     params: list
     slots: list
@@ -1250,6 +1254,8 @@ class FusedPlan:
 
 #: (layer ids, phase, T, B, head) -> FusedPlan
 _FUSED_PLANS: dict = {}
+#: the (launch name, why not optimized) `_plan_fused` logged its choice of kernel for
+_FUSED_SEEN: set = set()
 
 
 def _plan_fused(model, blocks, stream, pre_mix, step: StepIndices, head: bool,
@@ -1314,7 +1320,16 @@ def _plan_fused(model, blocks, stream, pre_mix, step: StepIndices, head: bool,
     ids = [b.attn.layer_id for b in blocks]
     name = (f"layers_{step.phase}{'_embed' if embed else ''}_L{ids[0]:02d}_L{ids[-1]:02d}"
             f"{'_head' if head else ''}_{plan.scheme}")
-    fk = mk_kernels.fused(name, tuple(kernels), tuple(plans), len(params), tuple(returns))
+    fargs = (name, tuple(kernels), tuple(plans), len(params), tuple(returns))
+    gen = mk_kernels.fused(*fargs)
+    fk, why = mk_kernels.optimized_fused(*fargs)
+    if (name, why) not in _FUSED_SEEN:
+        _FUSED_SEEN.add((name, why))
+        if fk is not None:
+            _mk_log.info("fused launch %s: the optimized kernel (kernels/tp64/fused/%s)", name, name)
+        elif name in mk_kernels.FUSED_LAUNCHES:
+            _mk_log.warning("fused launch %s: the generated launch (%s)", name, why)
+    fk = fk or gen
     # the step's own tensors: refilled every step
     dyn = {}
     if embed:
@@ -1335,8 +1350,9 @@ def _plan_fused(model, blocks, stream, pre_mix, step: StepIndices, head: bool,
     zeros = {id(z) for z in _ZEROS.values()}       # (the blocks may have made one)
     after = (step.compress_cache, step.index_cache,
              step.topk if isinstance(step.topk, torch.Tensor) and id(step.topk) in zeros else None)
-    trace = ",".join(k.func.__module__.rsplit(".", 2)[-2] for k in kernels)
-    return FusedPlan(fk, name, static, slots, len(taps_at), idx_member, head, after, trace)
+    trace = (f"tp64/fused/{name}" if fk is not gen
+             else ",".join(k.func.__module__.rsplit(".", 2)[-2] for k in kernels))
+    return FusedPlan(fk, gen, name, static, slots, len(taps_at), idx_member, head, after, trace)
 
 
 def _fill_fused(fp: FusedPlan, stream, pre_mix, step: StepIndices):

@@ -5007,29 +5007,9 @@ class DeepseekV41ForCausalLM(nn.Module):
                 "the routed experts and the engram tables are streamed, not "
                 "resident."
             )
-        meta = self._attn_meta(attn_metadata)
-        rows_per_seq = self._decode_rows_per_seq(meta, int(input_ids.shape[0]))
-        live_spans = self._sequence_spans(
-            positions, meta["slot_mapping"], rows_per_seq
+        spans, bucket_meta, paged, live_lengths, slices, bucket_rows, live_rows = (
+            self._step_rows(input_ids, positions, attn_metadata)
         )
-        live_rows = sum(length for _, length, _ in live_spans)
-        spans, bucket_meta = self._bucket_rows(
-            live_spans, meta, int(input_ids.shape[0]), rows_per_seq
-        )
-        paged = self._paged_spans(spans, bucket_meta, len(live_spans))
-        if _TRACE_INPUTS:
-            self._trace_inputs(input_ids, positions, meta, live_spans, spans)
-        live_lengths = [length for _, length, _ in live_spans]
-        # `_draft` indexes its per-row tensors by span, so a bucket that added
-        # spans has to extend this too. The drafts those rows produce are
-        # discarded — `NeuronModelRunner._sanitize_sync_drafts` aligns the row
-        # count to the request count — but the lengths have to be in range.
-        if len(live_lengths) < len(spans):
-            live_lengths = live_lengths + [
-                length for _, length, _ in spans[len(live_lengths):]
-            ]
-        slices = [(begin, length) for begin, length, _ in spans]
-        bucket_rows = sum(length for _, length, _ in spans)
 
         plan = self.mk_plan
         if _DUMP_DIR:
@@ -5063,8 +5043,6 @@ class DeepseekV41ForCausalLM(nn.Module):
         shared = [SharedAttentionState() for _ in paged]
         main_hiddens: list[torch.Tensor] = []
         target_layers = set(self.config.dspark_target_layer_ids)
-
-        _MOE_LIVE_ROWS[0] = live_rows if live_rows != bucket_rows else None
 
         if _MEGAKERNEL:
             # One specialized megakernel per block (`mk_kernels`: by phase, block
@@ -5719,6 +5697,47 @@ class DeepseekV41ForCausalLM(nn.Module):
         return split
 
     @torch._dynamo.disable
+    @torch._dynamo.disable
+    def _step_rows(self, input_ids: torch.Tensor, positions: torch.Tensor, attn_metadata):
+        """The step's rows by sequence: `(spans, bucket_meta, paged, live_lengths, slices,
+        bucket_rows, live_rows)` -- the spans of the runner's `num_seqs` bucket
+        (`_bucket_rows`), their pages, each span's live length, the bucket's and the live
+        sequences' row counts -- and `_MOE_LIVE_ROWS` for the blocks.
+
+        Outside dynamo: the live sequence count is a Python value, and dynamo guarded every
+        use of it in `forward` (`len(live_spans)`, `live_rows`, the first span's length),
+        so a request finishing while others decode -- a count the bucket's graphs had not
+        run with yet -- recompiled four of `forward`'s resume frames, ~1.1-2 s that every
+        live request waited out (measured 2026-10-30 at max_num_seqs=10, in1024: 18
+        recompiles in one 6 s measurement, `TORCH_LOGS=recompiles`). What `forward` reads
+        from here depends on the bucket only (the padded spans' lengths are a live
+        span's)."""
+        meta = self._attn_meta(attn_metadata)
+        rows_per_seq = self._decode_rows_per_seq(meta, int(input_ids.shape[0]))
+        live_spans = self._sequence_spans(
+            positions, meta["slot_mapping"], rows_per_seq
+        )
+        live_rows = sum(length for _, length, _ in live_spans)
+        spans, bucket_meta = self._bucket_rows(
+            live_spans, meta, int(input_ids.shape[0]), rows_per_seq
+        )
+        paged = self._paged_spans(spans, bucket_meta, len(live_spans))
+        if _TRACE_INPUTS:
+            self._trace_inputs(input_ids, positions, meta, live_spans, spans)
+        live_lengths = [length for _, length, _ in live_spans]
+        # `_draft` indexes its per-row tensors by span, so a bucket that added
+        # spans has to extend this too. The drafts those rows produce are
+        # discarded — `NeuronModelRunner._sanitize_sync_drafts` aligns the row
+        # count to the request count — but the lengths have to be in range.
+        if len(live_lengths) < len(spans):
+            live_lengths = live_lengths + [
+                length for _, length, _ in spans[len(live_lengths):]
+            ]
+        slices = [(begin, length) for begin, length, _ in spans]
+        bucket_rows = sum(length for _, length, _ in spans)
+        _MOE_LIVE_ROWS[0] = live_rows if live_rows != bucket_rows else None
+        return spans, bucket_meta, paged, live_lengths, slices, bucket_rows, live_rows
+
     def _engram_hashes(
         self, input_ids: torch.Tensor, paged: list[PagedSpan],
         ids_host: torch.Tensor | None = None,

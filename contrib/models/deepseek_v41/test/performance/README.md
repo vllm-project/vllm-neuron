@@ -19,8 +19,8 @@ reported numbers come from two runs -- see "Reproducing the reported numbers".
 
 ## Reproducing the reported numbers
 
-The current reference reports are `bench_report.opt6.json` (batch 1) and
-`bench_report.opt6_ms10.json` (batch 10), measured 2026-10-27 on a trn3.48xlarge
+The current reference reports are `bench_report.opt8.json` (batch 1) and
+`bench_report.opt8_ms10.json` (batch 10), measured 2026-10-30 on a trn3.48xlarge
 with the DLAMI venv `aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0` and the
 checkpoint at `/mnt/nvme/hf`. Run them one after the other, each with the devices to
 itself:
@@ -33,27 +33,28 @@ cd <vllm-neuron repo root>
 DEEPSEEK_V41_SCHEME=tp64 \
 python contrib/models/deepseek_v41/test/performance/run_bench.py --model /mnt/nvme/hf \
     --dataset-path contrib/models/deepseek_v41/test/performance/sonnet.txt \
-    --report contrib/models/deepseek_v41/test/performance/bench_report.opt6.json \
+    --report contrib/models/deepseek_v41/test/performance/bench_report.opt8.json \
     --bench-timeout 7200 --batch-sizes 1
 
 # batch 10: the same input lengths on ten-sequence engines
 DEEPSEEK_V41_SCHEME=tp64 DEEPSEEK_V41_MAX_NUM_SEQS=10 \
 python contrib/models/deepseek_v41/test/performance/run_bench.py --model /mnt/nvme/hf \
     --dataset-path contrib/models/deepseek_v41/test/performance/sonnet.txt \
-    --report contrib/models/deepseek_v41/test/performance/bench_report.opt6_ms10.json \
+    --report contrib/models/deepseek_v41/test/performance/bench_report.opt8_ms10.json \
     --bench-timeout 7200 --input-lens 512,1024,2048,8192 --batch-sizes 10
 ```
 
 Nothing else is set: every optimization in the reports is the default
 (`DEEPSEEK_V41_SCHEME=tp64` is too, spelled out for clarity). The knobs, each `1` by
-default unless noted, are `DEEPSEEK_V41_OPT_KERNELS` (`all`), `DEEPSEEK_V41_FUSE_DECODE`
-(`8` blocks a decode launch), `DEEPSEEK_V41_FUSE_EMBED`, `DEEPSEEK_V41_FUSE_HEAD`,
-`DEEPSEEK_V41_DRAFT_BATCHED` and `DEEPSEEK_V41_ONE_RPC_STEP`; `src/README.md`
-("A decode step is a handful of launches") says what each does. `--bench-timeout`
-only bounds a wedged run. Without `DEEPSEEK_V41_MAX_NUM_SEQS=10` the port clamps the
-engine to one sequence and a batch-10 cell queues its ten requests one at a time.
-A first run against a cold compile cache spends tens of minutes compiling on the
-way up and in each cell's warm-up; the measured figures are the same.
+default unless noted, are `DEEPSEEK_V41_OPT_KERNELS` (`all`), `DEEPSEEK_V41_FUSED_OPT`
+(`all`), `DEEPSEEK_V41_FUSE_DECODE` (`8` blocks a decode launch),
+`DEEPSEEK_V41_FUSE_EMBED`, `DEEPSEEK_V41_FUSE_HEAD`, `DEEPSEEK_V41_DRAFT_BATCHED` and
+`DEEPSEEK_V41_ONE_RPC_STEP`; `src/README.md` ("A decode step is a handful of
+launches") says what each does. `--bench-timeout` only bounds a wedged run. Without
+`DEEPSEEK_V41_MAX_NUM_SEQS=10` the port clamps the engine to one sequence and a
+batch-10 cell queues its ten requests one at a time. A first run against a cold
+compile cache spends tens of minutes compiling on the way up and in each cell's
+warm-up; the measured figures are the same.
 `DEEPSEEK_V41_HOST_PROF=1` adds a per-step host-time breakdown to the server logs
 (`cells/server_*.log`) without changing the figures materially.
 

@@ -193,6 +193,18 @@ comma list of packages) selects which run, and `test/unit/test_opt_kernels_diff.
 checks every one against the generic body on 8 ranks (shapes the recorded cases do
 not cover, every archetype).
 
+The index sources' scores and top-k in the prefill kernels (`r1_idx`, `r1_src_idx`,
+`r2_src_idx`, `r2_src_idx_e`) and in the `r1_src_idx` decode kernel (block 20) carry
+the fused decode launches' indexer (`mk_compress.py` in those packages):
+`index_scores_span` scores `128 // nh` tokens a pass (32 at the 4 index heads a rank;
+their heads side by side on the stationary, the head-weighted sum one matmul against a
+block-diagonal weight) instead of one token a dynamic iteration on 4 of the PE's 128
+columns, and `index_topk` builds its 16-partition snake tiles from contiguous row loads
+and PE transposes and stores the picks as 64-byte runs instead of 2-byte / 4-byte
+element-strided DMAs (~14 us a token at an 8k context). Same values: every score is the
+same dot products and per-token sum (plus exact zeros), the top-k sees the same bf16
+tiles.
+
 **A decode step is a handful of launches (flat scheme).** A decode block runs in well
 under a millisecond on the device, while every NEFF execution with collectives costs
 ~1.5 ms of host submission at the least -- more the more IO tensors it has (~5 ms for an
@@ -209,6 +221,22 @@ the step is built from as few launches as keep the device fed:
   a step instead of 40; larger groups cost more submission than they save, since the
   step's first block waits for the first launch's submission (20-block groups were
   slower). Prefill keeps one launch a block (device-bound).
+* Optimized fused launches (`kernels/tp64/fused/<launch>/`, `mk_kernels.optimized_fused`):
+  a decode step's launch can be replaced by one optimized as a whole -- written out from
+  the model's plan and run through an AutoHelix loop on the live server's recorded
+  inputs and golden outputs of all 64 ranks (bit-exact: same arithmetic and accumulation
+  order, only scheduling and data movement changed). Each package holds the launch
+  (`<launch>.py`, the generated launch's parameters and outputs), its own copies of the
+  members' kernels (so a loop can change them for that launch: share the slot / index
+  tables and index keys across the blocks reading the same top-k, keep the previous
+  block's output tiles in SBUF, prefetch the next block's projection weights during this
+  block's all-reduce, split the few-row hc / MoE / indexer work over both cores) and
+  `plan.json`, the model plan it replaces (each member's kernel and arguments, the
+  parameter count, the returns). `_plan_fused` runs it only for a plan that is
+  `plan.json` exactly (else the generated launch, with a warning naming the
+  difference); its entry carries a hash of the package's files (the NKI compile caches
+  key a kernel on its own source). `DEEPSEEK_V41_FUSED_OPT` (`all` by default, `none`,
+  or a comma list of launch names) selects which run.
 * The first launch opens with the token embedding and the hyper-connection expand
   (`tp64/head_kernel.embed_expand_body`, `DEEPSEEK_V41_FUSE_EMBED`), the last closes
   with the greedy head (`head_greedy_body`, `DEEPSEEK_V41_FUSE_HEAD`): collapse,
@@ -309,6 +337,15 @@ device, and the runtime's queue holds 32 executions: eight prefills in flight on
 the first stage overflowed it, "Execution Queue Full", 2026-10-24),
 `NEURON_RT_EXEC_TIMEOUT=120` turns a device wait into an error, and
 `TORCH_LOGS=recompiles` names the frame and the failed guard.
+
+The same guards made the live sequence count a recompile trigger: the forward's head
+computed its spans' lengths, the live row count and `len(live_spans)` in traced
+code, so every count a bucket had not run with yet -- a request finishing while
+others decode -- recompiled four of `forward`'s resume frames, ~1.1-2 s that every
+live request waited out (2026-10-30, `max_num_seqs=10`: 18 recompiles in a 6 s
+measurement; with faster prefills the requests finish at spread-out times, so it hit
+mid-run instead of at the end). `DeepseekV41ForCausalLM._step_rows` computes all of
+it outside dynamo; what `forward` reads from it depends on the bucket only.
 
 ## Quantization
 

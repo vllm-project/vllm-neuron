@@ -27,14 +27,21 @@ scores / top-k, ratio 0). `DEEPSEEK_V41_OPT_KERNELS` selects which of them run (
 Archetypes (`arch` = `(ratio, is_kv_src, is_idx_src, has_engram, tap)`) are taken
 from the config at first use; the names spell them `r<ratio>`, `src` (kv source),
 `idx` (index source), `e` (engram), `tap`.
+
+A fused decode launch (`fused`: several block kernels in sequence) can have an optimized
+replacement, `tp64/fused/<launch>/`, optimized as a whole; `optimized_fused` returns it for
+the plan it was written from (its `plan.json`).
 """
 
 from __future__ import annotations
 
 import contextlib
 import functools
+import glob
+import hashlib
 import importlib
 import inspect
+import json
 import linecache
 import os
 import sys
@@ -293,3 +300,97 @@ def fused(name: str, kernels: tuple, plan: tuple, nparams: int, returns: tuple):
     fn.__qualname__ = name
     return nki.jit(fn)
 
+
+
+#: The optimized fused decode launches: `tp64/fused/<launch>/`, one of a decode step's launches
+#: (`mk_model.run_fused`) written out and optimized as a whole in an AutoHelix loop. Its
+#: `<launch>.py` calls its own copies of the members' kernels (packages next to it, which may
+#: share tables and on-chip tiles across blocks and prefetch the next block's weights) and
+#: takes the parameters of the model's launch it replaces; `plan.json` is that launch's plan
+#: (each member's kernel and arguments, the parameter count, the returns). `optimized_fused`
+#: returns it for a plan that matches exactly. `DEEPSEEK_V41_FUSED_OPT`: unset or "all" ->
+#: every one, "none" / "0" -> none (the generated launch everywhere: A/B, debugging), else a
+#: comma list of launch names (`layers_decode_L24_L31_tp64,...`).
+_FUSED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tp64", "fused")
+_MK_HOST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "mk_host.py")
+FUSED_LAUNCHES = tuple(sorted(d for d in os.listdir(_FUSED_DIR)
+                              if os.path.isfile(os.path.join(_FUSED_DIR, d, "plan.json"))))
+
+
+def _fused_enabled() -> frozenset:
+    spec = os.environ.get("DEEPSEEK_V41_FUSED_OPT", "all").strip()
+    if spec.lower() in ("", "all", "1"):
+        return frozenset(FUSED_LAUNCHES)
+    if spec.lower() in ("none", "0"):
+        return frozenset()
+    names = {n.strip() for n in spec.split(",") if n.strip()}
+    unknown = names - set(FUSED_LAUNCHES)
+    if unknown:
+        raise ValueError(f"DEEPSEEK_V41_FUSED_OPT: unknown launches {sorted(unknown)}; "
+                         f"known: {', '.join(FUSED_LAUNCHES)}")
+    return frozenset(names)
+
+
+_FUSED_ENABLED = _fused_enabled()
+
+
+def plan_signature(kernels: tuple, plan: tuple, nparams: int, returns: tuple) -> dict:
+    """A fused plan (`fused`'s arguments) as `plan.json` spells it: each member's kernel
+    (`<package>.<module>:<name>`; the generic body's and the head's `kernels.mk_kernels:<name>`)
+    and arguments (`p<j>` / `o<m>.<k>`)."""
+    def ref(s):
+        return f"p{s[1]}" if s[0] == "p" else f"o{s[1]}.{s[2]}"
+
+    return {"nparams": int(nparams),
+            "members": [{"kernel": ".".join(k.func.__module__.rsplit(".", 2)[-2:]) + ":" + k.func.__name__,
+                         "args": " ".join(ref(s) for s in srcs)} for k, srcs in zip(kernels, plan)],
+            "returns": " ".join(ref(r) for r in returns)}
+
+
+def _tree_hash(root: str) -> int:
+    """A hash of an optimized launch's sources (every file of its package, and `mk_host.py`,
+    which builds the index columns it reads), put in its entry's source: the NKI compile
+    caches key a kernel on its own function source (see `mk_model.kernel_version`)."""
+    h = hashlib.sha256()
+    files = sorted(glob.glob(os.path.join(root, "**", "*.py"), recursive=True))
+    for path in files + [os.path.join(root, "plan.json"), _MK_HOST]:
+        h.update(os.path.basename(path).encode())
+        with open(path, "rb") as fh:
+            h.update(fh.read())
+    return int.from_bytes(h.digest()[:4], "little") & 0x7FFFFFFF
+
+
+@functools.lru_cache(maxsize=None)
+def optimized_fused(name: str, kernels: tuple, plan: tuple, nparams: int, returns: tuple):
+    """`(kernel, None)`: the optimized launch `tp64/fused/<name>/` (`@nki.jit`) for this plan
+    (`fused`'s arguments), else `(None, why not)` (no such launch, not enabled, or its
+    `plan.json` differs from the plan)."""
+    if name not in FUSED_LAUNCHES:
+        return None, "no optimized launch"
+    if name not in _FUSED_ENABLED:
+        return None, "not in DEEPSEEK_V41_FUSED_OPT"
+    root = os.path.join(_FUSED_DIR, name)
+    with open(os.path.join(root, "plan.json")) as fh:
+        want = json.load(fh)
+    got = plan_signature(kernels, plan, nparams, returns)
+    for key in ("nparams", "returns"):
+        if got[key] != want[key]:
+            return None, f"plan.json {key} {want[key]!r} != the model's {got[key]!r}"
+    if len(got["members"]) != len(want["members"]):
+        return None, f"plan.json has {len(want['members'])} members, the model's plan {len(got['members'])}"
+    for m, (g, w) in enumerate(zip(got["members"], want["members"])):
+        if g != w:
+            return None, f"member {m}: plan.json {w['kernel']} {w['args']!r} != the model's {g['kernel']} {g['args']!r}"
+    body = getattr(importlib.import_module(f".tp64.fused.{name}.{name}", __package__), name).func
+    names = _positional_names(body)
+    src = (f"def {name}({', '.join(names)}):\n"
+           f'    """tp64/fused/{name} ({_tree_hash(root):08x})"""\n'
+           f"    return _body({', '.join(names)})\n")
+    filename = f"<deepseek_v41.kernels.mk_kernels/{name}>"
+    linecache.cache[filename] = (len(src), None, src.splitlines(True), filename)
+    ns = {"_body": body}
+    exec(compile(src, filename, "exec"), ns)
+    fn = ns[name]
+    fn.__module__ = __name__
+    fn.__qualname__ = name
+    return nki.jit(fn), None

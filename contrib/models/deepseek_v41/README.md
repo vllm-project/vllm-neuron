@@ -311,6 +311,41 @@ the runner change in this branch's plugin (`vllm_neuron/vllm/worker/neuron_model
 `vllm_neuron/vllm/patches/pp_draft_patch.py`); on a plugin without it the port still
 serves, with vLLM's three RPCs a step.
 
+**Optimized fused decode launches (2026-10-28 to 2026-10-30, flat scheme).** Each of a
+decode step's five fused launches was written out and optimized as a whole in an
+AutoHelix loop on the live server's recorded inputs and golden outputs of all 64 ranks
+(blocks 0-7 with the embedding, 8-15, 24-31, 32-39 with the head; blocks 16-23 are
+composed from those loops' members), bit for bit on the recorded cases: the blocks of a
+launch share their slot / index tables, hand the output tiles over in SBUF, prefetch the
+next block's projection weights during the all-reduce, and split the few-row
+hyper-connection, MoE and indexer work over both cores (`src/kernels/tp64/fused/`,
+`src/README.md` "A decode step is a handful of launches"). The prefill index sources
+(and block 20's decode kernel) score 32 tokens a matmul and build the top-k tiles with
+PE transposes (the indexer those loops wrote), and the forward plans a step's rows
+outside dynamo, so a request finishing while others decode no longer recompiles it.
+The integration test passes with the verifier's texts unchanged. Measured 2026-10-30 on
+the same stack (`test/performance/bench_report.opt8.json` and `.opt8_ms10.json`), against
+the previous reference of 2026-10-28 (`bench_report.opt7*.json`: the opt6 kernels with
+direct executor launches):
+
+| Cell | TTFT p50 ms | TPOT p50 ms | decode tok/s | accept % |
+|------|-------------|-------------|--------------|----------|
+| in512_bs1 | 137 (163) | 11.5 (14.0) | 81.6 (67.3) | 51 |
+| in1024_bs1 | 232 (297) | 10.4 (12.8) | 81.0 (65.9) | 47 |
+| in2048_bs1 | 420 (584) | 11.4 (14.1) | 67.0 (52.9) | 42 |
+| in8192_bs1 | 1720 (3308) | 11.9 (14.5) | 39.7 (24.6) | 45 |
+| in512_bs10 | 722 (880) | 22.8 (27.7) | 334.2 (270.9) | 48 |
+| in1024_bs10 | 1247 (1610) | 24.0 (31.9) | 284.0 (218.6) | 51 |
+| in2048_bs10 | 2268 (3153) | 31.2 (58.0) | 192.4 (104.0) | 46 |
+| in8192_bs10 | 9480 (18162) | 81.3 (152.5) | 63.5 (33.3) | 45 |
+
+(In parentheses: the 2026-10-28 reference.) TTFT is 16-48 % lower (the indexer: it was
+62 % of an 8k prefill chunk), batch-1 TPOT 18-19 % lower, batch-10 TPOT 18-47 % lower.
+31 of the 32 batch-1 texts are the reference's word for word; one 8k text takes two
+other near-tie words ("they want" -> "wants", "parse" -> "respond") and is otherwise the
+same, reproducibly, from the blocks 32-39 launch alone -- bit-exact on all its recorded
+cases, so a summation order at that request's state.
+
 > **Read this before you deploy.** Every number in this contribution was
 > measured on `vllm-neuron` **0.24.0.1.1.0**, which is the branch the model was
 > developed against. The code is contributed on top of `main`, and the port's
