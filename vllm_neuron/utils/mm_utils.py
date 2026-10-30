@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 def get_vision_token_merge_factor(hf_config: PretrainedConfig) -> int:
     """Return the vision token merge factor for a model.
 
-    Looks up the model class via registry and calls its
+    Looks up the model class via the registry (``get_model_cls``) and calls its
     SupportsSpatialMerge.get_vision_token_merge_factor classmethod.
     Returns 1 if the model doesn't implement the protocol.
 
@@ -28,10 +28,9 @@ def get_vision_token_merge_factor(hf_config: PretrainedConfig) -> int:
         E.g., 4 for Qwen3-VL (spatial_merge_size=2, so 2x2=4).
     """
     from vllm_neuron.model.interfaces import SupportsSpatialMerge
-    from vllm_neuron.model.registry import get_models
+    from vllm_neuron.model.registry import get_model_cls
 
-    arch = hf_config.architectures[0]
-    model_cls = dict(get_models()).get(arch)
+    model_cls = get_model_cls((hf_config.architectures or [])[:1])
     if model_cls and issubclass(model_cls, SupportsSpatialMerge):
         return model_cls.get_vision_token_merge_factor(hf_config)
     return 1
@@ -75,7 +74,7 @@ def get_max_encoder_embed_budget(
 ) -> int | None:
     """Return the per-step encoder budget in embed tokens for a model, or None.
 
-    Looks up the model class via registry and calls its
+    Looks up the model class via the registry (``get_model_cls``) and calls its
     SupportsEncoderBudget.get_max_encoder_embed_budget classmethod. The scheduler
     caps the encoder compute budget at this value, so one prefill step never
     sends more encoder tokens than a compiled bucket holds. Each modality states
@@ -91,10 +90,9 @@ def get_max_encoder_embed_budget(
         The embed-token budget, or None if unsupported.
     """
     from vllm_neuron.model.interfaces import SupportsEncoderBudget
-    from vllm_neuron.model.registry import get_models
+    from vllm_neuron.model.registry import get_model_cls
 
-    arch = hf_config.architectures[0]
-    model_cls = dict(get_models()).get(arch)
+    model_cls = get_model_cls((hf_config.architectures or [])[:1])
     if model_cls and issubclass(model_cls, SupportsEncoderBudget):
         return model_cls.get_max_encoder_embed_budget(hf_config, encoder_neuron_config)
     return None
@@ -105,7 +103,7 @@ def get_max_encoder_blocks_per_request(
 ) -> int:
     """Return the largest encoder-cache block count one request uses, or 0.
 
-    Looks up the model class via registry and calls its
+    Looks up the model class via the registry (``get_model_cls``) and calls its
     SupportsEncoderBudget.get_max_encoder_blocks_per_request classmethod. The
     model runner sizes the per-request block gather with this value. Each
     modality states its buckets in a different unit, so the model owns the
@@ -119,10 +117,9 @@ def get_max_encoder_blocks_per_request(
         The block count, or 0 if unsupported.
     """
     from vllm_neuron.model.interfaces import SupportsEncoderBudget
-    from vllm_neuron.model.registry import get_models
+    from vllm_neuron.model.registry import get_model_cls
 
-    arch = hf_config.architectures[0]
-    model_cls = dict(get_models()).get(arch)
+    model_cls = get_model_cls((hf_config.architectures or [])[:1])
     if model_cls and issubclass(model_cls, SupportsEncoderBudget):
         return model_cls.get_max_encoder_blocks_per_request(
             hf_config, encoder_neuron_config
@@ -135,7 +132,7 @@ def get_max_pixels_token_count(
 ) -> int | None:
     """Return the raw vision-token count for a max_pixels cap, or None.
 
-    Looks up the model class via registry and calls its
+    Looks up the model class via the registry (``get_model_cls``) and calls its
     SupportsMaxPixels.get_max_pixels_token_count classmethod. Returns None
     when the model does not implement the protocol.
 
@@ -147,10 +144,9 @@ def get_max_pixels_token_count(
         Raw (pre-merge) vision token count, or None if unsupported.
     """
     from vllm_neuron.model.interfaces import SupportsMaxPixels
-    from vllm_neuron.model.registry import get_models
+    from vllm_neuron.model.registry import get_model_cls
 
-    arch = hf_config.architectures[0]
-    model_cls = dict(get_models()).get(arch)
+    model_cls = get_model_cls((hf_config.architectures or [])[:1])
     if model_cls and issubclass(model_cls, SupportsMaxPixels):
         return model_cls.get_max_pixels_token_count(hf_config, max_pixels)
     return None
@@ -161,7 +157,7 @@ def get_epd_kwargs(
 ) -> "MultiModalKwargsItem":
     """Return the subset of an item's mm kwargs the EPD LM pool needs.
 
-    Looks up the model class via registry and calls its
+    Looks up the model class via the registry (``get_model_cls``) and calls its
     SupportsDisaggEncoder.get_epd_kwargs classmethod, which drops encoder-only
     tensors (e.g. pixel_values) the LM pool pulls out-of-band. Returns the item
     unchanged when the model doesn't implement the protocol.
@@ -174,10 +170,9 @@ def get_epd_kwargs(
         The LM-relevant mm kwargs item.
     """
     from vllm_neuron.model.interfaces import SupportsDisaggEncoder
-    from vllm_neuron.model.registry import get_models
+    from vllm_neuron.model.registry import get_model_cls
 
-    arch = hf_config.architectures[0]
-    model_cls = dict(get_models()).get(arch)
+    model_cls = get_model_cls((hf_config.architectures or [])[:1])
     if model_cls and issubclass(model_cls, SupportsDisaggEncoder):
         return model_cls.get_epd_kwargs(item)
     return item
@@ -204,10 +199,9 @@ def get_placeholder_is_embed(
         A list[bool] mask over the span, or None if dense.
     """
     from vllm_neuron.model.interfaces import SupportsDisaggEncoder
-    from vllm_neuron.model.registry import get_models
+    from vllm_neuron.model.registry import get_model_cls
 
-    arch = hf_config.architectures[0]
-    model_cls = dict(get_models()).get(arch)
+    model_cls = get_model_cls((hf_config.architectures or [])[:1])
     if model_cls and issubclass(model_cls, SupportsDisaggEncoder):
         return model_cls.get_placeholder_is_embed(
             hf_config, modality, placeholder_token_ids
