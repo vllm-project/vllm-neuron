@@ -64,7 +64,23 @@ _MULTI_RANK_ENV = {
     "MALLOC_TRIM_THRESHOLD_": "131072",
     "MALLOC_TOP_PAD_": "131072",
     "NEURON_HOST_MEM_PER_RANK_GIB": "20.0",
+    "VLLM_NEURON_SHM_READER_SPIN_PATCH": "0",
+    "NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS": "128",
 }
+
+#: `NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS=128` (the worker's default is 32): under async
+#: scheduling (`ASYNC_ENV`) the host submits step N+1's executions while step N's are still
+#: queued, and a bs10 decode step is ~20 executions (5 fused launches, the prologue, the
+#: drafter, the sampler's and the runner's small graphs) -- 32 overflowed with "Failed to
+#: schedule neff execution ... Execution Queue Full" (measured 2026-10-30, in1024 bs10).
+
+#: `VLLM_NEURON_SHM_READER_SPIN_PATCH=0` keeps vLLM's own `shm_broadcast` reader spin (a reader
+#: polls the ring instead of blocking on the notification socket after 0.2 ms). A decode step
+#: waits for its next RPC on every rank, and the step's first launch waits at its entry barrier
+#: for the last rank to get it: with the plugin's bounded spin a rank 0 worker waited 1.4-1.9 ms
+#: for the next step's RPC, with the spin 0.4-0.6 ms (measured 2026-10-30, in512 bs1 / in1024
+#: bs10: TPOT -1.4 to -3.1 % / -1 to -1.5 %, texts unchanged). The cost is a core per reader,
+#: 64 of the host's 192 while the engine serves.
 
 #: `NEURON_RT_IO_RING_CACHE_SIZE` is iteration 7's addition, and the A/B the
 #: previous comment here asked for. `neuron_worker.py:713` raises the runtime's
@@ -769,6 +785,7 @@ def require_kv_cache_ceiling(vllm_config) -> None:
 #: the A/B that proves speculation changes nothing: the same prompts with it on
 #: and off have to produce identical tokens, and the only way to show that is to
 NO_SPEC_DECODE_ENV = "DEEPSEEK_V41_NO_SPEC_DECODE"
+from .config import ASYNC_ENV, async_decode  # noqa: E402,F401  (re-exported)
 
 
 def require_dspark_speculation(vllm_config) -> None:
@@ -809,7 +826,22 @@ def require_dspark_speculation(vllm_config) -> None:
         )
         return
     scheduler = getattr(vllm_config, "scheduler_config", None)
-    if scheduler is not None and getattr(scheduler, "async_scheduling", False):
+    if async_decode():
+        # The engine schedules step N+1 while step N runs: the decode step's inputs that
+        # depend on step N (positions, slots, tokens, n-gram ids) are made on the device
+        # (`mk_model.StepPrologue` corrects the optimistic starts from step N's rejection
+        # output), the drafts stay there, and the host never waits on the device.
+        # (the model class takes the runner's correction inputs under the same variable,
+        # `DeepseekV41ForCausalLM._async_spec_decoded`, which the workers inherit)
+        if scheduler is not None and not getattr(scheduler, "async_scheduling", False):
+            scheduler.async_scheduling = True
+        # A lone request's step that may be its last is not followed by one scheduled
+        # ahead (`NeuronAsyncScheduler._hold_back_possibly_final_steps`): that step ran for
+        # nothing whenever it was, and the next request's prefill queued behind it (TTFT
+        # +17-22 ms for half the requests of a batch-1 bench, 2026-10-30).
+        os.environ.setdefault("VLLM_NEURON_ASYNC_MAX_TOKENS_HOLDBACK", "1")
+        logger.info("deepseek_v41: async scheduling on (%s=1)", ASYNC_ENV)
+    elif scheduler is not None and getattr(scheduler, "async_scheduling", False):
         scheduler.async_scheduling = False
         logger.info(
             "deepseek_v41: async scheduling off — the DSpark draft is "

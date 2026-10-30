@@ -4,9 +4,11 @@ blocks 8-15, in order:
 
     L08 r2_src_idx, L09 r2, L10 r2, L11 r2, L12 r2, L13 r2, L14 r2_src_idx_e, L15 r2
 
-Each member is this launch's own copy of the kernel of its block archetype (`<kind>/<kind>.py`,
-from the port's `kernels/tp64/<kind>/`, with its own helper copies), called inside `member`
-(see fused_member.py). Member m's arguments are this launch's parameters, or outputs of an
+Each member is this launch's own copy of an optimized kernel of its block archetype
+(`<kind>/<kind>.py`, with its own helper copies): the r2 / r2_src_idx kernels of the L00-L07
+launch (`../layers_decode_embed_L00_L07_tp64`), and for L14 that launch's r2_src_idx kernel with
+the engram read-out of its r0_e block. They are called inside `member` (see fused_member.py),
+sharing state through the module hooks set below. Member m's arguments are this launch's parameters, or outputs of an
 earlier member (`o<m>[0]` stream, `o<m>[1]` pre-mix, `o<m>[2]` an index source's top-k,
 `o<m>[3]` a tap). One parameter is one tensor of the model: several members read the same
 one where the model passes them the same tensor (a kv source's caches, the step's index
@@ -16,7 +18,8 @@ from (each member's kernel and arguments). Returns: the last block's stream and 
 the last index source's top-k, the greedy head's tokens (what the launch has of these).
 
 Written out from the model's fused plan (`mk_kernels.fused`) and optimized as a whole in an
-AutoHelix loop (workspace ~/ds41_fused_L08_L15: its `git log` lists the changes, README.md the setup).
+AutoHelix loop (workspace ~/ds41_fused_L08_L15: its `git log` lists the changes, README.md the setup);
+its members were then replaced by the L00-L07 launch's (bit-exact on the workspace's recorded cases).
 `mk_kernels.optimized_fused` runs it in place of the generated launch when the model's plan
 is plan.json.
 """
@@ -87,9 +90,30 @@ def layers_decode_L08_L15_tp64(
     L15_w3, L15_s3, L15_w2, L15_s2, L15_sh_w1, L15_sh_s1, L15_sh_w3, L15_sh_s3, L15_sh_w2,
     L15_sh_s2
 ):
-    # the slot / index tables an index source shares with the r2 blocks after it
-    share = {}
+    # The members (the L00-L07 launch's r2 kernels; L14's is its r2_src_idx with the engram
+    # read-out) share, through module hooks set here: an index source's slot table and index
+    # tables with the r2 blocks after it (`SHARE_TAB`), each block's output rows' SBUF tiles
+    # with the next block's hc_in (`XS_SHARE`), and each r2 block's q / kv projection weights,
+    # loaded by the block before it right after that block's world all-reduce trigger
+    # (`AFTER_WORLD_AR` -> `r2_decode.prefetch_proj` -> `r2_decode.PRE_PROJ`)
+    mods = (r2_src_idx_decode, r2_decode, r2_src_idx_e_decode)
+    share_tab, xs_share = {}, {}
+    for m in mods:
+        m.SHARE_TAB = share_tab
+        m.XS_SHARE = xs_share
+        m.AFTER_WORLD_AR = None
+
+    def prefetch(wq_a, wq_a_s, wkv, wkv_s, wq_b=None, wq_b_s=None):
+        if not r2_decode.PREFETCH_NEXT_PROJ or L08_stream.shape[0] > r2_decode.PREFETCH_MAX_T:
+            return None
+
+        def f(pid, after):
+            r2_decode.PRE_PROJ = (wq_a, r2_decode.prefetch_proj(pid, wq_a, wq_a_s, wkv, wkv_s, after=after,
+                                                                wq_b=wq_b, wq_b_s=wq_b_s))
+        return f
+
     # L08 (r2_src_idx)
+    r2_src_idx_decode.AFTER_WORLD_AR = prefetch(L09_wq_a, L09_wq_a_s, L09_wkv, L09_wkv_s, L09_wq_b, L09_wq_b_s)
     with member(0, r2_src_idx_decode):
         o0 = r2_src_idx_decode.layer_decode_r2_src_idx_tp64.func(
             L08_stream, L08_pre_mix, L08_hca_fn_t, L08_hca_base, L08_hca_scale, L08_attn_norm_w,
@@ -104,9 +128,10 @@ def layers_decode_L08_L15_tp64(
             placeholder_int32, placeholder_uint8, placeholder_uint8, placeholder_float32,
             L08_gate_w_t, L08_gate_b, L08_expert_lo, L08_w1, L08_s1, L08_w3, L08_s3, L08_w2,
             L08_s2, L08_sh_w1, L08_sh_s1, L08_sh_w3, L08_sh_s3, L08_sh_w2, L08_sh_s2,
-            L08_groups_attn, L08_groups_world, L08_flags, share=share
+            L08_groups_attn, L08_groups_world, L08_flags
         )
     # L09 (r2)
+    r2_decode.AFTER_WORLD_AR = prefetch(L10_wq_a, L10_wq_a_s, L10_wkv, L10_wkv_s, L10_wq_b, L10_wq_b_s)
     with member(1, r2_decode):
         o1 = r2_decode.layer_decode_r2_tp64.func(
             o0[0], o0[1], L09_hca_fn_t, L09_hca_base, L09_hca_scale, L09_attn_norm_w, L09_hcf_fn_t,
@@ -121,9 +146,10 @@ def layers_decode_L08_L15_tp64(
             placeholder_uint8, placeholder_uint8, placeholder_float32, L09_gate_w_t, L09_gate_b,
             L09_expert_lo, L09_w1, L09_s1, L09_w3, L09_s3, L09_w2, L09_s2, L09_sh_w1, L09_sh_s1,
             L09_sh_w3, L09_sh_s3, L09_sh_w2, L09_sh_s2, L08_groups_attn, L08_groups_world,
-            L09_flags, share=share
+            L09_flags
         )
     # L10 (r2)
+    r2_decode.AFTER_WORLD_AR = prefetch(L11_wq_a, L11_wq_a_s, L11_wkv, L11_wkv_s, L11_wq_b, L11_wq_b_s)
     with member(2, r2_decode):
         o2 = r2_decode.layer_decode_r2_tp64.func(
             o1[0], o1[1], L10_hca_fn_t, L10_hca_base, L10_hca_scale, L10_attn_norm_w, L10_hcf_fn_t,
@@ -138,9 +164,10 @@ def layers_decode_L08_L15_tp64(
             placeholder_uint8, placeholder_uint8, placeholder_float32, L10_gate_w_t, L10_gate_b,
             L10_expert_lo, L10_w1, L10_s1, L10_w3, L10_s3, L10_w2, L10_s2, L10_sh_w1, L10_sh_s1,
             L10_sh_w3, L10_sh_s3, L10_sh_w2, L10_sh_s2, L08_groups_attn, L08_groups_world,
-            L09_flags, share=share
+            L09_flags
         )
     # L11 (r2)
+    r2_decode.AFTER_WORLD_AR = prefetch(L12_wq_a, L12_wq_a_s, L12_wkv, L12_wkv_s, L12_wq_b, L12_wq_b_s)
     with member(3, r2_decode):
         o3 = r2_decode.layer_decode_r2_tp64.func(
             o2[0], o2[1], L11_hca_fn_t, L11_hca_base, L11_hca_scale, L11_attn_norm_w, L11_hcf_fn_t,
@@ -155,9 +182,10 @@ def layers_decode_L08_L15_tp64(
             placeholder_uint8, placeholder_uint8, placeholder_float32, L11_gate_w_t, L11_gate_b,
             L11_expert_lo, L11_w1, L11_s1, L11_w3, L11_s3, L11_w2, L11_s2, L11_sh_w1, L11_sh_s1,
             L11_sh_w3, L11_sh_s3, L11_sh_w2, L11_sh_s2, L08_groups_attn, L08_groups_world,
-            L09_flags, share=share
+            L09_flags
         )
     # L12 (r2)
+    r2_decode.AFTER_WORLD_AR = prefetch(L13_wq_a, L13_wq_a_s, L13_wkv, L13_wkv_s, L13_wq_b, L13_wq_b_s)
     with member(4, r2_decode):
         o4 = r2_decode.layer_decode_r2_tp64.func(
             o3[0], o3[1], L12_hca_fn_t, L12_hca_base, L12_hca_scale, L12_attn_norm_w, L12_hcf_fn_t,
@@ -172,9 +200,10 @@ def layers_decode_L08_L15_tp64(
             placeholder_uint8, placeholder_uint8, placeholder_float32, L12_gate_w_t, L12_gate_b,
             L12_expert_lo, L12_w1, L12_s1, L12_w3, L12_s3, L12_w2, L12_s2, L12_sh_w1, L12_sh_s1,
             L12_sh_w3, L12_sh_s3, L12_sh_w2, L12_sh_s2, L08_groups_attn, L08_groups_world,
-            L09_flags, share=share
+            L09_flags
         )
     # L13 (r2)
+    r2_decode.AFTER_WORLD_AR = None
     with member(5, r2_decode):
         o5 = r2_decode.layer_decode_r2_tp64.func(
             o4[0], o4[1], L13_hca_fn_t, L13_hca_base, L13_hca_scale, L13_attn_norm_w, L13_hcf_fn_t,
@@ -189,9 +218,10 @@ def layers_decode_L08_L15_tp64(
             placeholder_uint8, placeholder_uint8, placeholder_float32, L13_gate_w_t, L13_gate_b,
             L13_expert_lo, L13_w1, L13_s1, L13_w3, L13_s3, L13_w2, L13_s2, L13_sh_w1, L13_sh_s1,
             L13_sh_w3, L13_sh_s3, L13_sh_w2, L13_sh_s2, L08_groups_attn, L08_groups_world,
-            L09_flags, share=share
+            L09_flags
         )
     # L14 (r2_src_idx_e)
+    r2_src_idx_e_decode.AFTER_WORLD_AR = prefetch(L15_wq_a, L15_wq_a_s, L15_wkv, L15_wkv_s, L15_wq_b, L15_wq_b_s)
     with member(6, r2_src_idx_e_decode):
         o6 = r2_src_idx_e_decode.layer_decode_r2_src_idx_e_tp64.func(
             o5[0], o5[1], L14_hca_fn_t, L14_hca_base, L14_hca_scale, L14_attn_norm_w, L14_hcf_fn_t,
@@ -205,9 +235,10 @@ def layers_decode_L08_L15_tp64(
             L08_clen, L14_hash_ids, L14_etable, L14_erow_start, L14_e_wkv, L14_e_wkv_s, L14_e_qk,
             L14_gate_w_t, L14_gate_b, L14_expert_lo, L14_w1, L14_s1, L14_w3, L14_s3, L14_w2,
             L14_s2, L14_sh_w1, L14_sh_s1, L14_sh_w3, L14_sh_s3, L14_sh_w2, L14_sh_s2,
-            L08_groups_attn, L08_groups_world, L14_flags, share=share
+            L08_groups_attn, L08_groups_world, L14_flags
         )
     # L15 (r2)
+    r2_decode.AFTER_WORLD_AR = None
     with member(7, r2_decode):
         o7 = r2_decode.layer_decode_r2_tp64.func(
             o6[0], o6[1], L15_hca_fn_t, L15_hca_base, L15_hca_scale, L15_attn_norm_w, L15_hcf_fn_t,
@@ -222,6 +253,6 @@ def layers_decode_L08_L15_tp64(
             placeholder_uint8, placeholder_uint8, placeholder_float32, L15_gate_w_t, L15_gate_b,
             L15_expert_lo, L15_w1, L15_s1, L15_w3, L15_s3, L15_w2, L15_s2, L15_sh_w1, L15_sh_s1,
             L15_sh_w3, L15_sh_s3, L15_sh_w2, L15_sh_s2, L08_groups_attn, L08_groups_world,
-            L09_flags, share=share
+            L09_flags
         )
     return o7[0], o7[1], o6[2]

@@ -1553,7 +1553,56 @@ class NeuronAsyncScheduler(NeuronScheduler, AsyncScheduler):
         NeuronScheduler.schedule() calls this method to delegate to the base scheduler.
         For async scheduling, we need AsyncScheduler's behavior.
         """
+        if os.environ.get("VLLM_NEURON_ASYNC_MAX_TOKENS_HOLDBACK", "") not in ("", "0"):
+            self._hold_back_possibly_final_steps()
+            self._hold_back_first_decodes()
         return AsyncScheduler.schedule(self, throttle_prefills)
+
+    def _hold_back_first_decodes(self) -> None:
+        """Do not schedule a request's first decode while its prefill is still in flight.
+
+        Scheduled right after the prefill was submitted, that decode runs before any prefill
+        of a request that reaches the scheduler a moment later -- requests sent together
+        arrive over a few milliseconds -- and that prefill, and every one queued behind it,
+        waits a decode step longer (~40 ms of TTFT for nine of ten requests sent at once,
+        2026-10-30). Waiting for the first token instead is what synchronous scheduling did,
+        once per request."""
+        for request in self.running:
+            if (
+                request.num_output_placeholders > 0
+                and request.num_output_tokens == 0
+                and not request.is_prefill_chunk
+            ):
+                request.next_decode_eligible_step = max(
+                    request.next_decode_eligible_step, self.current_step + 2
+                )
+
+    def _hold_back_possibly_final_steps(self) -> None:
+        """``VLLM_NEURON_ASYNC_MAX_TOKENS_HOLDBACK``: do not schedule a lone running
+        request's next step while its in-flight one may already reach ``max_tokens``.
+
+        vLLM skips the next step only when the in-flight one is *sure* to finish the
+        request (every draft rejected). When the in-flight step merely *can* finish it,
+        the next step is scheduled ahead and, when it does finish, runs for nothing --
+        a whole decode step of device time that the next request's prefill queues
+        behind (with a speculative model ~20 ms of TTFT for a request sent after the
+        previous one's last token). Holding such a step back until the output is in
+        costs one host round trip when the request did not finish. Only for a request
+        that is alone: in a batch the step serves the others too."""
+        if len(self.running) != 1:
+            return
+        request = self.running[0]
+        if (
+            request.num_output_placeholders > 0
+            and not request.is_prefill_chunk
+            and request.num_output_tokens + request.num_output_placeholders
+            >= request.max_tokens
+        ):
+            # ``schedule()`` advances ``current_step`` first, then skips a request
+            # whose ``next_decode_eligible_step`` is still ahead of it.
+            request.next_decode_eligible_step = max(
+                request.next_decode_eligible_step, self.current_step + 2
+            )
 
     def _update_after_schedule(self, scheduler_output: "SchedulerOutput") -> None:
         """Override to suppress spec-token placeholders near max_model_len.

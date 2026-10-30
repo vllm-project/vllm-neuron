@@ -23,7 +23,6 @@ import nki.language as nl
 from .blockquant import _pow2_ceil_log2
 from .mk_common import (
     PT,
-    FP32_BF16_STATIONARY,
     NEG_BOUND,
     _gemm,
     _stage_rows,
@@ -131,17 +130,15 @@ def fp4_qdq_tile(x, nr, n, blk, e4m3):
 
 
 def rope_fp4_put(src_hbm, tiles, width, head, nheads, freqs_hbm, pos_hbm, blk, e4m3,
-                 cache_hbm=None, slots_hbm=None, dst_hbm=None, col0=0):
+                 cache_hbm=None, slots_hbm=None, dst_hbm=None):
     """For the row tiles: load bf16 rows of `src_hbm[rows, width]`, rope the last 64
     columns of each of `nheads` heads of width `head` at positions `pos_hbm`, fp4
     round-trip (`blk`, `e4m3`) and scatter into `cache_hbm[slots_hbm[row]]`
-    (and, optionally, store to `dst_hbm[rows]`). `col0`: columns `col0 .. col0+width`
-    of the rows (whole heads and fp4 blocks; `dst_hbm` only).
+    (and, optionally, store to `dst_hbm[rows]`).
     """
-    assert col0 == 0 or cache_hbm is None
     for r0, nr in tiles:
         t = nl.ndarray((PT, width), dtype=nl.bfloat16, buffer=nl.sbuf)
-        nisa.dma_copy(dst=t[0:nr, :], src=src_hbm[r0 : r0 + nr, col0 : col0 + width])
+        nisa.dma_copy(dst=t[0:nr, :], src=src_hbm[r0 : r0 + nr, 0:width])
         cos, sin = load_freqs(freqs_hbm, pos_hbm, r0, nr)
         for h in range(nheads):
             rope_inplace(t, nr, h * head + head - 64, cos, sin, False)
@@ -156,7 +153,7 @@ def rope_fp4_put(src_hbm, tiles, width, head, nheads, freqs_hbm, pos_hbm, blk, e
                 src=q[0:nr, :],
             )
         if dst_hbm is not None:
-            nisa.dma_copy(dst=dst_hbm[r0 : r0 + nr, col0 : col0 + width], src=q[0:nr, :])
+            nisa.dma_copy(dst=dst_hbm[r0 : r0 + nr, 0:width], src=q[0:nr, :])
 
 
 # --------------------------------------------------------------------------- compressor
@@ -178,11 +175,8 @@ def fp32_proj_rows(x_hbm, w_t_hbm, out_hbm, tiles, k, n):
             nisa.nc_transpose(dst=tps[0:PT, 0:nr], data=x[0:nr, kb * PT : (kb + 1) * PT])
             xT = nl.ndarray((PT, PT), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_copy(dst=xT[0:PT, 0:nr], src=tps[0:PT, 0:nr])
-            # (the stationary is bf16 data widened to fp32: its LOW pass only adds exact
-            # zeros, `FP32_BF16_STATIONARY`)
             nisa.nc_matmul(dst=acc[0:nr, 0:n], stationary=xT[0:PT, 0:nr],
-                           moving=wT[0:PT, kb, 0:n], accumulate=(kb > 0),
-                           is_stationary_onezero=FP32_PROJ_ONEZERO)
+                           moving=wT[0:PT, kb, 0:n], accumulate=(kb > 0))
         o = nl.ndarray((PT, n), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=o[0:nr, :], src=acc[0:nr, :])
         nisa.dma_copy(dst=out_hbm[r0 : r0 + nr, 0:n], src=o[0:nr, :])
@@ -246,93 +240,52 @@ def bf16_gemm_rows(x_hbm, w_hbm, out_hbm, m, k, n, lo, hi):
 # --------------------------------------------------------------------------- indexer
 
 
-#: `index_scores_span`'s score matmuls in 512-column blocks (plus a remainder) for any
-#: `read_len` (it used 128-column blocks unless `read_len` was a multiple of 512).
-INDEX_SCORE_BLOCK_512 = True
-#: `index_scores_span` stacks up to 128 / 32 tokens' index heads in one score matmul and
-#: runs their weighted-sum matmuls (fp32, nh-deep) in separate 32-row PE tiles.
-INDEX_SCORE_TILED = True
-#: ... for spans of at most this many tokens a core (statically unrolled).
-INDEX_SCORE_TILED_MAX_TOK = 16
+#: `index_scores_span` scores up to 512 keys per matmul pair (else 128 unless 512 divides
+#: the span's keys).
+INDEX_SCORE_WIDE = True
+#: `index_topk` stores the masked bf16 scores snake-major (see there): the top-k's snake
+#: tile loads with one contiguous-run DMA per 8 tokens instead of 8 two-byte-strided ones.
+TOPK_SNAKE_ROWS = True
 
 
-#: `fp32_proj_rows` skips its bf16-valued stationary's LOW fp32 pass.
-FP32_PROJ_ONEZERO = True
-#: `index_scores_span(w_bf16=True)`: the per-head weights are bf16 values times a power of
-#: two (bf16-exact), so the weighted sums skip their stationary's LOW fp32 pass.
-INDEX_W_ONEZERO = True
-
-
-def index_scores_span(qi_hbm, wi_hbm, ktab_hbm, sc_hbm, tok0, ntok, nh, read_len, kd=128, w_bf16=False):
+def index_scores_span(qi_hbm, wi_hbm, ktab_hbm, sc_hbm, tok0, ntok, nh, read_len, kd=128, ktab_full=None,
+                      krow0=0):
     """Index scores for `ntok` tokens from row `tok0` of one span (a dynamic loop):
     `sc[t, j] = sum_h relu(q[t, h] . k[j]) * w[t, h]`, fp32. `ktab_hbm[read_len, kd]`
     (bf16) is the span's index-key table; `qi_hbm[Tp, nh*kd]` the fp4-rounded, roped
     queries; `wi_hbm[Tp, nh]` the per-head weights (already scaled)."""
-    # score columns per matmul: 512 (one PSUM bank), the last block the remainder (each
-    # score is one 128-deep dot product and each weighted sum one nh-deep one, whatever
-    # the block width: the same values with a quarter of the instructions when read_len
-    # is not a multiple of 512)
-    if INDEX_SCORE_BLOCK_512:
-        blocks = [(c0, min(512, read_len - c0)) for c0 in range(0, read_len, 512)]
+    if INDEX_SCORE_WIDE:
+        # blocks of up to 512 score columns (one PSUM bank), the last one shorter: each
+        # column's two contractions do not depend on its block (4224 keys: 9 blocks, not 33)
+        n128 = (read_len // PT) * PT
+        blocks = [(b0, min(512, n128 - b0)) for b0 in range(0, n128, 512)]
     else:
-        nt = 512 if read_len % 512 == 0 else 128
-        blocks = [(c0, nt) for c0 in range(0, read_len, nt)]
+        nb = read_len // 512 if read_len % 512 == 0 else None
+        nt = 512 if nb else 128
+        nb = read_len // nt
+        blocks = [(b * nt, nt) for b in range(nb)]
+    ntw = max(w for _, w in blocks)
     kT = nl.ndarray((PT, read_len), dtype=nl.bfloat16, buffer=nl.sbuf)
-    for jb in range(read_len // PT):
-        nisa.dma_transpose(dst=kT[0:PT, jb * PT : (jb + 1) * PT], src=ktab_hbm[jb * PT : (jb + 1) * PT, 0:kd])
+    nkb = read_len // PT
+    if INDEX_KT_PE and ktab_full is not None and kd == PT:
+        # the key tiles by plain row DMAs (4 tiles a DMA) and PE transposes (exact data
+        # movement) into one PSUM bank, one copy out per 4 tiles, instead of one DMA
+        # transpose per tile (2-byte-element DMA transposes, slow and contending with the
+        # slot table's gathers for the DMA rings)
+        for g0 in range(0, nkb, 4):
+            ng = min(4, nkb - g0)
+            kr = nl.ndarray((PT, 4, kd), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=kr[0:PT, 0:ng, 0:kd],
+                          src=ktab_full.ap(pattern=[[kd, PT], [PT * kd, ng], [1, kd]], offset=(krow0 + g0 * PT) * kd))
+            tp = nl.ndarray((PT, 4 * PT), dtype=nl.bfloat16, buffer=nl.psum)
+            for m in range(ng):
+                nisa.nc_transpose(dst=tp[0:PT, m * PT : (m + 1) * PT], data=kr[0:PT, m, 0:kd])
+            nisa.tensor_copy(dst=kT[0:PT, g0 * PT : (g0 + ng) * PT], src=tp[0:PT, 0 : ng * PT],
+                             engine=nisa.engine.scalar)
+    else:
+        for jb in range(nkb):
+            nisa.dma_transpose(dst=kT[0:PT, jb * PT : (jb + 1) * PT], src=ktab_hbm[jb * PT : (jb + 1) * PT, 0:kd])
     hp = -(-nh // 16) * 16
-    blk = 32 if nh <= 32 else (64 if nh <= 64 else 0)
-    if INDEX_SCORE_TILED and blk and kd == PT and 0 < ntok <= INDEX_SCORE_TILED_MAX_TOK:
-        # (a decode span's few tokens, statically unrolled in groups of G; more tokens take
-        # the dynamic per-token loop below)
-        G = PT // blk
-
-        def ap_tok(t_hbm, pattern, off):
-            return t_hbm.ap(pattern=pattern, offset=off)
-
-        def body_tiled(g, base):
-            # tokens base + u (u < g): token u's index heads stacked at partitions /
-            # stationary columns blk*u.. -- one score matmul and one relu for the g tokens
-            # (each score the same 128-deep dot product), and the g weighted sums (the same
-            # nh-deep fp32 contractions) in separate PE tiles that run together
-            qall = nl.ndarray((PT, kd), dtype=nl.bfloat16, buffer=nl.sbuf)
-            nisa.memset(qall, 0.0)
-            wall = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
-            for u in range(g):
-                t = tok0 + base + u
-                nisa.dma_copy(dst=qall[blk * u : blk * u + nh, :],
-                              src=ap_tok(qi_hbm, [[kd, nh], [1, kd]], t * nh * kd))
-                nisa.dma_copy(dst=wall[blk * u : blk * u + nh, :],
-                              src=ap_tok(wi_hbm, [[1, nh], [1, 1]], t * nh))
-            M = g * blk
-            qps = nl.ndarray((PT, PT), dtype=nl.bfloat16, buffer=nl.psum)
-            nisa.nc_transpose(dst=qps[0:PT, 0:M], data=qall[0:M, 0:kd])
-            qt = nl.ndarray((PT, PT), dtype=nl.bfloat16, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=qt[0:PT, 0:M], src=qps[0:PT, 0:M])
-            rowall = nl.ndarray((PT, read_len), dtype=nl.float32, buffer=nl.sbuf)
-            for c0, nt in blocks:
-                acc = nl.ndarray((PT, nt), dtype=nl.float32, buffer=nl.psum)
-                nisa.nc_matmul(dst=acc[0:M, :], stationary=qt[0:PT, 0:M], moving=kT[0:PT, c0 : c0 + nt])
-                rect = nl.ndarray((PT, nt), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_scalar(dst=rect[0:M, :], data=acc[0:M, :], op0=nl.maximum, operand0=0.0)
-                wsum = nl.ndarray((PT, nt), dtype=nl.float32, buffer=nl.psum)
-                for u in range(g):
-                    nisa.nc_matmul(dst=wsum[32 * u : 32 * u + 1, 0:nt],
-                                   stationary=wall[blk * u : blk * u + nh, 0:1],
-                                   moving=rect[blk * u : blk * u + nh, 0:nt],
-                                   tile_position=(blk * u, 32 * u), tile_size=(blk, 32),
-                                   is_stationary_onezero=INDEX_W_ONEZERO and w_bf16)
-                for u in range(g):
-                    nisa.tensor_copy(dst=rowall[32 * u : 32 * u + 1, c0 : c0 + nt], src=wsum[32 * u : 32 * u + 1, 0:nt],
-                                     engine=nisa.scalar_engine if u % 2 else nisa.vector_engine)
-            for u in range(g):
-                t = tok0 + base + u
-                nisa.dma_copy(dst=ap_tok(sc_hbm, [[read_len, 1], [1, read_len]], t * read_len),
-                              src=rowall[32 * u : 32 * u + 1, :])
-
-        for b0 in range(0, ntok, G):
-            body_tiled(min(G, ntok - b0), b0)
-        return
 
     def body(i):
         qrow = nl.ndarray((hp, kd), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -347,27 +300,191 @@ def index_scores_span(qi_hbm, wi_hbm, ktab_hbm, sc_hbm, tok0, ntok, nh, read_len
         nisa.dma_copy(dst=wt[0:nh, :],
                       src=wi_hbm.ap(pattern=[[1, nh], [1, 1]], offset=tok0 * nh, scalar_offset=i, indirect_dim=0))
         row = nl.ndarray((1, read_len), dtype=nl.float32, buffer=nl.sbuf)
-        for c0, nt in blocks:
-            acc = nl.ndarray((hp, nt), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_matmul(dst=acc[0:nh, :], stationary=qt[0:PT, 0:nh], moving=kT[0:PT, c0 : c0 + nt])
-            rect = nl.ndarray((hp, nt), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_scalar(dst=rect[0:nh, :], data=acc[0:nh, :], op0=nl.maximum, operand0=0.0)
-            wsum = nl.ndarray((1, nt), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_matmul(dst=wsum, stationary=wt[0:nh, 0:1], moving=rect[0:nh, 0:nt],
-                           is_stationary_onezero=INDEX_W_ONEZERO and w_bf16)
-            nisa.tensor_copy(dst=row[0:1, c0 : c0 + nt], src=wsum)
+        for b0, nt in blocks:
+            acc = nl.ndarray((hp, ntw), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=acc[0:nh, 0:nt], stationary=qt[0:PT, 0:nh], moving=kT[0:PT, b0 : b0 + nt])
+            rect = nl.ndarray((hp, ntw), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=rect[0:nh, 0:nt], data=acc[0:nh, 0:nt], op0=nl.maximum, operand0=0.0)
+            wsum = nl.ndarray((1, ntw), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=wsum[0:1, 0:nt], stationary=wt[0:nh, 0:1], moving=rect[0:nh, 0:nt])
+            nisa.tensor_copy(dst=row[0:1, b0 : b0 + nt], src=wsum[0:1, 0:nt])
         nisa.dma_copy(dst=sc_hbm.ap(pattern=[[read_len, 1], [1, read_len]], offset=tok0 * read_len,
                                     scalar_offset=i, indirect_dim=0), src=row)
 
-    nl.fori_loop(0, ntok, body)
+    if ntok > INDEX_SCORE_STATIC_MAX:
+        nl.fori_loop(0, ntok, body)
+        return
+    # few tokens (decode): a static loop, the tokens' chains interleaved block by block (each
+    # token's instructions unchanged) instead of one token's serial PE -> DVE -> PE chain at
+    # a time in the dynamic loop
+    if INDEX_SCORE_PAIR and 2 * nh <= PT and kd == PT and ntok > 1:
+        _index_scores_pairs(qi_hbm, wi_hbm, kT, sc_hbm, tok0, ntok, nh, read_len, kd, blocks, ntw)
+        return
+    qts, wts, rows = [], [], []
+    for i in range(ntok):
+        t = tok0 + i
+        qrow = nl.ndarray((hp, kd), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.dma_copy(dst=qrow[0:nh, :], src=qi_hbm.ap(pattern=[[kd, nh], [1, kd]], offset=t * nh * kd))
+        qps = nl.ndarray((PT, hp), dtype=nl.bfloat16, buffer=nl.psum)
+        nisa.nc_transpose(dst=qps[0:PT, 0:nh], data=qrow[0:nh, 0:kd])
+        qt = nl.ndarray((PT, hp), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=qt[0:PT, 0:nh], src=qps[0:PT, 0:nh])
+        wt = nl.ndarray((hp, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=wt[0:nh, :], src=wi_hbm.ap(pattern=[[1, nh], [1, 1]], offset=t * nh))
+        qts.append(qt)
+        wts.append(wt)
+        rows.append(nl.ndarray((1, read_len), dtype=nl.float32, buffer=nl.sbuf))
+    for b0, nt in blocks:
+        accs = []
+        for i in range(ntok):
+            acc = nl.ndarray((hp, ntw), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=acc[0:nh, 0:nt], stationary=qts[i][0:PT, 0:nh], moving=kT[0:PT, b0 : b0 + nt])
+            accs.append(acc)
+        rects = []
+        for i in range(ntok):
+            rect = nl.ndarray((hp, ntw), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=rect[0:nh, 0:nt], data=accs[i][0:nh, 0:nt], op0=nl.maximum, operand0=0.0)
+            rects.append(rect)
+        for i in range(ntok):
+            wsum = nl.ndarray((1, ntw), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=wsum[0:1, 0:nt], stationary=wts[i][0:nh, 0:1], moving=rects[i][0:nh, 0:nt])
+            nisa.tensor_copy(dst=rows[i][0:1, b0 : b0 + nt], src=wsum[0:1, 0:nt])
+    for i in range(ntok):
+        nisa.dma_copy(dst=sc_hbm.ap(pattern=[[read_len, 1], [1, read_len]], offset=(tok0 + i) * read_len),
+                      src=rows[i])
 
 
-#: `index_topk`'s masking with one row tile split by columns between the cores (it was
-#: core 0's alone).
-INDEX_MASK_COL_SPLIT = True
-#: `index_topk` stores the masked bf16 scores in the 16-partition snake order (permuted on
-#: chip) so the top-k's per-token loads are contiguous (they were 2-byte strided gathers).
-INDEX_SNAKE_STORE = True
+#: `index_scores_span` with at most this many tokens runs them in a static loop, interleaved.
+INDEX_SCORE_STATIC_MAX = 4
+#: `index_scores_span` builds the transposed key table by row DMAs + PE transposes (off:
+#: no gain measured, in8192_bs10 exec - cc 6.81 -> 6.83 ms; the scores then waited elsewhere).
+INDEX_KT_PE = False
+#: The static loop's tokens several at a time (`_index_scores_pairs`: as many as fit
+#: 128 / heads) when 2 * heads <= 128.
+INDEX_SCORE_PAIR = True
+
+
+def _index_scores_pairs(qi_hbm, wi_hbm, kT, sc_hbm, tok0, ntok, nh, read_len, kd, blocks, ntw):
+    """`index_scores_span`'s static loop with the tokens taken G = 128 / heads at a time:
+    the group's queries side by side in one stationary (the score matmul's output rows are
+    the tokens' heads: each row's contraction over the same 128 key-dim rows, unchanged),
+    one relu over all of them, and the head-weight matmul against a block-diagonal
+    stationary (each token's column sums its own heads' rows; the other tokens' rows add
+    exact zeros), so each PE / DVE instruction serves G tokens."""
+    G = max(1, min(ntok, PT // nh))
+    groups = [(i0, min(G, ntok - i0)) for i0 in range(0, ntok, G)]
+    qts, wts, rows = [], [], []
+    for i0, g in groups:
+        t = tok0 + i0
+        qrow = nl.ndarray((PT, kd), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.dma_copy(dst=qrow[0 : g * nh, :], src=qi_hbm.ap(pattern=[[kd, g * nh], [1, kd]], offset=t * nh * kd))
+        qps = nl.ndarray((PT, PT), dtype=nl.bfloat16, buffer=nl.psum)
+        nisa.nc_transpose(dst=qps[0:PT, 0 : g * nh], data=qrow[0 : g * nh, 0:kd])
+        qt = nl.ndarray((PT, PT), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=qt[0:PT, 0 : g * nh], src=qps[0:PT, 0 : g * nh])
+        wt = nl.ndarray((PT, G), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(wt, 0.0)
+        for k in range(g):
+            nisa.dma_copy(dst=wt[k * nh : (k + 1) * nh, k : k + 1],
+                          src=wi_hbm.ap(pattern=[[1, nh], [1, 1]], offset=(t + k) * nh))
+        qts.append(qt)
+        wts.append(wt)
+        rows.append(nl.ndarray((G, read_len), dtype=nl.float32, buffer=nl.sbuf))
+    for b0, nt in blocks:
+        accs = []
+        for (i0, g), qt in zip(groups, qts):
+            acc = nl.ndarray((PT, ntw), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=acc[0 : g * nh, 0:nt], stationary=qt[0:PT, 0 : g * nh], moving=kT[0:PT, b0 : b0 + nt])
+            accs.append(acc)
+        rects = []
+        for (i0, g), acc in zip(groups, accs):
+            rect = nl.ndarray((PT, ntw), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=rect[0 : g * nh, 0:nt], data=acc[0 : g * nh, 0:nt], op0=nl.maximum, operand0=0.0)
+            rects.append(rect)
+        for (i0, g), wt, rect, row in zip(groups, wts, rects, rows):
+            wsum = nl.ndarray((G, ntw), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=wsum[0:g, 0:nt], stationary=wt[0 : g * nh, 0:g], moving=rect[0 : g * nh, 0:nt])
+            nisa.tensor_copy(dst=row[0:g, b0 : b0 + nt], src=wsum[0:g, 0:nt])
+    for (i0, g), row in zip(groups, rows):
+        nisa.dma_copy(dst=sc_hbm.ap(pattern=[[read_len, g], [1, read_len]], offset=(tok0 + i0) * read_len),
+                      src=row[0:g, :])
+
+
+#: The index scores split by KEYS across the cores (`index_scores_keys`): each core gathers
+#: its half of a span's key tiles straight from the index-key cache into SBUF and scores
+#: every token of the span on them (no `ktab` HBM table, store, cross-core barrier or DMA
+#: transposes; the gathers no longer wait behind the compressor's stores on the HWDGE queues).
+INDEX_KEY_SPLIT = True
+
+
+def index_scores_keys(qi_hbm, wi_hbm, kcache, kslots, ks0, sc_hbm, tok0, ntok, nh, read_len, pid, kd=128):
+    """`index_scores_span`'s scores for ALL `ntok` tokens of a span from row `tok0`, over this
+    core's contiguous half of the span's 128-key tiles (core 0 the first ceil(n/2)): the
+    keys `kcache[kslots[ks0 + j]]` gathered by tile (the per-tile indirect DMA of
+    `gather_rows`), PE-transposed (exact data movement) into `kT`, then the token groups of
+    `_index_scores_pairs` (each score column's contractions unchanged) over 512-column blocks;
+    each token row's slice `sc[t, lo : hi]` stored once."""
+    nfull = read_len // PT
+    a = (nfull + 1) // 2
+    t_lo, t_hi = (0, a) if pid == 0 else (a, nfull)
+    nloc = t_hi - t_lo
+    if nloc <= 0:
+        return
+    ncol = nloc * PT
+    c0 = t_lo * PT
+    ix = nl.ndarray((PT, nloc), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=ix, src=kslots.ap(pattern=[[1, PT], [PT, nloc]], offset=ks0 + c0),
+                  dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
+    kT = nl.ndarray((PT, ncol), dtype=nl.bfloat16, buffer=nl.sbuf)
+    for g0 in range(0, nloc, 4):
+        ng = min(4, nloc - g0)
+        tp = nl.ndarray((PT, 4 * PT), dtype=nl.bfloat16, buffer=nl.psum)
+        for m in range(ng):
+            kr = nl.ndarray((PT, kd), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=kr, src=kcache.ap(pattern=[[kd, PT], [1, kd]], vector_offset=ix[0:PT, g0 + m : g0 + m + 1],
+                                                indirect_dim=0))
+            nisa.nc_transpose(dst=tp[0:PT, m * PT : (m + 1) * PT], data=kr[0:PT, 0:kd])
+        nisa.tensor_copy(dst=kT[0:PT, g0 * PT : (g0 + ng) * PT], src=tp[0:PT, 0 : ng * PT],
+                         engine=nisa.engine.scalar)
+    blocks = [(b0, min(512, ncol - b0)) for b0 in range(0, ncol, 512)]
+    ntw = max(w for _, w in blocks)
+    G = max(1, min(ntok, PT // nh))
+    groups = [(i0, min(G, ntok - i0)) for i0 in range(0, ntok, G)]
+    qts, wts, rows = [], [], []
+    for i0, g in groups:
+        t = tok0 + i0
+        qrow = nl.ndarray((PT, kd), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.dma_copy(dst=qrow[0 : g * nh, :], src=qi_hbm.ap(pattern=[[kd, g * nh], [1, kd]], offset=t * nh * kd))
+        qps = nl.ndarray((PT, PT), dtype=nl.bfloat16, buffer=nl.psum)
+        nisa.nc_transpose(dst=qps[0:PT, 0 : g * nh], data=qrow[0 : g * nh, 0:kd])
+        qt = nl.ndarray((PT, PT), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=qt[0:PT, 0 : g * nh], src=qps[0:PT, 0 : g * nh])
+        wt = nl.ndarray((PT, G), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(wt, 0.0)
+        for k in range(g):
+            nisa.dma_copy(dst=wt[k * nh : (k + 1) * nh, k : k + 1],
+                          src=wi_hbm.ap(pattern=[[1, nh], [1, 1]], offset=(t + k) * nh))
+        qts.append(qt)
+        wts.append(wt)
+        rows.append(nl.ndarray((G, ncol), dtype=nl.float32, buffer=nl.sbuf))
+    for b0, nt in blocks:
+        accs = []
+        for (i0, g), qt in zip(groups, qts):
+            acc = nl.ndarray((PT, ntw), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=acc[0 : g * nh, 0:nt], stationary=qt[0:PT, 0 : g * nh], moving=kT[0:PT, b0 : b0 + nt])
+            accs.append(acc)
+        rects = []
+        for (i0, g), acc in zip(groups, accs):
+            rect = nl.ndarray((PT, ntw), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=rect[0 : g * nh, 0:nt], data=acc[0 : g * nh, 0:nt], op0=nl.maximum, operand0=0.0)
+            rects.append(rect)
+        for (i0, g), wt, rect, row in zip(groups, wts, rects, rows):
+            wsum = nl.ndarray((G, ntw), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=wsum[0:g, 0:nt], stationary=wt[0 : g * nh, 0:g], moving=rect[0 : g * nh, 0:nt])
+            nisa.tensor_copy(dst=row[0:g, b0 : b0 + nt], src=wsum[0:g, 0:nt])
+    for (i0, g), row in zip(groups, rows):
+        nisa.dma_copy(dst=sc_hbm.ap(pattern=[[read_len, g], [1, ncol]], offset=(tok0 + i0) * read_len + c0),
+                      src=row[0:g, 0:ncol])
 
 
 def index_topk(sc_hbm, clen_hbm, sc16_hbm, topk_hbm, T, Tp, read_len, topk, pid):
@@ -377,48 +494,38 @@ def index_topk(sc_hbm, clen_hbm, sc16_hbm, topk_hbm, T, Tp, read_len, topk, pid)
     Rows beyond `T` are left alone. Token groups of 8 alternate between the cores."""
     n16 = read_len // 16
     k16 = cdiv(topk, 16)
-    # 1. mask + bf16, by row tile (this core's tiles); one row tile: by column halves
-    # (elementwise, so the same values)
+    # 1. mask + bf16, by row tile (this core's tiles)
     tiles = [(i * PT, min(PT, T - i * PT)) for i in range(cdiv(T, PT)) if i % 2 == pid]
-    snake_rows = INDEX_SNAKE_STORE and read_len % 16 == 0
-    if INDEX_MASK_COL_SPLIT and cdiv(T, PT) == 1 and read_len >= 2 * PT:
-        hcol = cdiv(read_len // 2, 16) * 16
-        mtiles = [((0, min(PT, T)), hcol * pid, (hcol if pid == 0 else read_len - hcol))]
-    else:
-        mtiles = [((r0, nr), 0, read_len) for r0, nr in tiles]
-    for (r0, nr), c0, ncol in mtiles:
-        s = nl.ndarray((PT, ncol), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=s[0:nr, :], src=sc_hbm[r0 : r0 + nr, c0 : c0 + ncol])
-        j = nl.ndarray((PT, ncol), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.iota(dst=j[0:nr, :], pattern=[[1, ncol]], offset=c0, channel_multiplier=0)
-        jf = nl.ndarray((PT, ncol), dtype=nl.float32, buffer=nl.sbuf)
+    for r0, nr in tiles:
+        s = nl.ndarray((PT, read_len), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=s[0:nr, :], src=sc_hbm[r0 : r0 + nr, 0:read_len])
+        j = nl.ndarray((PT, read_len), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.iota(dst=j[0:nr, :], pattern=[[1, read_len]], offset=0, channel_multiplier=0)
+        jf = nl.ndarray((PT, read_len), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=jf[0:nr, :], src=j[0:nr, :])
         ci = nl.ndarray((PT, 1), dtype=nl.int32, buffer=nl.sbuf)
         nisa.dma_copy(dst=ci[0:nr, :], src=clen_hbm[r0 : r0 + nr, 0:1])
         cf = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=cf[0:nr, :], src=ci[0:nr, :])
         # live = (j < clen) ; s = s * live + (live - 1) * (-NEG_BOUND)  -> NEG_BOUND where dead
-        live = nl.ndarray((PT, ncol), dtype=nl.float32, buffer=nl.sbuf)
+        live = nl.ndarray((PT, read_len), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=live[0:nr, :], data=jf[0:nr, :], op0=nl.less, operand0=cf[0:nr, 0:1])
         nisa.tensor_tensor(dst=s[0:nr, :], data1=s[0:nr, :], data2=live[0:nr, :], op=nl.multiply)
-        dead = nl.ndarray((PT, ncol), dtype=nl.float32, buffer=nl.sbuf)
+        dead = nl.ndarray((PT, read_len), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=dead[0:nr, :], data=live[0:nr, :], op0=nl.add, operand0=-1.0,
                            op1=nl.multiply, operand1=-NEG_BOUND)
         nisa.tensor_tensor(dst=s[0:nr, :], data1=s[0:nr, :], data2=dead[0:nr, :], op=nl.add)
-        s16 = nl.ndarray((PT, ncol), dtype=nl.bfloat16, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=s16[0:nr, :], src=s[0:nr, :])
-        if snake_rows:
-            # stored in the snake order, `sc16[r, p * n16 + c] = s[r, 16 c + p]` (permuted
-            # on chip, contiguous runs in HBM), so step 2 loads each row with plain
-            # contiguous DMAs instead of 2-byte strided reads
-            nc = ncol // 16
-            perm = nl.ndarray((PT, 16, nc), dtype=nl.bfloat16, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=perm[0:nr, :, :], src=s16.ap(pattern=[[ncol, nr], [1, 16], [16, nc]], offset=0))
-            nisa.dma_copy(dst=sc16_hbm.ap(pattern=[[read_len, nr], [n16, 16], [1, nc]],
-                                          offset=r0 * read_len + c0 // 16),
-                          src=perm[0:nr, :, :])
+        if TOPK_SNAKE_ROWS:
+            # stored snake-major, `sc16[t, p * n16 + c] = s16[t, 16 c + p]` (the bf16 cast
+            # copy reads `s` in that order), so a token's 16 snake partitions are 16
+            # contiguous runs and a group's 8 tokens load with one DMA
+            s16 = nl.ndarray((PT, 16, n16), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=s16[0:nr, :, :], src=s.ap(pattern=[[read_len, nr], [1, 16], [16, n16]], offset=0))
+            nisa.dma_copy(dst=sc16_hbm[r0 : r0 + nr, 0:read_len], src=s16.reshape((PT, read_len))[0:nr, :])
         else:
-            nisa.dma_copy(dst=sc16_hbm[r0 : r0 + nr, c0 : c0 + ncol], src=s16[0:nr, :])
+            s16 = nl.ndarray((PT, read_len), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=s16[0:nr, :], src=s[0:nr, :])
+            nisa.dma_copy(dst=sc16_hbm[r0 : r0 + nr, 0:read_len], src=s16[0:nr, :])
     nisa.core_barrier(data=sc16_hbm, cores=(0, 1))
     # 2. top-k, 8 tokens per instruction
     ngroups = cdiv(T, 8)
@@ -429,11 +536,12 @@ def index_topk(sc_hbm, clen_hbm, sc16_hbm, topk_hbm, T, Tp, read_len, topk, pid)
         snake = nl.ndarray((PT, n16), dtype=nl.bfloat16, buffer=nl.sbuf)
         if rows < 8:
             nisa.memset(snake, NEG_BOUND)
-        for q in range(rows):
-            if snake_rows:
-                nisa.dma_copy(dst=snake[16 * q : 16 * q + 16, 0:n16],
-                              src=sc16_hbm.ap(pattern=[[n16, 16], [1, n16]], offset=(g * 8 + q) * read_len))
-            else:
+        if TOPK_SNAKE_ROWS:
+            # snake[16 q + p, c] = sc16[g*8 + q, p * n16 + c]: a uniform partition stride n16
+            nisa.dma_copy(dst=snake[0 : 16 * rows, 0:n16],
+                          src=sc16_hbm.ap(pattern=[[n16, 16 * rows], [1, n16]], offset=g * 8 * read_len))
+        else:
+            for q in range(rows):
                 nisa.dma_copy(dst=snake[16 * q : 16 * q + 16, 0:n16],
                               src=sc16_hbm.ap(pattern=[[1, 16], [16, n16]], offset=(g * 8 + q) * read_len))
         vals = nl.ndarray((PT, topk), dtype=nl.bfloat16, buffer=nl.sbuf)

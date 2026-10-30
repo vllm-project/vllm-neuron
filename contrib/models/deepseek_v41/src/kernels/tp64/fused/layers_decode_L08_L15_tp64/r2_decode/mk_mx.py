@@ -118,9 +118,92 @@ def stage_rows(rows, k, xq, xs, mi):
         )
 
 
-def stage_x(x_hbm, r0, k, xq, xs, mi, col0=0):
+#: Staging with `nv` (<= 42) valid rows (decode): `G = 128 // nv` 512-wide chunks share
+#: one set of four PE transposes -- chunk c's rows sit on partitions `c*nv .. c*nv+nv` of
+#: a packed `[128, 512]` tile (or `m*nkc + c` when one group holds every chunk: a single
+#: contiguous DMA) -- and only the nv valid columns are copied / quantized; the other
+#: columns of `xq` / `xs` are zero (rows past nv give exact zeros). Every valid row's
+#: values and 32-element scale groups are unchanged, so its quantization is identical.
+STAGE_PACK = True
+#: ... only when at least this many chunks share a transpose: at G = 2 (T = 60) the per-chunk
+#: row DMAs cost more than the halved transposes save (in8192_bs10 exec-cc 6.40 -> 6.45 ms).
+PACK_MIN_G = 3
+
+
+def pack_ok(nv, k):
+    return STAGE_PACK and nv is not None and 0 < nv and PT // nv >= PACK_MIN_G and k % PT == 0
+
+
+def stage_x_packed(x_hbm, r0, k, xq, xs, mi, nv, col0=0, shifts=1):
+    """`stage_x` for the first `nv` rows only (`pack_ok(nv, k)`; the rest zero).
+    `shifts`: slots `mi .. mi + shifts` get the same rows, slot `mi + s` at columns
+    `s*nv .. s*nv + nv` (for `gemm_sb_packed`)."""
+    chunks = chunks_of(k)
+    nkc = len(chunks)
+    G = PT // nv
+    kfull = x_hbm.shape[1]
+    nisa.memset(xq[:, mi : mi + shifts, :, :], 0)
+    for c0 in range(0, nkc, G):
+        g = min(G, nkc - c0)
+        q = g * nv
+        full = all(chunks[c0 + c][1] == KC for c in range(g))
+        xp = nl.ndarray((PT, KC), dtype=nl.bfloat16, buffer=nl.sbuf)
+        mmajor = (g == nkc and full and kfull == k and col0 == 0)
+        if mmajor:
+            # partition m * nkc + c = the rows' flat 512-element runs: one DMA
+            nisa.dma_copy(dst=xp[0:q, :], src=x_hbm.ap(pattern=[[KC, q], [1, KC]], offset=r0 * kfull))
+        else:
+            if not full:
+                # (a short chunk's columns past its end feed only unused partitions)
+                nisa.memset(xp, 0.0, engine=nisa.engine.gpsimd)
+            for c in range(g):
+                k0, kk = chunks[c0 + c]
+                nisa.dma_copy(dst=xp[c * nv : (c + 1) * nv, 0:kk],
+                              src=x_hbm[r0 : r0 + nv, col0 + k0 : col0 + k0 + kk])
+        _stage_packed_tile(xp, nv, chunks, c0, g, xq, xs, mi, mmajor, shifts)
+
+
+def _stage_packed_tile(xp, nv, chunks, c0, g, xq, xs, mi, mmajor=False, shifts=1):
+    """Chunks `c0 .. c0+g` from the packed bf16 SBUF tile `xp` (`[128, xw]`, chunk c's
+    row m on partition `c*nv + m`, or `m*g + c` when `mmajor`) into slot `mi`."""
+    q = g * nv
+    xw = xp.shape[1]
+    tp = nl.ndarray((PT, 4, q), dtype=nl.bfloat16, buffer=nl.psum)
+    for j in range(4):
+        nisa.nc_transpose(dst=tp[:, j, :], data=xp.ap(pattern=[[xw, q], [4, PT]], offset=j))
+    # xT[p, c, m, j] = tp[p, j, (c, m)]
+    xT = nl.ndarray((PT, g, nv * 4), dtype=nl.bfloat16, buffer=nl.sbuf)
+    if mmajor:
+        src = tp.ap(pattern=[[4 * q, PT], [1, g], [g, nv], [q, 4]])
+        dst = xT.ap(pattern=[[g * nv * 4, PT], [nv * 4, g], [4, nv], [1, 4]])
+    else:
+        src = tp.ap(pattern=[[4 * q, PT], [1, q], [q, 4]])
+        dst = xT.ap(pattern=[[g * nv * 4, PT], [4, q], [1, 4]])
+    nisa.tensor_copy(dst=dst, src=src)
+    for c in range(g):
+        pk = chunks[c0 + c][1] // 4
+        for sh in range(shifts):
+            nisa.quantize_mx(dst=xq[0:pk, mi + sh, c0 + c, sh * nv : (sh + 1) * nv], src=xT[0:pk, c, :],
+                             dst_scale=xs[0:pk, mi + sh, c0 + c, sh * nv : (sh + 1) * nv])
+
+
+def stage_rows_packed(xp, nv, k, c0, g, xq, xs, mi):
+    """Quantize chunks `c0 .. c0+g` of a contraction of `k` from the packed bf16 SBUF
+    tile `xp` (`[128, 512]`: chunk c0 + c's row m on partition `c*nv + m`) into slot `mi`
+    (whose other columns the caller zeroed)."""
+    chunks = chunks_of(k)
+    assert g * nv <= PT
+    _stage_packed_tile(xp, nv, chunks, c0, g, xq, xs, mi)
+
+
+def stage_x(x_hbm, r0, k, xq, xs, mi, col0=0, nv=None, shifts=1):
     """Load rows `r0 .. r0+128` (columns `col0 .. col0+k`) of the bf16 HBM `x_hbm`
-    and quantize them into slot `mi`."""
+    and quantize them into slot `mi`. `nv`: only the first `nv` rows are real (the
+    packed staging when `pack_ok`, `shifts` as `stage_x_packed`)."""
+    if pack_ok(nv, k):
+        stage_x_packed(x_hbm, r0, k, xq, xs, mi, nv, col0=col0, shifts=shifts)
+        return
+    assert shifts == 1
     rows = nl.ndarray((PT, k), dtype=nl.bfloat16, buffer=nl.sbuf)
     nisa.dma_copy(dst=rows, src=x_hbm[r0 : r0 + PT, col0 : col0 + k])
     stage_rows(rows, k, xq, xs, mi)
@@ -162,17 +245,28 @@ _wdma_n = [0]
 #: The static (dense) GEMMs' weight / scale DMAs on the same hardware DGE queues
 #: (`GEMM_SB_HW_ENGINES`) instead of the default DMA path.
 DENSE_W_HWDGE = True
+#: `gemm`'s result stores by statically generated descriptors (their own DMA ring) instead
+#: of the scalar engine's hardware-DGE queue, where they waited behind the next GEMM's
+#: prefetched weight DMAs (core 1's q/kv halves landed ~10 us late at in1024_bs1).
+GEMM_STORE_STATIC = True
 
 
 #: The routed experts' (dynamic-address) weight DMAs rotate over these queues ("sync" /
 #: "scalar": hardware DGE; "swdge": GpSimd's software DGE -- adding it as a third queue
 #: did not change the bs10 expert loop, which is tensor-engine-bound: in1024_bs10 172 -> 170 us).
 EXPERT_W_QUEUES = ("sync", "scalar")
-#: `gemm_sb_multi` with a dynamic expert offset loads the weights of up to this many output
-#: columns (consecutive `NT`-wide tiles) per DMA group (0: one group per tile).
-EXPERT_W_MERGE_COLS = 2048
 _edma_n = [0]
 _edma_s = [0]
+
+
+#: `prefetch_w`: the instruction its weight DMAs are schedule-pinned after (else None).
+_W_AFTER = [None]
+
+
+def _pin(ins):
+    after = _W_AFTER[0]
+    if after is not None and ins is not None and hasattr(ins, "depends_on"):
+        ins.depends_on(after, kind=nisa.dependency.schedule)
 
 
 def _wdma(dst, src, hw, eoff=None, scale=False):
@@ -192,9 +286,9 @@ def _wdma(dst, src, hw, eoff=None, scale=False):
     if hw:
         eng = GEMM_SB_HW_ENGINES[_wdma_n[0] % len(GEMM_SB_HW_ENGINES)]
         _wdma_n[0] += 1
-        nisa.dma_copy(dst=dst, src=src, dge_mode=nisa.dge_mode.hwdge, engine=eng)
+        _pin(nisa.dma_copy(dst=dst, src=src, dge_mode=nisa.dge_mode.hwdge, engine=eng))
     else:
-        nisa.dma_copy(dst=dst, src=src)
+        _pin(nisa.dma_copy(dst=dst, src=src))
 
 
 def load_w_group(w_mx, s_mx, chunks, g0, ng, krow0, n0, w, fp4, hw=False, dense=False, eoff=None):
@@ -205,7 +299,7 @@ def load_w_group(w_mx, s_mx, chunks, g0, ng, krow0, n0, w, fp4, hw=False, dense=
     wt = nl.ndarray((PT, ng, w), dtype=FP4_X4 if fp4 else FP8_X4, buffer=nl.sbuf)
     ws = nl.ndarray((PT, ng, w), dtype=nl.uint8, buffer=nl.sbuf)
     # static GEMMs: GpSimd (idle there) zeroes it, off the DVE that stages activations
-    nisa.memset(ws, 0, engine=nisa.engine.unknown if hw else nisa.engine.gpsimd)
+    _pin(nisa.memset(ws, 0, engine=nisa.engine.unknown if hw else nisa.engine.gpsimd))
     _load_w_into(wt, ws, 0, w_mx, s_mx, chunks, g0, ng, krow0, n0, w, hw or (dense and DENSE_W_HWDGE),
                  eoff=eoff)
     return wt, ws
@@ -276,6 +370,38 @@ def load_w_full(w_mx, s_mx, k, n, wt, ws, krow0=0, n0=0):
                      GEMM_SB_HWDGE)
 
 
+def load_w_cols(w_mx, s_mx, k, n, fp4=False, krow0=0, n0=0, eoff=None, nblk=2):
+    """Every chunk of the weight columns `[n0, n0 + n)` into one SBUF slice
+    (`alloc_w_full`'s tiles) by `nblk` column blocks of `_load_w_into` DMAs (a few large
+    DMAs instead of one group per 512-column output tile), for `gemm_sb_pre_multi`.
+    `eoff`: as `gemm_sb_multi`'s."""
+    chunks = chunks_of(k)
+    wt, ws = alloc_w_full(k, n, fp4)
+    nisa.memset(ws, 0)
+    nb = cdiv(n // PT, nblk) * PT
+    for cb in range(0, n, nb):
+        wb = min(nb, n - cb)
+        _load_w_into(wt, ws, cb, w_mx, s_mx, chunks, 0, len(chunks), krow0, n0 + cb, wb,
+                     GEMM_SB_HWDGE, eoff=eoff)
+    return wt, ws
+
+
+def gemm_sb_pre_multi(xq, xs, k, wt, ws, n, emit):
+    """`gemm_sb_multi` (one staged tile) against a slice already in SBUF (`load_w_cols`):
+    the same matmuls in the same order, `emit(0, c0, w, acc)` per output tile."""
+    chunks = chunks_of(k)
+    for c0, w in ntiles_of(n):
+        acc = nl.ndarray((PT, w), dtype=nl.float32, buffer=nl.psum)
+        for kc in range(len(chunks)):
+            pk = chunks[kc][1] // 4
+            nisa.nc_matmul_mx(
+                dst=acc, stationary=xq[0:pk, 0, kc, :], moving=wt[0:pk, kc, c0 : c0 + w],
+                stationary_scale=xs[0:pk, 0, kc, :], moving_scale=ws[0:pk, kc, c0 : c0 + w],
+                accumulate=(kc > 0),
+            )
+        emit(0, c0, w, acc)
+
+
 def gemm_sb_pre(xq, xs, k, wt, ws, out_sb, n):
     """`gemm_sb` against a weight slice already in SBUF (`load_w_full`): the same
     matmuls in the same order."""
@@ -292,8 +418,27 @@ def gemm_sb_pre(xq, xs, k, wt, ws, out_sb, n):
         nisa.tensor_copy(dst=out_sb[:, c0 : c0 + w], src=acc)
 
 
+def prefetch_w(k, w_mx, s_mx, lo, hi, fp4=False, krow0=0, after=None):
+    """`gemm`'s weight groups for the output columns `[lo, hi)` loaded ahead (the same
+    tiles and DMAs), for `gemm(pre=...)`: `{(n0, g0): (wt, ws)}`. `after`: the DMAs are
+    schedule-pinned after this instruction."""
+    chunks = chunks_of(k)
+    nkc = len(chunks)
+    pre = {}
+    _W_AFTER[0] = after
+    try:
+        for n0, w in ntiles_of(hi - lo):
+            n0 += lo
+            for g0 in range(0, nkc, WG):
+                ng = min(WG, nkc - g0)
+                pre[(n0, g0)] = load_w_group(w_mx, s_mx, chunks, g0, ng, krow0, n0, w, fp4, dense=True)
+    finally:
+        _W_AFTER[0] = None
+    return pre
+
+
 def gemm(xq, xs, nmt, k, w_mx, s_mx, out_hbm, r0, lo, hi, fp4=False, out_dtype=nl.bfloat16,
-         out_scale=1.0, krow0=0, epilogue=None, out_rows=None):
+         out_scale=1.0, krow0=0, epilogue=None, out_rows=None, pre=None, kc0=0):
     """`out[r0 + 128*mi + m, n] = out_scale * sum_k x[m, k] w[n, k]` for the `nmt` staged
     tiles and the output columns `[lo, hi)`.
 
@@ -302,6 +447,7 @@ def gemm(xq, xs, nmt, k, w_mx, s_mx, out_hbm, r0, lo, hi, fp4=False, out_dtype=n
     `epilogue(row0, n0, w, o)`, when given, takes each `(128, w)` SBUF result tile `o`
     (rows `row0 ..`, columns `n0 ..`) instead of the store to `out_hbm`.
     `out_rows`: only the rows below it are stored (`out_hbm` may have fewer rows).
+    `kc0`: the activation's chunks start at chunk `kc0` of `(xq, xs)`.
     """
     chunks = chunks_of(k)
     nkc = len(chunks)
@@ -310,14 +456,17 @@ def gemm(xq, xs, nmt, k, w_mx, s_mx, out_hbm, r0, lo, hi, fp4=False, out_dtype=n
         accs = [nl.ndarray((PT, w), dtype=nl.float32, buffer=nl.psum) for _ in range(nmt)]
         for g0 in range(0, nkc, WG):
             ng = min(WG, nkc - g0)
-            wt, ws = load_w_group(w_mx, s_mx, chunks, g0, ng, krow0, n0, w, fp4, dense=True)
+            if pre is not None:
+                wt, ws = pre[(n0, g0)]
+            else:
+                wt, ws = load_w_group(w_mx, s_mx, chunks, g0, ng, krow0, n0, w, fp4, dense=True)
             for j in range(ng):
                 kc = g0 + j
                 pk = chunks[kc][1] // 4
                 for mi in range(nmt):
                     nisa.nc_matmul_mx(
-                        dst=accs[mi], stationary=xq[0:pk, mi, kc, :], moving=wt[0:pk, j, :],
-                        stationary_scale=xs[0:pk, mi, kc, :], moving_scale=ws[0:pk, j, :],
+                        dst=accs[mi], stationary=xq[0:pk, mi, kc0 + kc, :], moving=wt[0:pk, j, :],
+                        stationary_scale=xs[0:pk, mi, kc0 + kc, :], moving_scale=ws[0:pk, j, :],
                         accumulate=(kc > 0),
                     )
         for mi in range(nmt):
@@ -333,7 +482,11 @@ def gemm(xq, xs, nmt, k, w_mx, s_mx, out_hbm, r0, lo, hi, fp4=False, out_dtype=n
             nr = PT if out_rows is None else min(PT, out_rows - row0)
             if nr <= 0:
                 continue
-            nisa.dma_copy(dst=out_hbm[row0 : row0 + nr, n0 : n0 + w], src=o[0:nr, :])
+            if GEMM_STORE_STATIC:
+                nisa.dma_copy(dst=out_hbm[row0 : row0 + nr, n0 : n0 + w], src=o[0:nr, :],
+                              dge_mode=nisa.dge_mode.none)
+            else:
+                nisa.dma_copy(dst=out_hbm[row0 : row0 + nr, n0 : n0 + w], src=o[0:nr, :])
 
 
 def gemm_sb(xq, xs, k, w_mx, s_mx, out_sb, n, fp4=False, krow0=0, n0=0, epilogue=None):
@@ -368,35 +521,6 @@ def gemm_sb_multi(xq, xs, nmt, k, w_mx, s_mx, n, emit, fp4=False, krow0=0, n0=0,
     `eoff` (a device scalar): `w_mx` / `s_mx` are stacked per expert, use slice `eoff`."""
     chunks = chunks_of(k)
     nkc = len(chunks)
-    if EXPERT_W_MERGE_COLS and eoff is not None and nkc <= WG:
-        # (routed experts) the weight / scale DMAs of consecutive output tiles merged, up to
-        # EXPERT_W_MERGE_COLS columns: far fewer dynamic-address DMAs (each one's issue cost
-        # paced the expert loop) with longer contiguous runs; each tile's matmuls unchanged
-        groups = []
-        for c0, w in ntiles_of(n):
-            if groups and c0 + w - groups[-1][0][0] <= EXPERT_W_MERGE_COLS:
-                groups[-1].append((c0, w))
-            else:
-                groups.append([(c0, w)])
-        for grp in groups:
-            g0c = grp[0][0]
-            gw = grp[-1][0] + grp[-1][1] - g0c
-            wt, ws = load_w_group(w_mx, s_mx, chunks, 0, nkc, krow0, n0 + g0c, gw, fp4,
-                                  hw=GEMM_SB_HWDGE, eoff=eoff)
-            for c0, w in grp:
-                a = c0 - g0c
-                accs = [nl.ndarray((PT, w), dtype=nl.float32, buffer=nl.psum) for _ in range(nmt)]
-                for kc in range(nkc):
-                    pk = chunks[kc][1] // 4
-                    for t in range(nmt):
-                        nisa.nc_matmul_mx(
-                            dst=accs[t], stationary=xq[0:pk, t, kc, :], moving=wt[0:pk, kc, a : a + w],
-                            stationary_scale=xs[0:pk, t, kc, :], moving_scale=ws[0:pk, kc, a : a + w],
-                            accumulate=(kc > 0),
-                        )
-                for t in range(nmt):
-                    emit(t, c0, w, accs[t])
-        return
     for c0, w in ntiles_of(n):
         accs = [nl.ndarray((PT, w), dtype=nl.float32, buffer=nl.psum) for _ in range(nmt)]
         for g0 in range(0, nkc, WG):
@@ -416,6 +540,31 @@ def gemm_sb_multi(xq, xs, nmt, k, w_mx, s_mx, n, emit, fp4=False, krow0=0, n0=0,
             emit(t, c0, w, accs[t])
 
 
+def gemm_sb_packed(xq, xs, k, w_mx, s_mx, n, acc, fp4=False, n0=0, eoff=None, t0=0, t1=None):
+    """`gemm_sb` for the output tiles `t0 .. t1` with tile `t0 + c`'s rows on partitions
+    `c*nv ..` of the one PSUM tile `acc` (`[128, 512]` fp32): its stationary is slot c of
+    a `stage_x(shifts=)` staging (the rows at columns `c*nv ..`, zero elsewhere), and
+    every matmul after the first accumulates (the other tiles' rows add exact zeros).
+    Each output element's products and accumulation order are `gemm_sb`'s."""
+    chunks = chunks_of(k)
+    nkc = len(chunks)
+    first = True
+    for c, (c0, w) in enumerate(ntiles_of(n)[t0:t1]):
+        for g0 in range(0, nkc, WG):
+            ng = min(WG, nkc - g0)
+            wt, ws = load_w_group(w_mx, s_mx, chunks, g0, ng, 0, n0 + c0, w, fp4,
+                                  hw=GEMM_SB_HWDGE, eoff=eoff)
+            for j in range(ng):
+                kc = g0 + j
+                pk = chunks[kc][1] // 4
+                nisa.nc_matmul_mx(
+                    dst=acc[:, 0:w], stationary=xq[0:pk, c, kc, :], moving=wt[0:pk, j, :],
+                    stationary_scale=xs[0:pk, c, kc, :], moving_scale=ws[0:pk, j, :],
+                    accumulate=not first,
+                )
+                first = False
+
+
 # --------------------------------------------------------------------------- whole GEMMs
 
 #: Row tiles staged together (their accumulators share PSUM: 4 x 512 fp32 = 8 KiB).
@@ -423,20 +572,21 @@ MG = 4
 
 
 def gemm_rows(x_hbm, m, k, w_mx, s_mx, out_hbm, lo, hi, fp4=False, out_dtype=nl.bfloat16,
-              out_scale=1.0, x_col0=0, krow0=0, epilogue=None, out_rows=None):
+              out_scale=1.0, x_col0=0, krow0=0, epilogue=None, out_rows=None, nv=None):
     """`out[0:m, lo:hi] = out_scale * x[0:m, x_col0 : x_col0 + k] @ w[lo:hi, krow].T` for
-    bf16 HBM rows (`m` a multiple of 128), the activation quantized on chip."""
+    bf16 HBM rows (`m` a multiple of 128), the activation quantized on chip. `nv`: only
+    the first `nv` rows are real (`m == 128`; the result's other rows are zero)."""
     mt = m // PT
     for g0 in range(0, mt, MG):
         nmt = min(MG, mt - g0)
         xq, xs = alloc_x(nmt, k)
         for mi in range(nmt):
-            stage_x(x_hbm, (g0 + mi) * PT, k, xq, xs, mi, col0=x_col0)
+            stage_x(x_hbm, (g0 + mi) * PT, k, xq, xs, mi, col0=x_col0, nv=nv if mt == 1 else None)
         gemm(xq, xs, nmt, k, w_mx, s_mx, out_hbm, g0 * PT, lo, hi, fp4=fp4, out_dtype=out_dtype,
              out_scale=out_scale, krow0=krow0, epilogue=epilogue, out_rows=out_rows)
 
 
-def gemm_rows_multi(x_hbm, m, k, specs, x_col0=0):
+def gemm_rows_multi(x_hbm, m, k, specs, x_col0=0, nv=None):
     """`gemm_rows` for several weights against the same activation rows, staging (and
     quantizing) each row group once: `specs` is a list of `(w_mx, s_mx, out_hbm, lo, hi)`
     (bf16 outputs). Same arithmetic as one `gemm_rows` per weight."""
@@ -445,6 +595,9 @@ def gemm_rows_multi(x_hbm, m, k, specs, x_col0=0):
         nmt = min(MG, mt - g0)
         xq, xs = alloc_x(nmt, k)
         for mi in range(nmt):
-            stage_x(x_hbm, (g0 + mi) * PT, k, xq, xs, mi, col0=x_col0)
-        for w_mx, s_mx, out_hbm, lo, hi in specs:
-            gemm(xq, xs, nmt, k, w_mx, s_mx, out_hbm, g0 * PT, lo, hi)
+            stage_x(x_hbm, (g0 + mi) * PT, k, xq, xs, mi, col0=x_col0, nv=nv if mt == 1 else None)
+        for spec in specs:
+            # (an optional 6th element: the weight's `prefetch_w` groups)
+            w_mx, s_mx, out_hbm, lo, hi = spec[:5]
+            gemm(xq, xs, nmt, k, w_mx, s_mx, out_hbm, g0 * PT, lo, hi,
+                 pre=spec[5] if len(spec) > 5 else None)

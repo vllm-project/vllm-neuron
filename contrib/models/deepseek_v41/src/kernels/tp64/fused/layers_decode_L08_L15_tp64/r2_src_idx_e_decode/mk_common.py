@@ -149,18 +149,24 @@ def sinkhorn_batched(t2all, nt, hc, after=None):
         # 1 / (sum over the 4 columns + eps), per (tile, row): (PT, n, 1)
         sm = nl.ndarray((PT, n, 1), dtype=f32, buffer=nl.sbuf)
         nisa.tensor_reduce(dst=sm, op=nl.add, data=src3, axis=(2,), keepdims=True)
-        r = nl.ndarray((PT, n, 1), dtype=f32, buffer=nl.sbuf)
-        if SINKHORN_FUSED_RECIP:
+        if SINKHORN_FUSE_EPS:
+            r = nl.ndarray((PT, n, 1), dtype=f32, buffer=nl.sbuf)
             nisa.activation(dst=r, op=nl.reciprocal, data=sm, bias=HC_EPS, scale=1.0)
             return r
         se = nl.ndarray((PT, n, 1), dtype=f32, buffer=nl.sbuf)
         nisa.activation(dst=se, op=nl.copy, data=sm, bias=HC_EPS, scale=1.0)
+        r = nl.ndarray((PT, n, 1), dtype=f32, buffer=nl.sbuf)
         nisa.activation(dst=r, op=nl.reciprocal, data=se)
         return r
 
     def rowsum_div(src, dst):
         src3 = src.reshape((PT, n, hc))
         r = recip_rows(src3)
+        if SINKHORN_BCAST_AP:
+            # r read with a 0 step over the 4 columns (no materialized broadcast copy)
+            nisa.tensor_tensor(dst=dst.reshape((PT, n, hc)), data1=src3,
+                               data2=r.ap(pattern=[[n, PT], [1, n], [0, hc]], offset=0), op=nl.multiply)
+            return
         nisa.tensor_tensor(dst=dst.reshape((PT, n, hc)), data1=src3,
                            data2=nl.broadcast_to(r, (PT, n, hc)), op=nl.multiply)
 
@@ -168,15 +174,23 @@ def sinkhorn_batched(t2all, nt, hc, after=None):
         s4 = src.reshape((PT, nt, hc, hc))
         d4 = dst.reshape((PT, nt, hc, hc))
         cs = nl.ndarray((PT, nt, hc), dtype=f32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=cs, data1=s4[:, :, 0, :], data2=s4[:, :, 1, :], op=nl.add)
-        for i in range(2, hc):
-            nisa.tensor_tensor(dst=cs, data1=cs, data2=s4[:, :, i, :], op=nl.add)
-        d = nl.ndarray((PT, nt, hc), dtype=f32, buffer=nl.sbuf)
-        if SINKHORN_FUSED_RECIP:
+        if SINKHORN_COLSUM_REDUCE and nt == 1:
+            # column j's sum over the rows i in one reduce over the (j, i) view (i innermost,
+            # added in order as by the chain of adds)
+            nisa.tensor_reduce(dst=cs.reshape((PT, hc)), op=nl.add,
+                               data=src.ap(pattern=[[hc * hc, PT], [1, hc], [hc, hc]], offset=0),
+                               axis=(2,), keepdims=False)
+        else:
+            nisa.tensor_tensor(dst=cs, data1=s4[:, :, 0, :], data2=s4[:, :, 1, :], op=nl.add)
+            for i in range(2, hc):
+                nisa.tensor_tensor(dst=cs, data1=cs, data2=s4[:, :, i, :], op=nl.add)
+        if SINKHORN_FUSE_EPS:
+            d = nl.ndarray((PT, nt, hc), dtype=f32, buffer=nl.sbuf)
             nisa.activation(dst=d, op=nl.reciprocal, data=cs, bias=HC_EPS, scale=1.0)
         else:
             ce = nl.ndarray((PT, nt, hc), dtype=f32, buffer=nl.sbuf)
             nisa.activation(dst=ce, op=nl.copy, data=cs, bias=HC_EPS, scale=1.0)
+            d = nl.ndarray((PT, nt, hc), dtype=f32, buffer=nl.sbuf)
             nisa.activation(dst=d, op=nl.reciprocal, data=ce)
         if SINKHORN_ONE_MUL:
             # the hc products in one instruction (d repeated along i by a stride-0 view)
@@ -193,7 +207,9 @@ def sinkhorn_batched(t2all, nt, hc, after=None):
     # (`after`: schedule-only anchor of the chain's first instruction; the rest follow it)
     _sched_after(nisa.tensor_reduce(dst=mx, op=nl.max, data=x3, axis=(2,), keepdims=True), after)
     dif = nl.ndarray((PT, n, hc), dtype=f32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=dif, data1=x3, data2=nl.broadcast_to(mx, (PT, n, hc)), op=nl.subtract)
+    mxb = (mx.ap(pattern=[[n, PT], [1, n], [0, hc]], offset=0) if SINKHORN_BCAST_AP
+           else nl.broadcast_to(mx, (PT, n, hc)))
+    nisa.tensor_tensor(dst=dif, data1=x3, data2=mxb, op=nl.subtract)
     e = nl.ndarray((PT, n, hc), dtype=f32, buffer=nl.sbuf)
     nisa.activation(dst=e, op=nl.exp, data=dif)
     se = nl.ndarray((PT, n, 1), dtype=f32, buffer=nl.sbuf)
@@ -201,7 +217,9 @@ def sinkhorn_batched(t2all, nt, hc, after=None):
     re = nl.ndarray((PT, n, 1), dtype=f32, buffer=nl.sbuf)
     nisa.activation(dst=re, op=nl.reciprocal, data=se)
     a3 = a.reshape((PT, n, hc))
-    nisa.tensor_tensor(dst=a3, data1=e, data2=nl.broadcast_to(re, (PT, n, hc)), op=nl.multiply)
+    reb = (re.ap(pattern=[[n, PT], [1, n], [0, hc]], offset=0) if SINKHORN_BCAST_AP
+           else nl.broadcast_to(re, (PT, n, hc)))
+    nisa.tensor_tensor(dst=a3, data1=e, data2=reb, op=nl.multiply)
     nisa.tensor_scalar(dst=a3, data=a3, op0=nl.add, operand0=HC_EPS)
     colsum_div(a, b)
     for _ in range(SINKHORN_ITERS - 1):
@@ -213,10 +231,19 @@ def sinkhorn_batched(t2all, nt, hc, after=None):
 #: `sinkhorn_batched`'s column normalization multiplies all hc row blocks in one DVE
 #: instruction (the column reciprocals broadcast along the block axis) instead of hc.
 SINKHORN_ONE_MUL = True
-#: `sinkhorn_batched`'s `1 / (sum + eps)`: one ACT reciprocal with the eps as its bias
-#: instead of an ACT copy with the bias and then the reciprocal (the 20-iteration chain is
-#: latency-bound: one instruction fewer per normalization).
-SINKHORN_FUSED_RECIP = True
+#: `sinkhorn_batched`'s `1 / (sum + eps)` as ONE ACT instruction (the eps as the activation's
+#: bias: `reciprocal(1.0 * x + eps)`, the sum rounded to fp32 once as by the copy) instead
+#: of an ACT copy with the bias, then the reciprocal (the chain is latency bound: 40
+#: of these pairs per sinkhorn, two sinkhorns a block on core 1). (OFF: bit-exact at
+#: in1024_bs1, but neutral there: compute +14 us, noise level; not checked at bs10.)
+SINKHORN_FUSE_EPS = True
+#: `sinkhorn_batched` reads its per-row / per-column reciprocals (and the softmax's max and
+#: 1 / sum) with a 0-step AP over the broadcast axis instead of materializing a broadcast
+#: copy first (one DVE instruction less a normalization).
+SINKHORN_BCAST_AP = True
+#: `sinkhorn_batched` (one row tile) sums each column with one DVE reduce over a view with
+#: the rows innermost instead of a chain of hc - 1 adds.
+SINKHORN_COLSUM_REDUCE = True
 
 
 #: `hc_in` calls run the sinkhorn once over all of the call's row tiles (`sinkhorn_batched`).
@@ -225,28 +252,41 @@ HC_SINKHORN_BATCHED = True
 
 #: `hc_in_consts` broadcasts its rows to the partitions by DMA (else DVE copies).
 HC_CONSTS_DMA = True
+#: The partition-broadcast constant rows (`hc_in_consts`, `norm_rows`' weights) filled only
+#: on the partitions a tile of the call reads (`0 .. rows`), not all 128: at T = 6 the
+#: five [128, 1024] fp32 norm-weight broadcasts of each hc_in call were 2.6 MB of DMA
+#: writes (~18 us of all 16 DMA engines) competing with the block start's small loads.
+CONSTS_ROWS_ONLY = True
 
 
-def hc_in_consts(base, scale, norm_w, hc, dim, out_chunk=1024, with_w=True):
+def hc_in_consts(base, scale, norm_w, hc, dim, out_chunk=1024, coef=True, w=True, rows=PT):
     """`hc_in_tile`'s row-invariant operands (`scale`, `base`, `norm_w` rows broadcast
-    to 128 partitions, fp32), materialized once for all of a call's tiles."""
+    to 128 partitions, fp32), materialized once for all of a call's tiles (`coef` /
+    `w`: the coefficients' `scale` / `base` rows, the norm weight; a `part` tile needs one).
+    `rows`: the most rows a tile of the call has (only partitions `0 .. rows` are filled:
+    the readers slice `[0:nr]`; see `CONSTS_ROWS_ONLY`)."""
+    if not CONSTS_ROWS_ONLY:
+        rows = PT
 
     def mat(row, c0, n):
         t = nl.ndarray((PT, n), dtype=nl.float32, buffer=nl.sbuf)
         if HC_CONSTS_DMA:
             # a broadcast DMA (partition stride 0, the bf16 -> fp32 widening exact) instead
             # of a DVE copy of a partition-broadcast load
-            nisa.dma_copy(dst=t, src=row.ap(pattern=[[0, PT], [1, n]], offset=c0))
+            nisa.dma_copy(dst=t[0:rows, :], src=row.ap(pattern=[[0, rows], [1, n]], offset=c0))
         else:
             nisa.tensor_copy(dst=t, src=bcast_row(row[0:1, c0 : c0 + n], n, PT))
         return t
 
-    d = dict(
-        s0=mat(scale, 0, 1), s1=mat(scale, 1, 1), s2=mat(scale, 2, 1),
-        b0=mat(base, 0, hc), b1=mat(base, hc, hc),
-        b2=mat(base, 2 * hc, hc * hc),
-        w=[mat(norm_w, c * out_chunk, out_chunk) for c in range(dim // out_chunk)] if with_w else None,
-    )
+    d = {}
+    if coef:
+        d.update(
+            s0=mat(scale, 0, 1), s1=mat(scale, 1, 1), s2=mat(scale, 2, 1),
+            b0=mat(base, 0, hc), b1=mat(base, hc, hc),
+            b2=mat(base, 2 * hc, hc * hc),
+        )
+    if w:
+        d["w"] = [mat(norm_w, c * out_chunk, out_chunk) for c in range(dim // out_chunk)]
     return d
 
 
@@ -286,7 +326,7 @@ HC_IN_INTERLEAVE = True
 
 def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
                normed, pre, post, comb, sq_chunk=1024, out_chunk=1024, consts=None, xin=None,
-               t2_dst=None, x_after=None, coef_only=False):
+               t2_dst=None, x_after=None, part=None):
     """One 128-row tile of the hyper-connection sublayer-in (`kernels.hc_in`).
 
     Reads `x2[r0:r0+nr]` (`[T, hc*dim]` bf16 HBM) and `pre_mix`, writes
@@ -296,12 +336,15 @@ def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
     in SBUF (`hc` `(PT, dim)` bf16 tiles, e.g. `hc_out_tile(keep=True)`'s), else they
     are loaded from `x2`. `t2_dst`: a `(PT, hc*hc)` SBUF view that receives the
     pre-sinkhorn comb logits instead of running the sinkhorn and storing `comb` here
-    (the caller runs `sinkhorn_batched` over its tiles). `coef_only`: only the
-    coefficients (`pre`/`post`/`comb` or `t2_dst`) -- no pre-mix or RMS norm, `normed`
-    is not written (`hc_in_norm_spread` makes it, on the other core).
+    (the caller runs `sinkhorn_batched` over its tiles).
+    `part`: only one of the tile's two independent halves (`hc_in_split`) -- "norm" (the
+    pre-mix of the rows with `pre_mix` and its RMS norm into `normed`) or "mix" (the sum of
+    squares, the mix GEMM and the `pre` / `post` / comb coefficients); `None`: both. Each
+    half runs exactly its instructions of the whole tile.
     """
+    do_norm = part in (None, "norm")
     if consts is None:
-        consts = hc_in_consts(base, scale, norm_w, hc, dim, out_chunk)
+        consts = hc_in_consts(base, scale, norm_w, hc, dim, out_chunk, rows=nr)
     width = hc * dim
     kpg = dim // PT
     inv_width = 1.0 / width
@@ -319,7 +362,8 @@ def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
             _sched_after(nisa.dma_copy(dst=xg[g][0:nr, :], src=x2[r0 : r0 + nr, g * dim : (g + 1) * dim]),
                          x_after)
     pm = nl.ndarray((PT, hc), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=pm[0:nr, :], src=pre_mix[r0 : r0 + nr, 0:hc])
+    if do_norm:
+        nisa.dma_copy(dst=pm[0:nr, :], src=pre_mix[r0 : r0 + nr, 0:hc])
 
     acc = nl.ndarray((PT, dim), dtype=nl.float32, buffer=nl.sbuf)
     y16 = nl.ndarray((PT, dim), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -382,21 +426,26 @@ def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
 
     nbatch = hc * cdiv(kpg, HC_T_BATCH)
     nout = dim // out_chunk
-    split = HC_IN_INTERLEAVE and nbatch >= 4 * (nout + 3)
+    split = HC_IN_INTERLEAVE and nbatch >= 4 * (nout + 3) and part is None
+    if part == "norm":
+        premix()
+        norm_ss()
+        for c in range(nout):
+            norm_chunk(c)
+        return
     # interleaved: the pre-mix, the sum of squares and the whole RMS norm of the mixed
     # rows (none needs the mix GEMM) are issued between the GEMM's transpose batches,
     # so they overlap it instead of forming a DVE / ACT stretch between tiles that
     # stalls the next tile's transpose copies (only the coefficients stay after it)
     work = {}
-    if coef_only:
-        split = True
-        work[2] = [sumsq]
-    elif split:
+    if split:
         work[0] = [premix]
         work[2] = [sumsq]
         work[8] = [norm_ss]
         for c in range(nout):
             work.setdefault(12 + 4 * c, []).append(lambda c=c: norm_chunk(c))
+    elif part == "mix":
+        sumsq()
     else:
         premix()
         sumsq()
@@ -485,96 +534,10 @@ def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
         comb_t = sinkhorn(t2, nr, hc)
         nisa.dma_copy(dst=comb[r0 : r0 + nr, 0 : hc * hc], src=comb_t[0:nr, :])
 
-    if not split:
+    if not split and do_norm:
         norm_ss()
         for c in range(nout):
             norm_chunk(c)
-
-
-#: Decode (one row tile of few rows): `hc_in` split between the two cores -- core 0 the
-#: pre-mix and the RMS norm (the normed rows the projections / MoE wait for) in the
-#: spread layout of `hc_out_spread_*` (nr * S partitions instead of nr), core 1 the
-#: coefficients (`hc_in_tile(coef_only=True)`: the whole-width sum of squares, the mix
-#: GEMM, pre / post / comb). Same per-element instructions; the row sums (sum of squares
-#: of the mixed rows) stay ACT accumulation chains over each row's columns in order.
-HC_IN_SPLIT = True
-#: With `HC_IN_SPLIT`: the decode hc_outs (spread layout) split by columns between the
-#: cores (each core its half of every hc group's columns; elementwise, so exact).
-HC_OUT_SPLIT = True
-#: Decode (one row tile): the q and o ropes split by whole heads between the cores (each
-#: core its GEMM's half of the q columns, then one barrier; o's halves after its barrier).
-ROPE_COL_SPLIT = True
-
-
-def hc_in_norm_spread(nr, x2, pre_mix, norm_w, hc, dim, normed, sq_chunk=1024, x_after=None):
-    """`hc_in_tile`'s pre-mix and RMS norm for rows `0 .. nr` (one tile) in the spread
-    layout (`spread_of`): `y = sum_g pre_mix[:, g] * x[:, g, :]` (fp32, bf16 on its last
-    add), `normed = (y * rstd) * norm_w` with `rstd` from the sum of squares of the bf16
-    `y` rows -- computed in the row layout (the rows written to a private HBM scratch
-    and read back) so each row's accumulation is the same ACT chain."""
-    S = spread_of(nr, dim)
-    W = dim // S
-    cw = _spread_chunk(W)
-    P = nr * S
-    width = hc * dim
-    f32, bf16 = nl.float32, nl.bfloat16
-    mode, groups = _sp_parts(nr, S)
-    gn = S if mode == "t" else nr
-    # the norm weight in the spread layout (partition (t, s): columns s*W .. +W), fp32
-    # (the bf16 -> fp32 widening in the DMA, as `hc_in_consts`)
-    ws = nl.ndarray((PT, W), dtype=f32, buffer=nl.sbuf)
-    for p0, q in groups:
-        if mode == "t":
-            src = norm_w.ap(pattern=[[W, S], [1, W]], offset=0)
-        else:
-            src = norm_w.ap(pattern=[[0, nr], [1, W]], offset=q * W)
-        nisa.dma_copy(dst=ws[p0 : p0 + gn, :], src=src)
-    pm = nl.ndarray((PT, hc), dtype=f32, buffer=nl.sbuf)
-    for p0, q in groups:
-        nisa.dma_copy(dst=pm[p0 : p0 + gn, :], src=_sp_bcast(mode, q, nr, S, pre_mix, hc))
-    nch = W // cw
-    y16 = nl.ndarray((PT, W), dtype=bf16, buffer=nl.sbuf)
-    for c in range(nch):
-        xs = nl.ndarray((PT, hc, cw), dtype=bf16, buffer=nl.sbuf)
-        for k, (p0, q) in enumerate(groups):
-            _sched_after(_sp_dma(mode, q, nr, S, W, x2, width, c * cw, cw, dst=xs[p0 : p0 + gn, 0:hc, 0:cw],
-                                 mid=(dim, hc), eng=_sp_eng(k)), x_after)
-        acc = nl.ndarray((PT, cw), dtype=f32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=acc[0:P, :], data=xs[0:P, 0, :], op0=nl.multiply,
-                           operand0=pm[0:P, 0:1], engine=nisa.engine.scalar)
-        for g in range(1, hc):
-            nisa.scalar_tensor_tensor(
-                dst=y16[0:P, c * cw : (c + 1) * cw] if g == hc - 1 else acc[0:P, :], data=xs[0:P, g, :],
-                op0=nl.multiply, operand0=pm[0:P, g : g + 1], op1=nl.add, operand1=acc[0:P, :],
-            )
-    # the mixed rows' sum of squares in the row layout
-    yh = nl.ndarray((PT, dim), dtype=bf16, buffer=nl.private_hbm)
-    for k, (p0, q) in enumerate(groups):
-        _sp_dma(mode, q, nr, S, W, yh, dim, 0, W, src=y16[p0 : p0 + gn, 0:W], eng=_sp_eng(k))
-    yr = nl.ndarray((PT, dim), dtype=bf16, buffer=nl.sbuf)
-    nisa.dma_copy(dst=yr[0:nr, :], src=yh[0:nr, :])
-    junk = nl.ndarray((PT, sq_chunk), dtype=f32, buffer=nl.psum)
-    ss2 = nl.ndarray((PT, 1), dtype=f32, buffer=nl.sbuf)
-    sum_squares(ss2, yr, nr, dim, sq_chunk, junk=junk)
-    rstd = nl.ndarray((PT, 1), dtype=f32, buffer=nl.sbuf)
-    rstd[0:nr, :] = rsqrt_newton(nl.add(nl.multiply(ss2[0:nr, 0:1], 1.0 / dim), NORM_EPS))
-    rh = nl.ndarray((PT, 1), dtype=f32, buffer=nl.private_hbm)
-    nisa.dma_copy(dst=rh[0:nr, :], src=rstd[0:nr, :])
-    rs = nl.ndarray((PT, 1), dtype=f32, buffer=nl.sbuf)
-    for k, (p0, q) in enumerate(groups):
-        e = _sp_eng(k)
-        kw = {} if e is None else dict(dge_mode=nisa.dge_mode.hwdge, engine=e)
-        nisa.dma_copy(dst=rs[p0 : p0 + gn, :], src=_sp_bcast(mode, q, nr, S, rh, 1), **kw)
-    last = None
-    for c in range(nch):
-        cols = slice(c * cw, (c + 1) * cw)
-        yv = nl.ndarray((PT, cw), dtype=f32, buffer=nl.sbuf)
-        nisa.activation(dst=yv[0:P, :], op=nl.copy, data=y16[0:P, cols], scale=rs[0:P, 0:1])
-        o16 = nl.ndarray((PT, cw), dtype=bf16, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=o16[0:P, :], data1=yv[0:P, :], data2=ws[0:P, cols], op=nl.multiply)
-        for k, (p0, q) in enumerate(groups):
-            last = _sp_dma(mode, q, nr, S, W, normed, dim, c * cw, cw, src=o16[p0 : p0 + gn, 0:cw], eng=_sp_eng(k))
-    return last
 
 
 FN_T_HWDGE = True
@@ -724,33 +687,26 @@ def _sp_parts(nr, S):
     return "s", [(s * nr, s) for s in range(S)]
 
 
-def _sp_dma(mode, q, nr, S, W, hbm, row_stride, col0, n, dst=None, src=None, mid=None, eng=None):
+#: The spread layout's SBUF -> HBM stores on the sync engine's hardware DGE queue (else the
+#: compiler's choice, the ACT queue: each store trigger, waiting there on the DVE rows it
+#: stores, held up the ACT instructions queued behind it -- the next pre-mix's first product).
+SP_STORE_SYNC = True
+
+
+def _sp_dma(mode, q, nr, S, W, hbm, row_stride, col0, n, dst=None, src=None, mid=None):
     """One DMA group between the spread SBUF partitions and the HBM rows: element
     (row, slice, k) of the group at `hbm[row * row_stride + col0 + slice * W + k]`
-    (`mid = (stride, count)`: a middle dimension, e.g. the hc column groups). `eng`: on
-    that engine's hardware DGE queue."""
+    (`mid = (stride, count)`: a middle dimension, e.g. the hc column groups)."""
     m = [list(mid)] if mid is not None else []
     if mode == "t":
         ap = hbm.ap(pattern=[[W, S]] + m + [[1, n]], offset=q * row_stride + col0)
     else:
         ap = hbm.ap(pattern=[[row_stride, nr]] + m + [[1, n]], offset=q * W + col0)
-    kw = {} if eng is None else dict(dge_mode=nisa.dge_mode.hwdge, engine=eng)
     if dst is not None:
-        return nisa.dma_copy(dst=dst, src=ap, **kw)
-    return nisa.dma_copy(dst=ap, src=src, **kw)
-
-
-#: `hc_in_norm_spread`'s per-group DMAs (one per row) alternate between the SP and ACT
-#: hardware DGE queues (one queue issued them one after another: ~1.5 us each).
-HC_SP_DMA_ALT = True
-#: ... and the spread hc_outs' (`hc_out_spread_*`).
-HC_OUT_DMA_ALT = True
-
-
-def _sp_eng(k):
-    if not HC_SP_DMA_ALT:
-        return None
-    return nisa.engine.sync if k % 2 == 0 else nisa.engine.scalar
+        return nisa.dma_copy(dst=dst, src=ap)
+    if SP_STORE_SYNC:
+        return nisa.dma_copy(dst=ap, src=src, dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
+    return nisa.dma_copy(dst=ap, src=src)
 
 
 def _sp_bcast(mode, q, nr, S, hbm, n):
@@ -760,14 +716,12 @@ def _sp_bcast(mode, q, nr, S, hbm, n):
     return hbm.ap(pattern=[[n, nr], [1, n]], offset=0)
 
 
-def hc_out_spread_acc(nr, res_hbm, post_hbm, comb_hbm, hc, dim, after=None, cols=None):
+def hc_out_spread_acc(nr, res_hbm, post_hbm, comb_hbm, hc, dim, after=None):
     """`hc_out_tile`'s x-independent half (`post` and the `sum_i comb * res`
     accumulators) for rows `0 .. nr` in the spread layout (`spread_of`); every op is
-    scheduled after `after`. Returns the state `hc_out_spread_out` takes. `cols = (c0,
-    n)`: only columns `c0 .. c0+n` of each of the hc groups (e.g. one core's half)."""
-    c0, dimc = cols if cols is not None else (0, dim)
-    S = spread_of(nr, dimc)
-    W = dimc // S
+    scheduled after `after`. Returns the state `hc_out_spread_out` takes."""
+    S = spread_of(nr, dim)
+    W = dim // S
     cw = _spread_chunk(W)
     P = nr * S
     width = hc * dim
@@ -784,9 +738,9 @@ def hc_out_spread_acc(nr, res_hbm, post_hbm, comb_hbm, hc, dim, after=None, cols
     last = None
     for c in range(W // cw):
         rg = nl.ndarray((PT, hc, cw), dtype=nl.bfloat16, buffer=nl.sbuf)
-        for k, (p0, q) in enumerate(groups):
-            last = _sp_dma(mode, q, nr, S, W, res_hbm, width, c0 + c * cw, cw, dst=rg[p0 : p0 + gn, 0:hc, 0:cw],
-                           mid=(dim, hc), eng=_sp_eng(k) if HC_OUT_DMA_ALT else None)
+        for p0, q in groups:
+            last = _sp_dma(mode, q, nr, S, W, res_hbm, width, c * cw, cw, dst=rg[p0 : p0 + gn, 0:hc, 0:cw],
+                           mid=(dim, hc))
             _sched_after(last, after)
         acc = nl.ndarray((PT, hc, cw), dtype=nl.float32, buffer=nl.sbuf)
         for j in range(hc):
@@ -801,31 +755,30 @@ def hc_out_spread_acc(nr, res_hbm, post_hbm, comb_hbm, hc, dim, after=None, cols
                     operand0=comb[0:P, col : col + 1], op1=nl.add, operand1=acc[0:P, j, :],
                 ), after)
         accs.append(acc)
-    return dict(S=S, W=W, cw=cw, P=P, post=post, accs=accs, last=last, c0=c0, sub=dimc != dim)
+    return dict(S=S, W=W, cw=cw, P=P, post=post, accs=accs, last=last)
 
 
-def hc_out_spread_out(st, nr, x_hbm, y_hbm, hc, dim):
+def hc_out_spread_out(st, nr, x_hbm, y_hbm, hc, dim, keep=None):
     """`hc_out_tile`'s x-dependent half for `hc_out_spread_acc`'s state: `y = post * x +
     acc` (x: the `[nr, dim]` fp32 sublayer output, read into bf16 by the DMA as
     `hc_out_tile` does), stored to the `[T, hc*dim]` bf16 `y_hbm`. The x loads are
     scheduled after the accumulators' loads (an x load waiting on an all-reduce would
-    hold up the DMA queue it sits in)."""
+    hold up the DMA queue it sits in). `keep`: a list that receives each chunk's
+    `(col0, cw, y tile)` (the spread `(PT, hc, cw)` bf16 rows, for `hc_in_norm_spread`)."""
     S, W, cw, P, post = st["S"], st["W"], st["cw"], st["P"], st["post"]
-    c0 = st.get("c0", 0)
     width = hc * dim
     mode, groups = _sp_parts(nr, S)
     gn = S if mode == "t" else nr
     last = None
     for c, acc in enumerate(st["accs"]):
         xg = nl.ndarray((PT, cw), dtype=nl.bfloat16, buffer=nl.sbuf)
-        if mode == "t" and not st.get("sub"):
+        if mode == "t":
             # (row stride dim = S * W: one uniform-stride DMA)
             _sched_after(nisa.dma_copy(dst=xg[0:P, :], src=x_hbm.ap(pattern=[[W, P], [1, cw]], offset=c * cw)),
                          st["last"])
         else:
-            for k, (p0, q) in enumerate(groups):
-                # (no HWDGE here: the fp32 -> bf16 cast is a software-DGE DMA)
-                _sched_after(_sp_dma(mode, q, nr, S, W, x_hbm, dim, c0 + c * cw, cw, dst=xg[p0 : p0 + gn, :]),
+            for p0, q in groups:
+                _sched_after(_sp_dma(mode, q, nr, S, W, x_hbm, dim, c * cw, cw, dst=xg[p0 : p0 + gn, :]),
                              st["last"])
         og = nl.ndarray((PT, hc, cw), dtype=nl.bfloat16, buffer=nl.sbuf)
         for j in range(hc):
@@ -833,13 +786,105 @@ def hc_out_spread_out(st, nr, x_hbm, y_hbm, hc, dim):
                 dst=og[0:P, j, :], data=xg[0:P, :], op0=nl.multiply,
                 operand0=post[0:P, j : j + 1], op1=nl.add, operand1=acc[0:P, j, :],
             )
-        for k, (p0, q) in enumerate(groups):
-            last = _sp_dma(mode, q, nr, S, W, y_hbm, width, c0 + c * cw, cw, src=og[p0 : p0 + gn, 0:hc, 0:cw],
-                           mid=(dim, hc), eng=_sp_eng(k) if HC_OUT_DMA_ALT else None)
+        for p0, q in groups:
+            last = _sp_dma(mode, q, nr, S, W, y_hbm, width, c * cw, cw, src=og[p0 : p0 + gn, 0:hc, 0:cw],
+                           mid=(dim, hc))
+        if keep is not None:
+            keep.append((c * cw, cw, og))
     return last
 
 
+#: `hc_in_tile(part="norm")` of one few-row tile as `hc_in_norm_spread`: the pre-mix in
+#: the spread layout (each row over S partitions: ~S x fewer DVE / ACT cycles, the same
+#: per-element instructions), its bf16 rows through an HBM scratch back into the row
+#: layout for the RMS norm (the sum of squares is a reduction along the row).
+HC_PREMIX_SPREAD = True
+#: `hc_in_norm_spread`'s pre-mix coefficient loads on the ACT engine's hardware DGE queue.
+#: (OFF: with `FFN_PRE_BAR_EARLY` core 0's pre-mix started ~10 us earlier, but core 0 then
+#: waited for core 1's q / kv half instead -- in1024_bs1 compute +19 us, noise level.)
+PM_LOAD_ACT = False
+
+
+def hc_in_norm_spread(nr, x2, pre_mix, normed, ysc, consts, hc, dim, xs=None, sq_chunk=1024,
+                      out_chunk=1024, ysc_bar=False, chunks=None):
+    """`hc_in_tile(0, nr, ..., part="norm")` for rows `0 .. nr` (one tile, `spread_of(nr,
+    dim) > 1`) with the pre-mix in the spread layout: `xs` the rows already in SBUF in that
+    layout (`hc_out_spread_out(keep=...)`'s chunks), else loaded from `x2`; `ysc` a
+    `[>= nr, dim]` bf16 HBM scratch for the mixed rows."""
+    S = spread_of(nr, dim)
+    W = dim // S
+    P = nr * S
+    width = hc * dim
+    mode, groups = _sp_parts(nr, S)
+    gn = S if mode == "t" else nr
+    if xs is None:
+        xt = nl.ndarray((PT, hc, W), dtype=nl.bfloat16, buffer=nl.sbuf)
+        for p0, q in groups:
+            _sp_dma(mode, q, nr, S, W, x2, width, 0, W, dst=xt[p0 : p0 + gn, 0:hc, 0:W], mid=(dim, hc))
+        xs = [(0, W, xt)]
+    pm = nl.ndarray((PT, hc), dtype=nl.float32, buffer=nl.sbuf)
+    for p0, q in groups:
+        # (`PM_LOAD_ACT`: on the ACT queue -- idle until this pre-mix -- not behind the previous
+        # block's out_stream stores and the projection weights' DMAs on the sync queue)
+        nisa.dma_copy(dst=pm[p0 : p0 + gn, :], src=_sp_bcast(mode, q, nr, S, pre_mix, hc),
+                      **(dict(dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.scalar) if PM_LOAD_ACT else {}))
+    for c0, cw, xc in xs:
+        # (hc_in_tile's premix, per element)
+        acc = nl.ndarray((PT, cw), dtype=nl.float32, buffer=nl.sbuf)
+        ys = nl.ndarray((PT, cw), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=acc[0:P, :], data=xc[0:P, 0, :], op0=nl.multiply, operand0=pm[0:P, 0:1],
+                           engine=nisa.engine.scalar)
+        for g in range(1, hc):
+            nisa.scalar_tensor_tensor(
+                dst=ys[0:P, :] if g == hc - 1 else acc[0:P, :], data=xc[0:P, g, :], op0=nl.multiply,
+                operand0=pm[0:P, g : g + 1], op1=nl.add, operand1=acc[0:P, :],
+            )
+        if mode == "t":
+            # (row stride dim = S * W: one uniform-stride DMA)
+            nisa.dma_copy(dst=ysc.ap(pattern=[[W, P], [1, cw]], offset=c0), src=ys[0:P, 0:cw],
+                          **(dict(dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync) if SP_STORE_SYNC else {}))
+        else:
+            for p0, q in groups:
+                _sp_dma(mode, q, nr, S, W, ysc, dim, c0, cw, src=ys[p0 : p0 + gn, 0:cw])
+    if ysc_bar:
+        # (`ysc_bar`: the mixed rows shared with the other core, which normalizes some of
+        # the output chunks itself -- `hc_norm_tail`)
+        nisa.core_barrier(data=ysc, cores=(0, 1))
+    hc_norm_tail(ysc, nr, normed, consts, dim, sq_chunk, out_chunk, chunks)
+
+
+def hc_norm_tail(ysc, nr, normed, consts, dim, sq_chunk=1024, out_chunk=1024, chunks=None):
+    """`hc_in_norm_spread`'s RMS norm of the mixed bf16 rows `ysc[0:nr]` (HBM) into `normed`
+    (the output chunks `chunks = (c0, c1)` of `out_chunk` columns; None: all). Every call
+    runs the same sum of squares / rsqrt instructions, so each core's `rstd` is the same."""
+    y16 = nl.ndarray((PT, dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.dma_copy(dst=y16[0:nr, :], src=ysc[0:nr, 0:dim])
+    # (hc_in_tile's norm_ss / norm_chunk)
+    cj = None
+    if HC_SQ_JUNK and HC_MIX_DMA_T and nr <= HC_MIX_DMA_T_ROWS:
+        cj = consts.get("junk")
+        if cj is None or cj.shape[1] < sq_chunk:
+            cj = nl.ndarray((PT, sq_chunk), dtype=nl.float32, buffer=nl.psum)
+            consts["junk"] = cj
+    ss2 = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
+    sum_squares(ss2, y16, nr, dim, sq_chunk, junk=cj)
+    rstd = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
+    rstd[0:nr, :] = rsqrt_newton(nl.add(nl.multiply(ss2[0:nr, 0:1], 1.0 / dim), NORM_EPS))
+    for c in range(*(chunks or (0, dim // out_chunk))):
+        lo, hi = c * out_chunk, (c + 1) * out_chunk
+        wj = consts["w"][c][0:nr, 0:out_chunk]
+        yv = nl.ndarray((PT, out_chunk), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.activation(dst=yv[0:nr, :], op=nl.copy, data=y16[0:nr, lo:hi], scale=rstd[0:nr, 0:1])
+        o16 = nl.ndarray((PT, out_chunk), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=o16[0:nr, :], data1=yv[0:nr, :], data2=wj, op=nl.multiply)
+        nisa.dma_copy(dst=normed[0:nr, lo:hi], src=o16[0:nr, :])
+
+
 # --------------------------------------------------------------------------- norms, rope, quant
+
+
+#: `norm_rows` broadcasts its weight rows to the partitions by DMA (else DVE copies).
+NORM_W_DMA = True
 
 
 def norm_rows(src_hbm, w_hbm, dst_hbm, tiles, n, qdq, chunk=None):
@@ -849,7 +894,17 @@ def norm_rows(src_hbm, w_hbm, dst_hbm, tiles, n, qdq, chunk=None):
     chunk = chunk or n
     inv_n = 1.0 / n
     # the weight rows broadcast once, not per row tile
-    wjs = [bcast_row(w_hbm[0:1, c * chunk : (c + 1) * chunk], chunk, PT) for c in range(n // chunk)]
+    if NORM_W_DMA:
+        # (by a partition-broadcast DMA, the bf16 -> fp32 widening exact, as `hc_in_consts`:
+        # not DVE copies in the projections' staging; none on a core without row tiles)
+        wjs = []
+        wr = max(nr for _, nr in tiles) if tiles and CONSTS_ROWS_ONLY else PT
+        for c in range(n // chunk if tiles else 0):
+            t = nl.ndarray((PT, chunk), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=t[0:wr, :], src=w_hbm.ap(pattern=[[0, wr], [1, chunk]], offset=c * chunk))
+            wjs.append(t)
+    else:
+        wjs = [bcast_row(w_hbm[0:1, c * chunk : (c + 1) * chunk], chunk, PT) for c in range(n // chunk)]
     for r0, nr in tiles:
         t = nl.ndarray((PT, n), dtype=nl.bfloat16, buffer=nl.sbuf)
         nisa.dma_copy(dst=t[0:nr, :], src=src_hbm[r0 : r0 + nr, 0:n])
@@ -920,17 +975,16 @@ def rope_inplace(tile, nr, col0, cos, sin, inverse):
 
 
 def rope_rows(src_hbm, dst_hbm, tiles, width, head, nheads, freqs_hbm, row_pos_hbm,
-              inverse, qdq=False, freqs_cache=None, col0=0):
+              inverse, qdq=False, freqs_cache=None):
     """Rope the last `ROPE_DIM` columns of each of `nheads` heads of width `head`
     in `src_hbm[rows, width]` (bf16), optionally fp8-round-trip the rows, and write
     `dst_hbm`. `src_hbm` and `dst_hbm` may be the same tensor. `freqs_cache`: `{r0:
-    (cos, sin)}` already gathered (`load_freqs`) for the tiles. `col0`: the rows' columns
-    `col0 .. col0+width` only (whole heads, e.g. one core's half)."""
+    (cos, sin)}` already gathered (`load_freqs`) for the tiles."""
     for r0, nr in tiles:
         t = nl.ndarray((PT, width), dtype=nl.bfloat16, buffer=nl.sbuf)
         if qdq and nr < PT:
             nisa.memset(t, 0.0)
-        nisa.dma_copy(dst=t[0:nr, :], src=src_hbm[r0 : r0 + nr, col0 : col0 + width])
+        nisa.dma_copy(dst=t[0:nr, :], src=src_hbm[r0 : r0 + nr, 0:width])
         if freqs_cache is not None and r0 in freqs_cache:
             cos, sin = freqs_cache[r0]
         else:
@@ -939,7 +993,7 @@ def rope_rows(src_hbm, dst_hbm, tiles, width, head, nheads, freqs_hbm, row_pos_h
             rope_inplace(t, nr, h * head + head - ROPE_DIM, cos, sin, inverse)
         if qdq:
             t = _qdq_fp8(t, PT, width)
-        nisa.dma_copy(dst=dst_hbm[r0 : r0 + nr, col0 : col0 + width], src=t[0:nr, :])
+        nisa.dma_copy(dst=dst_hbm[r0 : r0 + nr, 0:width], src=t[0:nr, :])
 
 
 # --------------------------------------------------------------------------- GEMMs (fp32 router)
@@ -1029,13 +1083,12 @@ def gather_rows(cache_hbm, slots_hbm, dst_hbm, tiles, n, dtype=nl.bfloat16, pair
         nisa.dma_copy(dst=dst_hbm[r0 : r0 + nr, 0:n], src=t[0:nr, :])
 
 
-def gather_rows_cores(cache_hbm, slots_hbm, s0, dst_hbm, d0, rows, pid, n, pair=False, off=0):
+def gather_rows_cores(cache_hbm, slots_hbm, s0, dst_hbm, d0, rows, pid, n, pair=False):
     """`dst[d0 + r] = cache[slots[s0 + r]]` for the rows `r < rows` of core `pid`'s 128-row
-    tiles (tile `i` to core `(i + off) % 2`, as `tiles_of` for `off = 0`), `gather_rows`'
-    per-tile gathers with the full tiles' slot indices loaded by ONE hardware-DGE DMA
-    (`ix[p, j]` = slot of row `(i0 + 2j) * 128 + p`) instead of one GpSimd DMA per tile.
-    Same rows, same values (`off` only moves tiles between the cores)."""
-    full = [i for i in range(rows // PT) if (i + off) % 2 == pid]
+    tiles (tile `i` to core `i % 2`, as `tiles_of`), `gather_rows`' per-tile gathers with
+    the full tiles' slot indices loaded by ONE hardware-DGE DMA (`ix[p, j]` = slot of row
+    `(i0 + 2j) * 128 + p`) instead of one GpSimd DMA per tile. Same rows, same values."""
+    full = [i for i in range(rows // PT) if i % 2 == pid]
     if full:
         k = len(full)
         i0 = full[0]
@@ -1056,7 +1109,7 @@ def gather_rows_cores(cache_hbm, slots_hbm, s0, dst_hbm, d0, rows, pid, n, pair=
                 t = tp.reshape((PT, n))
             r0 = d0 + i * PT
             nisa.dma_copy(dst=dst_hbm[r0 : r0 + PT, 0:n], src=t)
-    if rows % PT and (rows // PT + off) % 2 == pid:
+    if rows % PT and (rows // PT) % 2 == pid:
         r0 = (rows // PT) * PT
         gather_rows(cache_hbm, slots_hbm[s0 : s0 + rows], dst_hbm[d0 : d0 + rows], [(r0, rows - r0)], n,
                     pair=pair)
@@ -2069,11 +2122,12 @@ def attn_bufs3(U, heads, d, kpad):
 
 
 def route_topk(scores_hbm, bias_hbm, lo_hbm, tiles, n_experts, topk, n_local, route_scale,
-               wexp_hbm):
+               wexp_hbm, sb_out=None):
     """The router selection: `sqrtsoftplus` of the fp32 logits in `scores_hbm[T, n_experts]`,
     top-`topk` of `score + bias`, raw-score weights normalized to sum 1 and scaled, and
     per-local-expert dense weights `wexp_hbm[T, n_local]` (fp32): the routing weight of
-    expert `lo + e` for the row, or 0 when the row did not pick it.
+    expert `lo + e` for the row, or 0 when the row did not pick it. `sb_out`: (one row
+    tile) the `[PT, n_local]` SBUF tile the weights are formed in (also kept there).
     """
     for r0, nr in tiles:
         lg = nl.ndarray((PT, n_experts), dtype=nl.float32, buffer=nl.sbuf)
@@ -2100,7 +2154,7 @@ def route_topk(scores_hbm, bias_hbm, lo_hbm, tiles, n_experts, topk, n_local, ro
         idf = nl.ndarray((PT, topk), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=idf[0:nr, :], src=idx8[0:nr, 0:topk])
         lo = bcast_row(lo_hbm[0:1, 0:1], 1, nr)  # fp32 [1, 1] from the host
-        wexp = nl.ndarray((PT, n_local), dtype=nl.float32, buffer=nl.sbuf)
+        wexp = sb_out if sb_out is not None else nl.ndarray((PT, n_local), dtype=nl.float32, buffer=nl.sbuf)
         for e in range(n_local):
             target = nl.add(lo, float(e))
             m = nl.ndarray((PT, topk), dtype=nl.float32, buffer=nl.sbuf)
@@ -2234,30 +2288,58 @@ def engram_readout(pid, mine, T, Tp, hc, dim, hash_ids, etable, erow_start, e_wk
         nisa.dma_copy(dst=emb[T:Tp, :], src=padz[0 : Tp - T, :])
     nisa.core_barrier(data=emb, cores=(0, 1))
     ncc.all_reduce(srcs=[emb], dsts=[emb_sum], replica_group=rg_table, op=nl.add)
+    if ENGRAM_GATE_SPLIT and Tp == PT and hc % 2 == 0:
+        # one row tile: each core gates half of the hc copies (a copy's gate reads only
+        # its own stream / key columns), each copy's instructions unchanged
+        h2 = hc // 2
+        gtiles, copies = [(0, T)], range(pid * h2, (pid + 1) * h2)
+    else:
+        gtiles, copies = mine, None
+    # the stream rows' norms (independent of the projection) while the table rows are summed
+    # and projected, off the gate's critical path
+    pre = [engram_gate_pre(r0, nr, strm, hc, dim, copies) if ENGRAM_GATE_PRE else None for r0, nr in gtiles]
     tiles = e_out // PT
     a = (tiles + 1) // 2
     lo, hi = (0, a * PT) if pid == 0 else (a * PT, e_out)
-    X.gemm_rows(emb_sum, Tp, e_in, e_wkv4, e_wkv_s, ekv, lo, hi)
+    X.gemm_rows(emb_sum, Tp, e_in, e_wkv4, e_wkv_s, ekv, lo, hi, nv=T)
     nisa.core_barrier(data=ekv, cores=(0, 1))
-    if ENGRAM_GATE_SPLIT and Tp == PT and T <= PT and hc % 2 == 0:
-        # one row tile: the hc groups (each its own gate) split between the cores
-        engram_gate_tile(0, T, strm, ekv, e_qk, stream0, hc, dim,
-                         groups=range(pid * (hc // 2), (pid + 1) * (hc // 2)))
-    else:
-        for r0, nr in mine:
-            engram_gate_tile(r0, nr, strm, ekv, e_qk, stream0, hc, dim)
+    for (r0, nr), hr in zip(gtiles, pre):
+        engram_gate_tile(r0, nr, strm, ekv, e_qk, stream0, hc, dim, copies=copies, hrs=hr)
     nisa.core_barrier(data=stream0, cores=(0, 1))
 
 
-#: Decode (one row tile): `engram_gate_tile`'s hc groups split between the two cores
-#: (each group's gate and output depend on its own columns only; the same instructions).
+#: `engram_readout`'s gate split across the cores by hc copy when T <= 128 (else core 0
+#: alone gates the single row tile while core 1 idles).
 ENGRAM_GATE_SPLIT = True
+#: `engram_gate_tile` loads the gate weight rows by partition-broadcast DMA and the stream
+#: chunks straight into the fp32 row (no DVE / GpSimd broadcast or copy instructions).
+ENGRAM_GATE_DMA = True
+#: The stream rows' rsqrt norms of the gate (`engram_gate_pre`) are computed before the
+#: projection (they read only the stream), the same instructions.
+ENGRAM_GATE_PRE = True
 
 
-def engram_gate_tile(r0, nr, h_hbm, kv_hbm, w_hbm, out_hbm, hc, dim, chunk=1024, groups=None):
+def engram_gate_pre(r0, nr, h_hbm, hc, dim, copies=None, chunk=1024):
+    """`engram_gate_tile`'s stream half for the copies: `{c: rsqrt(mean(h_c^2) + eps)}`."""
+    nchunks = dim // chunk
+    inv_dim = 1.0 / dim
+    out = {}
+    for c in (range(hc) if copies is None else copies):
+        hsq = None
+        for j in range(nchunks):
+            lo = c * dim + j * chunk
+            hj = nl.ndarray((PT, chunk), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=hj[0:nr, :], src=h_hbm[r0 : r0 + nr, lo : lo + chunk])
+            sh = nl.sum(nl.square(hj[0:nr, :]), axis=1, keepdims=True)
+            hsq = sh if hsq is None else nl.add(hsq, sh)
+        out[c] = rsqrt_newton(nl.add(nl.multiply(hsq, inv_dim), NORM_EPS))
+    return out
+
+
+def engram_gate_tile(r0, nr, h_hbm, kv_hbm, w_hbm, out_hbm, hc, dim, chunk=1024, copies=None, hrs=None):
     """`kernels.engram_gate.gated_add` for one row tile: `h_hbm[T, hc*dim]` bf16 stream,
-    `kv_hbm[T, (hc+1)*dim]` bf16 (key | value), `w_hbm[1, hc*dim]` fp32 -> `out_hbm`.
-    `groups`: only these of the hc column groups (default all)."""
+    `kv_hbm[T, (hc+1)*dim]` bf16 (key | value), `w_hbm[1, hc*dim]` fp32 -> `out_hbm`
+    (the hc copies `copies`, default all)."""
     width = hc * dim
     nchunks = dim // chunk
     inv_dim = 1.0 / dim
@@ -2267,29 +2349,39 @@ def engram_gate_tile(r0, nr, h_hbm, kv_hbm, w_hbm, out_hbm, hc, dim, chunk=1024,
         v = nl.ndarray((PT, chunk), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(dst=v[0:nr, :], src=kv_hbm[r0 : r0 + nr, width + j * chunk : width + (j + 1) * chunk])
         vf.append(v)
-    for c in (range(hc) if groups is None else groups):
+    for c in (range(hc) if copies is None else copies):
         base = c * dim
         hf = nl.ndarray((PT, dim), dtype=nl.float32, buffer=nl.sbuf)
         hsq = ksq = dotp = None
         for j in range(nchunks):
             lo = base + j * chunk
-            hj = nl.ndarray((PT, chunk), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=hj[0:nr, :], src=h_hbm[r0 : r0 + nr, lo : lo + chunk])
-            nisa.tensor_copy(dst=hf[0:nr, j * chunk : (j + 1) * chunk], src=hj[0:nr, :])
+            if ENGRAM_GATE_DMA:
+                # (the bf16 -> fp32 widening in the DMA, exact)
+                hjs = hf[0:nr, j * chunk : (j + 1) * chunk]
+                nisa.dma_copy(dst=hjs, src=h_hbm[r0 : r0 + nr, lo : lo + chunk])
+            else:
+                hj = nl.ndarray((PT, chunk), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=hj[0:nr, :], src=h_hbm[r0 : r0 + nr, lo : lo + chunk])
+                nisa.tensor_copy(dst=hf[0:nr, j * chunk : (j + 1) * chunk], src=hj[0:nr, :])
+                hjs = hj[0:nr, :]
             kj = nl.ndarray((PT, chunk), dtype=nl.float32, buffer=nl.sbuf)
             nisa.dma_copy(dst=kj[0:nr, :], src=kv_hbm[r0 : r0 + nr, lo : lo + chunk])
-            wj = bcast_row(w_hbm[0:1, lo : lo + chunk], chunk, nr)
-            prod = nl.multiply(nl.multiply(hj[0:nr, :], wj), kj[0:nr, :])
-            sh = nl.sum(nl.square(hj[0:nr, :]), axis=1, keepdims=True)
+            if ENGRAM_GATE_DMA:
+                wt = nl.ndarray((PT, chunk), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=wt[0:nr, :], src=w_hbm.ap(pattern=[[0, nr], [1, chunk]], offset=lo))
+                wj = wt[0:nr, :]
+            else:
+                wj = bcast_row(w_hbm[0:1, lo : lo + chunk], chunk, nr)
+            prod = nl.multiply(nl.multiply(hjs, wj), kj[0:nr, :])
+            if hrs is None:
+                sh = nl.sum(nl.square(hjs), axis=1, keepdims=True)
+                hsq = sh if hsq is None else nl.add(hsq, sh)
             sk = nl.sum(nl.square(kj[0:nr, :]), axis=1, keepdims=True)
             sd = nl.sum(prod, axis=1, keepdims=True)
-            hsq = sh if hsq is None else nl.add(hsq, sh)
             ksq = sk if ksq is None else nl.add(ksq, sk)
             dotp = sd if dotp is None else nl.add(dotp, sd)
-        rstd = nl.multiply(
-            rsqrt_newton(nl.add(nl.multiply(hsq, inv_dim), NORM_EPS)),
-            rsqrt_newton(nl.add(nl.multiply(ksq, inv_dim), NORM_EPS)),
-        )
+        rh = hrs[c] if hrs is not None else rsqrt_newton(nl.add(nl.multiply(hsq, inv_dim), NORM_EPS))
+        rstd = nl.multiply(rh, rsqrt_newton(nl.add(nl.multiply(ksq, inv_dim), NORM_EPS)))
         dot = nl.multiply(nl.multiply(dotp, rstd), dim_rsqrt)
         mag = nl.sqrt(nl.maximum(nl.abs(dot), 1e-6))
         sgn = nl.subtract(nl.multiply(nl.copy(nl.greater_equal(dot, 0.0), dtype=nl.float32), 2.0), 1.0)

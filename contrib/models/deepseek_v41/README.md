@@ -346,6 +346,44 @@ other near-tie words ("they want" -> "wants", "parse" -> "respond") and is other
 same, reproducibly, from the blocks 32-39 launch alone -- bit-exact on all its recorded
 cases, so a summation order at that request's state.
 
+**Device-side step inputs and async scheduling (2026-10-30, flat scheme).** The device no
+longer waits for the host between two decode steps. A step's inputs that depend on the
+previous step -- its rows' positions and cache slots, the window / compressed slot tables,
+the compressors' groups, the two engram layers' n-gram ids and the token column -- are made
+on the device by one small NKI launch before the blocks (`src/kernels/tp64/step_kernel.py`,
+bit-exact against the host definitions, `test/unit/test_step_kernel.py`), and the engine
+runs with vLLM's async scheduling: it schedules step N+1 while step N runs, the step's
+optimistic positions are corrected on the device from step N's rejection output, step N+1's
+tokens are step N's drafter output, and the host reads nothing back before submitting the
+next step. A step's tail is one graph, so a decode step is eight device executions.
+Measured on the live system trace of three ranks, the device idles 0.68-0.75 ms a decode
+step at in512 bs1 and at in1024 bs10 -- the gaps between back-to-back
+executions -- where it idled 4.4-5.1 ms plus a 1.5-8 ms wait at the first launch's entry
+barrier before (`src/README.md`, "A decode step's inputs are made on the device"). This
+needs the runner and scheduler changes in this branch's plugin (`RUNNER_CAPABILITIES` in
+`vllm_neuron/vllm/worker/neuron_model_runner.py`, `NeuronAsyncScheduler`'s holdbacks);
+without them the port serves synchronously, and `DEEPSEEK_V41_ASYNC=0` does too. The
+integration test passes with the verifier's texts unchanged. Measured 2026-10-30 on the
+same stack (`test/performance/bench_report.opt9.json` and `.opt9_ms10.json`), against the
+morning's reference (`bench_report.opt8*.json`):
+
+| Cell | TTFT p50 ms | TPOT p50 ms | decode tok/s | accept % |
+|------|-------------|-------------|--------------|----------|
+| in512_bs1 | 135 (137) | 9.1 (11.5) | 100.8 (81.6) | 50 |
+| in1024_bs1 | 231 (232) | 8.3 (10.4) | 98.3 (81.0) | 49 |
+| in2048_bs1 | 416 (420) | 9.0 (11.4) | 80.2 (67.0) | 42 |
+| in8192_bs1 | 1681 (1720) | 9.3 (11.9) | 44.6 (39.7) | 45 |
+| in512_bs10 | 720 (722) | 17.6 (22.8) | 391.1 (334.2) | 46 |
+| in1024_bs10 | 1242 (1247) | 21.7 (24.0) | 311.6 (284.0) | 52 |
+| in2048_bs10 | 2247 (2268) | 28.7 (31.2) | 206.4 (192.4) | 46 |
+| in8192_bs10 | 9187 (9480) | 74.0 (81.3) | 67.8 (63.5) | 44 |
+
+(In parentheses: the morning's reference.) Batch-1 TPOT is 21-22 % lower and its texts are
+the reference's word for word (32 of 32); batch-10 TPOT is 8-23 % lower and its throughput
+7-17 % higher; TTFT is the same or lower in every cell (a request's first decode waits for
+its prefill's token, and a lone request's step that may be its last is not followed by one
+scheduled ahead: either would put a step in front of the next prefill).
+
 > **Read this before you deploy.** Every number in this contribution was
 > measured on `vllm-neuron` **0.24.0.1.1.0**, which is the branch the model was
 > developed against. The code is contributed on top of `main`, and the port's

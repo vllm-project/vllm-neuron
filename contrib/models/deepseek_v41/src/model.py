@@ -41,7 +41,7 @@ import vllm_neuron.functional as NF
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
 
-from .config import DeepseekV41Config
+from .config import DeepseekV41Config, async_decode
 from . import mk_host, mk_model
 
 #: Run every block and the DSpark drafter as one NKI megakernel each
@@ -1264,6 +1264,9 @@ def _compress_read_len(compress_len: int, ratio: int = 1) -> int:
     if _COMPRESS_READ_CEILING:
         want = max(want, -(-_COMPRESS_READ_CEILING // max(ratio, 1)))
     return -(-want // _COMPRESS_TILE) * _COMPRESS_TILE
+
+#: `DEEPSEEK_V41_ASYNC_DEBUG=1`: log each async decode step's position correction (`_async_debug`).
+_ASYNC_DEBUG = os.environ.get("DEEPSEEK_V41_ASYNC_DEBUG", "") not in ("", "0")
 
 #: The finite lower bound the reference kernel starts its running max at. A row
 #: whose every slot is empty would give exp(-inf - -inf) = NaN with a true -inf;
@@ -2586,6 +2589,40 @@ def _rejection_sample(sampled, draft_token_ids, cu_num_draft_tokens, max_spec_le
     view.cu_num_draft_tokens = cu_num_draft_tokens
     view.max_spec_len = max_spec_len
     return rejection_sampler(view, sampled.reshape(-1))
+
+
+def _rejection_sample_ids(sampled, input_ids, cu_num_draft_tokens, max_spec_len, rows_per_seq: int):
+    """`_rejection_sample` with the drafts taken from the step's input ids: every span's
+    rows after its first (`[seed, drafts...]` per sequence), which is what an async step's
+    target verified."""
+    drafts = input_ids.reshape(-1, rows_per_seq)[:, 1:].reshape(-1)
+    return _rejection_sample(sampled, drafts, cu_num_draft_tokens, max_spec_len)
+
+
+def _decode_tail_graph(greedy, sel, taps, drafts, cu_num_draft_tokens, lengths, starts,
+                       max_spec_len: int, rows_per_seq: int, drafts_are_ids: bool, nspans: int):
+    """A fused decode step's tail as one graph: the target tokens (`sel`'s rows of the
+    greedy head's, when the runner selects), the rejection sampler over the drafts (the
+    step's own input rows after each span's first when `drafts_are_ids`), each sequence's
+    seed and tap (`_accepted_tail`, `_tap_rows`), the drafter's `[B, 3]` (seed, tap, start)
+    meta (`mk_model._draft_meta`) and the taps' concatenation (`_concat_last`)."""
+    sampled = greedy.reshape(-1)
+    if sel is not None:
+        sampled = torch.index_select(sampled, 0, sel)
+    if drafts_are_ids:
+        drafts = drafts.reshape(-1, rows_per_seq)[:, 1:].reshape(-1)
+    accepted = _rejection_sample(sampled, drafts, cu_num_draft_tokens, max_spec_len)
+    seeds, valid = _accepted_tail(accepted)
+    tap = _tap_rows(valid[:nspans], lengths, int(accepted.shape[1]))
+    meta = torch.stack([seeds[:nspans].to(torch.int32), tap.to(torch.int32),
+                        starts.reshape(-1).to(torch.int32)], dim=-1)
+    return accepted, meta, torch.cat(taps, dim=-1)
+
+
+def _drafts_only(ids):
+    """`[B, K]` contiguous: the drafts of a `[B, 1 + K]` `[seed, drafts...]` block (the
+    runner feeds them to the next step's rejection sampler under async scheduling)."""
+    return ids[:, 1:].contiguous()
 
 
 def _accepted_tail(accepted):
@@ -4079,6 +4116,15 @@ class DeepseekV41ForCausalLM(nn.Module):
     #: Neuron model runner (`NeuronModelRunner` passes it to models that set this) and
     #: samples temperature rows from the full vocabulary (`_random_sampler_entry`).
     accepts_sampling_hint = True
+    #: The runner hands this forward the host copies of the step's positions, slot
+    #: mapping and block table (`host_positions`, `host_slot_mapping` /
+    #: `host_block_table` in the attention metadata), so `_step_rows` plans the step
+    #: without reading anything back from the device.
+    wants_host_step_inputs = True
+    #: Under async scheduling (`deepseek_v41.ASYNC_ENV`) the runner passes a decode step the
+    #: previous step's rejection output (`prev_sampled_token_ids`) and optimistic positions;
+    #: `mk_model.StepPrologue` corrects them on the device.
+    _async_spec_decoded = async_decode()
 
     def __init__(self, config: DeepseekV41Config) -> None:
         super().__init__()
@@ -5007,9 +5053,13 @@ class DeepseekV41ForCausalLM(nn.Module):
                 "the routed experts and the engram tables are streamed, not "
                 "resident."
             )
+        if mk_model.PROF is not None:
+            mk_model.PROF.mark("m_enter")
         spans, bucket_meta, paged, live_lengths, slices, bucket_rows, live_rows = (
-            self._step_rows(input_ids, positions, attn_metadata)
+            self._step_rows(input_ids, positions, attn_metadata, kwargs.get("host_positions"))
         )
+        if mk_model.PROF is not None:
+            mk_model.PROF.mark("m_rows")
 
         plan = self.mk_plan
         if _DUMP_DIR:
@@ -5031,14 +5081,18 @@ class DeepseekV41ForCausalLM(nn.Module):
             # (`mk_model.run_recv`, below); or the first fused launch embeds.
             stream = pre_mix = None
 
-        # The step's tokens on the host, read back once: the n-gram hash and the fused
-        # embedding's id column are both host work on them.
+        # A fused decode step hashes its n-grams and makes its token column on the device
+        # (`mk_model.StepPrologue`), from the device's ids.
+        prologue = mk_model.step_prologue(self) if fuse_embed else None
+        # Otherwise the step's tokens on the host, read back once: the n-gram hash and the
+        # fused embedding's id column are both host work on them.
         ids_host = (mk_model.host_ids(input_ids)
-                    if _MEGAKERNEL and (self.ngram_hash is not None or fuse_embed) else None)
+                    if _MEGAKERNEL and prologue is None and (self.ngram_hash is not None or fuse_embed)
+                    else None)
         # The n-gram ids of the engram blocks this rank holds (the hash state is
         # only built on stages with one).
         hashes = (self._engram_hashes(input_ids, paged, ids_host)
-                  if self.ngram_hash is not None else None)
+                  if self.ngram_hash is not None and prologue is None else None)
 
         shared = [SharedAttentionState() for _ in paged]
         main_hiddens: list[torch.Tensor] = []
@@ -5060,6 +5114,8 @@ class DeepseekV41ForCausalLM(nn.Module):
                                       decode_rows=1 + int(self.config.dspark_block_size),
                                       stable=plan.scheme == "tp64")
             self._mk_step = step
+            if mk_model.PROF is not None:
+                mk_model.PROF.mark("m_mkstep")
             host_heap_trim("layers", self.world_size)
             dump = (lambda name, t: self._dump(name, t, live_rows)) if _DUMP_DIR else None
             if not plan.is_first:
@@ -5071,7 +5127,26 @@ class DeepseekV41ForCausalLM(nn.Module):
                     and sampling_params is not None and sampling_hint is not None
                     and bool(sampling_hint[0]) and spec_decode_metadata is not None
                     and plan.is_last and mk_model.fuses_head(self, step))
-            if fuse_embed:
+            # Async scheduling: the runner's positions assume every draft of the previous
+            # step was accepted; the prologue subtracts the rejected ones (from the previous
+            # step's rejection output) on the device, and the drafts this step verifies are
+            # its input rows (`_finish_spec_step`).
+            prev = kwargs.get("prev_sampled_token_ids") if self._async_spec_decoded else None
+            self._async_ids = input_ids if self._async_spec_decoded and kwargs.get(
+                "prev_sampled_token_ids") is not None else None
+            if self._async_spec_decoded and fuse_embed:
+                mk_model.steps_ahead_wait()
+            if prev is not None and prologue is None:
+                raise NotImplementedError(
+                    "an async-scheduled decode step needs the device step prologue "
+                    "(DEEPSEEK_V41_STEP_PROLOGUE=1 and a fused decode step)")
+            if prologue is not None:
+                prologue.run(step, input_ids, prev)
+                if mk_model.PROF is not None:
+                    mk_model.PROF.mark("m_prologue")
+                if _ASYNC_DEBUG and self.rank == 0:
+                    self._async_debug(step, input_ids, prev, kwargs)
+            elif fuse_embed:
                 step.embed_ids = mk_model.embed_ids(input_ids, ids_host)
             stream, pre_mix = mk_model.run_blocks(self, stream, pre_mix, step, dump=dump, head=head,
                                                   embed=fuse_embed)
@@ -5141,6 +5216,15 @@ class DeepseekV41ForCausalLM(nn.Module):
         _MOE_LIVE_ROWS[0] = None
 
         greedy_ids = getattr(self._mk_step, "greedy_ids", None) if _MEGAKERNEL else None
+        if greedy_ids is not None and main_hiddens and mk_model.fuses_tail(self, self._mk_step):
+            # The step's tail in one graph (`_decode_tail`): verify, the drafts' seeds and
+            # taps, the drafter's meta, the taps' concatenation.
+            accepted, meta, main_hidden = self._decode_tail(
+                greedy_ids, sampling_positions, main_hiddens, spec_decode_metadata, live_lengths)
+            if mk_model.PROF is not None:
+                mk_model.PROF.mark("sampled", accepted)
+            self.last_draft = mk_model.run_draft(self, None, None, main_hidden, spans, paged, meta=meta)
+            return accepted
         if greedy_ids is not None:
             sampled = greedy_ids.reshape(-1)
             if sampling_positions is not None:
@@ -5205,12 +5289,7 @@ class DeepseekV41ForCausalLM(nn.Module):
             self._trace_sampler(logits_shard, logits, sampled, rank, sampling_params)
         accepted = None
         if spec_decode_metadata is not None:
-            accepted = _compiled(_rejection_sample)(
-                sampled,
-                spec_decode_metadata.draft_token_ids,
-                spec_decode_metadata.cu_num_draft_tokens,
-                max(spec_decode_metadata.num_draft_tokens),
-            )
+            accepted = self._verify_drafts(sampled, spec_decode_metadata)
 
         if mk_model.PROF is not None:
             mk_model.PROF.mark("sampled", sampled if accepted is None else accepted)
@@ -5223,21 +5302,73 @@ class DeepseekV41ForCausalLM(nn.Module):
         return sampled, logits
 
 
-    def _finish_spec_step(self, sampled, spec_decode_metadata, spans, paged, shared, main_hidden,
-                          gathered, live_lengths):
-        """A speculative step's end from its target tokens: verify the drafts, draft the
-        next block, return the accepted tokens (`forward`'s own tail, after sampling)."""
-        accepted = _compiled(_rejection_sample)(
+    def _verify_drafts(self, sampled, spec_decode_metadata):
+        """The rejection sampler's `[B, 1 + k]` accepted tokens of this step's drafts. An
+        async-scheduled step verifies its own input rows (`[seed, drafts...]` per sequence):
+        the runner's `draft_token_ids` may still be placeholders there."""
+        ids = getattr(self, "_async_ids", None)
+        if ids is not None:
+            return _compiled(_rejection_sample_ids)(
+                sampled, ids, spec_decode_metadata.cu_num_draft_tokens,
+                max(spec_decode_metadata.num_draft_tokens), 1 + int(self.config.dspark_block_size),
+            )
+        return _compiled(_rejection_sample)(
             sampled,
             spec_decode_metadata.draft_token_ids,
             spec_decode_metadata.cu_num_draft_tokens,
             max(spec_decode_metadata.num_draft_tokens),
         )
+
+    @torch._dynamo.disable
+    def _decode_tail(self, greedy_ids, sampling_positions, taps, spec_decode_metadata, live_lengths):
+        """`(accepted, drafter meta [B, 3], main_hidden)` of a fused decode step whose
+        prologue ran, as one compiled graph (`_decode_tail_graph`) -- what `_verify_drafts`,
+        `_draft`'s seeds and taps, `mk_model.run_draft`'s meta and `_concat_last` were as
+        five small executions, each with the device idle around it."""
+        step = self._mk_step
+        B = len(step.spans)
+        key = ("tail_lengths", tuple(live_lengths[:B]))
+        lengths = self._mk_consts.get(key) if hasattr(self, "_mk_consts") else None
+        if lengths is None:
+            self.__dict__.setdefault("_mk_consts", {})
+            lengths = self._mk_consts[key] = torch.tensor(
+                live_lengths[:B], dtype=torch.int64, device=greedy_ids.device)
+        ids = getattr(self, "_async_ids", None)
+        drafts = ids if ids is not None else spec_decode_metadata.draft_token_ids
+        return _compiled(_decode_tail_graph)(
+            greedy_ids, sampling_positions, tuple(taps), drafts, spec_decode_metadata.cu_num_draft_tokens,
+            lengths, step.dev_starts, max(spec_decode_metadata.num_draft_tokens),
+            1 + int(self.config.dspark_block_size), ids is not None, B,
+        )
+
+    @torch._dynamo.disable
+    def _async_debug(self, step, input_ids, prev, kwargs) -> None:
+        """`DEEPSEEK_V41_ASYNC_DEBUG=1` (rank 0): log a decode step's optimistic starts,
+        the previous step's rejection rows, the corrected starts and the input ids (device
+        read-backs: a debugging aid only)."""
+        # (the prologue writes its buffers in place: a read-back of one is ordered after the
+        # launch only through the launch's own output)
+        mk_model.step_prologue(self).last_done.cpu()
+        done = step.dev_starts.cpu()
+        logger.warning(
+            "async debug: opt starts %s | prev %s | corrected %s | ids %s | host pos %s",
+            [s for _, _, s in step.spans], None if prev is None else prev.cpu().tolist(),
+            done.reshape(-1).tolist(), input_ids.cpu().reshape(-1).tolist()[:12],
+            None if kwargs.get("host_positions") is None else kwargs["host_positions"].reshape(-1).tolist()[:12])
+
+    def _finish_spec_step(self, sampled, spec_decode_metadata, spans, paged, shared, main_hidden,
+                          gathered, live_lengths):
+        """A speculative step's end from its target tokens: verify the drafts, draft the
+        next block, return the accepted tokens (`forward`'s own tail, after sampling)."""
+        accepted = self._verify_drafts(sampled, spec_decode_metadata)
         if mk_model.PROF is not None:
             mk_model.PROF.mark("sampled", accepted)
         self.last_draft = self._draft(
             sampled, accepted, spans, paged, shared, main_hidden, gathered, live_lengths,
         )
+        if _ASYNC_DEBUG and self.rank == 0:
+            logger.warning("async debug: accepted %s | drafts %s", accepted.cpu().tolist(),
+                           [d[0].cpu().reshape(-1).tolist() for d in self.last_draft][:2])
         return accepted
 
     @torch._dynamo.disable
@@ -5330,10 +5461,15 @@ class DeepseekV41ForCausalLM(nn.Module):
         # that passes today. Via the host rather than `clamp_min(0)` on the
         # device, for the reason `_bucket_rows` spells the same way: this runs
         # outside every compiled region, and the payload is a few kB.
-        host_table = block_table.cpu().clamp_min(0)
+        host_table = meta.get("host_block_table")
+        if host_table is None or tuple(host_table.shape) != tuple(block_table.shape):
+            host_table = block_table.cpu()
+        host_table = host_table.clamp_min(0)
         block_table = host_table.to(block_table.device)
         slot_mapping = meta["slot_mapping"]
-        host_slots = slot_mapping.cpu()
+        host_slots = meta.get("host_slot_mapping")
+        if host_slots is None:
+            host_slots = slot_mapping.cpu()
         device = slot_mapping.device
         starts = torch.tensor(
             [start_pos for _, _, start_pos in spans], dtype=torch.int64
@@ -5407,16 +5543,24 @@ class DeepseekV41ForCausalLM(nn.Module):
         if begin != 0 or length >= total_rows:
             return spans, meta
         flat = meta["slot_mapping"].reshape(-1)
-        slots = flat[:length].tolist()
+        hflat = meta.get("host_slot_mapping")
+        slots = (flat if hflat is None else hflat.reshape(-1))[:length].tolist()
         slots.extend([0] * (total_rows - length))
         bucket = dict(meta)
-        bucket["slot_mapping"] = torch.tensor(slots, dtype=flat.dtype).to(flat.device)
+        host_slots = torch.tensor(slots, dtype=flat.dtype)
+        bucket["slot_mapping"] = host_slots.to(flat.device)
+        if hflat is not None:
+            bucket["host_slot_mapping"] = host_slots
+        htable = meta.get("host_block_table")
         for key in ("full_block_table_tensor", "block_table_tensor"):
             table = meta.get(key)
             if table is None:
                 continue
-            host = table.cpu().clamp_min(0)
+            same = htable is not None and tuple(htable.shape) == tuple(table.shape)
+            host = (htable if same else table.cpu()).clamp_min(0)
             bucket[key] = host.to(table.device)
+        if htable is not None:
+            bucket["host_block_table"] = htable.clamp_min(0)
         return [(0, total_rows, start_pos)], bucket
 
     @torch._dynamo.disable
@@ -5698,7 +5842,8 @@ class DeepseekV41ForCausalLM(nn.Module):
 
     @torch._dynamo.disable
     @torch._dynamo.disable
-    def _step_rows(self, input_ids: torch.Tensor, positions: torch.Tensor, attn_metadata):
+    def _step_rows(self, input_ids: torch.Tensor, positions: torch.Tensor, attn_metadata,
+                   host_positions: torch.Tensor | None = None):
         """The step's rows by sequence: `(spans, bucket_meta, paged, live_lengths, slices,
         bucket_rows, live_rows)` -- the spans of the runner's `num_seqs` bucket
         (`_bucket_rows`), their pages, each span's live length, the bucket's and the live
@@ -5714,8 +5859,10 @@ class DeepseekV41ForCausalLM(nn.Module):
         span's)."""
         meta = self._attn_meta(attn_metadata)
         rows_per_seq = self._decode_rows_per_seq(meta, int(input_ids.shape[0]))
+        # (the runner's host copies when it passed them: no read-back)
         live_spans = self._sequence_spans(
-            positions, meta["slot_mapping"], rows_per_seq
+            positions if host_positions is None else host_positions,
+            meta.get("host_slot_mapping", meta["slot_mapping"]), rows_per_seq
         )
         live_rows = sum(length for _, length, _ in live_spans)
         spans, bucket_meta = self._bucket_rows(
@@ -5736,6 +5883,8 @@ class DeepseekV41ForCausalLM(nn.Module):
         slices = [(begin, length) for begin, length, _ in spans]
         bucket_rows = sum(length for _, length, _ in spans)
         _MOE_LIVE_ROWS[0] = live_rows if live_rows != bucket_rows else None
+        # (for `mk_model.make_step`, out of the traced frame for the same reason)
+        mk_model.LIVE_SPANS[0] = len(live_spans)
         return spans, bucket_meta, paged, live_lengths, slices, bucket_rows, live_rows
 
     def _engram_hashes(
@@ -5757,6 +5906,10 @@ class DeepseekV41ForCausalLM(nn.Module):
         if ids_host is None:
             ids_host = mk_model.host_ids(input_ids)
         hashes = self.ngram_hash.hash_spans(ids_host, paged)
+        # The device's history follows the host's: a fused decode step reads it there.
+        prologue = mk_model.step_prologue(self) if _MEGAKERNEL else None
+        if prologue is not None:
+            prologue.put(ids_host, paged)
         return hashes if _MEGAKERNEL else hashes.to(input_ids.device)
 
     @torch._dynamo.disable

@@ -238,3 +238,32 @@ class DeepseekV41Config:
             filtered["neuron_config"] = neuron_config
 
         return cls(**filtered)
+
+
+#: `DEEPSEEK_V41_ASYNC` (default 1): serve with vLLM's async scheduling
+#: (`require_dspark_speculation`); 0: synchronous, the host waits for each step's drafts.
+ASYNC_ENV = "DEEPSEEK_V41_ASYNC"
+
+
+def async_decode() -> bool:
+    """Whether the engine runs with async scheduling (`ASYNC_ENV`, and a plugin runner that
+    replays a device-drafting proposer's drafts across batch-composition changes: without
+    that a step would verify the scheduler's -1 placeholders)."""
+    return os.environ.get(ASYNC_ENV, "1") not in ("", "0") and _runner_has("device_draft_futures")
+
+
+def _runner_has(capability: str) -> bool:
+    """Whether the plugin's `neuron_model_runner` declares `capability`
+    (`RUNNER_CAPABILITIES`), read from its source: the config hooks run before the
+    runner may be imported in this process."""
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("vllm_neuron.vllm.worker.neuron_model_runner")
+        with open(spec.origin, encoding="utf-8") as fh:
+            src = fh.read()
+    except (ImportError, AttributeError, OSError, TypeError):
+        return False
+    marker = "RUNNER_CAPABILITIES = ("
+    at = src.find(marker)
+    return at >= 0 and f'"{capability}"' in src[at : src.find(")", at)]

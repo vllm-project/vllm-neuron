@@ -228,6 +228,12 @@ def _remap_null_block_to_sentinel(block_table: torch.Tensor) -> torch.Tensor:
 # at 4, so 8 leaves two windows of margin.
 _BLOCK_TABLE_STAGE_DEPTH = 8
 
+#: Capabilities a model package can test for (by name, before importing this module):
+#: a model-registered proposer whose drafts are a device future (``device_draft_futures``)
+#: gets the async-spec transition cache, and a model with ``wants_host_step_inputs`` gets
+#: the step's host positions / slot mapping / block table.
+RUNNER_CAPABILITIES = ("device_draft_futures", "host_step_inputs")
+
 # threading.Lock is a factory and not a class, so capture the instance type one time for the
 # seam check in _batch_mutation_lock. A test stand-in holds a Mock there, and a Mock satisfies
 # `is not None` while failing the context-manager protocol.
@@ -2524,6 +2530,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             and prev_future.shape[0] > 0
         )
 
+        if use_real_prev and getattr(self, "_async_prev_consumed", False):
+            # An empty step ran since the previous one (the scheduler held this one back
+            # until that output was in): the positions already account for it.
+            use_real_prev = False
         if use_real_prev:
             prev_sampled = self._remap_prev_sampled_by_req_id(
                 prev_future, num_reqs_padded
@@ -5772,6 +5782,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 attn_metadata_i["raw_block_table_tensor"] = raw_blk_table_tensor
             if swa_kv_pos_offset is not None:
                 attn_metadata_i["swa_kv_pos_offset"] = swa_kv_pos_offset
+            if self._model_wants_host_inputs():
+                # The host copies the device tensors were uploaded from (the raw table:
+                # null blocks 0, not the -1 sentinel), so a model planning its step on
+                # the host reads nothing back from the device.
+                attn_metadata_i["host_slot_mapping"] = slot_mapping_cpu[
+                    :total_num_scheduled_tokens
+                ].clone()
+                attn_metadata_i["host_block_table"] = blk_table.get_cpu_tensor()[
+                    :padded_num_reqs
+                ].clone()
 
             for layer_name in kv_cache_group_spec.layer_names:
                 attn_metadata[layer_name] = attn_metadata_i
@@ -7338,6 +7358,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         logger.debug("Total scheduled tokens: %s", total_scheduled_tokens)
 
         if total_scheduled_tokens == 0:
+            if self.use_async_scheduling:
+                # The engine waits for the step in flight before it schedules again, so
+                # the next step's positions are exact: nothing for the on-device
+                # correction to subtract (``_get_prev_spec_tensors_for_on_device_correction``).
+                self._async_prev_consumed = True
             if not has_kv_transfer_group():
                 # Return empty ModelRunnerOutput if there's no work to do.
                 logger.debug("No scheduled tokens, returning empty output")
@@ -7615,6 +7640,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # engine calls `sample_tokens` only when this returns None.
             return self.sample_tokens(None)
         return None
+
+    def _model_wants_host_inputs(self) -> bool:
+        """Whether the model takes the step's host positions / slot mapping / block
+        table (``wants_host_step_inputs``) alongside the device copies."""
+        model = getattr(self, "model", None)
+        return bool(
+            getattr(model, "wants_host_step_inputs", False)
+            or getattr(getattr(model, "_orig_mod", None), "wants_host_step_inputs", False)
+        )
 
     def _one_rpc_step(self) -> bool:
         """`VLLM_NEURON_ONE_RPC_STEP=1` (synchronous scheduling, no pipeline): a step is
@@ -8642,7 +8676,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         cross-step device future, so the transition cache must replay those
         futures across batch-composition changes.
         """
-        return self.use_async_scheduling and self.is_spec_decode
+        # (also a model-registered proposer whose drafts are such a future,
+        # ``device_draft_futures``)
+        return self.use_async_scheduling and (
+            self.is_spec_decode or bool(getattr(self.drafter, "device_draft_futures", False))
+        )
 
     def _cache_async_spec_transition_drafts(
         self,
@@ -9029,6 +9067,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 positions,
             )
 
+        # A model that plans its step on the host takes the host positions too
+        # (`_model_wants_host_inputs`).
+        host_positions = (
+            positions
+            if self._model_wants_host_inputs() and positions.device.type == "cpu"
+            else None
+        )
         # Move inputs to Neuron device
         input_ids = input_ids.to(self.device)
         positions = positions.to(self.device)
@@ -9099,6 +9144,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if isinstance(self._async_reorder_kwargs, dict):
             model_kwargs.update(self._async_reorder_kwargs)
         model_kwargs["logit_mask"] = logit_mask
+        if host_positions is not None:
+            model_kwargs["host_positions"] = host_positions
         # Models that sample on their own full-vocabulary path (`accepts_sampling_hint`)
         # get the batch's sampling kind as host booleans -- (all_greedy, no_top_k,
         # no_top_p) -- so an all-greedy step needs no device read to pick its graph.
@@ -9134,6 +9181,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 num_reqs_padded=num_reqs_padded,
             )
             model_kwargs.update(async_spec_kwargs)
+            self._async_prev_consumed = False
 
         # Multimodal kwargs (encoder_embedding_buffer + encoder_block_ids + encoder_positions)
         if mm_kwargs:

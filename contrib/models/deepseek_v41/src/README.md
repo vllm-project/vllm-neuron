@@ -264,6 +264,67 @@ the step is built from as few launches as keep the device fed:
   pipeline parallelism (`neuron_pp_drafts`; `pp_draft_patch` skips
   `take_draft_token_ids`).
 
+**A decode step's inputs are made on the device, and the engine schedules ahead (flat
+scheme).** With the launches fed, the device's idle time between two decode steps was
+the host's: read the drafts back, return the output, the engine's scheduling and RPC, the
+runner's metadata, the step's index columns and n-gram hash, the first launch's
+submission -- 4.4-5.1 ms a step at in512 bs1 on the live system trace, plus 1.5-8 ms the
+first fused launch waited at its entry barrier for the slowest of the 64 hosts. Two
+changes remove it:
+
+* `kernels/tp64/step_kernel.step_prologue` (`mk_model.StepPrologue`,
+  `DEEPSEEK_V41_STEP_PROLOGUE`, default on): one small launch before the blocks writes,
+  in place into the step's persistent buffers, every input of the fused launches that
+  depends on the step -- the three `(ratio, window)` sets of `mk_host.AttnIndices`
+  columns (row positions, write / window / compressed slots, the compressors' groups),
+  both engram layers' n-gram row ids and the embedding's token column -- from one
+  upload of the spans' starts and block tables and the device's own token ids. The
+  n-gram hash is the reference's 64-bit arithmetic in exact int32 GpSimd ops (products
+  from a per-token table, XOR on the 32-bit words, Horner's rule over 7-bit chunks for
+  the prime moduli, the quotient from an fp32 estimate corrected by one); the per-slot
+  token history it reads is on the device (a prefill chunk, hashed on the host, puts its
+  tokens there, `history_put`). `test/unit/test_step_kernel.py` checks every column
+  and both layers' ids against `mk_host.build_attn_indices` and
+  `NgramHashState.hash_spans` on random steps, bit for bit.
+* Async scheduling (`DEEPSEEK_V41_ASYNC`, default on; `config.async_decode`): vLLM
+  schedules step N+1 while step N runs, with positions that assume every draft of step N
+  was accepted. The runner passes the step its previous step's rejection output
+  (`prev_sampled_token_ids`, `_async_spec_decoded`); the prologue subtracts each
+  sequence's rejected drafts from its start on the device. Step N+1's tokens are step
+  N's drafter output (`[seed, drafts...]` a sequence, which `DSparkProposer.propose`
+  returns as a device future), the drafts it verifies are those input rows
+  (`_verify_drafts`), the drafter reads the prologue's positions and slots, and nothing
+  of a step is read back by the host before the next is submitted. Host-written buffers
+  a queued launch still reads are ringed (the prologue's meta) or kept referenced
+  (`keep_alive`), and before a step's launches the host waits for the step two back
+  (`steps_ahead_wait`, `DEEPSEEK_V41_STEPS_AHEAD`), so the runtime's execution queue
+  (`NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS`, at most 63) cannot overflow.
+  The runner side is two changes in this branch's plugin (`RUNNER_CAPABILITIES` in
+  `neuron_model_runner.py`): the step's host positions, slot mapping and block table for
+  a model that plans on the host (`wants_host_step_inputs`, so `_step_rows` reads
+  nothing back), and the draft replay across batch-composition changes for a
+  model-registered proposer whose drafts are a device future (`device_draft_futures`:
+  without it the step after a prefill would verify the scheduler's -1 placeholders).
+  Without the second the port keeps synchronous scheduling.
+* The step's tail is one graph (`model._decode_tail_graph`, `DEEPSEEK_V41_FUSE_TAIL`, default
+  on): the rejection sampler, the drafts' seeds and taps, the drafter's meta and the taps'
+  concatenation, which were five executions of ~20 us with ~40-100 us of device idle
+  around each; and the drafts-only block the runner wants back is a constant (an async step
+  never reads it). A decode step is eight executions: the prologue, the five fused launches,
+  the tail, the drafter.
+* `VLLM_NEURON_ASYNC_MAX_TOKENS_HOLDBACK` (set by `require_dspark_speculation` under async
+  scheduling): the plugin's `NeuronAsyncScheduler` does not schedule a lone request's next
+  step while its step in flight may already reach `max_tokens` -- vLLM schedules it unless
+  that is certain, and when the request does finish the step runs for nothing while the next
+  request's prefill waits behind it (+17-22 ms of TTFT for half the requests of a batch-1
+  bench). The runner then knows the next step's positions are exact (an empty step ran in
+  between) and passes no correction.
+
+Measured on the live system trace (three ranks, `nc_exec_running`): the device idles
+0.68-0.75 ms a decode step at in512 bs1 and at in1024 bs10 -- the gaps between its eight
+back-to-back executions -- where the synchronous engine idled 4.4-5.1 ms plus the entry
+barrier's wait. `DEEPSEEK_V41_ASYNC=0` serves synchronously (one RPC a step, as before).
+
 `DEEPSEEK_V41_HOST_PROF=1` logs each forward's host time by part and the runner's RPCs
 with the waits between them (`DEEPSEEK_V41_HOST_PROF_SYNC=1` waits for the device at
 every mark, so a part is its host and device time; `DEEPSEEK_V41_CPROFILE=<start>:<count>`
@@ -333,8 +394,9 @@ hang: `DEEPSEEK_V41_MK_TRACE=1` logs every kernel launch on each stage's first
 rank, `DEEPSEEK_V41_MK_IN_FLIGHT=0` syncs after each launch (default: 12
 outstanding launches per process, counted across forwards and including the drafter's per-sequence graphs -- under pipeline
 parallelism a stage's host launches batch after batch without waiting on the
-device, and the runtime's queue holds 32 executions: eight prefills in flight on
-the first stage overflowed it, "Execution Queue Full", 2026-10-24),
+device, and the runtime's queue held 32 executions: eight prefills in flight on
+the first stage overflowed it, "Execution Queue Full", 2026-10-24; the port now asks for
+128, which the runtime caps at 63, for async scheduling's steps in flight),
 `NEURON_RT_EXEC_TIMEOUT=120` turns a device wait into an error, and
 `TORCH_LOGS=recompiles` names the frame and the failed guard.
 

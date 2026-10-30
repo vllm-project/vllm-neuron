@@ -18,6 +18,7 @@ the replica groups are passed as constants (consecutive ranks).
 
 from __future__ import annotations
 
+import collections
 import functools
 import glob
 import hashlib
@@ -27,6 +28,7 @@ import statistics
 import time
 from dataclasses import dataclass, field
 
+import numpy as np
 import torch
 
 from . import mk_host
@@ -56,6 +58,9 @@ class HostProf:
         t = time.perf_counter()
         gap = (t - self.last_end) * 1e3 if self.last_end is not None else float("nan")
         self.cur = {"t0": t, "gap": gap, "args": 0.0, "entry": 0.0, "post": 0.0, "launches": 0}
+        # the runner's work in this step's execute_model before the forward (`RpcProf`)
+        if _EXEC_T0[0] is not None:
+            self.cur["runner"] = (t - _EXEC_T0[0]) * 1e3
 
     def add(self, key: str, seconds: float) -> None:
         if self.cur is not None:
@@ -71,6 +76,9 @@ class HostProf:
     def end(self, step, rank: int) -> None:
         if self.cur is None:
             return
+        if _EXEC_COUNT is not None:
+            self.cur["m_execs"] = float(_EXEC_COUNT[0] - getattr(self, "_execs0", 0))
+            self._execs0 = _EXEC_COUNT[0]
         t = time.perf_counter()
         c, self.cur, self.last_end = self.cur, None, t
         c["total"] = (t - c["t0"]) * 1e3
@@ -98,18 +106,29 @@ class HostProf:
                 return statistics.median(v) if v else float("nan")
 
             _mk_log.warning(
-                "host prof %s x%d (T=%s): gap %.2f | forward %.2f = pre %.2f + blocks %.2f (args %.2f, "
-                "entry %.2f (first launch %.2f), post %.2f over %d launches) + tail %.2f (head %.2f, "
+                "host prof %s x%d (T=%s): crit %.2f | runner %.2f | gap %.2f | forward %.2f = pre %.2f + blocks %.2f "
+                "(args %.2f, entry %.2f (first launch %.2f), post %.2f over %d launches) + tail %.2f (head %.2f, "
                 "sampling %.2f, draft %.2f) ms (medians)",
-                phase, len(rs), sorted({r["T"] for r in rs}), med("gap"), med("total"), med("pre"),
+                phase, len(rs), sorted({r["T"] for r in rs}), med("crit"), med("runner"), med("gap"), med("total"),
+                med("pre"),
                 med("blocks"), med("args"), med("entry"), med("entry_first"), med("post"),
                 int(med("launches")), med("tail"), med("t_head"), med("t_sample"), med("t_draft"))
+            marks = sorted({k for r in rs for k in r if k.startswith("m_")}, key=lambda k: med(k))
+            if marks:
+                _mk_log.warning("host prof %s marks (ms since the forward began): %s", phase,
+                                ", ".join(f"{k[2:]} {med(k):.2f}" for k in marks))
             if any("t_collapse" in r for r in rs):    # (the separate tail ran)
                 _mk_log.warning("host prof %s head = collapse %.2f + head matmul %.2f + logits gather %.2f ms%s",
                                 phase, med("t_collapse"), med("t_lshard"), med("t_gather"),
                                 " (marks synced to the device)" if _HOST_PROF_SYNC else "")
 
 
+#: when the runner's current `execute_model` call started (`RpcProf`), for `HostProf`'s "runner"
+_EXEC_T0: list = [None]
+#: when the previous step's drafts reached the host (`DSparkProposer.propose`'s read-back):
+#: from there to this step's first fused launch is the host's part of the device's idle
+#: time between steps ("crit" in `HostProf`'s summary)
+_DRAFT_T: list = [None]
 PROF = HostProf(int(os.environ.get("DEEPSEEK_V41_HOST_PROF_EVERY", "32"))) if _HOST_PROF else None
 
 
@@ -134,6 +153,8 @@ class RpcProf:
                 if _name == "execute_model" and _CPROFILE and self.rank == 0:
                     self.cprofile_tick()
                 t0 = time.perf_counter()
+                if _name == "execute_model":
+                    _EXEC_T0[0] = t0
                 if _name == "execute_model" and self.cur:
                     # a new step: close the previous one
                     self.flush(self.cur)
@@ -224,6 +245,40 @@ _IN_FLIGHT = int(os.environ.get("DEEPSEEK_V41_MK_IN_FLIGHT", "12"))
 #: on 2026-10-24; the window went to 8 for a while and cost the flat scheme ~2 ms
 #: a token).
 _pending: list = []
+
+
+#: `DEEPSEEK_V41_STEPS_AHEAD` (default 1): under async scheduling the host submits a step
+#: while the previous ones may still be queued on the device; before a decode step's first
+#: launch the host waits until at most this many earlier steps are outstanding (each step
+#: leaves the small tensor its last launch makes, `step_mark`), so the runtime's execution
+#: queue (`NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS`, at most 63) cannot overflow however
+#: far ahead the engine schedules. With the host one step ahead the oldest is long done.
+_STEPS_AHEAD = int(os.environ.get("DEEPSEEK_V41_STEPS_AHEAD", "1"))
+_STEP_MARKS: list = []
+#: The fresh host-made tensors a queued launch reads (an upload's device copy): kept
+#: referenced for a few steps, so the allocator cannot hand their memory to a new tensor
+#: (and an upload overwrite it) while the launch is still queued under async scheduling.
+_KEEPALIVE = collections.deque(maxlen=256)
+
+
+def keep_alive(*tensors) -> None:
+    _KEEPALIVE.extend(t for t in tensors if isinstance(t, torch.Tensor))
+
+
+def step_mark(small: torch.Tensor) -> None:
+    """Record a step's completion marker (a fresh tensor its last launch writes)."""
+    _STEP_MARKS.append(small)
+
+
+@torch._dynamo.disable
+def steps_ahead_wait() -> None:
+    """Wait (reading back the oldest markers) until at most `_STEPS_AHEAD` steps are
+    outstanding."""
+    t0 = time.perf_counter() if PROF is not None else 0.0
+    while len(_STEP_MARKS) > _STEPS_AHEAD:
+        _STEP_MARKS.pop(0).cpu()
+    if PROF is not None:
+        PROF.add("m_ahead_wait", time.perf_counter() - t0)
 
 
 def _track(small: torch.Tensor) -> None:
@@ -528,7 +583,7 @@ def kernel_version(kind: str = "block", scheme: str = "tp64") -> int:
     h = hashlib.sha256()
     kdir = os.path.join(_HERE, "kernels", scheme)
     own = {"block": ("layer_kernel.py",), "draft": ("draft_kernel.py",), "pp": ("pp_kernels.py",),
-           "head": ("head_kernel.py",)}
+           "head": ("head_kernel.py",), "step": ("step_kernel.py",)}
     if kind not in own and kind not in mk_kernels.OPTIMIZED_KINDS:
         raise ValueError(f"kernel_version: unknown kind {kind!r}")
     if not os.path.isdir(kdir):
@@ -624,6 +679,21 @@ def _calibrate(kernel, params):
     return out, _DirectLaunch(NB._executor_for(art), pmap, outs)
 
 
+#: `DEEPSEEK_V41_EXEC_COUNT=1`: count the NEFF executions this process submits (the
+#: compiled entries' `_lite_execute` and the direct launches); `HostProf` logs them per step.
+_EXEC_COUNT = [0] if os.environ.get("DEEPSEEK_V41_EXEC_COUNT", "") not in ("", "0") else None
+if _EXEC_COUNT is not None:
+    from libtorch_neuronx_lite.compile import native_backend as _NB
+
+    _orig_lite_execute = _NB._lite_execute
+
+    def _counted_lite_execute(artifact, inputs):
+        _EXEC_COUNT[0] += 1
+        return _orig_lite_execute(artifact, inputs)
+
+    _NB._lite_execute = _counted_lite_execute
+
+
 def _launch(kernel, launches: dict, slots, params):
     """`entry(kernel)(*params)`, or the same launch straight on its executor (`_DIRECT`):
     `launches` holds the plan's `_DirectLaunch`es (None: stays on the entry) by the shapes
@@ -637,6 +707,8 @@ def _launch(kernel, launches: dict, slots, params):
     if d is None:
         return entry(kernel)(*params), False
     d.ex.execute([params[j] for j in d.pmap], d.outs)
+    if _EXEC_COUNT is not None:
+        _EXEC_COUNT[0] += 1
     return d.outs, True
 
 
@@ -901,8 +973,15 @@ class StepIndices:
     greedy_ids: torch.Tensor | None = None
     #: `[T, 1]` int32: the step's input tokens, when its first fused launch embeds them
     embed_ids: torch.Tensor | None = None
+    #: how many of `spans` are the scheduler's (the rest a bucket's padding, `_bucket_spans`);
+    #: -1: all of them
+    live_spans: int = -1
+    #: `[B, 1]` int32 on the device: the spans' start positions, when `StepPrologue` ran
+    dev_starts: torch.Tensor | None = None
 
     def __post_init__(self):
+        if self.live_spans < 0:
+            self.live_spans = len(self.spans)
         self.T = sum(length for _, length, _ in self.spans)
         self.block_size = int(self.paged[0].block_size)
         self.tables = [_host_table(p).to(torch.int64) for p in self.paged]
@@ -928,7 +1007,7 @@ class StepIndices:
         key = (ratio, window)
         idx = self._by_ratio.get(key)
         if idx is None:
-            idx = mk_host.build_attn_indices(
+            idx = attn_indices_np(
                 self.spans, self.tables, self.slot_mapping, self.block_size, window,
                 self.read_len(ratio), ratio, self.T,
             )
@@ -958,13 +1037,114 @@ class StepIndices:
         return t
 
 
+def attn_indices_np(spans, block_tables, slot_mapping, block_size: int, window: int, read_len: int = 0,
+                    ratio: int = 0, total_rows: int | None = None) -> mk_host.AttnIndices:
+    """`mk_host.build_attn_indices` (the definition: same arguments, same columns, the same
+    values -- `test/unit/test_attn_indices_np.py`) in numpy, vectorized over the spans: the
+    torch version's ~60 small CPU ops a call took ~0.4 ms of the host's path to a decode
+    step's first launch, per compressed ratio. (`mk_host.py` is part of every kernel's
+    `kernel_version`, so the host arithmetic it defines is reimplemented here rather than
+    edited there.)"""
+    lengths = {length for _, length, _ in spans}
+    if len(lengths) != 1:
+        raise ValueError(f"spans must share one length, got {sorted(lengths)}")
+    L = lengths.pop()
+    T = total_rows if total_rows is not None else sum(length for _, length, _ in spans)
+    nwin = window + L - 1
+    n = nwin + (read_len if ratio else 0)
+    B = len(spans)
+    begins = np.fromiter((s[0] for s in spans), np.int64, B)
+    starts = np.fromiter((s[2] for s in spans), np.int64, B)
+    widths = [int(t.numel()) for t in block_tables]
+    tabs = np.zeros((B, max(widths)), np.int64)
+    for b, t in enumerate(block_tables):
+        tabs[b, : widths[b]] = np.maximum(t.reshape(-1).numpy(), 0)
+    width = np.asarray(widths, np.int64)
+
+    def slots(pos):                          # pos: [B, k] absolute positions -> cache slots
+        blk = pos // block_size
+        if (blk >= width[:, None]).any():
+            raise IndexError(f"a position past its block table ({int(pos.max())}, block size {block_size})")
+        return np.take_along_axis(tabs, blk, 1) * block_size + pos % block_size
+
+    t = np.arange(L, dtype=np.int64)
+    rows = (begins[:, None] + t).reshape(-1)
+    row_pos = np.zeros(T, np.int64)
+    twin = np.zeros(T, np.int64)
+    wv = np.zeros(T, np.int64)
+    cbase = np.zeros(T, np.int64)
+    row_pos[rows] = (starts[:, None] + t).reshape(-1)
+    bn = (np.arange(B, dtype=np.int64) * n)[:, None]
+    twin[rows] = (bn + t).reshape(-1)
+    wv[rows] = (starts[:, None] - (window - 1) + t).reshape(-1)
+    cbase[rows] = np.broadcast_to(bn + nwin, (B, L)).reshape(-1)
+    wpos = starts[:, None] - (window - 1) + np.arange(nwin, dtype=np.int64)
+    wtab = slots(np.maximum(wpos, 0)).reshape(-1)
+    ctab = np.zeros(max(1, B * (read_len if ratio else 0)), np.int64)
+    if ratio:
+        clen_s = (starts + L) // ratio
+        gp = np.minimum(np.arange(read_len, dtype=np.int64)[None, :], np.maximum(clen_s - 1, 0)[:, None]) * ratio
+        ctab[: B * read_len] = slots(gp).reshape(-1)
+    sm = slot_mapping.reshape(-1).numpy().astype(np.int64, copy=False)
+    ws = np.zeros(T, np.int64)
+    m = min(sm.size, T)
+    ws[:m] = sm[:m]
+
+    def i32(x):
+        return torch.from_numpy(np.ascontiguousarray(x, dtype=np.int32).reshape(-1, 1))
+
+    out = mk_host.AttnIndices(
+        row_pos=i32(row_pos), write_slots=i32(ws), win_slots=i32(wtab), cmp_slots=i32(ctab),
+        twin=i32(twin), wv=i32(wv), cbase=i32(cbase), nwin=nwin, n_per_span=n,
+    )
+    if ratio:
+        out.clen = i32((row_pos + 1) // ratio)
+        G = L if ratio == 1 else L // ratio + 1
+        gpos = np.zeros(B * G, np.int64)
+        gm = np.zeros(B * G * ratio, np.int64)
+        gw = np.zeros(B * G, np.int64)
+        for b in range(B):
+            start, begin = int(starts[b]), int(begins[b])
+            if ratio == 1:
+                firsts = start + t
+            else:
+                firsts = np.arange(start // ratio, (start + L) // ratio, dtype=np.int64) * ratio
+            c = firsts.size
+            gpos[b * G : b * G + c] = firsts
+            if ratio == 1:
+                gw[b * G : b * G + c] = ws[begin : begin + L]
+            elif c:
+                gw[b * G : b * G + c] = slots_row(tabs[b], width[b], firsts, block_size)
+            if c:
+                members = (firsts[:, None] + np.arange(ratio, dtype=np.int64)).reshape(-1)
+                gm[b * G * ratio : b * G * ratio + c * ratio] = slots_row(tabs[b], width[b], members, block_size)
+        out.grp_pos, out.grp_mslots, out.grp_wslots, out.groups_per_span = i32(gpos), i32(gm), i32(gw), G
+    return out
+
+
+def slots_row(table, width: int, pos, block_size: int):
+    """`mk_host.slots_of` of one span's (clamped, padded) numpy block table row."""
+    blk = pos // block_size
+    if blk.size and int(blk.max()) >= width:
+        raise IndexError(f"a position past its block table ({int(pos.max())}, block size {block_size})")
+    return table[blk] * block_size + pos % block_size
+
+
+#: how many of the step's spans are the scheduler's, set by `model._step_rows` (a Python
+#: value the traced forward must not read: dynamo would guard on it and recompile whenever a
+#: request finishes, see `_step_rows`)
+LIVE_SPANS: list = [-1]
+
+
 @torch._dynamo.disable
 def make_step(spans, paged, device, hashes, decode_rows=6, stable=False) -> StepIndices:
     """`StepIndices` for this forward, built outside the frame dynamo traces
     (the index math is host work on CPU copies of the block tables). `stable`: the
     deployment runs one batch at a time (the flat scheme), so a decode step may write
     its own inputs into the `_step_buf`s."""
-    return StepIndices(spans, paged, device, hashes, decode_rows=decode_rows, stable=stable)
+    live = LIVE_SPANS[0]
+    return StepIndices(spans, paged, device, hashes, decode_rows=decode_rows, stable=stable,
+                       live_spans=live if 0 < live <= len(spans) else -1)
 
 
 #: layer id -> (window cache, its `[slots, head_dim]` view): the view, made once per cache
@@ -1192,6 +1372,194 @@ def embed_ids(input_ids: torch.Tensor, host: torch.Tensor | None = None) -> torc
     if host is None:
         host = host_ids(input_ids)
     return _step_buf(("ids",), host.reshape(-1).to(torch.int32).reshape(-1, 1), input_ids.device)
+
+
+#: `DEEPSEEK_V41_STEP_PROLOGUE` (default 1): a fused decode step of the flat scheme
+#: (`fuses_embed`) computes its index columns, its two engram layers' n-gram ids and its
+#: token column on the device, in one launch before the blocks' (`StepPrologue`,
+#: `kernels/tp64/step_kernel.step_prologue`), from one host upload of its span starts and
+#: block tables -- instead of the host's index math, its n-gram hash and a dozen uploads
+#: before the first fused launch. The n-gram history it reads lives on the device too;
+#: a step the host hashes (a prefill chunk) puts its tokens there (`history_put`).
+#: 0: the host computes them (`StepIndices.for_ratio` / `hash_cols`).
+_PROLOGUE = os.environ.get("DEEPSEEK_V41_STEP_PROLOGUE", "1") not in ("", "0")
+
+
+#: `StepPrologue`'s host-written step meta: this many buffers, used in turn (more than the
+#: steps the engine keeps in flight -- the plugin's block-table staging uses 8 for the same reason)
+_PMETA_RING = 8
+
+
+class StepPrologue:
+    """The device side of `_PROLOGUE` for one model: the hash constants, the n-gram
+    history, and by step shape the buffers the prologue writes in place (the same tensors
+    every step, so the launches reading them reuse their DMA rings, as `_step_buf`'s do)."""
+
+    def __init__(self, model, device):
+        from .kernels.tp64 import step_kernel as SK
+
+        self.SK = SK
+        cfg = model.config
+        nh = model.ngram_hash
+        host = nh._host
+        self.device = device
+        self.K = int(cfg.dspark_block_size)
+        self.vocab = int(cfg.vocab_size)
+        self.window = int(cfg.sliding_window)
+        self.pad_id = int(nh.pad_id)
+        self.kver = kernel_version("step", "tp64")
+        layer_ids = list(cfg.engram_layer_ids)
+        if len(layer_ids) != SK.HASH_LAYERS or int(nh.max_ngram_size) != SK.SHIFTS or int(nh.n_heads) != SK.HEADS:
+            raise NotImplementedError("the step prologue hashes 2 engram layers of 4-grams x 8 heads")
+        self.row_starts = [int(model.blocks_by_id[lid].engram.row_start) for lid in layer_ids]
+        tm = host["token_map"].to(torch.int64)
+        vc = int(tm.max()) + 1
+        mult = host["multipliers"].to(torch.int64)            # [layers, shifts]
+        cc = torch.arange(vc, dtype=torch.int64)
+        prod = torch.zeros(vc, SK.HASH_LAYERS * 2 * SK.SHIFTS, dtype=torch.int64)
+        for li in range(SK.HASH_LAYERS):
+            for s in range(SK.SHIFTS):
+                v = cc * int(mult[li, s])
+                prod[:, li * 2 * SK.SHIFTS + 2 * s] = v >> 32
+                prod[:, li * 2 * SK.SHIFTS + 2 * s + 1] = v & 0xFFFFFFFF
+        prod = torch.where(prod >= 2**31, prod - 2**32, prod).to(torch.int32)
+        primes = host["primes"].to(torch.int64).reshape(SK.HASH_LAYERS, -1)       # [layers, 24]
+        offs = host["offsets"].to(torch.int64).reshape(SK.HASH_LAYERS, -1)
+        hcol = torch.stack([primes.reshape(-1),
+                            torch.cat([offs[li] - self.row_starts[li] for li in range(SK.HASH_LAYERS)])])
+        self.tokmap = _dev(tm.to(torch.int32).reshape(-1, 1), device)
+        self.prod = _dev(prod, device)
+        self.hcol = _dev(hcol.to(torch.int32), device)
+        self.hinv = _dev((1.0 / primes.reshape(1, -1).to(torch.float64)).to(torch.float32), device)
+        self.history = _dev(torch.full((int(nh.cache.numel()), 1), SK.DEAD, dtype=torch.int32), device)
+        self.hash_keys = [(i, self.row_starts[i]) for i in range(SK.HASH_LAYERS)]
+        #: shape key -> the step's buffers; kernel -> `_launch` plans
+        self.bufs: dict = {}
+        self.launches: dict = {}
+        self.put_launches: dict = {}
+
+    def _buffers(self, B: int, L: int, W: int, read_lens: dict, block_size: int):
+        SK = self.SK
+        key = (B, L, W, read_lens[1], read_lens[2], block_size)
+        got = self.bufs.get(key)
+        if got is not None:
+            return got
+        dev, T, win = self.device, B * L, self.window
+        nwin = win + L - 1
+        nj = {r: read_lens[r] // (block_size // r) for r in (1, 2)}
+        Wp = max(W, nj[1], nj[2])
+        Hw = SK.H + Wp
+        G2 = L // 2 + 1
+        hdr = np.zeros((B, Hw), np.int32)
+        b = np.arange(B)
+        hdr[:, SK.C_TBASE] = b * Hw + SK.H
+        hdr[:, SK.C_BL] = b * L
+        hdr[:, SK.C_BG2] = b * G2
+        hdr[:, SK.C_BNJ2] = b * nj[2]
+        hdr[:, SK.C_BNJ1] = b * nj[1]
+
+        def col(n):
+            return torch.zeros(n, 1, dtype=torch.int32, device=dev)
+
+        def const(x):
+            return _dev(torch.from_numpy(np.ascontiguousarray(x, dtype=np.int32).reshape(-1, 1)), dev)
+
+        t = np.arange(L)
+        idx, outs = {}, []
+        for r in (0, 2, 1):
+            rl = read_lens.get(r, 0) if r else 0
+            n = nwin + rl
+            bn = (b * n)[:, None]
+            a = mk_host.AttnIndices(
+                row_pos=col(T), write_slots=col(T), win_slots=col(B * nwin),
+                cmp_slots=col(B * rl) if r else const(np.zeros(1)),
+                twin=const(bn + t), wv=col(T), cbase=const(np.broadcast_to(bn + nwin, (B, L))),
+                nwin=nwin, n_per_span=n,
+            )
+            outs += [a.row_pos, a.write_slots, a.win_slots, a.wv]
+            if r:
+                G = L if r == 1 else G2
+                a.clen, a.grp_pos, a.grp_mslots, a.grp_wslots, a.groups_per_span = (
+                    col(T), col(B * G), col(B * G * r), col(B * G), G)
+                outs += [a.cmp_slots, a.clen, a.grp_pos, a.grp_mslots, a.grp_wslots]
+            idx[(r, win)] = a
+        hashes = [torch.zeros(T, SK.HCOLS // SK.HASH_LAYERS, dtype=torch.int32, device=dev)
+                  for _ in range(SK.HASH_LAYERS)]
+        embed, starts = col(T), col(B)
+        got = dict(
+            hdr=hdr, Wp=Wp, pmeta=[col(B * Hw) for _ in range(_PMETA_RING)], ring=0,
+            prev=torch.zeros(B, self.K + 1, dtype=torch.int32, device=dev),
+            idx=idx, hashes=hashes, embed=embed, starts=starts, outs=outs,
+            flags=(B, L, self.K, Wp, block_size, win, self.vocab, self.pad_id, 0, 2, 1, read_lens[2],
+                   read_lens[1], self.kver),
+        )
+        self.bufs[key] = got
+        return got
+
+    @torch._dynamo.disable
+    def run(self, step: "StepIndices", ids: torch.Tensor, prev: torch.Tensor | None = None) -> None:
+        """Launch the prologue for `step` (a fused decode step) and point its index
+        columns, n-gram ids and token column at the buffers it writes. `ids`: the step's
+        `[T]` / `[T, 1]` token ids on the device; `prev`: the previous step's `[B, K + 1]`
+        rejection output when the step's starts are optimistic (else no correction)."""
+        SK = self.SK
+        B, L = len(step.spans), step.spans[0][1]
+        W = max(int(t.numel()) for t in step.tables)
+        read_lens = {r: step.read_len(r) for r in (1, 2)}
+        bs = step.block_size
+        bf = self._buffers(B, L, W, read_lens, bs)
+        # (a fresh host array each step: the upload of the previous one may still read it)
+        hdr = bf["hdr"].copy()
+        Hw = SK.H + bf["Wp"]
+        hdr[:, SK.C_START] = [s for _, _, s in step.spans]
+        hdr[:, SK.C_LIVE] = [int(i < step.live_spans) for i in range(B)]
+        hdr[:, SK.H:] = 0
+        for i, t in enumerate(step.tables):
+            n = int(t.numel())
+            hdr[i, SK.H : SK.H + n] = np.maximum(t.reshape(-1).numpy(), 0)
+        # The host writes the meta while earlier steps may still be queued on the device
+        # (async scheduling): a ring, so a queued prologue's meta is not overwritten.
+        pmeta = bf["pmeta"][bf["ring"]]
+        bf["ring"] = (bf["ring"] + 1) % _PMETA_RING
+        pmeta.copy_(torch.from_numpy(hdr.reshape(-1, 1)))
+        params = [pmeta, bf["prev"] if prev is None else prev, ids, self.history, self.tokmap, self.prod,
+                  self.hcol, self.hinv, *bf["outs"], *bf["hashes"], bf["embed"], bf["starts"], bf["flags"]]
+        # (the plan's key: the shapes of the meta, the ids and the compressed tables)
+        out, _ = _launch(self.SK.step_prologue, self.launches, [(0,), (2,), (16,), (25,)], params)
+        self.last_done = out[0] if isinstance(out, (list, tuple)) else out
+        step._by_ratio.update(bf["idx"])
+        for k, h in zip(self.hash_keys, bf["hashes"]):
+            step._hash_cols[k] = h
+        step.embed_ids = bf["embed"]
+        step.dev_starts = bf["starts"]
+
+    @torch._dynamo.disable
+    def put(self, ids_host: torch.Tensor, paged) -> None:
+        """Put a host-hashed step's tokens (compressed) into the device history at their
+        write slots (what `NgramHashState.hash_spans` did to the host's)."""
+        tm = self.tokmap_host if hasattr(self, "tokmap_host") else None
+        if tm is None:
+            tm = self.tokmap_host = self.tokmap.cpu().reshape(-1).to(torch.int64)
+        flat = ids_host.reshape(-1)
+        rows = torch.cat([flat[p.begin : p.begin + p.length] for p in paged])
+        slots = torch.cat([_host_slots(p).reshape(-1)[: p.length] for p in paged])
+        cids = tm[rows.to(torch.int64)].to(torch.int32).reshape(-1, 1).contiguous()
+        sl = slots.to(torch.int32).reshape(-1, 1).contiguous()
+        params = [self.history, _dev(sl, self.device), _dev(cids, self.device), (self.kver,)]
+        keep_alive(params[1], params[2])
+        _launch(self.SK.history_put, self.put_launches, [(1,)], params)
+
+
+@torch._dynamo.disable
+def step_prologue(model) -> StepPrologue | None:
+    """The model's `StepPrologue` (made on first use), or None when `_PROLOGUE` is off or
+    the model holds no engram hash state (`fuses_embed` gates the steps)."""
+    if not _PROLOGUE or model.ngram_hash is None or model.mk_plan.scheme != "tp64":
+        return None
+    sp = model.__dict__.get("_mk_prologue")
+    if sp is None:
+        sp = model.__dict__["_mk_prologue"] = StepPrologue(model, model.norm.weight.device)
+    return sp
 
 
 def embed_args(model) -> list:
@@ -1430,6 +1798,8 @@ def run_fused(model, blocks, stream: torch.Tensor, pre_mix: torch.Tensor, step: 
         PROF.add("launches", 1e-3)
         if embed:
             PROF.add("entry_first", t2 - t1)
+            if _DRAFT_T[0] is not None:
+                PROF.cur["crit"] = (t2 - _DRAFT_T[0]) * 1e3
     stream, pre_mix = out[0], out[1]
     step.taps.extend(out[2 : 2 + fp.ntaps])
     if fp.idx_member is not None:
@@ -1452,7 +1822,8 @@ def _draft_meta(seeds, taps, pos):
     """`[B, 3]` int32 (seed, tap, pos) per sequence, as a compiled step: the seeds
     and taps come out of the rejection sampler on the device, so this stays
     there (no read-back before the draft launch)."""
-    return torch.stack([seeds.reshape(-1), taps.reshape(-1), pos.reshape(-1)], dim=-1).to(torch.int32)
+    return torch.stack([seeds.reshape(-1).to(torch.int32), taps.reshape(-1).to(torch.int32),
+                        pos.reshape(-1).to(torch.int32)], dim=-1)
 
 
 def draft_consts(B: int, K: int, ntab_p: int) -> torch.Tensor:
@@ -1525,10 +1896,27 @@ def draft_weights(model) -> list:
 def _draft_meta_seq(seed, tap, pos):
     """`[1, 3]` int32 (seed, tap, pos) of one sequence, as a compiled step (the flat
     scheme's drafter prologue, unchanged)."""
-    return torch.stack([seed.reshape(-1)[:1], tap.reshape(-1)[:1], pos.reshape(-1)[:1]]).to(torch.int32).reshape(1, 3)
+    return torch.stack([seed.reshape(-1)[:1].to(torch.int32), tap.reshape(-1)[:1].to(torch.int32),
+                        pos.reshape(-1)[:1].to(torch.int32)]).reshape(1, 3)
 
 
-def _run_draft_seq(model, seed_ids, tap, main_hidden, span, paged):
+def _prologue_draft_rows(model, begin: int, length: int):
+    """`(row_pos [T, 1], write_slots [T, 1], starts [B, 1])` of the step's rows on the
+    device when `StepPrologue` made them and the drafter reads all of the step's rows (one
+    batched launch, or the one span of a single-sequence step), else None. Under async
+    scheduling these are the only correct ones (the host's starts are optimistic)."""
+    step = getattr(model, "_mk_step", None)
+    if step is None or step.dev_starts is None:
+        return None
+    idx = step.for_ratio(0, int(model.config.sliding_window))
+    if begin != 0 or length != int(idx.row_pos.shape[0]):
+        if getattr(model, "_async_ids", None) is not None:
+            raise NotImplementedError("an async decode step drafts all its sequences in one launch")
+        return None
+    return idx.row_pos, idx.write_slots, step.dev_starts
+
+
+def _run_draft_seq(model, seed_ids, tap, main_hidden, span, paged, meta=None):
     """The flat scheme's drafter launch for one sequence (`draft_kernel_seq`): the
     path as it was before the pipeline work, so `tp64` keeps its behaviour."""
     from . import model as M
@@ -1537,11 +1925,16 @@ def _run_draft_seq(model, seed_ids, tap, main_hidden, span, paged):
     device = main_hidden.device
     begin, length, start_pos = span
     main = main_hidden[begin : begin + length]
-    meta = M._compiled(_draft_meta_seq)(seed_ids, tap, paged.pos)
+    dev = _prologue_draft_rows(model, begin, length)
+    if meta is None:
+        meta = M._compiled(_draft_meta_seq)(seed_ids, tap, paged.pos if dev is None else dev[2])
     _track(meta)
     table = _host_table(paged).to(torch.int32).reshape(-1, 1).contiguous().to(device)
-    row_pos = (start_pos + torch.arange(length)).to(torch.int32).reshape(-1, 1).to(device)
-    write_slots = _host_slots(paged).reshape(-1)[:length].to(torch.int32).reshape(-1, 1).contiguous().to(device)
+    if dev is not None:
+        row_pos, write_slots = dev[0], dev[1]
+    else:
+        row_pos = (start_pos + torch.arange(length)).to(torch.int32).reshape(-1, 1).to(device)
+        write_slots = _host_slots(paged).reshape(-1)[:length].to(torch.int32).reshape(-1, 1).contiguous().to(device)
     weights, tail = model._mk_draft()
     K = int(cfg.dspark_block_size)
     stages = list(model.mtp)
@@ -1551,6 +1944,7 @@ def _run_draft_seq(model, seed_ids, tap, main_hidden, span, paged):
     caches = [s.attn.window_kv_cache.view(-1, s.attn.head_dim) for s in stages]
     args = [meta, main, row_pos, write_slots, table, *weights, *caches, *tail,
             model._mk_groups_attn, model._mk_groups_full, flags]
+    keep_alive(meta, row_pos, write_slots, table)
     kernel = mk_kernels.draft("prefill" if paged.at_zero else "decode", model.mk_plan.scheme)
     if _MK_TRACE and model.mk_plan.stage_rank == 0:
         _mk_log.warning("mk launch %s span=%s", kernel.func.__name__, span)
@@ -1569,8 +1963,22 @@ def _run_draft_seq(model, seed_ids, tap, main_hidden, span, paged):
 _DRAFT_BATCHED = os.environ.get("DEEPSEEK_V41_DRAFT_BATCHED", "1") not in ("", "0")
 
 
+#: `DEEPSEEK_V41_FUSE_TAIL` (default 1): a fused decode step whose prologue ran ends in one
+#: compiled graph (`model._decode_tail_graph`: verify, seeds, taps, the drafter's meta, the
+#: taps' concatenation) instead of five small ones -- on the device each execution is
+#: ~20 us of work and ~40-100 us of idle around it. 0: the separate graphs.
+_FUSE_TAIL = os.environ.get("DEEPSEEK_V41_FUSE_TAIL", "1") not in ("", "0")
+
+
+def fuses_tail(model, step) -> bool:
+    """Whether this step's tail is `model._decode_tail_graph` (the drafter then drafts every
+    sequence of the step in one launch)."""
+    return (_FUSE_TAIL and step is not None and step.dev_starts is not None and model.mk_plan.scheme == "tp64"
+            and (len(step.spans) == 1 or _DRAFT_BATCHED))
+
+
 @torch._dynamo.disable
-def run_draft(model, seeds, taps, main_hidden, spans, paged):
+def run_draft(model, seeds, taps, main_hidden, spans, paged, meta=None):
     """`_draft` for every sequence of the step: `[(output_ids [1, K+1] int32, None,
     confidence [1, K] fp32)]`, one per span; a batched launch also leaves its
     `[B, K+1]` ids in `model.last_draft_ids` (what `DSparkProposer.propose` reads back
@@ -1586,6 +1994,9 @@ def run_draft(model, seeds, taps, main_hidden, spans, paged):
     batched_tp64 = model.mk_plan.scheme == "tp64" and _DRAFT_BATCHED and len(spans) > 1
     model.last_draft_ids = None
     if model.mk_plan.scheme == "tp64" and not batched_tp64:
+        if meta is not None:
+            # (`fuses_tail`: one span, its meta made by the tail graph)
+            return [_run_draft_seq(model, None, None, main_hidden, spans[0], paged[0], meta=meta)]
         return [
             _run_draft_seq(model, seeds.reshape(-1)[b : b + 1], taps.reshape(-1)[b : b + 1],
                            main_hidden, span, pg)
@@ -1612,19 +2023,24 @@ def run_draft(model, seeds, taps, main_hidden, spans, paged):
         main = main_hidden if first == 0 and rows == int(main_hidden.shape[0]) else main_hidden[first : first + rows]
     else:
         main = torch.cat([main_hidden[begin : begin + length] for begin, length, _ in spans])
-    row_pos = torch.cat([start_pos + torch.arange(length) for _, length, start_pos in spans])
-    row_pos = row_pos.to(torch.int32).reshape(-1, 1).contiguous().to(device)
-    write_slots = torch.cat([
-        _host_slots(p).reshape(-1)[:length] for p, (_, length, _) in zip(paged, spans)
-    ]).to(torch.int32).reshape(-1, 1).contiguous().to(device)
+    dev = _prologue_draft_rows(model, first, sum(length for _, length, _ in spans))
+    if dev is not None:
+        row_pos, write_slots, pos = dev
+    else:
+        row_pos = torch.cat([start_pos + torch.arange(length) for _, length, start_pos in spans])
+        row_pos = row_pos.to(torch.int32).reshape(-1, 1).contiguous().to(device)
+        write_slots = torch.cat([
+            _host_slots(p).reshape(-1)[:length] for p, (_, length, _) in zip(paged, spans)
+        ]).to(torch.int32).reshape(-1, 1).contiguous().to(device)
+        # (from the spans' start positions on the host, not a `torch.cat` of their device copies)
+        pos = torch.tensor([int(p.start_pos) for p in paged], dtype=paged[0].pos.dtype).to(device)
     tables = [_host_table(p).to(torch.int32).reshape(-1) for p in paged]
     nblk = max(int(t.numel()) for t in tables)
     table = torch.stack([
         torch.nn.functional.pad(t, (0, nblk - int(t.numel()))) for t in tables
     ]).reshape(-1, 1).contiguous().to(device)
-    # (from the spans' start positions on the host, not a `torch.cat` of their device copies)
-    pos = torch.tensor([int(p.start_pos) for p in paged], dtype=paged[0].pos.dtype).to(device)
-    meta = M._compiled(_draft_meta)(seeds.reshape(-1)[:B], taps.reshape(-1)[:B], pos)
+    if meta is None:
+        meta = M._compiled(_draft_meta)(seeds.reshape(-1)[:B], taps.reshape(-1)[:B], pos)
     _track(meta)
     consts = model.__dict__.setdefault("_mk_draft_consts", {})
     rows_c = consts.get((B, K, ntab_p))
@@ -1639,6 +2055,7 @@ def run_draft(model, seeds, taps, main_hidden, spans, paged):
     caches = [s.attn.window_kv_cache.view(-1, s.attn.head_dim) for s in stages]
     args = [meta, rows_c, main, row_pos, write_slots, table, *weights, *caches, *tail,
             model._mk_groups_attn, model._mk_groups_full, flags]
+    keep_alive(meta, row_pos, write_slots, table, pos)
     # The drafter runs on the ranks that hold the head and the sampler: the flat
     # world under tp64, the last stage under tp8pp8 (`_mk_groups_full` is that
     # stage's groups); it is a distinct entry per scheme, `draft_<phase>_<scheme>`,

@@ -55,9 +55,54 @@ EXPERT_REAL_ROWS = True
 #: so every picked row's result and its accumulation order (ascending expert) are
 #: unchanged. The accumulator update is a static RMW over the T rows.
 EXPERT_MERGED = True
-#: From this many rows (most local experts active), the merged loop runs two experts
+#: From this many rows, the merged loop runs two experts
 #: per iteration.
-EXPERT_PAIR_MIN_T = 16
+EXPERT_PAIR_MIN_T = 2
+
+#: The merged loop (`EXPERT_MERGED`) accumulates the experts' w2 outputs in an SBUF fp32
+#: tile the caller owns (`acc_sb`, zeroed by it) -- each 512-column PSUM block added in
+#: place, ascending expert order as the HBM scatter-add -- instead of an indirect RMW
+#: `dma_compute` per expert into the HBM accumulator (and its read back after the loop).
+EXPERT_ACC_SB = True
+
+#: The merged loop with few rows (`pack_slots`): each expert's w1 / w3 output tiles land on
+#: disjoint partition ranges of ONE PSUM tile (`X.gemm_sb_packed`: tile c's stationary is
+#: the staged rows shifted to columns c*T ..), so the SwiGLU runs once on [128, 512] and its
+#: result is already the packed layout of the w2 staging (`X.stage_rows_packed`: 4 PE
+#: transposes instead of 4 per 512-wide chunk). The same per-element values.
+EXPERT_PACK = True
+#: `routed_experts_merged` loads the active-expert count for its loops from the SBUF
+#: `nonzero_with_count` result instead of through the HBM list.
+NACT_FROM_SBUF = True
+#: The merged loop loads an expert's whole w2 slice in `W2_BLOCKS` column blocks
+#: (`X.load_w_cols`: 7 DMAs a block instead of 7 per 512-column output tile, 70 at
+#: dim 5120 -- the per-DMA issue cost made w2 DMA-issue-bound at T = 6), issued right
+#: after w1 / w3 in program order (before the SwiGLU's ACT work on the scalar queue).
+W2_BLOCKS = 2
+#: With few rows (T <= EXPERT_FEW_ROWS: weight-DMA-bound experts) the merged loop's weight
+#: data DMAs rotate over these queues (`X.EXPERT_W_QUEUES`; scales stay on the HWDGE ones).
+#: None: off -- ("sync", "scalar", "swdge") measured neutral at in1024_bs1 (5.104 -> 5.131 ms).
+EXPERT_FEW_ROWS = 32
+EXPERT_W_QUEUES_FEW_ROWS = None
+
+
+def pack_slots(T, span):
+    """Shifted staging slots `routed_experts_merged`'s packed path needs (0: not used)."""
+    nt = len(X.ntiles_of(span))
+    if EXPERT_PACK and T is not None and X.pack_ok(T, span):
+        return min(nt, PT // T)
+    return 0
+
+
+def merged_ok(Tp, T):
+    """Whether `routed_experts` takes the merged path (`EXPERT_MERGED`)."""
+    return EXPERT_MERGED and Tp == PT and T is not None and T > 1
+
+
+def acc_sb_ok(Tp, T):
+    """Whether `routed_experts` takes the merged path that can fill an `acc_sb`."""
+    return EXPERT_ACC_SB and merged_ok(Tp, T)
+
 
 #: Mask rows an instruction compacts (one per GpSimd core: partitions 0, 16, .., 112).
 LANES = 8
@@ -299,16 +344,19 @@ def run_expert(ntiles, e, glist, Tp, x_hbm, wexp_hbm, n_local, w1, s1, w3, s3, w
 
 
 def routed_experts_merged(n_local, T, x_hbm, wexp_hbm, w1, s1, w3, s3, w2, s2, dim, lo, hi, limit,
-                          eacc_hbm, xstage=None, acc_sb=None):
+                          eacc_hbm, xstage=None, acc_sb=None, wsb_in=None):
     """`routed_experts` for T <= 128 rows (see `EXPERT_MERGED`). `xstage`: the rows
     already staged (`X.stage_x` of `x_hbm` rows 0..128, rows past T zero). `acc_sb`: a
-    zeroed `(PT, dim)` fp32 SBUF accumulator used instead of `eacc_hbm` (the same fp32
-    adds in the same expert order, without the read-modify-write DMAs)."""
+    zeroed `[PT, dim]` fp32 SBUF accumulator used instead of `eacc_hbm` (`EXPERT_ACC_SB`)."""
     span = hi - lo
     nreal = min(PT, T)
     # routing weights [rows, experts] and the active experts' ids (ascending) + count
-    wsb = nl.ndarray((PT, n_local), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=wsb, src=wexp_hbm[0:PT, 0:n_local])
+    if wsb_in is not None:
+        # (the caller's SBUF copy of `wexp_hbm[0:PT]`, rows past T zero)
+        wsb = wsb_in
+    else:
+        wsb = nl.ndarray((PT, n_local), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=wsb, src=wexp_hbm[0:PT, 0:n_local])
     m16 = nl.ndarray((PT, n_local), dtype=nl.bfloat16, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=m16, data=wsb, op0=nl.greater, operand0=0.0)
     ones = nl.ndarray((PT, 1), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -322,12 +370,21 @@ def routed_experts_merged(n_local, T, x_hbm, wexp_hbm, w1, s1, w3, s3, w2, s2, d
     nisa.nonzero_with_count(dst=nz, src=flag, index_offset=0, padding_val=-1)
     alist = nl.ndarray((1, n_local + 1), dtype=nl.int32, buffer=nl.private_hbm)
     nisa.dma_copy(dst=alist, src=nz[0:1, :])
-    c = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=c, src=alist[0:1, n_local : n_local + 1])
-    nact = nisa.scalar_load(c)
+    if NACT_FROM_SBUF:
+        # the count straight from the SBUF result (no HBM round trip before the loops)
+        nact = nisa.scalar_load(nz[0:1, n_local : n_local + 1])
+    else:
+        c = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=c, src=alist[0:1, n_local : n_local + 1])
+        nact = nisa.scalar_load(c)
     # the rows, quantized once (rows past T zero)
+    npk = 0
     if xstage is not None:
         xq, xs = xstage
+        # (the packed path needs the caller's `shifts=pack_slots(T, span)` staging)
+        npk = pack_slots(T, span)
+        if xq.shape[1] < npk:
+            npk = 0
     else:
         xq, xs = X.alloc_x(1, dim)
         rows = nl.ndarray((PT, dim), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -344,66 +401,113 @@ def routed_experts_merged(n_local, T, x_hbm, wexp_hbm, w1, s1, w3, s3, w2, s2, d
         nisa.dma_copy(dst=ec, src=alist.ap(pattern=[[n_local + 1, 1], [1, 1]], offset=t, scalar_offset=i,
                                            indirect_dim=1))
         e = nisa.scalar_load(ec)
-        g16 = nl.ndarray((PT, span), dtype=nl.bfloat16, buffer=nl.sbuf)
-        u16 = nl.ndarray((PT, span), dtype=nl.bfloat16, buffer=nl.sbuf)
+        if npk:
+            # groups of npk w1 / w3 tiles, tile c of a group on partitions c*T .. of one
+            # PSUM tile (see `EXPERT_PACK`); the routing weight column repeated per slot
+            wcol = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(wcol, 0.0)
+            for c in range(npk):
+                nisa.dma_copy(dst=wcol[c * nreal : (c + 1) * nreal, :],
+                              src=wexp_hbm.ap(pattern=[[n_local, nreal], [1, 1]], offset=0, scalar_offset=e,
+                                              indirect_dim=1))
+            yq, ys = X.alloc_x(1, span)
+            nisa.memset(yq[:, 0, :, :], 0)
+            ntl = len(X.ntiles_of(span))
+            for t0 in range(0, ntl, npk):
+                t1 = min(ntl, t0 + npk)
+                gp = nl.ndarray((PT, X.NT), dtype=nl.float32, buffer=nl.psum)
+                up = nl.ndarray((PT, X.NT), dtype=nl.float32, buffer=nl.psum)
+                X.gemm_sb_packed(xq, xs, dim, w1, s1, span, gp, fp4=True, n0=lo, eoff=e, t0=t0, t1=t1)
+                X.gemm_sb_packed(xq, xs, dim, w3, s3, span, up, fp4=True, n0=lo, eoff=e, t0=t0, t1=t1)
+                if t0 == 0 and W2_BLOCKS:
+                    w2pre = X.load_w_cols(w2, s2, span, dim, fp4=True, krow0=lo // 4, eoff=e,
+                                          nblk=W2_BLOCKS)
+                g16 = nl.ndarray((PT, X.NT), dtype=nl.bfloat16, buffer=nl.sbuf)
+                u16 = nl.ndarray((PT, X.NT), dtype=nl.bfloat16, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=g16, src=gp)
+                nisa.tensor_copy(dst=u16, src=up)
+                y16 = nl.ndarray((PT, X.NT), dtype=nl.bfloat16, buffer=nl.sbuf)
+                swiglu_tile(g16, u16, wcol, y16, X.NT, limit)
+                X.stage_rows_packed(y16, nreal, span, t0, t1 - t0, yq, ys, 0)
+        else:
+            g16 = nl.ndarray((PT, span), dtype=nl.bfloat16, buffer=nl.sbuf)
+            u16 = nl.ndarray((PT, span), dtype=nl.bfloat16, buffer=nl.sbuf)
 
-        def to_g(t, c0, w, acc):
-            nisa.tensor_copy(dst=g16[:, c0 : c0 + w], src=acc)
+            def to_g(t, c0, w, acc):
+                nisa.tensor_copy(dst=g16[:, c0 : c0 + w], src=acc)
 
-        def to_u(t, c0, w, acc):
-            nisa.tensor_copy(dst=u16[:, c0 : c0 + w], src=acc)
+            def to_u(t, c0, w, acc):
+                nisa.tensor_copy(dst=u16[:, c0 : c0 + w], src=acc)
 
-        X.gemm_sb_multi(xq, xs, 1, dim, w1, s1, span, to_g, fp4=True, n0=lo, eoff=e)
-        X.gemm_sb_multi(xq, xs, 1, dim, w3, s3, span, to_u, fp4=True, n0=lo, eoff=e)
-        wcol = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=wcol, src=wexp_hbm.ap(pattern=[[n_local, PT], [1, 1]], offset=0, scalar_offset=e,
-                                               indirect_dim=1))
-        y16 = nl.ndarray((PT, span), dtype=nl.bfloat16, buffer=nl.sbuf)
-        swiglu_tile(g16, u16, wcol, y16, span, limit)
-        yq, ys = X.alloc_x(1, span)
-        X.stage_rows(y16, span, yq, ys, 0)
+            X.gemm_sb_multi(xq, xs, 1, dim, w1, s1, span, to_g, fp4=True, n0=lo, eoff=e)
+            X.gemm_sb_multi(xq, xs, 1, dim, w3, s3, span, to_u, fp4=True, n0=lo, eoff=e)
+            if W2_BLOCKS:
+                w2pre = X.load_w_cols(w2, s2, span, dim, fp4=True, krow0=lo // 4, eoff=e,
+                                      nblk=W2_BLOCKS)
+            wcol = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=wcol, src=wexp_hbm.ap(pattern=[[n_local, PT], [1, 1]], offset=0, scalar_offset=e,
+                                                   indirect_dim=1))
+            y16 = nl.ndarray((PT, span), dtype=nl.bfloat16, buffer=nl.sbuf)
+            swiglu_tile(g16, u16, wcol, y16, span, limit)
+            yq, ys = X.alloc_x(1, span)
+            X.stage_rows(y16, span, yq, ys, 0)
+        if acc_sb is not None:
+            def to_acc(t, c0, w, acc):
+                nisa.tensor_tensor(dst=acc_sb[0:nreal, c0 : c0 + w], data1=acc_sb[0:nreal, c0 : c0 + w],
+                                   data2=acc[0:nreal, :], op=nl.add)
+
+            if W2_BLOCKS:
+                X.gemm_sb_pre_multi(yq, ys, span, w2pre[0], w2pre[1], dim, to_acc)
+            else:
+                X.gemm_sb_multi(yq, ys, 1, span, w2, s2, dim, to_acc, fp4=True, krow0=lo // 4, eoff=e)
+            return
         o32 = nl.ndarray((PT, dim), dtype=nl.float32, buffer=nl.sbuf)
 
         def to_o(t, c0, w, acc):
             nisa.tensor_copy(dst=o32[:, c0 : c0 + w], src=acc)
 
-        X.gemm_sb_multi(yq, ys, 1, span, w2, s2, dim, to_o, fp4=True, krow0=lo // 4, eoff=e)
-        if acc_sb is not None:
-            nisa.tensor_tensor(dst=acc_sb[0:nreal, :], data1=acc_sb[0:nreal, :], data2=o32[0:nreal, :],
-                               op=nl.add, engine=nisa.engine.gpsimd)
-            return
+        if W2_BLOCKS:
+            X.gemm_sb_pre_multi(yq, ys, span, w2pre[0], w2pre[1], dim, to_o)
+        else:
+            X.gemm_sb_multi(yq, ys, 1, span, w2, s2, dim, to_o, fp4=True, krow0=lo // 4, eoff=e)
         # (through identity row ids: the indirect form `run_expert` uses)
         tgt = eacc_hbm.ap(pattern=[[dim, nreal], [1, dim]], vector_offset=rid[0:nreal, 0:1], indirect_dim=0)
         nisa.dma_compute(dst=tgt, srcs=[tgt, o32[0:nreal, :]], reduce_op=nl.add)
 
-    if T >= EXPERT_PAIR_MIN_T:
-        # two active experts per iteration (the second's weight streams overlap the first's
-        # matmuls), then the odd last one
-        def body2(i):
-            body(i, 0)
-            body(i, 1)
+    queues = X.EXPERT_W_QUEUES
+    if EXPERT_W_QUEUES_FEW_ROWS is not None and T <= EXPERT_FEW_ROWS:
+        X.EXPERT_W_QUEUES = EXPERT_W_QUEUES_FEW_ROWS
+    try:
+        if T >= EXPERT_PAIR_MIN_T:
+            # two active experts per iteration (the second's weight streams overlap the first's
+            # matmuls), then the odd last one
+            def body2(i):
+                body(i, 0)
+                body(i, 1)
 
-        n2 = (nact // 2) * 2
-        nl.fori_loop(0, n2, body2, step=2)
-        nl.fori_loop(n2, nact, body)
-    else:
-        nl.fori_loop(0, nact, body)
+            n2 = (nact // 2) * 2
+            nl.fori_loop(0, n2, body2, step=2)
+            nl.fori_loop(n2, nact, body)
+        else:
+            nl.fori_loop(0, nact, body)
+    finally:
+        X.EXPERT_W_QUEUES = queues
 
 
 def routed_experts(pid, n_local, Tp, x_hbm, wexp_hbm, w1, s1, w3, s3, w2, s2, dim, inter, lo, hi,
-                   limit, eacc_hbm, zero_acc=True, T=None, xstage=None, acc_sb=None):
+                   limit, eacc_hbm, zero_acc=True, T=None, xstage=None, acc_sb=None, wsb_in=None):
     """Every routed expert, this core taking `inter` columns `[lo, hi)` of each
     (see `run_expert`), into `eacc_hbm` (zeroed here unless `zero_acc` is False: the
     caller zeroed it). `w1..s2` are the stacked `[E, K/4, N]` x4 views / scales."""
-    if zero_acc:
+    if zero_acc and acc_sb is None:
         zero_rows(eacc_hbm, Tp + PT, dim)
     # (not for a single row: the merged loop's indirect scatter-add `dma_compute` needs a
     # partition size > 1 -- a neuronx-cc limit -- so T = 1 takes the per-expert loops)
-    if EXPERT_MERGED and Tp == PT and T is not None and T > 1:
+    if merged_ok(Tp, T):
         routed_experts_merged(n_local, T, x_hbm, wexp_hbm, w1, s1, w3, s3, w2, s2, dim, lo, hi, limit,
-                              eacc_hbm, xstage=xstage, acc_sb=acc_sb)
+                              eacc_hbm, xstage=xstage, acc_sb=acc_sb, wsb_in=wsb_in)
         return
-    assert acc_sb is None, "the SBUF accumulator is the merged loop's only"
+    assert acc_sb is None and wsb_in is None, "acc_sb / wsb_in need the merged loop (`acc_sb_ok`)"
     glist = alloc_lists(n_local, Tp)
     build_expert_lists(wexp_hbm, Tp, n_local, glist)
     rampf = partition_ramp()

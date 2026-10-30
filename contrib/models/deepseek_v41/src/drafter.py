@@ -87,6 +87,15 @@ class DSparkProposer:
                 f"--num-speculative-tokens {block} or leave it unset."
             )
         self.num_speculative_tokens = block
+        sched = getattr(vllm_config, "scheduler_config", None)
+        #: vLLM schedules the next step before this one's drafts exist (`deepseek_v41.ASYNC_ENV`)
+        self._async = bool(getattr(sched, "async_scheduling", False))
+        #: Under async scheduling `propose` returns the `[B, 1 + k]` draft rows as a device
+        #: future, which the runner replays by request across a batch-composition change
+        #: (`NeuronModelRunner._uses_async_spec_transition_cache`).
+        self.device_draft_futures = self._async
+        #: `[B, k]` placeholder drafts-only blocks by shape (`propose` under async scheduling)
+        self._drafts_only: dict = {}
 
 
     @property
@@ -161,6 +170,38 @@ class DSparkProposer:
             )
 
         k = self.num_speculative_tokens
+        if self._async:
+            from . import mk_model
+
+            # Async scheduling: the drafts stay on the device -- the next step's input
+            # ids are `draft_token_ids` flattened (`[seed, drafts...]` per sequence) -- and
+            # the host never waits for them.
+            from . import model as M
+
+            batched = getattr(target, "last_draft_ids", None)
+            if batched is not None and int(batched.shape[0]) == len(drafts):
+                ids = batched
+            elif len(drafts) == 1:
+                ids = drafts[0][0].reshape(1, -1)
+            else:
+                raise NotImplementedError("async decode drafts every sequence in one launch")
+            # The drafts-only block the runner wants feeds the next step's `draft_token_ids`,
+            # which an async step does not read (it verifies its own input rows,
+            # `model._verify_drafts`): a constant of the right shape, not a copy (an execution
+            # of its own on the device).
+            if not mk_model._FUSE_TAIL:
+                drafts_only = M._compiled(M._drafts_only)(ids)
+                # (made after the drafter: the step's completion marker, `mk_model.steps_ahead_wait`)
+                mk_model.step_mark(drafts_only)
+                return ids, drafts_only
+            key = tuple(ids.shape)
+            drafts_only = self._drafts_only.get(key)
+            if drafts_only is None:
+                drafts_only = self._drafts_only[key] = torch.zeros(
+                    int(ids.shape[0]), k, dtype=ids.dtype, device=ids.device)
+            # (the drafter's own output: the step's completion marker, `mk_model.steps_ahead_wait`)
+            mk_model.step_mark(ids)
+            return ids, drafts_only
         # One read-back of the drafted ids (a batched drafter's `[B, k+1]`, else one row
         # per sequence), sliced on the host: stacking device slices was two eager device
         # ops a step. Host tensors are what the synchronous runner wants anyway (it reads
@@ -171,6 +212,12 @@ class DSparkProposer:
             ids = batched.cpu()
         else:
             ids = torch.cat([output_ids.reshape(1, -1)[:, : k + 1].cpu() for output_ids, _l, _c in drafts])
+        from . import mk_model
+
+        if mk_model.PROF is not None:
+            import time
+
+            mk_model._DRAFT_T[0] = time.perf_counter()
         ids = ids.to(torch.int64)
         draft_token_ids = ids[:, : k + 1].contiguous()
         drafts_only = ids[:, 1 : k + 1].contiguous()
