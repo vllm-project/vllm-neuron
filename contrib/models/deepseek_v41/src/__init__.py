@@ -113,6 +113,12 @@ _MULTI_RANK_ENV = {
 #: Whether that last one is *because* of this variable is open:
 #: `.autohelix/notes/iter-7.md` §11 states the confound plainly.
 #:
+#: Re-measured 2026-10-29 with the megakernels' direct launches (`mk_model._DIRECT`), whose
+#: IO tensors are the same every step: `NEURON_RT_IO_RING_CACHE_SIZE=64` takes a bs1 decode
+#: step's 40 layer launches from 23.8 to 9.3 ms of host time, and throughput does not move
+#: (in1024_bs1 36.24 vs 36.05 tok/s; bs10 unchanged), because that loop now waits on the
+#: device. The host time is real; the wedge risk above is the reason it stays at 1.
+#:
 #: Above one rank only, as the ancestor had it: at one rank the pool has never
 #: run out. `NEURON_RT_IO_RING_CACHE_SIZE=32` in the environment restores the
 #: worker default, since every key here is applied with `setdefault` semantics.

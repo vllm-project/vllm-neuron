@@ -92,6 +92,26 @@ def bcast_row(hbm_row, n, nr, dtype=nl.float32):
     return nl.broadcast_to(nl.load(hbm_row[0:1, 0:n], dtype=dtype), (nr, n))
 
 
+def rank_pairs(best, idx_f, vocab_start_hbm, part, world, nr):
+    """`[nr, 2 * world]` fp32 SBUF: row `t`'s (max | index) -- `best[t, 0]`, `idx_f[t, 0]` --
+    in this rank's own column (its rank `vocab_start / part`, matched exactly in fp32), zero
+    in every other. All-reduced (summed) over the world it is every rank's pair, exactly:
+    the argmax exchange of the vocabulary-parallel heads. (An `ncc.all_gather` of the pairs
+    delivered wrong values to whole devices at 64 ranks; see `head_kernel`.)"""
+    ci = nl.ndarray((PT, world), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.iota(dst=ci[0:nr, :], pattern=[[part, world]], offset=0, channel_multiplier=0)
+    cf = nl.ndarray((PT, world), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=cf[0:nr, :], src=ci[0:nr, :])
+    vs = bcast_row(vocab_start_hbm[0:1, 0:1], 1, nr)
+    oh = nl.ndarray((PT, world), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=oh[0:nr, :], data=cf[0:nr, :], op0=nl.equal, operand0=vs[0:nr, 0:1])
+    pair = nl.ndarray((PT, 2 * world), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=pair[0:nr, 0:world], data=oh[0:nr, :], op0=nl.multiply, operand0=best[0:nr, 0:1])
+    nisa.tensor_scalar(dst=pair[0:nr, world : 2 * world], data=oh[0:nr, :], op0=nl.multiply,
+                       operand0=idx_f[0:nr, 0:1])
+    return pair
+
+
 # --------------------------------------------------------------------------- hyper-connections
 
 

@@ -38,6 +38,7 @@ import hashlib
 import inspect
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 
 import torch
@@ -57,6 +58,165 @@ _IN_FLIGHT = 8
 #: does not finish.
 _MK_SYNC = os.environ.get("DEEPSEEK_V41_MK_SYNC", "") not in ("", "0")
 PT = 128
+
+
+class HostProf:
+    """`DEEPSEEK_V41_HOST_PROF=1`: the host time of every forward, by part (ms; every rank
+    times, so every rank takes the same dynamo-disabled calls and traces the same graphs;
+    rank 0 logs),
+    logged as medians every `DEEPSEEK_V41_HOST_PROF_EVERY` forwards (default 32) per phase:
+    `gap` since the previous forward returned (the engine's scheduling, output processing
+    and input preparation), `pre` until the block loop (span metadata, embedding, hashes),
+    `layers` the loop -- `args` (each launch's arguments), `launch` (the call that submits
+    it) and `post` -- `head` (collapse, norm, logits, sampling) and `draft` (the drafter).
+    `DEEPSEEK_V41_HOST_PROF_WAIT=1` adds `wait`: how long the next forward, on entry, blocks
+    reading back the previous one's last output (`tail`) -- 0 when the device had already
+    drained, i.e. when the step boundary, not the device, is the critical path."""
+
+    KEYS = ("gap", "wait", "pre", "layers", "args", "launch", "post", "head", "draft", "total")
+    WAIT = os.environ.get("DEEPSEEK_V41_HOST_PROF_WAIT", "") not in ("", "0")
+
+    def __init__(self, every: int):
+        self.every, self.rows, self.cur, self.last_end, self.rank = every, {}, None, None, 0
+        self.tail = None
+
+    #: `DEEPSEEK_V41_CPROFILE=<start>:<count>`: cProfile rank 0 from forward `start` to forward
+    #: `start + count` -- the forwards and everything between them (the engine's side) -- and log
+    #: the top functions by cumulative and own time
+    _cprof = os.environ.get("DEEPSEEK_V41_CPROFILE", "")
+    calls, cprofile = 0, None
+
+    def _cprofile_tick(self) -> None:
+        import cProfile
+        import io
+        import pstats
+
+        start, count = (int(v) for v in self._cprof.split(":"))
+        self.calls += 1
+        if self.calls == start:
+            self.cprofile = cProfile.Profile()
+            self.cprofile.enable()
+        elif self.calls == start + count and self.cprofile is not None:
+            self.cprofile.disable()
+            for key in ("cumulative", "tottime"):
+                buf = io.StringIO()
+                pstats.Stats(self.cprofile, stream=buf).sort_stats(key).print_stats(40)
+                logger.warning("deepseek_v41 cprofile over %d forwards by %s:\n%s", count, key, buf.getvalue())
+            self.cprofile = None
+
+    @torch._dynamo.disable
+    def begin(self) -> None:
+        if self._cprof and self.rank == 0:
+            self._cprofile_tick()
+        t = time.perf_counter()
+        gap = (t - self.last_end) * 1e3 if self.last_end else float("nan")
+        wait = float("nan")
+        if self.WAIT and self.tail is not None:
+            self.tail.cpu()
+            wait = (time.perf_counter() - t) * 1e3
+            t = time.perf_counter()
+        self.tail = None
+        self.cur = {"t0": t, "gap": gap, "wait": wait, "args": 0.0, "launch": 0.0, "post": 0.0,
+                    "launches": 0}
+
+    def add(self, key: str, seconds: float) -> None:
+        if self.cur is not None:
+            self.cur[key] = self.cur.get(key, 0.0) + seconds * 1e3
+
+    @torch._dynamo.disable
+    def mark(self, key: str) -> None:
+        if self.cur is not None:
+            self.cur[key] = (time.perf_counter() - self.cur["t0"]) * 1e3
+
+    @torch._dynamo.disable
+    def end(self) -> None:
+        if self.cur is None:
+            return
+        phase = self.cur.get("phase", "?")
+        t = time.perf_counter()
+        c, self.cur, self.last_end = self.cur, None, t
+        if self.tail is None:
+            # the step's last launch: the drafter's (`run_draft_batched` sets it), else the
+            # newest throttled output
+            pending = getattr(self, "pending", None)
+            self.tail = pending[-1] if pending else None
+        c["total"] = (t - c["t0"]) * 1e3
+        m = [c.get(k, c["total"]) for k in ("m_layers0", "m_layers1", "m_head")]
+        c["pre"], c["layers"], c["head"], c["draft"] = m[0], m[1] - m[0], m[2] - m[1], c["total"] - m[2]
+        rows = self.rows.setdefault(phase, [])
+        rows.append(c)
+        if len(rows) >= self.every and self.rank != 0:
+            rows.clear()
+        elif len(rows) >= self.every:
+            import statistics
+
+            def med(k):
+                v = [r[k] for r in rows if r[k] == r[k]]
+                return statistics.median(v) if v else float("nan")
+
+            logger.warning("deepseek_v41 host prof %s x%d: %s ms (medians; %d launches)", phase, len(rows),
+                           " | ".join(f"{k} {med(k):.2f}" for k in self.KEYS), c["launches"])
+            rows.clear()
+
+
+class RpcProf:
+    """`DEEPSEEK_V41_HOST_PROF=1`: the model runner's per-step calls (ms) -- how long each
+    runs and how long the worker sits between them (`idle>call`: the engine's output
+    processing and scheduling, and the RPC to the 64 workers) -- logged as medians on
+    rank 0 (a port of the Trainium3 `RpcProf`, `origin/deepseek_v41_trn3`)."""
+
+    CALLS = ("execute_model", "sample_tokens", "take_draft_token_ids")
+
+    def __init__(self, every: int):
+        self.every, self.rows, self.cur, self.last_end, self.rank = every, [], {}, None, 0
+
+    def wrap(self, cls, rank: int) -> None:
+        self.rank = rank
+        for name in self.CALLS:
+            fn = getattr(cls, name, None)
+            if fn is None or getattr(fn, "_rpc_prof", False):
+                continue
+
+            def timed(runner, *args, _fn=fn, _name=name, **kwargs):
+                t0 = time.perf_counter()
+                if _name == "execute_model" and self.cur:
+                    self.flush(self.cur)
+                    self.cur = {}
+                if self.last_end is not None:
+                    key = f"idle>{_name}"
+                    self.cur[key] = self.cur.get(key, 0.0) + (t0 - self.last_end) * 1e3
+                try:
+                    return _fn(runner, *args, **kwargs)
+                finally:
+                    t1 = time.perf_counter()
+                    self.cur[_name] = self.cur.get(_name, 0.0) + (t1 - t0) * 1e3
+                    self.last_end = t1
+
+            timed._rpc_prof = True
+            setattr(cls, name, timed)
+
+    def flush(self, row) -> None:
+        import statistics
+
+        self.rows.append(row)
+        if len(self.rows) < self.every:
+            return
+        rows, self.rows = self.rows, []
+        if self.rank != 0:
+            return
+        keys = sorted({k for r in rows for k in r})
+
+        def med(k):
+            v = [r[k] for r in rows if k in r]
+            return statistics.median(v) if v else float("nan")
+
+        logger.warning("deepseek_v41 rpc prof x%d: %s (medians, ms)", len(rows),
+                       " | ".join(f"{k} {med(k):.2f}" for k in keys))
+
+
+HOST_PROF = (HostProf(int(os.environ.get("DEEPSEEK_V41_HOST_PROF_EVERY", "32")))
+             if os.environ.get("DEEPSEEK_V41_HOST_PROF", "") not in ("", "0") else None)
+RPC_PROF = RpcProf(HOST_PROF.every) if HOST_PROF is not None else None
 
 
 @functools.lru_cache(maxsize=None)
@@ -109,9 +269,165 @@ def entry(kernel):
 
 
 @functools.lru_cache(maxsize=None)
+@functools.lru_cache(maxsize=None)
 def params(kernel) -> tuple[str, ...]:
     func = kernel.func if hasattr(kernel, "func") else kernel
     return tuple(inspect.signature(func).parameters)
+
+
+#: `DEEPSEEK_V41_DIRECT_LAUNCH` (default 1): a decode step's layer kernels are launched
+#: on their NEFF's executor directly -- the arguments in the NEFF's input order, the KV caches
+#: passed back as their own aliased outputs, every other output into a tensor of that
+#: launch's own, the same every step -- instead of through the compiled entry (dynamo's
+#: guards, AOTAutograd's wrapper and `_lite_execute`, which allocates fresh outputs). With the
+#: step's index columns in `_step_buf`s too, a launch's IO tensors are where they were the
+#: step before. The first launch of each (layer, shapes) goes through the entry and records
+#: the mapping (`_calibrate`); one that cannot be mapped stays on the entry. 0: the entry.
+_DIRECT = os.environ.get("DEEPSEEK_V41_DIRECT_LAUNCH", "1") not in ("", "0")
+
+
+@dataclass
+class _DirectLaunch:
+    """A launch's executor; `pmap[i]` the argument that is NEFF input i; `outs[i]` NEFF
+    output i's tensor (None: aliased to input `alias[i]`, a cache written in place); `ret`
+    the entry's return values, each `("o", i)` (NEFF output i) or `("a", i)` (NEFF input i)."""
+
+    ex: object
+    pmap: list
+    outs: list
+    alias: dict
+    ret: list
+
+
+#: (layer id, shapes of the step's own arguments) -> `_DirectLaunch` / None (stays on the entry)
+_DIRECTS: dict = {}
+_UNSET = object()
+
+
+def _calibrate(kernel, args):
+    """`entry(kernel)(*args)`, watching the one executor call it makes. Returns
+    `(out, direct)`; `direct` is None unless every NEFF input is one of `args`, the artifact's
+    recorded FX-pass IO mutations are ALIAS-only (metadata), and every value the entry
+    returns is a NEFF output or an aliased input."""
+    from libtorch_neuronx_lite.compile import native_backend as NB
+
+    seen = []
+    lite_execute = NB._lite_execute
+
+    def watch(artifact, inputs):
+        res = lite_execute(artifact, inputs)
+        seen.append((artifact, list(inputs), res))
+        return res
+
+    NB._lite_execute = watch
+    try:
+        out = entry(kernel)(*args)
+    finally:
+        NB._lite_execute = lite_execute
+
+    def no(why):
+        if os.environ.get("DEEPSEEK_V41_DIRECT_DEBUG"):
+            logger.warning("deepseek_v41 direct launch: no mapping (%s)", why)
+        return out, None
+
+    if len(seen) != 1:
+        return no(f"{len(seen)} executor calls")
+    pm = getattr(seen[0][0], "pass_mutations", None) or []
+    kinds = {m.kind.value for p in pm for m in (*p.input_mutations, *p.output_mutations)}
+    if kinds - {"alias"}:
+        # (ALIAS entries are metadata -- `_lite_execute` skips them -- anything else changes
+        # the IO the executor sees)
+        return no(f"FX-pass IO mutations {sorted(kinds)}")
+    art, ins, louts = seen[0]
+    at = {id(x): j for j, x in enumerate(args) if isinstance(x, torch.Tensor)}
+    pmap = [at.get(id(t)) for t in ins]
+    if not ins or None in pmap:
+        return no(f"{sum(p is None for p in pmap)} of {len(ins)} NEFF inputs are not arguments")
+    alias = {a.output_index: a.input_index for a in art.io_spec.aliases}
+    # `_lite_execute` returns every output when the artifact recorded mutations (ALIAS-only
+    # here), else only the unaliased ones
+    free = (list(range(len(art.io_spec.outputs))) if pm
+            else [i for i in range(len(art.io_spec.outputs)) if i not in alias])
+    if len(louts) != len(free):
+        return no(f"{len(louts)} executor outputs vs {len(free)} unaliased")
+    ret = []
+    for e in (out if isinstance(out, (tuple, list)) else (out,)):
+        k = next((m for m, t in enumerate(louts) if t is e), None)
+        if k is not None:
+            ret.append(("o", free[k]))
+            continue
+        j = next((m for m, t in enumerate(ins) if t is e), None)
+        if j is None:
+            return no(f"return value {len(ret)} {tuple(getattr(e, 'shape', ()))} is neither an output "
+                      f"nor an input (aliases {sorted(alias.items())})")
+        ret.append(("a", j))
+    outs = [None if i in alias else torch.empty(tuple(o.shape), dtype=o.dtype, device=ins[0].device)
+            for i, o in enumerate(art.io_spec.outputs)]
+    return out, _DirectLaunch(NB._executor_for(art), pmap, outs, alias, ret)
+
+
+def _launch(kernel, key, args):
+    """`entry(kernel)(*args)`, on the executor directly once calibrated (`_DIRECT`)."""
+    d = _DIRECTS.get(key, _UNSET)
+    if d is _UNSET:
+        out, _DIRECTS[key] = _calibrate(kernel, args)
+        if _DIRECTS[key] is None:
+            logger.warning("deepseek_v41: %s stays on the compiled entry (no direct mapping)",
+                           getattr(getattr(kernel, "func", kernel), "__name__", kernel))
+        # (a one-output entry returns the bare tensor; the direct launch, a tuple)
+        return out if isinstance(out, (tuple, list)) else (out,)
+    if d is None:
+        out = entry(kernel)(*args)
+        return out if isinstance(out, (tuple, list)) else (out,)
+    ins = [args[j] for j in d.pmap]
+    outs = [ins[d.alias[i]] if t is None else t for i, t in enumerate(d.outs)]
+    d.ex.execute(ins, outs)
+    return tuple(outs[i] if kind == "o" else ins[i] for kind, i in d.ret)
+
+
+#: (name, shape, dtype, device) -> the device tensor a decode step's own host-built input (an
+#: index column, the live-row count) is written into: the same tensor every step, so a direct
+#: launch's IO is where it was the step before. Rewriting one in place is safe: a step starts
+#: after the previous step's launches completed (rank 0 read its tokens back), and within a
+#: step each is written once, before the first launch that reads it is submitted.
+_STEP_BUFS: dict = {}
+
+
+def _step_buf(name, t: torch.Tensor, device) -> torch.Tensor:
+    """`t` (host) in its `_STEP_BUFS` tensor on `device`."""
+    t = t.contiguous()
+    key = (name, tuple(t.shape), t.dtype, str(device))
+    buf = _STEP_BUFS.get(key)
+    if buf is None:
+        buf = _STEP_BUFS[key] = t.to(device)
+    else:
+        buf.copy_(t)
+    return buf
+
+
+@torch._dynamo.disable
+def step_tensor(name, values, dtype, device) -> torch.Tensor:
+    """Host `values` (a list) in a `_STEP_BUFS` tensor on `device`, for the traced
+    forward: one copy into a persistent buffer instead of a fresh device tensor a step."""
+    return _step_buf(name, torch.tensor(values, dtype=dtype), device)
+
+
+#: shape -> a zero int32 top-k the layers before the step's first index source read (no
+#: kernel writes it): one per shape instead of a `torch.zeros` on the device every step
+_ZEROS: dict = {}
+
+
+def _zeros_i32(shape, device) -> torch.Tensor:
+    key = (tuple(shape), str(device))
+    z = _ZEROS.get(key)
+    if z is None:
+        z = _ZEROS[key] = torch.zeros(shape, dtype=torch.int32, device=device)
+    return z
+
+
+#: the arguments a decode step builds itself (their shapes pick the NEFF a launch runs)
+_STEP_ARGS = ("stream", "pre_mix", "row_pos", "write_slots", "win_slots", "twin", "wv", "cmp_slots",
+              "cbase", "topk_in", "grp_pos", "grp_mslots", "grp_wslots", "clen", "hash_ids", "live")
 
 
 def _host(t: torch.Tensor) -> torch.Tensor:
@@ -210,6 +526,15 @@ class LayerWeights:
 def prepare(model) -> None:
     """Re-lay every weight the kernels read (see the module docstring). Called once,
     from `load_weights`, so the KV cache is sized against the converted footprint."""
+    if HOST_PROF is not None:
+        HOST_PROF.rank = int(model.rank)
+        HOST_PROF.pending = model.__dict__.setdefault("_mk_pending", [])
+        try:
+            from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
+
+            RPC_PROF.wrap(NeuronModelRunner, int(model.rank))
+        except ImportError:  # outside a server (the unit tests)
+            pass
     for block in model.layers:
         _block_weights(model, block)
     draft_weights(model, with_freqs=False)
@@ -321,7 +646,10 @@ class StepIndices:
                 f"the layer kernels want every span of a step to have the same length, got "
                 f"{sorted(lengths)}; the Neuron scheduler does not mix prefill and decode"
             )
-        self.live = torch.tensor([[float(self.live_rows)]], dtype=torch.float32, device=self.device)
+        #: a decode step writes its own device inputs into `_step_buf`s (see `_DIRECT`)
+        self.stable = _DIRECT and self.T <= PT
+        live = torch.tensor([[float(self.live_rows)]], dtype=torch.float32)
+        self.live = _step_buf(("live",), live, self.device) if self.stable else live.to(self.device)
 
     def read_len(self, ratio: int) -> int:
         if not ratio:
@@ -343,7 +671,8 @@ class StepIndices:
                          "clen", "grp_pos", "grp_mslots", "grp_wslots"):
                 t = getattr(idx, name)
                 if t is not None:
-                    setattr(idx, name, t.to(self.device))
+                    setattr(idx, name, _step_buf(("idx", key, name), t, self.device) if self.stable
+                            else t.to(self.device))
             self._by_ratio[key] = idx
         return idx
 
@@ -377,6 +706,8 @@ def run_layers(model, stream, pre_mix, spans, paged, hashes, live_rows):
     read only here."""
     from . import model as M
 
+    if HOST_PROF is not None and HOST_PROF.cur is not None:
+        HOST_PROF.cur["phase"] = f"{'decode' if int(stream.shape[0]) <= PT else 'prefill'}_B{len(spans)}"
     step = StepIndices(
         spans, paged, stream.device, hashes,
         [span.host_table for span in paged],
@@ -393,6 +724,7 @@ def run_layers(model, stream, pre_mix, spans, paged, hashes, live_rows):
 @torch._dynamo.disable
 def run_layer(model, block, stream: torch.Tensor, pre_mix: torch.Tensor, step: StepIndices):
     """One backbone block through its archetype's kernel. Returns `(stream, ffn_pre)`."""
+    t_args = time.perf_counter()
     lw = layer_weights(model, block)
     attn = block.attn
     T = int(stream.shape[0])
@@ -446,7 +778,7 @@ def run_layer(model, block, stream: torch.Tensor, pre_mix: torch.Tensor, step: S
                     f"{limit} the candidate-block mask keeps; the kernels assume the mask is a no-op"
                 )
         if step.topk is None:
-            step.topk = torch.zeros(T, int(model.config.index_topk), dtype=torch.int32, device=step.device)
+            step.topk = _zeros_i32((T, int(model.config.index_topk)), step.device)
         n.update(cmp_slots=idx.cmp_slots, cbase=idx.cbase, topk_in=step.topk,
                  compress_kv_cache=step.compress_cache)
     if lw.idx_src:
@@ -455,14 +787,25 @@ def run_layer(model, block, stream: torch.Tensor, pre_mix: torch.Tensor, step: S
         index = list(model.config.engram_layer_ids).index(attn.layer_id)
         n["hash_ids"] = step.hash_cols(index, block.engram.row_start)
     kernel = layer_kernel.KERNELS[(lw.arch, phase)]
+    prof = HOST_PROF if HOST_PROF is not None and HOST_PROF.cur is not None else None
+    if prof is not None:
+        t_launch = time.perf_counter()
+        prof.add("args", t_launch - t_args)
     if _MK_SYNC:
-        import time
-
         t0 = time.perf_counter()
         if model.rank in (0, model.world_size - 1):
             logger.warning("deepseek_v41 MK_SYNC rank %d layer %d %s/%s T=%d B=%d submit",
                            model.rank, attn.layer_id, lw.arch, phase, T, B)
-    out = entry(kernel)(*[n[name] for name in params(kernel)])
+    args = [n[name] for name in params(kernel)]
+    if step.stable and not _MK_SYNC:
+        key = (attn.layer_id, tuple(tuple(n[a].shape) for a in _STEP_ARGS if a in n))
+        out = _launch(kernel, key, args)
+    else:
+        out = entry(kernel)(*args)
+    if prof is not None:
+        t_post = time.perf_counter()
+        prof.add("launch", t_post - t_launch)
+        prof.cur["launches"] += 1
     if _MK_SYNC:
         out[1].cpu()
         if model.rank in (0, model.world_size - 1):
@@ -476,6 +819,8 @@ def run_layer(model, block, stream: torch.Tensor, pre_mix: torch.Tensor, step: S
     if lw.tap:
         step.taps.append(out[k])
     _throttle(model, ffn_pre)
+    if prof is not None:
+        prof.add("post", time.perf_counter() - t_post)
     return out_stream, ffn_pre
 
 
@@ -500,6 +845,198 @@ def _throttle(model, small: torch.Tensor) -> None:
 
 def _draft_meta(seed, tap, pos):
     return torch.stack([seed.reshape(-1)[:1], tap.reshape(-1)[:1], pos.reshape(-1)[:1]]).to(torch.int32).reshape(1, 3)
+
+
+def _draft_meta_b(seeds, taps, pos):
+    """`meta [B, 3]` int32 (seed, tap, pos) per sequence, as a compiled step."""
+    return torch.stack([seeds.reshape(-1), taps.reshape(-1), pos.reshape(-1)], 1).to(torch.int32)
+
+
+#: `DEEPSEEK_V41_DRAFT_BATCHED` (default 1): a decode step of B > 1 sequences drafts them all
+#: in one launch of `draft_batched.draft_decode_batched` (bit-identical to B launches of
+#: `draft_decode`, which re-stream the three stages' weights once per sequence). 0: one
+#: launch a sequence.
+DRAFT_BATCHED = os.environ.get("DEEPSEEK_V41_DRAFT_BATCHED", "1") not in ("", "0")
+
+
+@torch._dynamo.disable
+def run_draft_batched(model, seeds, taps, main_hidden, spans, paged):
+    """`forward_spec` for every sequence of a decode step in one drafter launch:
+    `[(output_ids [1, K+1] int64, None, confidence [1, K] fp32)]` a sequence."""
+    from . import model as M
+    from .kernels import draft_batched
+
+    cfg = model.config
+    device = main_hidden.device
+    B = len(spans)
+    K = int(cfg.dspark_block_size)
+    stages = list(model.mtp)
+    win = int(stages[0].attn.window_size)
+    ntab_p = -(-(win + K) // PT) * PT
+    lengths = {length for _, length, _ in spans}
+    assert len(lengths) == 1, f"the batched drafter wants equal spans, got {sorted(lengths)}"
+    L = lengths.pop()
+    # the spans tile the step's rows in order, so the main rows are one slice
+    first = spans[0][0]
+    if all(begin == first + b * L for b, (begin, _, _) in enumerate(spans)):
+        rows = B * L
+        main = main_hidden if first == 0 and rows == int(main_hidden.shape[0]) else main_hidden[first : first + rows]
+    else:
+        main = torch.cat([main_hidden[begin : begin + length] for begin, length, _ in spans])
+    pos = _step_buf(("dpos", B), torch.tensor([int(sp) for _, _, sp in spans], dtype=torch.int64), device)
+    meta = M._compiled(_draft_meta_b)(seeds.reshape(-1)[:B], taps.reshape(-1)[:B], pos)
+    consts = model.__dict__.setdefault("_mk_draft_b_consts", {})
+    ck = (B, K, ntab_p)
+    if ck not in consts:
+        rows_c = torch.tensor([[b, i, b * ntab_p, 0] for b in range(B) for i in range(K)], dtype=torch.int32)
+        consts[ck] = (rows_c.to(device), torch.tensor([[float(B * K)]], dtype=torch.float32).to(device))
+    rows_c, live = consts[ck]
+    row_pos = torch.cat([sp + torch.arange(length) for _, length, sp in spans]).to(torch.int32).reshape(-1, 1)
+    write_slots = torch.cat([torch.as_tensor(p.host_slots[:length], dtype=torch.int32)
+                             for p, (_, length, _) in zip(paged, spans)]).reshape(-1, 1)
+    tables = [p.host_table.to(torch.int32).reshape(-1) for p in paged]
+    nblk = max(int(t.numel()) for t in tables)
+    table = torch.stack([torch.nn.functional.pad(t, (0, nblk - int(t.numel()))) for t in tables]).reshape(-1, 1)
+    n = dict(draft_weights(model))
+    n.update(
+        meta=meta, rows_c=rows_c, main_hidden=main, live=live,
+        row_pos=_step_buf(("drow_pos", B), row_pos, device),
+        write_slots=_step_buf(("dwrite_slots", B), write_slots, device),
+        block_table=_step_buf(("dblock_table", B), table, device),
+        cache0=stages[0].attn.window_kv_cache.view(-1, stages[0].attn.head_dim),
+        cache1=stages[1].attn.window_kv_cache.view(-1, stages[1].attn.head_dim),
+        cache2=stages[2].attn.window_kv_cache.view(-1, stages[2].attn.head_dim),
+        groups_attn=model._mk_groups_attn, groups_world=model._mk_groups_world,
+        flags=(K, win, 9, kernel_key(draft_batched.draft_decode_batched),
+               int(cfg.dspark_noise_token_id), int(cfg.vocab_size), int(cfg.dspark_num_experts_per_tok),
+               int(paged[0].block_size)),
+    )
+    kernel = draft_batched.draft_decode_batched
+    args = [n[name] for name in params(kernel)]
+    if _DIRECT and not _MK_SYNC:
+        out = _launch(kernel, ("draft_b", tuple(tuple(t.shape) for t in (main, table, rows_c))), args)
+    else:
+        out = entry(kernel)(*args)
+    output_ids, confidence = out[0], out[1]
+    _throttle(model, confidence)
+    ids = M._compiled(_ids_i64)(output_ids)
+    conf = confidence.reshape(B, K)
+    return [(ids[b : b + 1], None, conf[b : b + 1]) for b in range(B)]
+
+
+#: `DEEPSEEK_V41_HEAD_GREEDY` (default 1): an all-greedy speculative decode step runs
+#: the collapse, final norm, vocabulary-parallel head and the argmax as one launch
+#: (`kernels/head_kernel.head_greedy`) in place of the collapse / norm / head graphs and
+#: the sampler; `model.forward` decides from the runner's `sampling_hint`.
+HEAD_GREEDY = os.environ.get("DEEPSEEK_V41_HEAD_GREEDY", "1") not in ("", "0")
+
+#: `DEEPSEEK_V41_EMBED_KERNEL` (default 1): a decode step embeds its tokens and expands them
+#: to the hyper-connection copies in one launch (`kernels/head_kernel.embed_expand`) in
+#: place of the embedding graph (its XLA all-reduce) and the `hc_expand` kernel.
+EMBED_KERNEL = os.environ.get("DEEPSEEK_V41_EMBED_KERNEL", "1") not in ("", "0")
+
+
+#: `DEEPSEEK_V41_CHECK_ENDS=1` (debugging): every decode step also runs the separate
+#: embedding / head path and logs (rank 0) where `run_embed` / `run_head_greedy` differ.
+CHECK_ENDS = os.environ.get("DEEPSEEK_V41_CHECK_ENDS", "") not in ("", "0")
+
+
+_CHECK_NOTES: set = set()
+
+
+@torch._dynamo.disable
+def check_note(msg: str) -> None:
+    """Log `msg` once (rank 0)."""
+    if msg not in _CHECK_NOTES:
+        _CHECK_NOTES.add(msg)
+        logger.warning("deepseek_v41 CHECK %s", msg)
+
+
+@torch._dynamo.disable
+def check_ends(name, got, ref, input_ids) -> None:
+    import torch.distributed as dist
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    g, r = got.cpu(), ref.cpu()
+    if name == "head ids":
+        logits = r.float()
+        want = logits.argmax(-1)
+        ids = g.reshape(-1).to(torch.int64)
+        bad = (ids != want).nonzero().reshape(-1).tolist()
+        if bad and rank == 0:
+            rows = [(t, int(ids[t]), int(want[t]), float(logits[t, ids[t].clamp(0, logits.shape[1] - 1)]),
+                     float(logits[t, want[t]])) for t in bad[:6]]
+            logger.warning("deepseek_v41 CHECK %s: %d/%d rows differ (row, got, want, logit[got], logit[want]) %s",
+                           name, len(bad), ids.numel(), rows)
+        elif rank == 0:
+            logger.warning("deepseek_v41 CHECK %s: %d rows equal", name, ids.numel())
+        return
+    same = g.shape == r.shape and torch.equal(g.contiguous().view(torch.uint8), r.contiguous().view(torch.uint8))
+    if rank == 0:
+        if same:
+            logger.warning("deepseek_v41 CHECK %s: equal %s", name, tuple(g.shape))
+        else:
+            diff = (g.float() - r.float()).abs().reshape(g.shape[0], -1).amax(1) if g.shape == r.shape else None
+            logger.warning("deepseek_v41 CHECK %s: DIFFER shapes %s %s dtypes %s %s, row max |diff| %s, ids %s",
+                           name, tuple(g.shape), tuple(r.shape), g.dtype, r.dtype,
+                           None if diff is None else diff.tolist(),
+                           None if input_ids is None else input_ids.cpu().reshape(-1).tolist())
+
+
+@torch._dynamo.disable
+def run_embed(model, input_ids):
+    """A decode step's `(stream [T, hc, dim], pre_mix [T, hc])` -- the token embedding and
+    the hyper-connection expand -- in one launch (`kernels/head_kernel.embed_expand`)."""
+    from .kernels import head_kernel
+
+    device = input_ids.device
+    T = int(input_ids.shape[0])
+    n = model.__dict__.get("_mk_embed_")
+    if n is None:
+        part = int(model.part_vocab_size)
+        n = model.__dict__["_mk_embed_"] = {
+            "embed_w": model.embed_weight,
+            "vocab_start": torch.tensor([[int(model.rank * part)]], dtype=torch.int32).to(device),
+            "groups_world": model._mk_groups_world,
+            "flags": (int(model.config.hc_mult), kernel_key(head_kernel.embed_expand)),
+        }
+    kernel = head_kernel.embed_expand
+    # int32 ids as they are; int64 ones as int32 (low, high) pairs -- a view, no device op
+    ids = (input_ids.reshape(T, 1) if input_ids.dtype == torch.int32
+           else input_ids.reshape(T).view(torch.int32).reshape(T, 2))
+    args = [ids] + [n[name] for name in params(kernel)[1:]]
+    if _DIRECT and not _MK_SYNC:
+        out = _launch(kernel, ("embed", T, input_ids.dtype), args)
+    else:
+        out = entry(kernel)(*args)
+    return out[0], out[1]
+
+
+@torch._dynamo.disable
+def run_head_greedy(model, stream, pre_mix):
+    """The greedy token of every row of a decode step, `[T, 1]` int32, in one launch."""
+    from .kernels import head_kernel
+
+    device = stream.device
+    n = model.__dict__.get("_mk_head_")
+    if n is None:
+        part = int(model.part_vocab_size)
+        bias = model.__dict__.get("_vocab_pad_bias_t")
+        n = model.__dict__["_mk_head_"] = {
+            "norm_w": _row(model.norm.weight, device),
+            "head_w": model.head_weight,
+            "pad_bias": (bias.reshape(1, part) if bias is not None
+                         else torch.zeros(1, part, dtype=torch.float32).to(device)),
+            "vocab_start": torch.tensor([[int(model.rank * part)]], dtype=torch.int32).to(device),
+            "groups_world": model._mk_groups_world,
+            "flags": (kernel_key(head_kernel.head_greedy),),
+        }
+    kernel = head_kernel.head_greedy
+    args = [stream, pre_mix] + [n[name] for name in params(kernel)[2:]]
+    if _DIRECT and not _MK_SYNC:
+        return _launch(kernel, ("head", tuple(stream.shape)), args)[0]
+    out = entry(kernel)(*args)
+    return out[0] if isinstance(out, (tuple, list)) else out
 
 
 def _ids_i64(ids):

@@ -29,8 +29,10 @@ rows' positions, the window's validity base and the window's cache slots
 (`block_table[p // bs] * bs + p % bs`).
 
 The argmax over the full vocabulary never gathers the logits: each rank takes the
-(max, index) of its own vocabulary shard and an all_gather of those pairs decides
-(ties to the lowest rank, i.e. the lowest vocabulary index, as `argmax` does).
+(max, index) of its own vocabulary shard and the world's pairs decide (ties to the
+lowest rank, i.e. the lowest vocabulary index, as `argmax` does), exchanged with an
+all-reduce of a one-hot table (`mk_common.rank_pairs`; see `head_kernel` for why not
+an all-gather).
 
 Trn2 specifics as in `layer_kernel`: bf16 k-major weights for every fp8 linear
 (`mk_gemm`), the fp4 routed experts decoded in SBUF (`mk_moe`), per-token gather
@@ -66,6 +68,7 @@ from .mk_common import (
     load_fn_t,
     norm_rows,
     pad_to,
+    rank_pairs,
     rope_rows,
     route_topk,
     scatter_rows,
@@ -228,10 +231,9 @@ def _draft(a, phase):
     lg32 = nl.ndarray((Kp, part), dtype=nl.float32, buffer=nl.shared_hbm, name="lg32")
     mcc_src = nl.ndarray((1, mrank), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="mcc_src")
     mcc_dst = nl.ndarray((1, mrank), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="mcc_dst")
-    gv_src = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.shared_hbm, name="gv_src")
-    gv_dst = nl.ndarray((world, 1), dtype=nl.float32, buffer=nl.shared_hbm, name="gv_dst")
-    gi_src = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.shared_hbm, name="gi_src")
-    gi_dst = nl.ndarray((world, 1), dtype=nl.float32, buffer=nl.shared_hbm, name="gi_dst")
+    # (max | index) per rank column, this rank's filled, summed over the world (`rank_pairs`)
+    pv_src = nl.ndarray((1, 2 * world), dtype=nl.float32, buffer=nl.shared_hbm, name="pv_src")
+    pv_dst = nl.ndarray((1, 2 * world), dtype=nl.float32, buffer=nl.shared_hbm, name="pv_dst")
     memb = nl.ndarray((Kp, mrank), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="memb")
 
     # ------------------------------------------------------------------ 0. the draft's indices
@@ -629,19 +631,17 @@ def _draft(a, phase):
         gidx_f = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=gidx_f, data1=bf, data2=vs1, op=nl.add)
         if pid == 0:
-            nisa.dma_copy(dst=gv_src[0:1, 0:1], src=best[0:1, 0:1])
-            nisa.dma_copy(dst=gi_src[0:1, 0:1], src=gidx_f)
-        nisa.core_barrier(data=gv_src, cores=(0, 1))
-        nisa.core_barrier(data=gi_src, cores=(0, 1))
-        ncc.all_gather(srcs=[gv_src], dsts=[gv_dst], replica_group=rg_world, collective_dim=0)
-        ncc.all_gather(srcs=[gi_src], dsts=[gi_dst], replica_group=rg_world, collective_dim=0)
+            pair = rank_pairs(best, gidx_f, vocab_start, part, world, 1)
+            nisa.dma_copy(dst=pv_src[0:1, 0 : 2 * world], src=pair[0:1, :])
+        nisa.core_barrier(data=pv_src, cores=(0, 1))
+        ncc.all_reduce(srcs=[pv_src], dsts=[pv_dst], replica_group=rg_world, op=nl.add)
         # the global argmax: the highest shard max, ties to the lowest rank (lowest index)
         vrow = nl.ndarray((1, W8), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(vrow, NEG)
-        nisa.dma_copy(dst=vrow[0:1, 0:world], src=gv_dst.reshape((1, world))[0:1, 0:world])
+        nisa.dma_copy(dst=vrow[0:1, 0:world], src=pv_dst[0:1, 0:world])
         trow = nl.ndarray((1, W8), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(trow, 0.0)
-        nisa.dma_copy(dst=trow[0:1, 0:world], src=gi_dst.reshape((1, world))[0:1, 0:world])
+        nisa.dma_copy(dst=trow[0:1, 0:world], src=pv_dst[0:1, world : 2 * world])
         gbest = nl.ndarray((1, 8), dtype=nl.float32, buffer=nl.sbuf)
         nisa.max8(dst=gbest, src=vrow)
         gidx = nl.ndarray((1, 8), dtype=nl.uint32, buffer=nl.sbuf)

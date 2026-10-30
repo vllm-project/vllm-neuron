@@ -3117,6 +3117,19 @@ def _accepted_tail(accepted):
     return seeds, valid.to(torch.int64)
 
 
+def _greedy_step(ids, rows, draft_token_ids, cu_num_draft_tokens, max_spec_len, lengths, taps,
+                 n_seqs: int):
+    """Everything between the greedy head (`mk_model.run_head_greedy`, `[T, 1]` int32) and
+    the drafter, as one compiled step: the tokens at the sampling rows (what the sampler
+    returns), the rejection sampler's verdict on them, each sequence's draft seed and tap
+    row (`_accepted_tail`, `_tap_rows`) and the drafter's main rows (`_concat_last`)."""
+    sampled = torch.index_select(ids.reshape(-1), 0, rows)
+    accepted = _rejection_sample(sampled, draft_token_ids, cu_num_draft_tokens, max_spec_len)
+    seeds, valid = _accepted_tail(accepted)
+    tap_rows = _tap_rows(valid[:n_seqs], lengths, int(accepted.shape[1]))
+    return accepted, seeds[:n_seqs], tap_rows, torch.cat(taps, dim=-1)
+
+
 def _greedy_rows(logits):
     """`argmax` over the vocabulary, as a compiled step."""
     return logits.argmax(dim=-1)
@@ -4582,6 +4595,12 @@ class DeepseekV41ForCausalLM(nn.Module):
     attention inputs of layers 37/38/39.
     """
 
+    #: The forward takes `sampling_hint` (all_greedy, no_top_k, no_top_p), host booleans
+    #: the Neuron model runner passes to models that set this: an all-greedy decode step
+    #: takes the one-launch greedy head (`mk_model.run_head_greedy`) without reading the
+    #: device-resident sampling parameters back.
+    accepts_sampling_hint = True
+
     def __init__(self, config: DeepseekV41Config) -> None:
         super().__init__()
         self.config = config
@@ -5420,6 +5439,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         spec_decode_metadata: object | None = None,
         logit_mask: torch.Tensor | None = None,
         rank: torch.Tensor | None = None,
+        sampling_hint: tuple | None = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """tokens -> logits, through all 40 layers and the three DSpark stages.
@@ -5431,6 +5451,9 @@ class DeepseekV41ForCausalLM(nn.Module):
             embed -> expand to hc_mult=4 copies -> 40 x Block -> collapse with
             the last layer's pre_mix -> norm -> head
         """
+        prof = mk_model.HOST_PROF if _MEGAKERNEL else None
+        if prof is not None:
+            prof.begin()
         if self.weight_store is None:
             raise RuntimeError(
                 "forward() needs the weight store that load_weights attaches: "
@@ -5459,10 +5482,25 @@ class DeepseekV41ForCausalLM(nn.Module):
         slices = [(begin, length) for begin, length, _ in spans]
         bucket_rows = sum(length for _, length, _ in spans)
 
-        hidden = self.embed_input_ids(input_ids)
-        hidden = NF.merge_prompt_embeds(hidden, inputs_embeds, is_token_ids)
-        stream, pre_mix = _nki_entry("hc_expand")(hidden.unsqueeze(0))
-        stream, pre_mix = stream.squeeze(0), pre_mix.squeeze(0)
+        if (_MEGAKERNEL and mk_model.EMBED_KERNEL and inputs_embeds is None
+                and input_ids.dtype in (torch.int32, torch.int64)
+                and int(input_ids.shape[0]) <= mk_model.PT):
+            # a step of at most 128 rows (every decode step): the embedding and the
+            # expand in one launch
+            stream, pre_mix = mk_model.run_embed(self, input_ids)
+            if mk_model.CHECK_ENDS:
+                ref = self.embed_input_ids(input_ids)
+                ref_stream, ref_mix = _nki_entry("hc_expand")(ref.unsqueeze(0))
+                mk_model.check_ends("embed stream", stream, ref_stream.squeeze(0), input_ids)
+                mk_model.check_ends("embed pre_mix", pre_mix, ref_mix.squeeze(0), input_ids)
+        else:
+            if mk_model.CHECK_ENDS:
+                mk_model.check_note(f"embed kernel skipped: T={int(input_ids.shape[0])} dtype={input_ids.dtype} "
+                                    f"inputs_embeds={'set' if inputs_embeds is not None else None}")
+            hidden = self.embed_input_ids(input_ids)
+            hidden = NF.merge_prompt_embeds(hidden, inputs_embeds, is_token_ids)
+            stream, pre_mix = _nki_entry("hc_expand")(hidden.unsqueeze(0))
+            stream, pre_mix = stream.squeeze(0), pre_mix.squeeze(0)
 
         hashes = self._engram_hashes(input_ids, paged)
 
@@ -5486,9 +5524,13 @@ class DeepseekV41ForCausalLM(nn.Module):
             # bookkeeping (block tables, slot lists, span positions) is Python data
             # that changes every step, and touched from the traced forward it would
             # key a new graph each step.
+            if prof is not None:
+                prof.mark("m_layers0")
             stream, pre_mix, main_hiddens = mk_model.run_layers(
                 self, stream, pre_mix, spans, paged, hashes, live_rows
             )
+            if prof is not None:
+                prof.mark("m_layers1")
 
         for layer_id, block in enumerate([] if _MEGAKERNEL else self.layers):
             if layer_id % _HEAP_TRIM_EVERY == 0:
@@ -5539,6 +5581,38 @@ class DeepseekV41ForCausalLM(nn.Module):
                 )
         _MOE_LIVE_ROWS[0] = None
 
+        # An all-greedy speculative decode step: the head and the argmax are one launch,
+        # and the step returns the rejection sampler's tokens, so its logits are never
+        # read (a structured-output mask needs the sampler's path).
+        if (_MEGAKERNEL and mk_model.HEAD_GREEDY and self.sampler is not None and main_hiddens
+                and spec_decode_metadata is not None and sampling_hint is not None
+                and bool(sampling_hint[0]) and logit_mask is None
+                and sampling_positions is not None and int(stream.shape[0]) <= mk_model.PT):
+            ids = mk_model.run_head_greedy(self, stream, pre_mix)
+            if mk_model.CHECK_ENDS:
+                ref = self.norm(HyperConnections.pre(stream.unsqueeze(0), pre_mix.unsqueeze(0))).squeeze(0)
+                ref_logits = self.gather_logits(self.logits_shard(ref))
+                mk_model.check_ends("head ids", ids, ref_logits, None)
+            lengths = mk_model.step_tensor(
+                ("live_lengths", len(spans)), live_lengths, torch.int64, ids.device
+            )
+            accepted, seeds, taps, main_hidden = _compiled(_greedy_step)(
+                ids, sampling_positions,
+                spec_decode_metadata.draft_token_ids,
+                spec_decode_metadata.cu_num_draft_tokens,
+                max(spec_decode_metadata.num_draft_tokens),
+                lengths, main_hiddens, len(spans),
+            )
+            if prof is not None:
+                prof.mark("m_head")
+            self.last_draft = self._draft(
+                None, accepted, spans, paged, shared, main_hidden,
+                True, live_lengths, seeds_taps=(seeds, taps),
+            )
+            if prof is not None:
+                prof.end()
+            return accepted
+
         collapsed = HyperConnections.pre(stream.unsqueeze(0), pre_mix.unsqueeze(0))
         collapsed = self.norm(collapsed).squeeze(0)
 
@@ -5546,7 +5620,11 @@ class DeepseekV41ForCausalLM(nn.Module):
         if sampling_positions is not None:
             selected = _compiled(_select_rows)(collapsed, sampling_positions)
         logits_shard = self.logits_shard(selected)
-        logits = self.gather_logits(logits_shard)
+        # The full-vocabulary logits (an all-gather of `[T, vocab]` fp32) are only ever
+        # returned when there is no rejection sampler's output to return instead, or read by
+        # the sampler-less path below; a speculative step with a sampler never reads them.
+        need_logits = self.sampler is None or spec_decode_metadata is None
+        logits = self.gather_logits(logits_shard) if need_logits else None
 
         main_hidden = (
             _compiled(_concat_last)(main_hiddens) if main_hiddens else None
@@ -5581,10 +5659,14 @@ class DeepseekV41ForCausalLM(nn.Module):
                 max(spec_decode_metadata.num_draft_tokens),
             )
 
+        if prof is not None:
+            prof.mark("m_head")
         self.last_draft = self._draft(
             sampled, accepted, spans, paged, shared, main_hidden,
             sampling_positions is not None, live_lengths,
         )
+        if prof is not None:
+            prof.end()
         if accepted is not None:
             return accepted
         return sampled, logits
@@ -6019,12 +6101,16 @@ class DeepseekV41ForCausalLM(nn.Module):
         main_hidden: torch.Tensor | None,
         gathered: bool,
         live_lengths: list[int] | None = None,
+        seeds_taps: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """One DSpark draft per scheduled sequence, seeded from this step's own
-        committed token.
+        committed token. `seeds_taps`: the seeds and tap rows already computed
+        (the greedy head's step, `_greedy_step`).
 
             RuntimeError: Expected self.dtype() == dst.dtype() to be true
         """
+        if seeds_taps is not None:
+            return self._draft_from(seeds_taps[0], seeds_taps[1], spans, paged, shared, main_hidden)
         device = sampled.device
         if live_lengths is None:
             live_lengths = [length for _, length, _ in spans]
@@ -6049,6 +6135,14 @@ class DeepseekV41ForCausalLM(nn.Module):
             seeds = _compiled(_select_rows)(sampled.reshape(-1), picks)
             valid, rows_per_seq = ones, 1
         taps = _compiled(_tap_rows)(valid, lengths, rows_per_seq)
+        return self._draft_from(seeds, taps, spans, paged, shared, main_hidden)
+
+    def _draft_from(self, seeds, taps, spans, paged, shared, main_hidden):
+        """`_draft` from each sequence's seed and tap row."""
+        if (_MEGAKERNEL and mk_model.DRAFT_BATCHED and len(spans) > 1 and main_hidden is not None
+                and not any(p.at_zero for p in paged)):
+            # every sequence in one drafter launch (bit-identical to one launch each)
+            return mk_model.run_draft_batched(self, seeds, taps, main_hidden, spans, paged)
         return [
             self.forward_spec(
                 seeds[row : row + 1], taps[row : row + 1],
