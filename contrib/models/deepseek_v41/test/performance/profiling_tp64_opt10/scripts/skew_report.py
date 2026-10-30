@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""Cross-rank tables from skew6.py output -> report_parts/80_skew_<name>.md (+ printed)
+
+  skew_report.py <out_name> <phase> [--steps a,b,..]
+
+1. per collective kind: arrival spread over the captured ranks, rank 0's lower-bound wait, which rank
+   arrives last, and rank 0's duration-based wait estimate (duration - fastest instance) for comparison
+2. the MoE world all-reduce: why the last rank is late -- each block's span from its start (the previous
+   block's world all-reduce end, a common instant on every rank) to its attention all-reduce trigger
+   (attention), to its world all-reduce trigger (MoE), and the HBM bytes the rank read in the MoE span
+   (its routed experts' weights: ~18.8 MB per expert that got >= 1 token)
+3. the kernel-entry barrier: device start of the launch on each rank vs the host's submission
+   (nrt_model_submit / kbl_exec_post in the rank's system trace)
+"""
+import argparse, json, re, sys
+import duckdb, numpy as np, pandas as pd
+
+ROOT = "/mnt/nvme/ds41_profiling_opt10"
+
+
+def var_of(s):
+    m = re.search(r"srcs=\[(\w+)\]", s) if isinstance(s, str) else None
+    return m.group(1) if m else None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("name")
+    ap.add_argument("phase")
+    ap.add_argument("--steps", default=None)
+    a = ap.parse_args()
+    D = f"{ROOT}/analysis/{a.name}"
+    S = pd.read_parquet(f"{D}/skew_cc.parquet")
+    SU = pd.read_parquet(f"{D}/skew_units.parquet")
+    info = json.load(open(f"{D}/skew_info.json"))
+    # decode: skip the first two steps (the profiler's start reaches the 8 ranks at different times and stalls
+    # their first step unequally) and the last, incomplete one
+    steps = ([int(s) for s in a.steps.split(",")] if a.steps else
+             sorted(S.step.unique())[2:-1] if a.phase == "decode" else sorted(S.step.unique()))
+    S = S[S.step.isin(steps)].copy()
+    S["var"] = S.src.map(var_of)
+    from tl_summary import TENSOR
+    ex0r = pd.read_parquet(f"{ROOT}/analysis/{info['runs'][str(info['ranks'][0])]}/execs.parquet").set_index("exec")
+    S["role"] = S.exec0.map(ex0r.role)
+
+    def _lab(r):
+        if r.kind == "barrier":
+            return "kernel-entry barrier"
+        op = {"allreduce": "AR", "allgather": "AG"}.get(r.kind.split("-")[0], r.kind) + "-" + r.kind.split("-")[1][:-1]
+        sz = f"{r.size / 1e6:.1f} MB" if r.size >= 1e6 else f"{r.size / 1e3:.0f} KB" if r.size >= 1e3 else f"{r.size} B"
+        var = r.var if isinstance(r.var, str) else None
+        if var is None:
+            return f"{op} XLA-graph collective ({sz})"
+        return f"{op} `{var}` ({TENSOR.get(var, var)}, {sz})" + (" — drafter" if r.role == "draft" else "")
+    S["label"] = [_lab(r) for r in S.itertuples()]
+    ranks = info["ranks"]
+    r0 = ranks[0]
+    k = len(steps) if a.phase == "decode" else 1
+    out = []
+    # ---- 1. per collective kind
+    g = S.groupby(["exec0", "i"])
+    S["spread"] = g.arrive.transform("max") - g.arrive.transform("min")
+    s0 = S[S["rank"] == r0].copy()
+    floor = s0.groupby("label").dur.min()
+    s0["dur_wait"] = s0.dur - s0.label.map(floor)
+    lastc = S[S.is_last].groupby("label")["rank"].agg(lambda x: x.value_counts().to_dict())
+    t = s0.groupby("label").agg(n=("dur", "size"), dur_us=("dur", "mean"), floor_us=("dur", "min"),
+                                wait_est_us=("dur_wait", "mean"), wait_lb_us=("wait_lb", "mean")).reset_index()
+    sp = S.drop_duplicates(["exec0", "i"]).groupby("label").spread.agg(["mean", "median", lambda x: x.quantile(0.9)])
+    sp.columns = ["spread_mean", "spread_p50", "spread_p90"]
+    t = t.join(sp, on="label")
+    for c in ("dur_us", "floor_us", "wait_est_us", "wait_lb_us", "spread_mean", "spread_p50", "spread_p90"):
+        t[c] = t[c] / 1e3
+    t["per_step_ms_wait_est"] = t.wait_est_us * t.n / k / 1e3
+    t = t.sort_values("per_step_ms_wait_est", ascending=False)
+    out.append(f"**Alignment**: ranks {ranks}; after aligning on the 64-rank all-reduce ends, those ends agree "
+               f"within {info['end_spread_us_p50']:.1f} µs (median; p90 {info['end_spread_us_p90']:.1f} µs).\n")
+    out.append("| Collective (rank 0) | per step | mean µs | fastest µs | rank 0 wait, duration-based µs | rank 0 wait vs last of 8 captured ranks µs | "
+               "arrival spread over 8 ranks µs: mean / p50 / p90 | last to arrive (rank: times) |")
+    out.append("|---|---:|---:|---:|---:|---:|---:|---|")
+    for r in t.itertuples():
+        lc = lastc.get(r.label, {})
+        lcs = ", ".join(f"{kk}: {vv}" for kk, vv in sorted(lc.items(), key=lambda x: -x[1])[:4])
+        out.append(f"| {r.label} | {r.n / k:.1f} | {r.dur_us:.1f} | {r.floor_us:.1f} | {r.wait_est_us:.1f} | {r.wait_lb_us:.1f} | "
+                   f"{r.spread_mean:.1f} / {r.spread_p50:.1f} / {r.spread_p90:.1f} | {lcs} |")
+    tab1 = "\n".join(out)
+
+    # ---- 2. MoE world all-reduce: attention / MoE spans per rank and block
+    w = S[(S["var"] == "cc2_src") & (S.gsize == 64)][["exec0", "i", "rank", "u", "arrive", "end", "wait_lb", "is_last"]]
+    at = S[(S["var"] == "cc_src") & (S.gsize == 8)][["exec0", "i", "rank", "arrive", "end"]]
+    rows = []
+    for (e0, rk), ww in w.groupby(["exec0", "rank"]):
+        aa = at[(at.exec0 == e0) & (at["rank"] == rk)].sort_values("i")
+        ww = ww.sort_values("i")
+        if len(aa) != len(ww):
+            continue
+        u = SU[(SU.exec0 == e0) & (SU["rank"] == rk)].sort_values("member")
+        blocks = u[u.unit.str.match(r"L\d\d ")]
+        if len(blocks) != len(ww):
+            continue
+        for (_, wr), (_, ar), (_, br) in zip(ww.iterrows(), aa.iterrows(), blocks.iterrows()):
+            rows.append(dict(exec0=e0, rank=rk, block=br.unit, t_start=br.t0, attn_arrive=ar.arrive, attn_end=ar.end,
+                             moe_arrive=wr.arrive, world_end=wr.end, wait_lb=wr.wait_lb, is_last=wr.is_last))
+    B = pd.DataFrame(rows)
+    tab2 = ""
+    if len(B):
+        B["attn_span"] = B.attn_arrive - B.t_start
+        B["moe_span"] = B.moe_arrive - B.attn_end
+        B["key"] = B.exec0.astype(str) + "|" + B.block
+        # HBM bytes read in the MoE span, per rank (Instruction attribution)
+        hb = []
+        for rk in B["rank"].unique():
+            run = info["runs"][str(rk)] if str(rk) in info["runs"] else info["runs"][rk]
+            meta = json.load(open(f"{ROOT}/analysis/{run}/meta.json"))
+            off = info["offsets_ns"][str(rk)]
+            q = B[B["rank"] == rk][["key", "attn_end", "moe_arrive"]].copy()
+            q["s"] = q.attn_end - off
+            q["e"] = q.moe_arrive - off
+            con = duckdb.connect()
+            con.sql("set threads to 16")
+            con.register("Q", q[["key", "s", "e"]])
+            r = con.sql(f"""select Q.key, sum(coalesce(i.hbm_read_bytes,0)) rd from read_parquet('{meta['dev_dir']}/Instruction.parquet') i
+                join Q on i.start_ts >= Q.s and i.start_ts < Q.e group by 1""").df()
+            r["rank"] = rk
+            hb.append(r)
+        if hb:
+            B = B.merge(pd.concat(hb), on=["key", "rank"], how="left")
+        B["moe_rd_MB"] = B.get("rd", np.nan) / 1e6
+        g = B.groupby("key")
+        for c in ("attn_span", "moe_span", "moe_rd_MB"):
+            B[f"{c}_rel"] = B[c] - g[c].transform("median")
+        B["arr_rel"] = B.moe_arrive - g.moe_arrive.transform("median")
+        last = B[B.is_last]
+        corr_moe = np.corrcoef(B.arr_rel, B.moe_span_rel)[0, 1]
+        corr_att = np.corrcoef(B.arr_rel, B.attn_span_rel)[0, 1]
+        corr_rd = np.corrcoef(B.moe_span_rel.fillna(0), B.moe_rd_MB_rel.fillna(0))[0, 1] if B.moe_rd_MB.notna().any() else np.nan
+        tab2 = "\n".join([
+            "| Over all blocks and steps | mean | p50 | p90 |", "|---|---:|---:|---:|",
+            f"| arrival spread at the MoE world all-reduce over the 8 ranks, µs | {(g.moe_arrive.max() - g.moe_arrive.min()).mean() / 1e3:.1f} | {(g.moe_arrive.max() - g.moe_arrive.min()).median() / 1e3:.1f} | {(g.moe_arrive.max() - g.moe_arrive.min()).quantile(0.9) / 1e3:.1f} |",
+            f"| last rank's lateness vs the median rank, µs | {last.arr_rel.mean() / 1e3:.1f} | {last.arr_rel.median() / 1e3:.1f} | {last.arr_rel.quantile(0.9) / 1e3:.1f} |",
+            f"|  … of which its MoE span (attention AR end → MoE AR trigger) is longer by, µs | {last.moe_span_rel.mean() / 1e3:.1f} | {last.moe_span_rel.median() / 1e3:.1f} | {last.moe_span_rel.quantile(0.9) / 1e3:.1f} |",
+            f"|  … of which its attention span (block start → attention AR trigger) is longer by, µs | {last.attn_span_rel.mean() / 1e3:.1f} | {last.attn_span_rel.median() / 1e3:.1f} | {last.attn_span_rel.quantile(0.9) / 1e3:.1f} |",
+            f"| last rank's extra HBM reads in its MoE span vs the median rank, MB | {last.moe_rd_MB_rel.mean():.1f} | {last.moe_rd_MB_rel.median():.1f} | {last.moe_rd_MB_rel.quantile(0.9):.1f} |",
+            f"| MoE span per rank, µs (all ranks) | {B.moe_span.mean() / 1e3:.1f} | {B.moe_span.median() / 1e3:.1f} | {B.moe_span.quantile(0.9) / 1e3:.1f} |",
+            f"| MoE-span HBM reads per rank, MB (all ranks) | {B.moe_rd_MB.mean():.1f} | {B.moe_rd_MB.median():.1f} | {B.moe_rd_MB.quantile(0.9):.1f} |",
+            "",
+            f"Correlation over all (block, rank) samples: arrival delay vs MoE span **{corr_moe:.2f}**, vs attention span "
+            f"**{corr_att:.2f}**; MoE span vs MoE-span HBM reads **{corr_rd:.2f}**."])
+        B.to_parquet(f"{D}/skew_blocks.parquet")
+
+    # ---- 3. kernel-entry barrier and host submission (async scheduling: the host runs ahead of the device)
+    # Per rank, the i-th nrt_model_submit of the session belongs to its i-th device execution (both in order; the
+    # system trace holds a few extra executions after the device buffer filled).  lead = submission end -> device
+    # start (the launch waited in the queue); host gap = previous launch's device end -> submission end (> 0: the
+    # device waited for the host).
+    tab3 = ""
+    X = []
+    for rk in ranks:
+        run = info["runs"][str(rk)]
+        meta = json.load(open(f"{ROOT}/analysis/{run}/meta.json"))
+        off = info["offsets_ns"][str(rk)]
+        exr = pd.read_parquet(f"{ROOT}/analysis/{run}/execs.parquet").sort_values("t0").reset_index(drop=True)
+        ev = pd.read_parquet(f"{meta['sys_dir']}/SystemProfileEvents.parquet")
+        sb = ev[ev.name == "nrt_model_submit"].sort_values("start_ts")
+        n = min(len(exr), len(sb))
+        exr = exr.iloc[:n].copy()
+        bad = ((exr.sys_start - exr.t0).abs() > 100_000).sum()
+        if bad:
+            print(f"WARNING rank {rk}: {bad} executions whose live-trace start is > 100 us from the device start",
+                  file=sys.stderr)
+        exr["sub_end"] = sb.end_ts.values[:n]
+        exr["prev_end"] = exr.t1.shift()
+        for c in ("t0", "t1", "sub_end", "prev_end"):
+            exr[c] = exr[c] + off
+        exr["rank"] = rk
+        X.append(exr)
+    X = pd.concat(X)
+    ex0 = pd.read_parquet(f"{ROOT}/analysis/{info['runs'][str(r0)]}/execs.parquet").set_index("exec")
+    X = X.reset_index(drop=True)
+    # rank 0's execution each row belongs to (by kernel and nearest start, as in skew6)
+    keys = []
+    for rk in ranks:
+        x0 = X[X["rank"] == rk]
+        for e in ex0[ex0.step.isin(steps)].itertuples():
+            ta = e.t0 + info["offsets_ns"][str(r0)]
+            c = x0[(x0.neff_name == e.neff_name) & ((x0.t0 - ta).abs() < 15_000_000)]
+            if len(c):
+                keys.append((c.index[(c.t0 - ta).abs().argmin()], e.Index))
+    X["exec0"] = pd.Series({i: e for i, e in keys})
+    X = X[X.exec0.notna()].copy()
+    X["exec0"] = X.exec0.astype(int)
+    if a.phase == "prefill":
+        lay = ex0.layer.reindex(X.exec0).values
+        X["pos"] = np.where(X.name == "embedding + hc_expand", "E", np.where(lay == 0, "F0",
+                            np.where(X.role == "draft", "drafter",
+                                     np.where(np.isnan(lay.astype(float)), "other", "F1-F4"))))
+        labs = (("E", "embedding graph (the iteration's first launch)"), ("F0", "first block launch (L00)"),
+                ("F1-F4", "block launches L01–L39"), ("drafter", "drafter launch"), ("other", "other launches (history put, tail, glue, drafter meta)"))
+    else:
+        X["pos"] = np.where(X.name == "step prologue", "P", np.where(X.name.str.contains("_embed_"), "F0",
+                            np.where(X.role == "draft", "drafter",
+                                     np.where(X.role == "fused", "F1-F4", "other"))))
+        labs = (("P", "step prologue (no collective)"), ("F0", "first fused launch (`…_embed_L00_L07`)"),
+                ("F1-F4", "fused launches 2–5"), ("other", "decode tail graph"), ("drafter", "drafter launch"))
+    X["lead"] = X.t0 - X.sub_end
+    X["host_gap"] = X.sub_end - X.prev_end
+    X["dev_idle"] = X.t0 - X.prev_end
+    g = X.groupby("exec0")
+    X["start_rel"] = X.t0 - g.t0.transform("min")
+    X["prev_rel"] = X.prev_end - g.prev_end.transform("min")
+    X["sub_rel"] = X.sub_end - g.sub_end.transform("min")
+    bar = S[S.kind == "barrier"].set_index(["exec0", "rank"]).dur
+    X["barrier"] = [bar.get((e, r), np.nan) for e, r in zip(X.exec0, X["rank"])]
+    lines = ["| Launch (8 ranks, steady steps) | device-start spread over the 8 ranks, µs (mean / p90) | "
+             "kernel-entry barrier, rank 0, µs (mean) | correlation of a rank's device-start delay with: its previous launch's end delay / its host's submission-end delay | "
+             "device idle before the launch, µs (median) | submitted ahead of its device start, ms (median; min over all) | "
+             "launches the device waited on the host for (host gap > 0) |",
+             "|---|---:|---:|---:|---:|---:|---:|"]
+    for pos, lab in labs:
+        d = X[X.pos == pos]
+        if not len(d):
+            continue
+        sp = d.groupby("exec0").t0.agg(lambda x: x.max() - x.min()) / 1e3
+        ok = d.prev_rel.notna() & d.start_rel.notna()
+        cor = lambda u, v: np.corrcoef(u, v)[0, 1] if u.std() > 0 and v.std() > 0 else np.nan
+        c = cor(d.start_rel[ok], d.prev_rel[ok])
+        cs = cor(d.start_rel, d.sub_rel)
+        b0 = d[d["rank"] == r0].barrier
+        bs = f"{b0.mean() / 1e3:.0f}" if b0.notna().any() else "– (none)"
+        nw = int((d.host_gap > 0).sum())
+        f2 = lambda v: "–" if pd.isna(v) else f"{v:.2f}"
+        unit = "step" if a.phase == "decode" else "iteration"
+        lines.append(f"| {lab} | {sp.mean():.0f} / {sp.quantile(0.9):.0f} | {bs} | {f2(c)} / {f2(cs)} | "
+                     f"{'–' if d.dev_idle.isna().all() else f'{d.dev_idle.median() / 1e3:.0f}'} | "
+                     f"{d.lead.median() / 1e6:.2f}; {d.lead.min() / 1e6:.2f} | {nw} of {len(d)}"
+                     + (f" ({d[d.host_gap > 0].host_gap.sum() / 1e6 / k / len(ranks):.2f} ms of device wait per rank and {unit})"
+                        if nw else "") + " |")
+    tab3 = "\n".join(lines)
+    X.to_parquet(f"{D}/skew_launch.parquet")
+    md = "\n\n".join(x for x in (tab1, tab2, tab3) if x)
+    open(f"{ROOT}/report_parts/80_skew_{a.name}.md", "w").write(md + "\n")
+    print(md)
+
+
+if __name__ == "__main__":
+    main()
