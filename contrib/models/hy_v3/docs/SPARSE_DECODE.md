@@ -8,9 +8,10 @@ Status: the study below found no accuracy loss at 12.5% of the blocks. The
 implementation that reads only the kept blocks
 ([Implementation](#implementation)) keeps that accuracy on the full model
 with FP8 KV + MTP (LongBench v2 55% vs 56%, 97/100 same answers, needle
-12/12) and makes 8-request decode steps **14% faster** (ITL 76.7 -> 66.2 ms,
-TPOT 51.0 -> 47.4 ms); 4 requests break even and 1 request is 7% slower (it
-stays dense but keeps the summaries up to date). Off by default.
+12/12) and makes 8-request decode steps **20% faster** (ITL 76.7 -> 61.3 ms,
+TPOT 51.0 -> 44.7 ms, +15% output throughput), 4-request steps 3% faster;
+1 request is 7% slower (it stays dense but keeps the summaries up to date).
+Off by default.
 
 ## Accuracy study
 
@@ -84,7 +85,7 @@ summaries from the unpacked values).
 | K min / max | per 32-token block, gathered from the K cache every step | per group of `HY3_SPARSE_GROUP` blocks (4: 128 tokens), `k_sum` [blocks, 2, kv heads, 128] BF16 next to the KV cache, at the row of the group's first block (`bind_attention_kv`); written by prefill (`update_k_summary_prefill`, from the K before FP8 quantization) and by every decode step (`update_k_summary_decode`); 1/16 of the FP8 KV bytes |
 | query (and K) for the bound | the kernel's | computed again in torch (`_sparse_decode_blocks`) from own copies of the Q and K weight columns (dequantized to BF16) and the norm gammas, with RoPE from the positions (`prepare_sparse_decode`) |
 | kept | a fraction of each request's blocks | `sparse_budget_blocks`: the fraction of the decode context bucket, rounded up to a multiple of 256 blocks (0.125 of 2688 -> 512 blocks = 128 groups, 16k tokens): the first group and the last 2 (`HY3_SPARSE_SINK_GROUPS`, `HY3_SPARSE_RECENT_GROUPS`) and the rest by bound (top-k) |
-| decode attention | full-width table, masked | the kept groups' blocks as a [B, 512] block table and `s_prior` 16384: the kernel reads only them |
+| decode attention | full-width table, masked | the kept groups' blocks as a [B, 512] block table and `s_prior` 16384: the kernel reads only them. The kept groups are in any order (attention does not depend on it), then the history's last group, then the one after it; a history that fits gets the head of its table |
 
 With MTP the bound is the max over the 4 verify tokens, and the draft layer
 selects for its own cache too (`HY3_SPARSE_DRAFT=0` turns that off). Steps
@@ -103,7 +104,7 @@ NeuronCore at the full-model per-rank shapes (8 requests x 4 verify tokens,
 | per block (group 1, the first version): summary gather / + bound / + top-511 / + sort | 0.24 / 0.27 / 0.86 / 0.98 ms |
 | per block, top-k replaced by a 16-step threshold bisection, + scatter or compare compaction | 0.57, + 1.8 or + 0.3 ms |
 | per block, whole function | 1.07 ms |
-| **groups of 4 (672 groups, top-127), whole function** | **0.35 ms** |
+| groups of 4 (672 groups, top-127), whole function | 0.35 ms |
 
 By the 85k profile, attending to 1/5 of the blocks saves ~0.46 ms per layer
 at 8 requests, ~0.23 ms at 4 and ~0.06 ms at 1.
@@ -133,6 +134,28 @@ comments in the code):
   tokens: with MTP even a recompiled dense run flips near-tie tokens there.
   Compare captured activations (without MTP) or use the full model.
 
+### Profile of a sparse step
+
+`scripts/profile_85k.sh` with `HY3_SPARSE_DECODE=0.125` (KV_CAP 0.45 for the
+profiler's buffers: 5 requests at 85k, the batch-8 NEFF), rank 0, version
+255fbaf (`results/profile_85k_sparse/`, `scripts/profile_attn_breakdown.py`
+attributes the attention module's instructions to their model.py function):
+
+| per 5-request step | dense (c6, [PROFILE_85K.md](PROFILE_85K.md)) | sparse |
+|---|---|---|
+| target NEFF | 72.0 ms | 61.9 ms |
+| attention module (union) | 45.7 ms | 30.0 ms |
+| NKI attention kernels (`attention_tkg`, `attention_block_tkg`) | ~38 ms | 12.9 ms |
+| torch: selection (`sparse_select_blocks`) | | 16.2 ms |
+| torch: Q / K for the bound (`_sparse_decode_blocks`) | | 2.4 ms |
+| torch: summary update | | 1.4 ms |
+
+Within the selection (80 + 1 layer calls): the summary gather 4.3 ms, top-k
+3.6, the sort back into table order 2.6, the empty-summary handling 3.5, the
+block-id gather 2.2, the bound 1.7. The sort, the empty-summary handling (a
+group without a summary scores <= 0 by itself) and the per-block gather (now
+per group) are gone in the current version.
+
 ### Results (full model, `serve_85k.sh` FP8 KV + MTP k=3, 0.125)
 
 Accuracy (`results/sparse_decode/lb_full_fp8mtp_*.json`, needle logs):
@@ -140,27 +163,30 @@ Accuracy (`results/sparse_decode/lb_full_fp8mtp_*.json`, needle logs):
 | | LongBench v2 | same answer as dense | needle |
 |---|---|---|---|
 | dense | 56% | | |
-| first version (per block, prefill summaries) | 55% | 95/100 | 12/12 (before the verify-token fix) |
-| **groups + decode summaries** | **55%** | **97/100** | **12/12** |
+| per block, prefill summaries (c5ab0c9) | 55% | 95/100 | 12/12 (before the verify-token fix) |
+| groups + decode summaries (255fbaf) | 55% | 97/100 | 12/12 |
+| **+ no sort / per-group gather (current)** | **55%** | **97/100** | **12/12** |
 
 The differing items are coherent near-ties ("The correct answer is (B)");
 8 unparsable answers in every run.
 
 Speed: P/D split, `bench_pd_split.sh "1 4 8"` (85k prompts with a 78k shared
-prefix, 256 output tokens, pass 2; `results/bench/pd_split_85k_nodcp_fp8kv_mtp3`,
-`..._sparse` for the first version, `..._sparse_g4`):
+prefix, 256 output tokens, pass 2; `results/bench/pd_split_85k_nodcp_fp8kv_mtp3`
+and `..._sparse` (c5ab0c9), `..._sparse_g4` (255fbaf), `..._sparse_g4b`
+(current)):
 
-| concurrency | ITL dense | first version | groups | TPOT dense | first version | groups | output tok/s dense / groups |
-|---|---|---|---|---|---|---|---|
-| 1 | 47.4 ms | 100.5 ms | 50.8 ms | 23.4 ms | 49.4 ms | 24.9 ms | 37.9 / 35.7 |
-| 4 | 66.6 ms | 128.1 ms | 66.9 ms | 39.2 ms | 69.2 ms | 39.3 ms | 92.0 / 91.5 |
-| 8 | 76.7 ms | 137.1 ms | **66.2 ms** | 51.0 ms | 81.5 ms | **47.4 ms** | 138.3 / **150.5** |
+| concurrency | ITL dense | c5ab0c9 | 255fbaf | **current** | TPOT dense | 255fbaf | **current** | output tok/s dense / current |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 47.4 ms | 100.5 ms | 50.8 ms | 50.7 ms | 23.4 ms | 24.9 ms | 25.6 ms | 37.9 / 35.2 |
+| 4 | 66.6 ms | 128.1 ms | 66.9 ms | **64.3 ms** | 39.2 ms | 39.3 ms | **37.3 ms** | 92.0 / 93.9 |
+| 8 | 76.7 ms | 137.1 ms | 66.2 ms | **61.3 ms** | 51.0 ms | 47.4 ms | **44.7 ms** | 138.3 / **159.6** |
 
 MTP accepts 2.0 tokens per step in every run. TPOT gains less than ITL at 4
 and 8 requests because it also carries the (dense) prefill steps of arriving
 requests that interrupt decode (p99 ITL ~600 ms in all runs). At 1 request
-the step stays dense; the 3.4 ms are the Q / K projection and the summary
-update in 80 + 3 layer calls. The 8-request step saves ~10 ms of the ~20 ms
-the single-core timings predict: the selection costs more inside the model
-graph than alone. Next steps: profile the sparse step, and an NKI kernel for
-the selection and the summary update.
+the step stays dense; the ~3 ms are the Q / K projection and the summary
+update in 80 + 3 layer calls. What is left at 8 requests: the summary gather
+(~4 ms per step) and top-k (~3.6 ms), the Q / K projection (2.4 ms) and the
+update (1.4 ms); the next step is an NKI kernel for the bound and top-k over
+the gathered summaries, and taking K from the decode kernel instead of
+recomputing it (which would also remove the 1-request cost).

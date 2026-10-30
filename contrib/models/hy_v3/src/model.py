@@ -425,57 +425,47 @@ def sparse_select_blocks(q, k_sum, block_table, n_hist, block_size, group, n_sel
     """The ``n_sel`` blocks a decode step attends to, and the history tokens they hold.
 
     q: [nh, B, S, D] fp32 (QK-norm + RoPE), k_sum: [blocks, 2, kvh, D],
-    block_table: [B, nb], n_hist: [B] history tokens. Scores every group of
-    ``group`` blocks with the Quest bound
+    block_table: [B, nb], n_hist: [B] history tokens. A request whose history
+    fits in ``n_sel / group - 1`` groups gets the head of its table (dense).
+    Otherwise every group is scored with the Quest bound
     max_k q . k <= relu(q) . max + min(q, 0) . min (max over the step's queries
-    and the KV head's query heads), always keeps the first ``sink`` and the
-    last ``recent`` valid groups, and returns the kept groups' blocks in their
-    original order ([B, n_sel]) and the number of history tokens in them ([B]).
-    At most ``n_sel / group - 1`` groups are kept: the kernel reads a step's
-    earlier tokens back through the table (MTP verify), so the group after the
-    history must stay in it when they cross into it.
+    and the KV head's query heads); the first ``sink`` and the ``recent`` last
+    groups are always kept. The table ([B, n_sel]) holds the kept groups' blocks
+    in any order, then the history's last group, then the group after it: the
+    kernel reads a step's earlier tokens back through the table (MTP verify),
+    so that one must be in it when they cross into it. Returns the table and
+    the number of history tokens it holds ([B]).
     """
     nh, B, S, D = q.shape
     kvh = k_sum.shape[2]
     t = block_table.to(torch.long)
     nb = t.shape[1]
     ns, L, k_g = nb // group, block_size * group, n_sel // group
-    first = torch.clamp(t.view(B, ns, group)[:, :, 0], min=0)  # unallocated: -1, masked below
-    summ = k_sum[first].to(torch.float32)  # [B, ns, 2, kvh, D]
-    smin, smax = summ[:, :, 0], summ[:, :, 1]
-    # A group without a summary (min > max) scores 0 here and is kept below:
-    # the +-3e38 sentinels times q would overflow into inf - inf = NaN, which
-    # top-k does not order.
-    empty_g = smax < smin
-    empty = empty_g.any(dim=-1).any(dim=-1)  # [B, ns]
-    smin = torch.where(empty_g, 0.0, smin)
-    smax = torch.where(empty_g, 0.0, smax)
+    t3 = t.view(B, ns, group)
+    summ = k_sum[torch.clamp(t3[:, :, 0], min=0)].to(torch.float32)  # [B, ns, 2, kvh, D]
     qg = q.view(kvh, nh // kvh, B, S, D).permute(2, 0, 1, 3, 4).reshape(B, kvh, -1, D)
-    qpos, qneg = torch.clamp(qg, min=0), torch.clamp(qg, max=0)
-    bound = torch.einsum("bhqd,bnhd->bnhq", qpos, smax) + torch.einsum("bhqd,bnhd->bnhq", qneg, smin)
+    # Both terms are <= 0 for a group without a summary (min = +3e38,
+    # max = -3e38): it scores very low (or -inf), never NaN.
+    bound = torch.einsum("bhqd,bnhd->bnhq", torch.clamp(qg, min=0), summ[:, :, 1]) + torch.einsum(
+        "bhqd,bnhd->bnhq", torch.clamp(qg, max=0), summ[:, :, 0])
     score = bound.amax(dim=(2, 3))  # [B, ns]
     n = n_hist.to(torch.long).view(B, 1)
     nsv = torch.div(n + L - 1, L, rounding_mode="floor")
     idx = torch.arange(ns, device=q.device).view(1, ns)
-    valid = idx < nsv
-    forced = valid & ((idx < sink) | (idx >= nsv - recent) | empty)
     big = torch.finfo(torch.float32).max
-    # The last group ranks first: it must stay even if the forced ones overflow.
-    score = torch.where(valid & (idx == nsv - 1), big, torch.where(forced, big / 2, torch.where(valid, score, -big)))
-    top = torch.topk(score, k_g - 1, dim=1).indices  # [B, k_g - 1]
-    # Kept groups first, in their original order; then the groups that follow
-    # the history in the request's table (the step's own tokens are written
-    # there, and the kernel may read those slots as history).
-    key = torch.sort(torch.where(top < nsv, top, top + ns), dim=1).values
-    key = torch.cat([key, key.new_zeros(B, 1)], dim=1)
-    cnt = torch.minimum(nsv, torch.full_like(nsv, k_g - 1))  # [B, 1]
-    j = torch.arange(k_g, device=q.device).view(1, k_g)
-    pick = torch.where(j < cnt, key, torch.clamp(nsv + j - cnt, max=ns - 1))
-    blocks = (pick.unsqueeze(-1) * group + torch.arange(group, device=q.device)).view(B, n_sel)
-    compact = t.gather(1, blocks).to(block_table.dtype)
-    cnt = cnt.view(B)
-    fill = n.view(B) - L * (nsv.view(B) - 1)  # tokens in the last (always kept) group
-    return compact, L * (cnt - 1) + fill
+    # Candidates: the history groups but the last; sink and recent ones first.
+    cand = idx < nsv - 1
+    forced = (idx < sink) | (idx >= nsv - recent)
+    score = torch.where(cand, torch.where(forced, big, score), -big)
+    top = torch.topk(score, k_g - 2, dim=1).indices  # [B, k_g - 2], any order
+    last = torch.clamp(torch.cat([nsv - 1, nsv], dim=1), min=0, max=ns - 1)
+    dense = nsv <= k_g - 1
+    pick = torch.where(dense, torch.arange(k_g, device=q.device).view(1, k_g), torch.cat([top, last], dim=1))
+    # Whole groups of block ids at a time (one row of `group` ids per kept group).
+    compact = t3[torch.arange(B, device=q.device).view(B, 1), pick].reshape(B, n_sel)
+    fill = n - L * (nsv - 1)  # tokens in the history's last group
+    prior = torch.where(dense, n, L * (k_g - 2) + fill).view(B)
+    return compact.to(block_table.dtype), prior
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:

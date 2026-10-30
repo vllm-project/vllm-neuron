@@ -868,7 +868,7 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 | `scripts/check_mtp.py` | MTP vs plain greedy output (lossless check) and acceptance; `KV_DTYPE=fp8`, `PREFIX_CACHING=1`, `DUMP_IDS` |
 | `scripts/profile_85k.sh` / `scripts/profile_85k_client.py` | device-profiling server (85k FP8 KV + MTP config, fewest NEFFs) and the profiled sessions (cold prefill, 1- and N-request decode) |
 | `scripts/expert_load.sh` / `expert_load_client.py` / `expert_load.py` | capture each token's routed experts (tensor_capture of `moe_route.<layer>`), real-text workload, and the expert-placement simulation (docs/PROFILE_85K.md, "Expert load") |
-| `scripts/sparse_decode_study.sh` / `sparse_decode_eval.py` / `longbench_v2.py` | EXPERIMENTAL block-sparse decode (`HY3_SPARSE_DECODE`, off; same accuracy, 8-request decode steps 14% faster at 85k): server, long-continuation agreement, LongBench v2 multiple choice ([docs/SPARSE_DECODE.md](docs/SPARSE_DECODE.md)) |
+| `scripts/sparse_decode_study.sh` / `sparse_decode_eval.py` / `longbench_v2.py` | EXPERIMENTAL block-sparse decode (`HY3_SPARSE_DECODE`, off; same accuracy, 8-request decode steps 20% faster at 85k): server, long-continuation agreement, LongBench v2 multiple choice ([docs/SPARSE_DECODE.md](docs/SPARSE_DECODE.md)) |
 | `scripts/profile_analyze.py` | tables for docs/PROFILE_85K.md from neuron-explorer parquet exports: per-phase times and MoE waiting per layer and rank |
 | `scripts/check_mtp_gaps.py` | HF FP32 log-probs at the first token where the plain and MTP runs differ (near-tie or defect) |
 | `scripts/bench_matrix.sh` | `vllm bench serve` matrix, random dataset, a distinct seed per cell so cells never share prefix-cache entries |
@@ -877,6 +877,7 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 | `scripts/gen_bench_prompts.py` | generates `bench_data/prompts`: sglang-style ShareGPT text cut / repeated to an exact token count |
 | `scripts/bench_prefix_fixed.sh` | prefix-cache benchmark over `bench_data/prefix` (85k input, 92% shared prefix): warm-up request, one `cache_salt` per run, hit rate from `/metrics` |
 | `scripts/bench_pd_split.sh` | prefill-only (output 1) and decode-only (replay twice) split over `bench_data/prefix`, with per-cell `cache_salt`, hit rates and MTP acceptance |
+| `scripts/profile_attn_breakdown.py` | attention-module time of a profiled decode step by model.py function (sparse-decode profile, [docs/SPARSE_DECODE.md](docs/SPARSE_DECODE.md)) |
 | `scripts/sparse_select_bench.py` | single-core timing of the sparse-decode block selection variants ([docs/SPARSE_DECODE.md](docs/SPARSE_DECODE.md)) |
 | `scripts/serve_85k.sh` | 85k-context config without DCP (max_model_len 86016, 4 requests at once), for MTP on `bench_data/prefix` |
 | `scripts/gen_prefix_prompts.py` | generates `bench_data/prefix`: real-text shared prefix + distinct suffixes, exact token counts |

@@ -127,6 +127,13 @@ def _summaries(n, n_blocks, g, hot=None):
     return table, k, k_sum
 
 
+def _groups(compact, table):
+    """The table's groups as group indices of the request's table."""
+    first = compact.view(-1, GROUP)[:, 0].tolist()
+    row = table[0].tolist()
+    return [row.index(b) // GROUP for b in first]
+
+
 def test_bound_is_an_upper_bound_and_the_hot_group_is_kept():
     g = torch.Generator().manual_seed(3)
     n, nb = 1000, 40  # 8 history groups, the last one partial; 10 in the table
@@ -138,13 +145,15 @@ def test_bound_is_an_upper_bound_and_the_hot_group_is_kept():
         s = k_sum[int(table[0, gi * GROUP])].float()
         bound = (q[:, 0, 0].clamp(min=0) @ s[1, 0] + q[:, 0, 0].clamp(max=0) @ s[0, 0]).max()
         assert bound >= true - 1e-2
-    # 5 groups in the table: 4 kept (sink, hot, 2 recent) + the one after the history
+    # 5 groups in the table: sink, hot, the recent one before the last (any order),
+    # then the last history group and the one after it
     compact, prior = sparse_select_blocks(q, k_sum, table, torch.tensor([n]), BS, GROUP, 20, 1, 2)
     nsv = -(-n // L)
-    kept = (0, 3, nsv - 2, nsv - 1)
-    assert compact[0].tolist() == torch.cat(
-        [table[0, gi * GROUP : (gi + 1) * GROUP] for gi in (*kept, nsv)]
-    ).tolist()
+    gs = _groups(compact[0], table)
+    assert sorted(gs[:3]) == [0, 3, nsv - 2] and gs[3:] == [nsv - 1, nsv]
+    # every kept group's blocks, in order within the group
+    for i, gi in enumerate(gs):
+        assert compact[0, i * GROUP : (i + 1) * GROUP].tolist() == table[0, gi * GROUP : (gi + 1) * GROUP].tolist()
     assert int(prior[0]) == 3 * L + (n - L * (nsv - 1))
 
 
@@ -156,6 +165,9 @@ def test_budget_covering_the_history_is_dense():
     compact, prior = sparse_select_blocks(q, k_sum, table, torch.tensor([n]), BS, GROUP, 16, 1, 1)
     assert compact[0].tolist() == table[0, :16].tolist()  # the table, incl. the next group
     assert int(prior[0]) == n
+    # 3 history groups also fit exactly in 4 table groups minus one
+    compact, prior = sparse_select_blocks(q, k_sum, table, torch.tensor([3 * L]), BS, GROUP, 16, 1, 1)
+    assert compact[0].tolist() == table[0, :16].tolist() and int(prior[0]) == 3 * L
 
 
 def test_the_group_after_the_history_stays_in_the_table():
@@ -168,6 +180,19 @@ def test_the_group_after_the_history_stays_in_the_table():
     assert compact[0, 4:8].tolist() == table[0, 20:24].tolist()  # the last history group, kept
     assert compact[0, 8:].tolist() == table[0, 24:28].tolist()  # the next one
     assert int(prior[0]) == 2 * L
+
+
+def test_empty_summaries_are_not_nan_and_rank_last():
+    g = torch.Generator().manual_seed(7)
+    n = 10 * L
+    table, _, k_sum = _summaries(n, 48, g)
+    # group 4 lost its summary (never happens with decode updates; must stay sane)
+    k_sum[int(table[0, 4 * GROUP]), 0] = _SUMMARY_EMPTY
+    k_sum[int(table[0, 4 * GROUP]), 1] = -_SUMMARY_EMPTY
+    q = torch.randn(1, 1, 4, D, generator=g) * 100
+    compact, _ = sparse_select_blocks(q, k_sum, table, torch.tensor([n]), BS, GROUP, 32, 1, 1)
+    gs = _groups(compact[0], table)
+    assert 4 not in gs[:6] and gs[6:] == [9, 10] and len(set(gs)) == 8
 
 
 def test_padding_requests_get_no_history():
