@@ -45,6 +45,11 @@ NT = 512
 MG = 4
 #: Weight k-tiles loaded together: `WG * NT * 2` bytes a partition (8 KiB at 512).
 WG = 8
+#: Descriptor generation of the static weight loads: the hardware DGE. On the default
+#: (the GpSimd software DGE) the drafter's weight tiles kept GpSimd busy for its whole
+#: kernel at bs1 (6.9 ms, `DMA_DIRECT2D` + semaphore waits, 2026-10-30 profile); the
+#: tuned packages already load this way (`tuned/*/mk_gemm.WDGE`).
+WDGE = nisa.dge_mode.hwdge
 
 
 def cdiv(n, d):
@@ -127,7 +132,8 @@ def gemm_staged(xTs, nrs, r0s, k, wk_hbm, out_hbm, lo, hi, out_dtype=nl.bfloat16
             wt = nl.ndarray((PT, ng, w), dtype=nl.bfloat16, buffer=nl.sbuf)
             for j in range(ng):
                 kr = krow0 + (g0 + j) * PT
-                nisa.dma_copy(dst=wt[:, j, :], src=wk_hbm[kr : kr + PT, n0 : n0 + w])
+                nisa.dma_copy(dst=wt[:, j, :], src=wk_hbm[kr : kr + PT, n0 : n0 + w],
+                              dge_mode=WDGE)
             for j in range(ng):
                 kb = g0 + j
                 for i in range(len(xTs)):
@@ -176,7 +182,8 @@ def gemm_sb(xT, nr, k, wk_hbm, out_sb, lo, hi, krow0=0):
             wt = nl.ndarray((PT, ng, w), dtype=nl.bfloat16, buffer=nl.sbuf)
             for j in range(ng):
                 kr = krow0 + (g0 + j) * PT
-                nisa.dma_copy(dst=wt[:, j, :], src=wk_hbm[kr : kr + PT, n0 : n0 + w])
+                nisa.dma_copy(dst=wt[:, j, :], src=wk_hbm[kr : kr + PT, n0 : n0 + w],
+                              dge_mode=WDGE)
             for j in range(ng):
                 kb = g0 + j
                 nisa.nc_matmul(dst=acc[0:nr, :], stationary=xT[:, kb, 0:nr], moving=wt[:, j, :],

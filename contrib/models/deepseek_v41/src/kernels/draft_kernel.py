@@ -51,7 +51,7 @@ import nki.isa as nisa
 import nki.language as nl
 
 from . import mk_gemm as G
-from . import mk_moe
+from . import mk_moe, shared_split
 from .mk_common import (
     KTILE,
     PT,
@@ -356,8 +356,10 @@ def _draft(a, phase):
         o = nl.ndarray((Kp, heads * hd), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="o")
         oq = nl.ndarray((Kp, heads * hd), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="oq")
         z = nl.ndarray((Kp, o_lora_total), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="z")
-        cc_src = nl.ndarray((Kp, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc_src")
-        cc_dst = nl.ndarray((Kp, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc_dst")
+        # the two all-reduces carry the K draft rows (the rest of the 128-row tile is never
+        # read back): 2.6 MB of fp32 on the wire a stage each, ~120 KB at K = 6
+        cc_src = nl.ndarray((K, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc_src")
+        cc_dst = nl.ndarray((K, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc_dst")
         attn_out = nl.ndarray((Kp, dim), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="attn_out")
         xn2 = nl.ndarray((Kp + PT, dim), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="xn2")
         logits = nl.ndarray((Kp, n_experts), dtype=nl.float32, buffer=nl.shared_hbm, name="logits")
@@ -367,8 +369,8 @@ def _draft(a, phase):
         ey = nl.ndarray((Kp, inter), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="ey")
         eo32 = nl.ndarray((Kp, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="eo32")
         eacc = nl.ndarray((Kp + PT, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="eacc")
-        cc2_src = nl.ndarray((Kp, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc2_src")
-        cc2_dst = nl.ndarray((Kp, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc2_dst")
+        cc2_src = nl.ndarray((K, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc2_src")
+        cc2_dst = nl.ndarray((K, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc2_dst")
         ffn_out = nl.ndarray((Kp, dim), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="ffn_out")
         live = a["live"]
 
@@ -455,7 +457,7 @@ def _draft(a, phase):
         for g in range(ngroups):
             proj(oq, Kp, g_in, wo_a[s], z, o_lora_total, x_col0=g * g_in, lo=g * o_lora, hi=(g + 1) * o_lora)
         nisa.core_barrier(data=z, cores=(0, 1))
-        proj(z, Kp, o_lora_total, wo_b[s], cc_src, dim, out_dtype=nl.float32)
+        proj(z, K, o_lora_total, wo_b[s], cc_src, dim, out_dtype=nl.float32)
         nisa.core_barrier(data=cc_src, cores=(0, 1))
         if s == 0 and stage == 15:
             cast_rows(cc_src, dbg[0:Kp, 0:dim], kt, dim, nl.float32)
@@ -502,10 +504,11 @@ def _draft(a, phase):
         nisa.core_barrier(data=ey, cores=(0, 1))
         # The shared expert's weights are replicated on every rank and the model adds its
         # output ONCE, after the expert all-reduce; every rank adds it scaled by 1/world.
-        proj(ey, Kp, inter, a["sh_w2"][s], eo32, dim, out_dtype=nl.float32, out_scale=1.0 / world)
+        proj(ey, Kp, inter, a["sh_w2"][s], eo32, dim, out_dtype=nl.float32,
+             out_scale=shared_split.scale(inter, len(a["groups_attn"][0]), world))
         _add_into(eacc, eo32, ptiles, ocol0, ocol1)
         nisa.core_barrier(data=eacc, cores=(0, 1))
-        for r0, nr in tiles_of(Kp, pid):
+        for r0, nr in tiles_of(K, pid):
             t = nl.ndarray((PT, dim), dtype=nl.float32, buffer=nl.sbuf)
             nisa.dma_copy(dst=t[0:nr, :], src=eacc[r0 : r0 + nr, :])
             nisa.dma_copy(dst=cc2_src[r0 : r0 + nr, :], src=t[0:nr, :])

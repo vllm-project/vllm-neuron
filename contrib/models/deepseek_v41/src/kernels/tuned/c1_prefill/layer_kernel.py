@@ -66,6 +66,7 @@ import nki.language as nl
 
 from . import mk_gemm as G
 from . import mk_moe
+from ... import shared_split
 from .mk_common import (
     KTILE,
     PT,
@@ -205,6 +206,9 @@ def _layer(a, arch, phase):
     kd = a["index_k_cache"].shape[1] if (idx_src or kv_src) else 0
     nh_idx = a["ix_wproj_t"].shape[1] if idx_src else 0
     world = len(groups_world[0])
+    # the shared partial's scale: 1/world for the whole shared expert, attn_tp/world for
+    # this rank's slice of it (`kernels/shared_split`)
+    sh_scale = shared_split.scale(inter, len(groups_attn[0]), world)
     IDX_SCALE = float(max(kd, 1)) ** -0.5 * float(max(nh_idx, 1) * len(groups_attn[0])) ** -0.5
     scale = float(hd) ** -0.5
     assert hpg * ngroups == heads, "o_groups must divide the local heads"
@@ -664,7 +668,7 @@ def _layer(a, arch, phase):
                     SWIGLU_LIMIT)
         nisa.core_barrier(data=ey, cores=(0, 1))
         # w2 by output columns: this core's are exactly its routed-expert columns
-        proj(ey, Tp, inter, a["sh_w2"], eo32, dim, out_dtype=nl.float32, out_scale=1.0 / world)
+        proj(ey, Tp, inter, a["sh_w2"], eo32, dim, out_dtype=nl.float32, out_scale=sh_scale)
         _add_into(eacc, eo32, ptiles, ocol0, ocol1)
         nisa.core_barrier(data=eacc, cores=(0, 1))
     else:
@@ -681,7 +685,7 @@ def _layer(a, arch, phase):
 
         # as AR1: chunk 0 from the GEMM, the later triggers interleaved with hc_out
         G.gemm_rows_split(ey, rt, inter, a["sh_w2"], cc2s, arw, out_dtype=nl.float32,
-                          out_scale=1.0 / world, add_hbm=eacc,
+                          out_scale=sh_scale, add_hbm=eacc,
                           after=lambda c: ar2(c) if c == 0 else None)
         if stage in (8, 82):
             for c in range(1, narc):

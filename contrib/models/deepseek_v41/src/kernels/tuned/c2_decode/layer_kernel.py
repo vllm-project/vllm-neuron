@@ -65,6 +65,7 @@ import nki.language as nl
 
 from . import mk_gemm as G
 from . import mk_moe
+from ... import moe_tp8, shared_split
 from .mk_common import (
     KTILE,
     PT,
@@ -186,6 +187,10 @@ def _layer(a, arch, phase):
     n_experts = a["gate_w_t"].shape[1]
     w1, s1, w3, s3, w2, s2 = a["w1"], a["s1"], a["w3"], a["s3"], a["w2"], a["s2"]
     n_local = w1.shape[0]
+    # TP8EP8 decode (`kernels/moe_tp8`): `w1` holds this rank's 256-column chunk records of
+    # its group's experts, and the router writes a routing column a chunk plus a zero one
+    tp8 = moe_tp8.uses(decode, a)
+    n_route = n_local + 1 if tp8 else n_local
     inter = a["sh_w1"].shape[1]
     nwin = a["win_slots"].shape[0] // nspans
     read_len = a["cmp_slots"].shape[0] // nspans if ratio else 0
@@ -202,6 +207,9 @@ def _layer(a, arch, phase):
     kd = a["index_k_cache"].shape[1] if (idx_src or kv_src) else 0
     nh_idx = a["ix_wproj_t"].shape[1] if idx_src else 0
     world = len(groups_world[0])
+    # the shared partial's scale: 1/world for the whole shared expert, attn_tp/world for
+    # this rank's slice of it (decode, `kernels/shared_split`)
+    sh_scale = shared_split.scale(inter, len(groups_attn[0]), world)
     IDX_SCALE = float(max(kd, 1)) ** -0.5 * float(max(nh_idx, 1) * len(groups_attn[0])) ** -0.5
     scale = float(hd) ** -0.5
     assert hpg * ngroups == heads, "o_groups must divide the local heads"
@@ -298,17 +306,18 @@ def _layer(a, arch, phase):
     # expert's last row tile gather from and scatter into it (`mk_moe`).
     xn2 = nl.ndarray((Tp + PT, dim), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="xn2")
     logits = nl.ndarray((Tp, n_experts), dtype=nl.float32, buffer=nl.shared_hbm, name="logits")
-    wexp = nl.ndarray((Tp + PT, n_local), dtype=nl.float32, buffer=nl.shared_hbm, name="wexp")
+    wexp = nl.ndarray((Tp + PT, n_route), dtype=nl.float32, buffer=nl.shared_hbm, name="wexp")
     eg = nl.ndarray((Tp, inter), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="eg")
     eu = nl.ndarray((Tp, inter), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="eu")
     ey = nl.ndarray((Tp, inter), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="ey")
     eo32 = nl.ndarray((Tp, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="eo32")
     eacc = nl.ndarray((Tp + PT, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="eacc")
-    # The world reduction keeps the full row tile: its fp32 summation order depends
-    # on the payload size, and the padded tile's order is the reference's. Its rows
-    # past R are never written nor read back (the sum is elementwise).
-    cc2_src = nl.ndarray((Tp, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc2_src")
-    cc2_dst = nl.ndarray((Tp, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc2_dst")
+    # The world reduction carries the rows the MoE wrote: R (= T) in decode, where a
+    # padded 128-row fp32 tile is 2.6 MB on the wire against ~120 KB at bs1 (its fp32
+    # summation order depends on the payload size, so the sum may differ from the
+    # padded tile's in the last bit).
+    cc2_src = nl.ndarray((R, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc2_src")
+    cc2_dst = nl.ndarray((R, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc2_dst")
     ffn_out = nl.ndarray((Tp, dim), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="ffn_out")
 
     # decode: the one row tile's rope table, loaded ahead of the weight prefetches
@@ -625,19 +634,19 @@ def _layer(a, arch, phase):
                                   defer=True)]
     else:
         gemm_fp32(xn2, a["gate_w_t"], logits, mine, dim, n_experts)
-    route_topk(logits, a["gate_b"], a["expert_lo"], mine, n_experts, TOPK_EXPERTS, n_local,
-               ROUTE_SCALE, wexp, live_hbm=a["live"])
+    route_topk(logits, a["gate_b"], a["expert_lo"], mine, n_experts, TOPK_EXPERTS, n_route,
+               ROUTE_SCALE, wexp, live_hbm=a["live"], targets=tp8)
     if decode and sh_hi > sh_lo:
         for fin in sh_fin:
             fin()
     if pid == 0:
-        if not dense_moe or mk_moe.ONE_LOOP:
+        if not dense_moe or mk_moe.ONE_LOOP or tp8:
             # (the dense per-expert loops read only wexp[0:T])
-            _zero_pad(wexp, T, Tp, n_local, dtype=nl.float32)
+            _zero_pad(wexp, T, Tp, n_route, dtype=nl.float32)
         if not dense_moe:
-            _zero_pad(wexp, Tp, Tp + PT, n_local, dtype=nl.float32)
+            _zero_pad(wexp, Tp, Tp + PT, n_route, dtype=nl.float32)
     nisa.core_barrier(data=wexp, cores=(0, 1))
-    experts = [(w1[e], s1[e], w3[e], s3[e], w2[e], s2[e]) for e in range(n_local)]
+    experts = [] if tp8 else [(w1[e], s1[e], w3[e], s3[e], w2[e], s2[e]) for e in range(n_local)]
     racc = None
     ocol0, ocol1 = pid * mk_moe.DIM_H, (pid + 1) * mk_moe.DIM_H
     w2_sb = decode and dense_moe and G.gemm_wide_fits(ocol0, ocol1)
@@ -645,7 +654,9 @@ def _layer(a, arch, phase):
     w2_pre = None
     if w2_sb and SHW2_PRE:
         w2_pre = G.wide_prefetch(inter, a["sh_w2"], ocol0, ocol1, SHW2_PRE)
-    if dense_moe:
+    if tp8:
+        racc = moe_tp8.routed_experts_tp8(pid, T, xn2, wexp, (w1, s1, w3, s3, w2, s2))
+    elif dense_moe:
         # decode keeps the routed sum in SBUF for the shared expert's add
         racc = mk_moe.routed_experts_dense(pid, n_local, T, xn2, wexp, (w1, s1, w3, s3, w2, s2),
                                            None if decode else eacc)
@@ -673,7 +684,7 @@ def _layer(a, arch, phase):
             xT3 = G.stage_rows_T(ey, 0, R, inter, True)
             o32 = nl.ndarray((PT, ocol1 - ocol0), dtype=nl.float32, buffer=nl.sbuf)
             w2_fin = G.gemm_wide(xT3, R, inter, a["sh_w2"], None, ocol0, ocol1,
-                                 out_scale=1.0 / world, out_sb=o32, defer=True,
+                                 out_scale=sh_scale, out_sb=o32, defer=True,
                                  prew=w2_pre)
             # core 0's deferred sinkhorn under the (DMA-bound) w2 weight stream
             for fin in comb_fin:
@@ -685,7 +696,7 @@ def _layer(a, arch, phase):
             if racc is not None:
                 nisa.dma_copy(dst=eacc[0:T, ocol0:ocol1], src=racc[0:T, :])
             proj(ey, R, inter, a["sh_w2"], eo32, dim, out_dtype=nl.float32,
-                 out_scale=1.0 / world)
+                 out_scale=sh_scale)
             # this core's columns of eacc (routed) + eo32 (shared) straight into the
             # collective source
             _add_into(eacc, eo32, ptiles, ocol0, ocol1, dst_hbm=cc2_src)
@@ -693,7 +704,7 @@ def _layer(a, arch, phase):
         proj2(xn2, R, dim, [(a["sh_w1"], eg, inter), (a["sh_w3"], eu, inter)])
         rt = tiles_of(Tp, pid)
         swiglu_rows(eg, eu, None, 0, ey, rt, inter, SWIGLU_LIMIT)
-        proj(ey, Tp, inter, a["sh_w2"], eo32, dim, out_dtype=nl.float32, out_scale=1.0 / world)
+        proj(ey, Tp, inter, a["sh_w2"], eo32, dim, out_dtype=nl.float32, out_scale=sh_scale)
         # both cores' routed columns are in before this core adds its rows' shared output
         nisa.core_barrier(data=eacc, cores=(0, 1))
         _add_into(eacc, eo32, rt, 0, dim)

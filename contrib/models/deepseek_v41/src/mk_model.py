@@ -538,8 +538,123 @@ def prepare(model) -> None:
     for block in model.layers:
         _block_weights(model, block)
     draft_weights(model, with_freqs=False)
+    _free_staging_slots(model)
+    # before the TP8 build sizes itself against the free HBM
+    _build_shared_split(model)
+    from . import mk_tp8
+
+    mk_tp8.build(model, stacked_experts)
     logger.info("deepseek_v41: megakernel weights prepared (fp8 linears as bf16 k-major, "
                 "expert pools stacked)")
+
+
+#: `DEEPSEEK_V41_SHARED_SPLIT` (default 1): the decode kernels read this rank's slice of
+#: each block's shared expert (`kernels/shared_split`) instead of the whole of it.
+SHARED_SPLIT = os.environ.get("DEEPSEEK_V41_SHARED_SPLIT", "1") not in ("", "0")
+
+
+def shared_slices(w1: torch.Tensor, w3: torch.Tensor, w2: torch.Tensor, members: int,
+                  j: int) -> dict:
+    """Member `j` of `members`' slice of a shared expert (`kernels/shared_split`) from the
+    whole k-major `w1` / `w3` `[dim, inter]` and `w2` `[inter, dim]` (host tensors)."""
+    from .kernels import shared_split as SS
+
+    dim, inter = w1.shape
+    cols = []
+    for t in SS.member_tiles(inter // SS.TILE, members, j):
+        cols.extend(range(t * SS.TILE, (t + 1) * SS.TILE))
+    idx = torch.tensor(cols, dtype=torch.long)
+    s1 = torch.zeros((dim, SS.SLICED_COLS), dtype=w1.dtype)
+    s3 = torch.zeros((dim, SS.SLICED_COLS), dtype=w3.dtype)
+    s2 = torch.zeros((SS.SLICED_COLS, w2.shape[1]), dtype=w2.dtype)
+    s1[:, : len(cols)] = w1.index_select(1, idx)
+    s3[:, : len(cols)] = w3.index_select(1, idx)
+    s2[: len(cols), :] = w2.index_select(0, idx)
+    return {"sh_w1": s1, "sh_w3": s3, "sh_w2": s2}
+
+
+def _build_shared_split(model) -> None:
+    """Each block's shared-expert slice for this rank (`kernels/shared_split`): it replaces
+    the whole `sh_w1` / `sh_w3` / `sh_w2` in the block's kernel arguments (prefill and
+    decode), and the whole ones are freed -- before the TP8 build sizes itself against
+    the free HBM."""
+    if not SHARED_SPLIT or model.world_size == 1:
+        return
+    from .kernels import shared_split as SS
+
+    t0 = time.perf_counter()
+    rank = int(model.rank)
+    members = list(next(g for g in model._mk_groups_attn if rank in g))
+    j = members.index(rank)
+    built = 0
+    for block in model.layers:
+        n = _block_weights(model, block)
+        w1, w3, w2 = n["sh_w1"], n["sh_w3"], n["sh_w2"]
+        dim, inter = w1.shape
+        if inter % SS.TILE or SS.width(inter // SS.TILE, len(members)) != SS.SLICED_COLS:
+            logger.info("deepseek_v41: shared expert not split (%d intermediate columns over "
+                        "%d members)", inter, len(members))
+            return
+        sl = shared_slices(_host(w1), _host(w3), _host(w2), len(members), j)
+        n.update({k: _dev(v, w1.device) for k, v in sl.items()})
+        # the whole weights' last references: the k-major cache on each linear
+        se = block.ffn.shared_experts
+        for lin in (se.w1, se.w3, se.w2):
+            lin._kb16 = None
+        del w1, w3, w2
+        built += 1
+    # the drafter's stages the same way (both its phases: its attention all-reduce is the
+    # attention group's too)
+    dw = draft_weights(model, with_freqs=False)
+    sl = [shared_slices(_host(dw["sh_w1"][i]), _host(dw["sh_w3"][i]), _host(dw["sh_w2"][i]),
+                        len(members), j) for i in range(dw["sh_w1"].shape[0])]
+    model._mk_draft_sh = {k: _dev(torch.stack([x[k] for x in sl]), dw["sh_w1"].device)
+                          for k in ("sh_w1", "sh_w3", "sh_w2")}
+    logger.info("deepseek_v41: decode shared expert split over the attention group on %d "
+                "layers (member %d of %d, %d of %d intermediate columns, %.1f s) for rank %d",
+                built, j, len(members), SS.SLICED_COLS, inter, time.perf_counter() - t0, rank)
+
+
+def _free_staging_slots(model) -> None:
+    """Release the per-op path's per-layer expert staging slot (one expert's buffers a
+    block, ~0.75 GiB a rank): with the pool resident the megakernels never stage."""
+    freed = 0
+    for block in list(model.layers) + list(model.mtp):
+        ffn = block.ffn
+        if not getattr(ffn, "resident", False):
+            continue
+        for name in ("w1", "w2", "w3"):
+            linear = getattr(ffn.expert_slot, name)
+            for buf in ("weight", "scale"):
+                t = getattr(linear, buf, None)
+                if isinstance(t, torch.Tensor) and t.numel() > 1:
+                    freed += t.numel() * t.element_size()
+                    setattr(linear, buf, t.new_empty((0,)))
+    if freed:
+        logger.info("deepseek_v41: released %.2f GiB of per-op expert staging slots",
+                    freed / 2**30)
+
+
+#: `DEEPSEEK_V41_MOE_TP8_MAX_SEQS` (default 4): the decode steps of at most this many
+#: sequences run the TP8EP8 MoE (`kernels/moe_tp8`), the larger ones EP64. TP8EP8 wins
+#: where the routing is sparse and lopsided -- bs1: 36 picks over 384 experts, the
+#: busiest of 64 ranks runs ~3 experts and most run none (in1024_bs1 37.9 -> 39.5
+#: tok/s); by bs10 every rank has 3-6 active experts, EP64's imbalance is ~1.6x and a
+#: TP8EP8 chunk's fixed costs give the gain back (in512_bs10 160.2 -> 158.2).
+TP8_MAX_SEQS = int(os.environ.get("DEEPSEEK_V41_MOE_TP8_MAX_SEQS", "4"))
+
+
+def _tp8_args(block, kernel, nseqs):
+    """The decode kernel's TP8EP8 MoE arguments for `block` (`mk_tp8`), if it has them,
+    `kernel` (a tuned decode package's) runs them and the step has at most
+    `TP8_MAX_SEQS` sequences."""
+    t8 = getattr(block, "_mk_tp8", None)
+    if t8 is None or nseqs > TP8_MAX_SEQS:
+        return None
+    import sys
+
+    mod = sys.modules.get((kernel.func if hasattr(kernel, "func") else kernel).__module__)
+    return t8 if getattr(mod, "moe_tp8", None) is not None else None
 
 
 def _block_weights(model, block) -> dict:
@@ -698,6 +813,25 @@ def _local_ids(hashes, index, row_start):
     return (hashes[0, :, index, :] - row_start).to(torch.int32)
 
 
+_HBM_LOG_AT = (64, 512)
+_FORWARDS = [0]
+
+
+def _log_hbm_once(model) -> None:
+    """The HBM the runtime reports at a couple of forwards into serving (rank 0): what the
+    weights, the KV cache and every loaded NEFF's own allocations leave free -- the
+    headroom `mk_tp8`'s budget reserves."""
+    _FORWARDS[0] += 1
+    if _FORWARDS[0] not in _HBM_LOG_AT or int(model.rank) != 0:
+        return
+    try:
+        used, free = torch.classes.neuron.Runtime().get_vnc_memory_stats()
+    except Exception:  # noqa: BLE001
+        return
+    logger.warning("deepseek_v41: HBM at forward %d: %.2f GiB used, %.2f GiB free", _FORWARDS[0],
+                   used / 2**30, free / 2**30)
+
+
 @torch._dynamo.disable
 def run_layers(model, stream, pre_mix, spans, paged, hashes, live_rows):
     """Every backbone block of one forward through its layer kernel. Returns
@@ -708,6 +842,7 @@ def run_layers(model, stream, pre_mix, spans, paged, hashes, live_rows):
 
     if HOST_PROF is not None and HOST_PROF.cur is not None:
         HOST_PROF.cur["phase"] = f"{'decode' if int(stream.shape[0]) <= PT else 'prefill'}_B{len(spans)}"
+    _log_hbm_once(model)
     step = StepIndices(
         spans, paged, stream.device, hashes,
         [span.host_table for span in paged],
@@ -787,6 +922,10 @@ def run_layer(model, block, stream: torch.Tensor, pre_mix: torch.Tensor, step: S
         index = list(model.config.engram_layer_ids).index(attn.layer_id)
         n["hash_ids"] = step.hash_cols(index, block.engram.row_start)
     kernel = layer_kernel.KERNELS[(lw.arch, phase)]
+    if phase == "decode":
+        t8 = _tp8_args(block, kernel, B)
+        if t8 is not None:
+            n.update(t8)
     prof = HOST_PROF if HOST_PROF is not None and HOST_PROF.cur is not None else None
     if prof is not None:
         t_launch = time.perf_counter()
@@ -898,6 +1037,7 @@ def run_draft_batched(model, seeds, taps, main_hidden, spans, paged):
     nblk = max(int(t.numel()) for t in tables)
     table = torch.stack([torch.nn.functional.pad(t, (0, nblk - int(t.numel()))) for t in tables]).reshape(-1, 1)
     n = dict(draft_weights(model))
+    n.update(getattr(model, "_mk_draft_sh", None) or {})
     n.update(
         meta=meta, rows_c=rows_c, main_hidden=main, live=live,
         row_pos=_step_buf(("drow_pos", B), row_pos, device),
@@ -1127,6 +1267,7 @@ def run_draft(model, seed_ids, tap, main_hidden, span, paged):
     main = main_hidden[begin : begin + length]
     meta = M._compiled(_draft_meta)(seed_ids, tap, paged.pos)
     n = dict(draft_weights(model))
+    n.update(getattr(model, "_mk_draft_sh", None) or {})
     K = int(cfg.dspark_block_size)
     stages = list(model.mtp)
     n.update(

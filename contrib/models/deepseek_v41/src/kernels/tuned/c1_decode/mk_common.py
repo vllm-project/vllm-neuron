@@ -1006,7 +1006,7 @@ def attn_tokens_body(i, tok0s, q_hbm, kvtab_hbm, idx_hbm, o_hbm, sink_t, heads, 
 
 
 def route_topk(scores_hbm, bias_hbm, lo_hbm, tiles, n_experts, topk, n_local, route_scale,
-               wexp_hbm, live_hbm=None):
+               wexp_hbm, live_hbm=None, targets=False):
     """The router selection: `sqrtsoftplus` of the fp32 logits in `scores_hbm[T, n_experts]`,
     top-`topk` of `score + bias`, raw-score weights normalized to sum 1 and scaled, and
     per-local-expert dense weights `wexp_hbm[T, n_local]` (fp32): the routing weight of
@@ -1040,9 +1040,24 @@ def route_topk(scores_hbm, bias_hbm, lo_hbm, tiles, n_experts, topk, n_local, ro
         nisa.tensor_scalar(dst=wts[0:nr, :], data=picked[0:nr, :], op0=nl.multiply, operand0=inv[0:nr, 0:1])
         idf = nl.ndarray((PT, topk), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=idf[0:nr, :], src=idx8[0:nr, 0:topk])
-        lo = bcast_row(lo_hbm[0:1, 0:1], 1, nr)  # fp32 [1, 1] from the host
         wexp = nl.ndarray((PT, n_local), dtype=nl.float32, buffer=nl.sbuf)
-        for e in range(n_local):
+        if targets:
+            # `lo_hbm` `[1, n_local]` is column e's expert id (TP8EP8 decode, `kernels/
+            # moe_tp8`: one column a chunk, -1 never matches): every column at once on
+            # [nr, n_local, topk] views, (id == target) * w summed over the picks
+            tgt = nl.ndarray((PT, n_local), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=tgt[0:nr, :], src=bcast_row(lo_hbm[0:1, 0:n_local], n_local, nr))
+            m3 = nl.ndarray((PT, n_local, topk), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=m3[0:nr, :, :],
+                               data1=idf[0:nr, :].reshape((nr, 1, topk)).broadcast(1, n_local),
+                               data2=tgt[0:nr, :].reshape((nr, n_local, 1)).broadcast(2, topk),
+                               op=nl.equal)
+            nisa.tensor_tensor(dst=m3[0:nr, :, :], data1=m3[0:nr, :, :],
+                               data2=wts[0:nr, :].reshape((nr, 1, topk)).broadcast(1, n_local),
+                               op=nl.multiply)
+            nisa.tensor_reduce(dst=wexp[0:nr, :], op=nl.add, data=m3[0:nr, :, :], axis=(2,))
+        lo = bcast_row(lo_hbm[0:1, 0:1], 1, nr)  # fp32 [1, 1] from the host
+        for e in range(0 if targets else n_local):
             target = nl.add(lo, float(e))
             m = nl.ndarray((PT, topk), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_scalar(dst=m[0:nr, :], data=idf[0:nr, :], op0=nl.equal, operand0=target[0:nr, 0:1])

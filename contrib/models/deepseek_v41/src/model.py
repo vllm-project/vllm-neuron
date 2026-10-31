@@ -3130,6 +3130,25 @@ def _greedy_step(ids, rows, draft_token_ids, cu_num_draft_tokens, max_spec_len, 
     return accepted, seeds[:n_seqs], tap_rows, torch.cat(taps, dim=-1)
 
 
+def _hashes_of(model, input_ids, paged):
+    """`model._engram_hashes`, as a compiled step (`_hashes_entry`)."""
+    return model._engram_hashes(input_ids, paged)
+
+
+_HASHES_ENTRY: list = []
+
+
+def _hashes_entry():
+    """The n-gram hashes of a decode step outside the traced forward
+    (`DeepseekV41ForCausalLM._forward_mk_decode`): their own compiled entry, keyed on
+    the bucketed spans; not `fullgraph` (`_engram_hashes` may break the graph)."""
+    if not _HASHES_ENTRY:
+        _raise_dynamo_limits()
+        _HASHES_ENTRY.append(torch.compile(_hashes_of, backend=_compile_backend_name(),
+                                           options=_COMPILE_OPTIONS))
+    return _HASHES_ENTRY[0]
+
+
 def _greedy_rows(logits):
     """`argmax` over the vocabulary, as a compiled step."""
     return logits.argmax(dim=-1)
@@ -5460,6 +5479,15 @@ class DeepseekV41ForCausalLM(nn.Module):
                 "the routed experts and the engram tables are streamed, not "
                 "resident."
             )
+        if (_MEGAKERNEL and mk_model.HEAD_GREEDY and mk_model.EMBED_KERNEL
+                and self.sampler is not None and spec_decode_metadata is not None
+                and sampling_hint is not None and bool(sampling_hint[0]) and logit_mask is None
+                and sampling_positions is not None and inputs_embeds is None
+                and input_ids.dtype in (torch.int32, torch.int64)
+                and int(input_ids.shape[0]) <= mk_model.PT and self.pp_size == 1):
+            # an all-greedy speculative decode step: all of it outside dynamo
+            return self._forward_mk_decode(input_ids, positions, attn_metadata,
+                                           sampling_positions, spec_decode_metadata, prof)
         meta = self._attn_meta(attn_metadata)
         rows_per_seq = self._decode_rows_per_seq(meta, int(input_ids.shape[0]))
         live_spans = self._sequence_spans(
@@ -5671,6 +5699,70 @@ class DeepseekV41ForCausalLM(nn.Module):
             return accepted
         return sampled, logits
 
+
+    @torch._dynamo.disable
+    def _forward_mk_decode(self, input_ids, positions, attn_metadata, sampling_positions,
+                           spec_decode_metadata, prof):
+        """`forward` for an all-greedy speculative decode step on the megakernel path, run
+        outside dynamo: the embedding, the blocks, the greedy head and the drafter are
+        kernel launches and small compiled steps of their own (`mk_model.run_embed`,
+        `run_layers`, `run_head_greedy`, `_greedy_step`, the drafters).
+
+        Traced, the step's host bookkeeping -- the live spans, their count and rows --
+        was Python data the forward's guards specialized on: every combination of live
+        and bucketed sequences a step met for the first time recompiled the forward
+        around it (four resume functions, seconds on every rank), and a bench pass whose
+        sequences happened to finish in a new order measured half its throughput
+        (in512_bs10, 2026-10-30). Here only the compiled steps key on anything, and
+        they key on the bucketed span count."""
+        meta = self._attn_meta(attn_metadata)
+        rows_per_seq = self._decode_rows_per_seq(meta, int(input_ids.shape[0]))
+        live_spans = self._sequence_spans(positions, meta["slot_mapping"], rows_per_seq)
+        live_rows = sum(length for _, length, _ in live_spans)
+        spans, bucket_meta = self._bucket_rows(
+            live_spans, meta, int(input_ids.shape[0]), rows_per_seq
+        )
+        paged = self._paged_spans(spans, bucket_meta, len(live_spans))
+        live_lengths = [length for _, length, _ in live_spans]
+        if len(live_lengths) < len(spans):
+            live_lengths = live_lengths + [length for _, length, _ in spans[len(live_lengths):]]
+        bucket_rows = sum(length for _, length, _ in spans)
+        if bucket_rows != int(input_ids.shape[0]):
+            raise NotImplementedError(
+                f"the megakernel path wants the spans to tile the {int(input_ids.shape[0])} "
+                f"rows of the step, got {bucket_rows}"
+            )
+        stream, pre_mix = mk_model.run_embed(self, input_ids)
+        hashes = _hashes_entry()(self, input_ids, paged)
+        _MOE_LIVE_ROWS[0] = live_rows if live_rows != bucket_rows else None
+        if prof is not None:
+            prof.mark("m_layers0")
+        stream, pre_mix, main_hiddens = mk_model.run_layers(
+            self, stream, pre_mix, spans, paged, hashes, live_rows
+        )
+        if prof is not None:
+            prof.mark("m_layers1")
+        _MOE_LIVE_ROWS[0] = None
+        ids = mk_model.run_head_greedy(self, stream, pre_mix)
+        lengths = mk_model.step_tensor(("live_lengths", len(spans)), live_lengths, torch.int64,
+                                       ids.device)
+        accepted, seeds, taps, main_hidden = _compiled(_greedy_step)(
+            ids, sampling_positions,
+            spec_decode_metadata.draft_token_ids,
+            spec_decode_metadata.cu_num_draft_tokens,
+            max(spec_decode_metadata.num_draft_tokens),
+            lengths, main_hiddens, len(spans),
+        )
+        if prof is not None:
+            prof.mark("m_head")
+        shared = [SharedAttentionState() for _ in paged]
+        self.last_draft = self._draft(
+            None, accepted, spans, paged, shared, main_hidden, True, live_lengths,
+            seeds_taps=(seeds, taps),
+        )
+        if prof is not None:
+            prof.end()
+        return accepted
 
     @torch._dynamo.disable
     def _engram_rows(

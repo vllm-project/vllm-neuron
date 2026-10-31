@@ -32,7 +32,7 @@ import nki.isa as nisa
 import nki.language as nl
 
 from . import mk_gemm as G
-from . import mk_moe
+from . import mk_moe, shared_split
 from .draft_kernel import CORES, NEG, ROUTE_SCALE, SWIGLU_LIMIT, _add_into, _log2, _zero_pad
 from .mk_common import (
     KTILE,
@@ -431,7 +431,8 @@ def _draft_b(a):
         lo, hi = G.half_cols(inter, pid)
         swiglu_rows(eg[0:Kp, lo:hi], eu[0:Kp, lo:hi], None, 0, ey[0:Kp, lo:hi], ptiles, hi - lo, SWIGLU_LIMIT)
         nisa.core_barrier(data=ey, cores=(0, 1))
-        proj(ey, Kp, inter, a["sh_w2"][s], eo32, dim, out_dtype=nl.float32, out_scale=1.0 / world)
+        proj(ey, Kp, inter, a["sh_w2"][s], eo32, dim, out_dtype=nl.float32,
+             out_scale=shared_split.scale(inter, len(a["groups_attn"][0]), world))
         _add_into(eacc, eo32, ptiles, ocol0, ocol1)
         nisa.core_barrier(data=eacc, cores=(0, 1))
         for r0, nr in tiles_of(Kp, pid):

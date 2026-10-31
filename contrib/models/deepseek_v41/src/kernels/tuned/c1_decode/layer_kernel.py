@@ -65,6 +65,7 @@ import nki.language as nl
 
 from . import mk_gemm as G
 from . import mk_moe
+from ... import moe_tp8, shared_split
 from .mk_common import (
     ATTN_BATCH,
     KTILE,
@@ -209,6 +210,10 @@ def _layer(a, arch, phase):
     n_experts = a["gate_w_t"].shape[1]
     w1, s1, w3, s3, w2, s2 = a["w1"], a["s1"], a["w3"], a["s3"], a["w2"], a["s2"]
     n_local = w1.shape[0]
+    # TP8EP8 decode (`kernels/moe_tp8`): `w1` holds this rank's 256-column chunk records of
+    # its group's experts, and the router writes a routing column a chunk plus a zero one
+    tp8 = moe_tp8.uses(decode, a)
+    n_route = n_local + 1 if tp8 else n_local
     inter = a["sh_w1"].shape[1]
     nwin = a["win_slots"].shape[0] // nspans
     read_len = a["cmp_slots"].shape[0] // nspans if ratio else 0
@@ -225,6 +230,9 @@ def _layer(a, arch, phase):
     kd = a["index_k_cache"].shape[1] if (idx_src or kv_src) else 0
     nh_idx = a["ix_wproj_t"].shape[1] if idx_src else 0
     world = len(groups_world[0])
+    # the shared partial's scale: 1/world for the whole shared expert, attn_tp/world for
+    # this rank's slice of it (decode, `kernels/shared_split`)
+    sh_scale = shared_split.scale(inter, len(groups_attn[0]), world)
     IDX_SCALE = float(max(kd, 1)) ** -0.5 * float(max(nh_idx, 1) * len(groups_attn[0])) ** -0.5
     scale = float(hd) ** -0.5
     assert hpg * ngroups == heads, "o_groups must divide the local heads"
@@ -319,14 +327,16 @@ def _layer(a, arch, phase):
     # expert's last row tile gather from and scatter into it (`mk_moe`).
     xn2 = nl.ndarray((Tp + PT, dim), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="xn2")
     logits = nl.ndarray((Tp, n_experts), dtype=nl.float32, buffer=nl.shared_hbm, name="logits")
-    wexp = nl.ndarray((Tp + PT, n_local), dtype=nl.float32, buffer=nl.shared_hbm, name="wexp")
+    wexp = nl.ndarray((Tp + PT, n_route), dtype=nl.float32, buffer=nl.shared_hbm, name="wexp")
     eg = nl.ndarray((Tp, inter), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="eg")
     eu = nl.ndarray((Tp, inter), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="eu")
     ey = nl.ndarray((Tp, inter), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="ey")
     eo32 = nl.ndarray((Tp, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="eo32")
     eacc = nl.ndarray((Tp + PT, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="eacc")
-    cc2_src = nl.ndarray((Tp, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc2_src")
-    cc2_dst = nl.ndarray((Tp, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc2_dst")
+    # the world reduction carries the rows the MoE wrote (Rg = T in decode), not the
+    # padded 128-row tile (`c2_decode/layer_kernel`)
+    cc2_src = nl.ndarray((Rg, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc2_src")
+    cc2_dst = nl.ndarray((Rg, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc2_dst")
     ffn_out = nl.ndarray((Tp, dim), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="ffn_out")
 
     # ------------------------------------------------------------------ 0. engram, tap
@@ -692,7 +702,7 @@ def _layer(a, arch, phase):
     # out_stream rel. L2 4.9e-3 vs the unsplit kernel) -- bisected to this change; the
     # unsplit path is exact on every recorded case of every archetype.
     SHARD_SHARED_EXPERT = False
-    shard_sh = (SHARD_SHARED_EXPERT and decode and inter % PT == 0
+    shard_sh = (SHARD_SHARED_EXPERT and decode and not tp8 and inter % PT == 0
                 and n_experts == world * n_local and max(nsl, ncol2) <= world)
 
     def rank_slot(n):
@@ -783,19 +793,19 @@ def _layer(a, arch, phase):
         nisa.core_barrier(data=logits, cores=(0, 1))
     else:
         gemm_fp32(xn2, a["gate_w_t"], logits, mine, dim, n_experts)
-    route_topk(logits, a["gate_b"], a["expert_lo"], mine, n_experts, TOPK_EXPERTS, n_local,
-               ROUTE_SCALE, wexp, live_hbm=a["live"])
+    route_topk(logits, a["gate_b"], a["expert_lo"], mine, n_experts, TOPK_EXPERTS, n_route,
+               ROUTE_SCALE, wexp, live_hbm=a["live"], targets=tp8)
     if pid == 0:
-        _zero_pad(wexp, T, Tp, n_local, dtype=nl.float32)
+        _zero_pad(wexp, T, Tp, n_route, dtype=nl.float32)
         if not dense:
-            _zero_pad(wexp, Tp, Tp + PT, n_local, dtype=nl.float32)
+            _zero_pad(wexp, Tp, Tp + PT, n_route, dtype=nl.float32)
     nisa.core_barrier(data=wexp, cores=(0, 1))
     sh_w2_loc = shard_sh and dense and 0 < SH_W2_LOCAL_ROWS <= Rg
     if sh_w2_loc:
         # w2 unsplit over the gathered `ey`, this core's (= its routed-expert) columns: the
         # very values the slices below gather, without a third world all_reduce
         proj(sh_dst, Rg, inter, a["sh_w2"], eo32, dim, out_dtype=nl.float32,
-             out_scale=1.0 / world)
+             out_scale=sh_scale)
     elif shard_sh:
         # w2: this rank's 128 output columns over the whole gathered `ey` (as the unsplit
         # GEMM computes them, scaled by 1/world), gathered the same way
@@ -807,7 +817,7 @@ def _layer(a, arch, phase):
                            op1=nl.add, operand1=pid, engine=nisa.engine.vector)
         yT = G.stage_rows_T(sh_dst, 0, Rg, inter, True)
         eo_s = G.gemm_slice_cols(yT, Rg, inter, a["sh_w2"], sub, hw, None,
-                                 out_dtype=nl.float32, out_scale=1.0 / world)
+                                 out_dtype=nl.float32, out_scale=sh_scale)
         row2 = nl.ndarray((PT, ncol2, hw), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=row2, data1=eo_s.reshape((PT, 1, hw)).broadcast(1, ncol2),
                            data2=oh2.reshape((PT, ncol2, 1)).broadcast(2, hw), op=nl.multiply)
@@ -815,10 +825,12 @@ def _layer(a, arch, phase):
                       src=row2[0:Rg, :, :])
         nisa.core_barrier(data=sh2_src, cores=(0, 1))
         ncc.all_reduce(srcs=[sh2_src], dsts=[sh2_dst], replica_group=rg_world, op=nl.add)
-    experts = [(w1[e], s1[e], w3[e], s3[e], w2[e], s2[e]) for e in range(n_local)]
+    experts = [] if tp8 else [(w1[e], s1[e], w3[e], s3[e], w2[e], s2[e]) for e in range(n_local)]
     # decode: every row is in one tile, so each expert runs over the whole tile with
     # no row lists / gathers / scatters, accumulating in SBUF (`routed_experts_dense`)
-    if dense:
+    if tp8:
+        eacc_sb = moe_tp8.routed_experts_tp8(pid, T, xn2, wexp, (w1, s1, w3, s3, w2, s2))
+    elif dense:
         eacc_sb = mk_moe.routed_experts_dense(pid, n_local, xn2, wexp, experts)
     else:
         mk_moe.routed_experts(pid, n_local, Tp, xn2, wexp, experts, eacc)
@@ -843,7 +855,7 @@ def _layer(a, arch, phase):
                     SWIGLU_LIMIT)
         nisa.core_barrier(data=ey, cores=(0, 1))
         # w2 by output columns: this core's are exactly its routed-expert columns
-        proj(ey, Rg, inter, a["sh_w2"], eo32, dim, out_dtype=nl.float32, out_scale=1.0 / world)
+        proj(ey, Rg, inter, a["sh_w2"], eo32, dim, out_dtype=nl.float32, out_scale=sh_scale)
         # routed + shared of this core's columns straight into the reduce's source
         if dense:
             _add_sb_into(eacc_sb, eo32, Rg, ocol0, ocol1, cc2_src)
@@ -854,7 +866,7 @@ def _layer(a, arch, phase):
         proj(xn2, Rg, dim, a["sh_w3"], eu, inter)
         rt = tiles_of(Tp, pid)
         swiglu_rows(eg, eu, None, 0, ey, rt, inter, SWIGLU_LIMIT)
-        proj(ey, Rg, inter, a["sh_w2"], eo32, dim, out_dtype=nl.float32, out_scale=1.0 / world)
+        proj(ey, Rg, inter, a["sh_w2"], eo32, dim, out_dtype=nl.float32, out_scale=sh_scale)
         # both cores' routed columns are in before this core adds its rows' shared output
         nisa.core_barrier(data=eacc, cores=(0, 1))
         _add_into(eacc, eo32, rt, 0, dim)
