@@ -384,6 +384,39 @@ the reference's word for word (32 of 32); batch-10 TPOT is 8-23 % lower and its 
 its prefill's token, and a lone request's step that may be its last is not followed by one
 scheduled ahead: either would put a step in front of the next prefill).
 
+**Optimized decode drafter (2026-10-31, flat scheme).** With the host off the critical
+path, the DSpark drafter was ~19 % of a bs1 decode step and ~17 % of a bs10 one. Its
+decode kernels -- the per-sequence and the batched one -- were optimized in a standalone
+workspace (the live server's recorded drafter launches on all 64 ranks, an AutoHelix
+loop) and are now `src/kernels/tp64/draft_decode/` (`src/README.md`, "Optimized decode
+drafter"): ~2.7x faster on the recorded launches and bit-exact -- the same drafts, the
+same confidences, the same window-cache rows. Part of the gain is a weight layout: the
+taps' projection `main_proj` and the shared expert's gate / up projections, which every
+rank held and computed in full, are column-sharded over the 64 ranks
+(`mk_model.draft_weights_decode`). The integration test passes with the verifier's texts
+unchanged. Measured 2026-10-31 on the same stack (`test/performance/bench_report.opt11.json`
+and `.opt11_ms10.json`), against the previous day's reference (`bench_report.opt10*.json`):
+
+| Cell | TTFT p50 ms | TPOT p50 ms | decode tok/s | median ITL ms |
+|------|-------------|-------------|--------------|---------------|
+| in512_bs1 | 137 (135) | 7.8 (8.8) | 114.8 (103.0) | |
+| in1024_bs1 | 232 (232) | 7.2 (8.1) | 110.6 (100.4) | |
+| in2048_bs1 | 417 (416) | 7.8 (8.8) | 89.3 (81.8) | |
+| in8192_bs1 | 1667 (1673) | 8.1 (9.1) | 47.5 (45.2) | |
+| in512_bs10 | 716 (708) | 16.4 (18.5) | 403.7 (389.9) | 40.8 (45.9) |
+| in1024_bs10 | 1240 (1239) | 20.9 (21.9) | 318.5 (308.1) | 41.7 (46.9) |
+| in2048_bs10 | 2247 (2231) | 27.0 (29.1) | 213.8 (212.1) | 42.9 (47.9) |
+| in8192_bs10 | 9162 (9193) | 73.0 (74.1) | 68.8 (67.7) | 46.6 (51.6) |
+
+(In parentheses: the previous reference.) Batch-1 TPOT is 11-12 % lower, as the drafter's
+share of a step and its speedup predict (~3.4 ms of a ~28.5 ms step), and its texts and
+draft / acceptance counts are the reference's exactly (32 of 32). At batch 10 one decode
+step (the median inter-token latency, a streamed chunk per step) is 10-11 % shorter, as
+predicted (in1024: 47.2 ms profiled -> 42.1 ms expected, 41.7 measured); TPOT p50 moves
+less (-1.5 to -11 %) because it also carries the other requests' prefills. TTFT is
+unchanged (the prefill drafter is the original). Batch-10 texts differ from run to run
+(ten simultaneous arrivals change the batch order), as they did between earlier runs.
+
 > **Read this before you deploy.** Every number in this contribution was
 > measured on `vllm-neuron` **0.24.0.1.1.0**, which is the branch the model was
 > developed against. The code is contributed on top of `main`, and the port's

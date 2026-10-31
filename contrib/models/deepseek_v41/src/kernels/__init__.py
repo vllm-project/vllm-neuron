@@ -41,6 +41,10 @@ engram, DSpark tap) and per parallelization scheme (`DEEPSEEK_V41_SCHEME`:
       sharded vocabulary, the
       confidence head             <scheme>/draft_kernel.draft_forward  mk_model.run_draft
                                                               <- model.forward_spec
+      (the flat scheme's decode
+      phase: the optimized copy,
+      own helpers and weight
+      layout)                     tp64/draft_decode/           mk_model.run_draft
     the fp8 / fp4 GEMMs on the
       tensor engine's MX matmul
       (`nc_matmul_mx`: block-

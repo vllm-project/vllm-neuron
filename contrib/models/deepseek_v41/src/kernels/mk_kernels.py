@@ -102,7 +102,10 @@ _KIND = {
     ("decode", (1, 0, 1, 0, 0), "tp64"): "r1_idx_decode",
     ("decode", (1, 0, 0, 0, 1), "tp64"): "r1_tap_decode",
 }
-OPTIMIZED_KINDS = tuple(sorted(set(_KIND.values())))
+#: The flat scheme's optimized decode drafter (`kernels/tp64/draft_decode/`: both entries, the
+#: per-sequence and the batched one, and their weight layout); its `mk_model.kernel_version` kind.
+DRAFT_DECODE_KIND = "draft_decode"
+OPTIMIZED_KINDS = tuple(sorted(set(_KIND.values()) | {DRAFT_DECODE_KIND}))
 #: (phase, arch, scheme) -> the optimized kernel (`@nki.jit`)
 _OPTIMIZED = {
     key: getattr(importlib.import_module(f".{key[2]}.{kind}.{kind}", __package__),
@@ -181,13 +184,25 @@ def version_kind(phase: str, arch, scheme: str) -> str:
     return kind if kind in _ENABLED else "block"
 
 
+def draft_optimized(phase: str, scheme: str = "tp64") -> bool:
+    """Whether the drafter of `phase` x `scheme` is the optimized one (`tp64/draft_decode/`:
+    the flat scheme's decode phase, unless `DEEPSEEK_V41_OPT_KERNELS` leaves it out). Its
+    weights are `mk_model.draft_weights_decode`'s, its version kind `DRAFT_DECODE_KIND`."""
+    return phase == "decode" and scheme == "tp64" and DRAFT_DECODE_KIND in _ENABLED
+
+
+def _draft_decode_pkg():
+    return importlib.import_module(".tp64.draft_decode", __package__)
+
+
 def draft(phase: str, scheme: str):
     """The drafter entry of a scheme: the flat scheme's kernel drafts one sequence
     per launch, the pipeline scheme's every sequence of the step in one launch
-    (`pkg(scheme).draft_kernel`)."""
+    (`pkg(scheme).draft_kernel`). The flat scheme's decode phase runs the optimized
+    body (`draft_optimized`)."""
     assert phase in PHASES and scheme in SCHEMES
-    return specialize(pkg(scheme).draft_kernel.draft_body, f"draft_{phase}_{scheme}",
-                      (("phase", phase), ("scheme", scheme)))
+    body = _draft_decode_pkg().draft_seq.draft_body if draft_optimized(phase, scheme) else pkg(scheme).draft_kernel.draft_body
+    return specialize(body, f"draft_{phase}_{scheme}", (("phase", phase), ("scheme", scheme)))
 
 
 def draft_batched(phase: str):
@@ -196,10 +211,10 @@ def draft_batched(phase: str):
     run on -- the world here) specialized for tp64. `mk_model.run_draft` launches it
     unless `DEEPSEEK_V41_DRAFT_BATCHED=0` (one launch per sequence: `draft(phase, "tp64")`).
     Its `mk_model.kernel_version` is `kernel_version("draft", "tp8pp8")`, the package it is
-    built from."""
+    built from (the decode phase: the optimized body, `draft_optimized`, kind `DRAFT_DECODE_KIND`)."""
     assert phase in PHASES
-    return specialize(_tp8pp8.draft_kernel.draft_body, f"draft_{phase}_batched_tp64",
-                      (("phase", phase), ("scheme", "tp64")))
+    body = _draft_decode_pkg().draft_batched.draft_body if draft_optimized(phase) else _tp8pp8.draft_kernel.draft_body
+    return specialize(body, f"draft_{phase}_batched_tp64", (("phase", phase), ("scheme", "tp64")))
 
 
 @functools.lru_cache(maxsize=None)

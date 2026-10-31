@@ -205,6 +205,26 @@ element-strided DMAs (~14 us a token at an 8k context). Same values: every score
 same dot products and per-token sum (plus exact zeros), the top-k sees the same bf16
 tiles.
 
+**Optimized decode drafter (flat scheme).** A decode step's drafter -- `draft_decode_tp64`
+for a step of one sequence, `draft_decode_batched_tp64` for a step of several -- runs the
+package `kernels/tp64/draft_decode/` (`draft_seq.py`, `draft_batched.py`, its own helper
+copies), produced in the standalone workspace ~/ds41_dspark_draft (the live server's
+recorded drafter inputs and golden outputs on all 64 ranks, an AutoHelix loop): bit-exact
+on the recorded cases -- drafted tokens, confidences, window-cache rows -- and ~2.7x
+faster there. Besides scheduling (the three stages' hyper-connection and norm work split
+over both cores and moved into the collectives' shadows, dense per-sequence attention
+instead of a per-token loop, live-row embedding all-reduce, the markov head in one
+all-gather per token) it lays two weights out differently (`draft_decode/layout.py`,
+applied once by `mk_model.draft_weights_decode`): `main_proj` is column-sharded over the
+64 ranks (each rank projects its 80 columns, then an all-gather; 1.2 MB a rank instead of
+79 MB of replicated weight), and the shared expert's gate / up projections likewise (36 of
+2304 hidden columns a rank, its SwiGLU slice all-gathered for the down projection, which
+stays replicated so every sum is the original's). The prefill drafter keeps the original
+kernels and weights. `mk_kernels.draft` / `draft_batched` route the decode phase there
+(`draft_optimized`), `mk_model.kernel_version("draft_decode")` hashes the package, and
+`DEEPSEEK_V41_OPT_KERNELS` without `draft_decode` (or `none`) brings the original drafter
+back.
+
 **A decode step is a handful of launches (flat scheme).** A decode block runs in well
 under a millisecond on the device, while every NEFF execution with collectives costs
 ~1.5 ms of host submission at the least -- more the more IO tensors it has (~5 ms for an

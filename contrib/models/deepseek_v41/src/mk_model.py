@@ -565,6 +565,80 @@ def _fcapture_save(model, arm, fp, step, params, before, out) -> None:
                     len(params), len(inplace))
 
 
+#: `DEEPSEEK_V41_DCAPTURE=<dir>`: record the drafter's launch (`run_draft`: the per-sequence
+#: kernel of a one-sequence step, the batched one of a step of several) on every rank, for
+#: standalone work on the drafter megakernel -- its arguments before the launch, its outputs,
+#: and the rows it wrote into the window caches it updates in place -- to
+#: `<dir>/<tag>/<kernel>/rank<rank>.pt`. Armed by `<dir>/ARM.json` (`{"tag", "phase", "nth"}`
+#: plus any of `"min_start"`, `"nspans"`, as for `_FCAPTURE`): the `nth` matching step after
+#: the arm is captured. Unset, a launch only tests the flag.
+_DCAPTURE = os.environ.get("DEEPSEEK_V41_DCAPTURE", "")
+_dcap = {"arm": None, "mtime": None, "step": None, "count": 0, "done": False}
+#: The drafter's arguments it updates in place (the three stages' window caches).
+_DCAPTURE_INPLACE = ("cache0", "cache1", "cache2")
+
+
+def _dcapture_target(model) -> dict | None:
+    """The arm spec when this drafter launch is the one to record, else None."""
+    path = os.path.join(_DCAPTURE, "ARM.json")
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    if mtime != _dcap["mtime"]:
+        import json
+
+        with open(path) as fh:
+            _dcap.update(arm=json.load(fh), mtime=mtime, step=None, count=0, done=False)
+    arm = _dcap["arm"]
+    step = getattr(model, "_mk_step", None)
+    if step is None or _dcap["done"]:
+        return None
+    starts = [int(s[2]) for s in step.spans]
+    if (step.phase != arm["phase"]
+            or (arm.get("min_start") is not None and min(starts) < int(arm["min_start"]))
+            or (arm.get("nspans") is not None and len(starts) != int(arm["nspans"]))):
+        return None
+    if _dcap["step"] is not step:
+        _dcap["step"] = step
+        _dcap["count"] += 1
+    if _dcap["count"] != int(arm["nth"]):
+        return None
+    _dcap["done"] = True
+    return arm
+
+
+def _dcapture_run(model, arm, kernel, body, args):
+    """Launch the drafter with `args` and write this rank's record of it (see `_DCAPTURE`)."""
+    names = mk_kernels._positional_names(body)
+    assert len(names) == len(args), f"{len(names)} names for {len(args)} drafter arguments"
+    before = [a.detach().cpu().clone() if isinstance(a, torch.Tensor) else a for a in args]
+    out = entry(kernel)(*args)
+    # (the outputs first: their read-back waits for the launch, which updates the caches in place)
+    outs = [o.detach().cpu() for o in out]
+    written = {}
+    for j, n in enumerate(names):
+        if n in _DCAPTURE_INPLACE:
+            after = args[j].detach().cpu()
+            rows = (after != before[j]).reshape(after.shape[0], -1).any(dim=1).nonzero().reshape(-1)
+            written[j] = {"rows": rows, "values": after[rows].clone()}
+    step = model._mk_step
+    rec = {
+        "kernel": kernel.func.__name__, "body": f"{body.__module__}.{body.__name__}", "names": names,
+        "params": before, "outs": outs, "written": written,
+        "meta": {"rank": int(model.rank), "world": int(model.world_size), "phase": step.phase,
+                 "spans": [tuple(int(v) for v in s) for s in step.spans], "T": int(step.T), "arm": arm},
+    }
+    d = os.path.join(_DCAPTURE, arm["tag"], kernel.func.__name__)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"rank{int(model.rank):02d}.pt")
+    torch.save(rec, path + ".tmp")
+    os.replace(path + ".tmp", path)
+    _mk_log.warning("dcapture: %s rank %d -> %s (%d args, %d in-place)", kernel.func.__name__, model.rank, d,
+                    len(args), len(written))
+    return out
+
+
 @functools.lru_cache(maxsize=None)
 def kernel_version(kind: str = "block", scheme: str = "tp64") -> int:
     """A hash of the kernel source files a kernel is built from, folded into its
@@ -1893,6 +1967,30 @@ def draft_weights(model) -> list:
     return head + hc + moe, tail
 
 
+def draft_weights_decode(model) -> tuple:
+    """`draft_weights` in the optimized decode drafter's layout (`kernels/tp64/draft_decode/layout.py`:
+    `main_proj` and the shared expert's gate / up projections column-sharded over the world, each rank
+    its own slice), as two lists in the same order; cached on the model. Made once from this rank's
+    copies through the host (as `draft_weights` is); the prefill drafter keeps `draft_weights`."""
+    cached = model.__dict__.get("_mk_draft_dec_")
+    if cached is not None:
+        return cached
+    pkg = mk_kernels._draft_decode_pkg()
+    names = mk_kernels._positional_names(pkg.draft_seq.draft_body)
+    w_names = names[names.index("main_proj") : names.index("cache0")]
+    t_names = names[names.index("cache2") + 1 : names.index("groups_attn")]
+    weights, tail = model._mk_draft()
+    assert len(w_names) == len(weights) and len(t_names) == len(tail), "drafter weight lists vs the kernel signature"
+    by_name = dict(zip(w_names + t_names, weights + tail))
+    new = pkg.layout.prepare(int(model.rank), int(model.world_size), "draft_decode_tp64",
+                             {n: _host(t) for n, t in by_name.items()}, None)
+    device = weights[0].device
+    by_name.update({n: _dev(t, device) for n, t in new.items()})
+    out = ([by_name[n] for n in w_names], [by_name[n] for n in t_names])
+    model.__dict__["_mk_draft_dec_"] = out
+    return out
+
+
 def _draft_meta_seq(seed, tap, pos):
     """`[1, 3]` int32 (seed, tap, pos) of one sequence, as a compiled step (the flat
     scheme's drafter prologue, unchanged)."""
@@ -1935,20 +2033,28 @@ def _run_draft_seq(model, seed_ids, tap, main_hidden, span, paged, meta=None):
     else:
         row_pos = (start_pos + torch.arange(length)).to(torch.int32).reshape(-1, 1).to(device)
         write_slots = _host_slots(paged).reshape(-1)[:length].to(torch.int32).reshape(-1, 1).contiguous().to(device)
-    weights, tail = model._mk_draft()
+    dphase = "prefill" if paged.at_zero else "decode"
+    opt = mk_kernels.draft_optimized(dphase, model.mk_plan.scheme)
+    weights, tail = draft_weights_decode(model) if opt else model._mk_draft()
     K = int(cfg.dspark_block_size)
     stages = list(model.mtp)
-    flags = (int(paged.at_zero), K, int(stages[0].attn.window_size), 9, kernel_version("draft", model.mk_plan.scheme),
+    kver = kernel_version(mk_kernels.DRAFT_DECODE_KIND, "tp64") if opt else kernel_version("draft", model.mk_plan.scheme)
+    flags = (int(paged.at_zero), K, int(stages[0].attn.window_size), 9, kver,
              int(cfg.dspark_noise_token_id), int(cfg.vocab_size), int(cfg.dspark_num_experts_per_tok),
              int(paged.block_size))
     caches = [s.attn.window_kv_cache.view(-1, s.attn.head_dim) for s in stages]
     args = [meta, main, row_pos, write_slots, table, *weights, *caches, *tail,
             model._mk_groups_attn, model._mk_groups_full, flags]
     keep_alive(meta, row_pos, write_slots, table)
-    kernel = mk_kernels.draft("prefill" if paged.at_zero else "decode", model.mk_plan.scheme)
+    kernel = mk_kernels.draft(dphase, model.mk_plan.scheme)
     if _MK_TRACE and model.mk_plan.stage_rank == 0:
         _mk_log.warning("mk launch %s span=%s", kernel.func.__name__, span)
-    out = entry(kernel)(*args)
+    dcap = _dcapture_target(model) if _DCAPTURE else None
+    if dcap is not None:
+        body = (mk_kernels._draft_decode_pkg().draft_seq if opt else mk_kernels.pkg(model.mk_plan.scheme).draft_kernel).draft_body
+        out = _dcapture_run(model, dcap, kernel, body, args)
+    else:
+        out = entry(kernel)(*args)
     output_ids, confidence = out[0], out[1]
     _track(confidence)
     return output_ids, None, confidence.reshape(1, K)
@@ -2046,10 +2152,13 @@ def run_draft(model, seeds, taps, main_hidden, spans, paged, meta=None):
     rows_c = consts.get((B, K, ntab_p))
     if rows_c is None:
         rows_c = consts[(B, K, ntab_p)] = draft_consts(B, K, ntab_p).to(device)
-    weights, tail = model._mk_draft()
     at_zero = int(paged[0].at_zero)
+    dphase = "prefill" if at_zero else "decode"
+    opt = mk_kernels.draft_optimized(dphase, model.mk_plan.scheme)
+    weights, tail = draft_weights_decode(model) if opt else model._mk_draft()
     kscheme = "tp8pp8" if batched_tp64 else model.mk_plan.scheme   # the drafter body's package
-    flags = (at_zero, K, win, 9, kernel_version("draft", kscheme),
+    kver = kernel_version(mk_kernels.DRAFT_DECODE_KIND, "tp64") if opt else kernel_version("draft", kscheme)
+    flags = (at_zero, K, win, 9, kver,
              int(cfg.dspark_noise_token_id), int(cfg.vocab_size), int(cfg.dspark_num_experts_per_tok),
              int(paged[0].block_size))
     caches = [s.attn.window_kv_cache.view(-1, s.attn.head_dim) for s in stages]
@@ -2060,11 +2169,19 @@ def run_draft(model, seeds, taps, main_hidden, spans, paged, meta=None):
     # world under tp64, the last stage under tp8pp8 (`_mk_groups_full` is that
     # stage's groups); it is a distinct entry per scheme, `draft_<phase>_<scheme>`,
     # as every other kernel is.
-    dphase = "prefill" if at_zero else "decode"
     kernel = mk_kernels.draft_batched(dphase) if batched_tp64 else mk_kernels.draft(dphase, model.mk_plan.scheme)
     if _MK_TRACE and model.mk_plan.stage_rank == 0:
         _mk_log.warning("mk launch %s B=%d spans=%s", kernel.func.__name__, B, spans)
-    out = entry(kernel)(*args)
+    dcap = _dcapture_target(model) if _DCAPTURE else None
+    if dcap is not None:
+        if opt:
+            pkg = mk_kernels._draft_decode_pkg()
+            body = (pkg.draft_batched if batched_tp64 else pkg.draft_seq).draft_body
+        else:
+            body = (mk_kernels._tp8pp8 if batched_tp64 else mk_kernels.pkg(model.mk_plan.scheme)).draft_kernel.draft_body
+        out = _dcapture_run(model, dcap, kernel, body, args)
+    else:
+        out = entry(kernel)(*args)
     output_ids, confidence = out[0], out[1]
     _track(confidence)
     model.last_draft_ids = output_ids
