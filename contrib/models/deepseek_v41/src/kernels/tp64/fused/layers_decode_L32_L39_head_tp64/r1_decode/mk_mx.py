@@ -118,10 +118,86 @@ def stage_rows(rows, k, xq, xs, mi):
         )
 
 
+#: Staging with `nv` (<= 42) valid rows (decode): `G = 128 // nv` 512-wide chunks share
+#: one set of four PE transposes -- chunk c's rows sit on partitions `c*nv .. c*nv+nv` of
+#: a packed `[128, 512]` tile (or `m*nkc + c` when one group holds every chunk: a single
+#: contiguous DMA) -- and only the nv valid columns are copied / quantized; the other
+#: columns of `xq` / `xs` are zero (rows past nv give exact zeros). Every valid row's
+#: values and 32-element scale groups are unchanged, so its quantization is identical.
+STAGE_PACK = True
+#: ... only when at least this many chunks share a transpose: at G = 2 (T = 60) the per-chunk
+#: row DMAs cost more than the halved transposes save (in8192_bs10 exec-cc 6.40 -> 6.45 ms).
+PACK_MIN_G = 3
+#: The valid rows of the member's row tile (`stage_x` of rows 0.., set by the member at its
+#: start: its T when one 128-row tile holds every row, else None = the unpacked staging).
+PACK_NV = [None]
+
+
+def pack_ok(nv, k):
+    return STAGE_PACK and nv is not None and 0 < nv and PT // nv >= PACK_MIN_G and k % PT == 0
+
+
+def stage_x_packed(x_hbm, r0, k, xq, xs, mi, nv, col0=0, shifts=1):
+    """`stage_x` for the first `nv` rows only (`pack_ok(nv, k)`; the rest zero).
+    `shifts`: slots `mi .. mi + shifts` get the same rows, slot `mi + s` at columns
+    `s*nv .. s*nv + nv` (for `gemm_sb_packed`)."""
+    chunks = chunks_of(k)
+    nkc = len(chunks)
+    G = PT // nv
+    kfull = x_hbm.shape[1]
+    nisa.memset(xq[:, mi : mi + shifts, :, :], 0)
+    for c0 in range(0, nkc, G):
+        g = min(G, nkc - c0)
+        q = g * nv
+        full = all(chunks[c0 + c][1] == KC for c in range(g))
+        xp = nl.ndarray((PT, KC), dtype=nl.bfloat16, buffer=nl.sbuf)
+        mmajor = (g == nkc and full and kfull == k and col0 == 0)
+        if mmajor:
+            # partition m * nkc + c = the rows' flat 512-element runs: one DMA
+            nisa.dma_copy(dst=xp[0:q, :], src=x_hbm.ap(pattern=[[KC, q], [1, KC]], offset=r0 * kfull))
+        else:
+            if not full:
+                # (a short chunk's columns past its end feed only unused partitions)
+                nisa.memset(xp, 0.0, engine=nisa.engine.gpsimd)
+            for c in range(g):
+                k0, kk = chunks[c0 + c]
+                nisa.dma_copy(dst=xp[c * nv : (c + 1) * nv, 0:kk],
+                              src=x_hbm[r0 : r0 + nv, col0 + k0 : col0 + k0 + kk])
+        _stage_packed_tile(xp, nv, chunks, c0, g, xq, xs, mi, mmajor, shifts)
+
+
+def _stage_packed_tile(xp, nv, chunks, c0, g, xq, xs, mi, mmajor=False, shifts=1):
+    """Chunks `c0 .. c0+g` from the packed bf16 SBUF tile `xp` (`[128, xw]`, chunk c's
+    row m on partition `c*nv + m`, or `m*g + c` when `mmajor`) into slot `mi`."""
+    q = g * nv
+    xw = xp.shape[1]
+    tp = nl.ndarray((PT, 4, q), dtype=nl.bfloat16, buffer=nl.psum)
+    for j in range(4):
+        nisa.nc_transpose(dst=tp[:, j, :], data=xp.ap(pattern=[[xw, q], [4, PT]], offset=j))
+    # xT[p, c, m, j] = tp[p, j, (c, m)]
+    xT = nl.ndarray((PT, g, nv * 4), dtype=nl.bfloat16, buffer=nl.sbuf)
+    if mmajor:
+        src = tp.ap(pattern=[[4 * q, PT], [1, g], [g, nv], [q, 4]])
+        dst = xT.ap(pattern=[[g * nv * 4, PT], [nv * 4, g], [4, nv], [1, 4]])
+    else:
+        src = tp.ap(pattern=[[4 * q, PT], [1, q], [q, 4]])
+        dst = xT.ap(pattern=[[g * nv * 4, PT], [4, q], [1, 4]])
+    nisa.tensor_copy(dst=dst, src=src)
+    for c in range(g):
+        pk = chunks[c0 + c][1] // 4
+        for sh in range(shifts):
+            nisa.quantize_mx(dst=xq[0:pk, mi + sh, c0 + c, sh * nv : (sh + 1) * nv], src=xT[0:pk, c, :],
+                             dst_scale=xs[0:pk, mi + sh, c0 + c, sh * nv : (sh + 1) * nv])
+
+
 def stage_x(x_hbm, r0, k, xq, xs, mi, col0=0, nvalid=PT):
     """Load rows `r0 .. r0+128` (columns `col0 .. col0+k`) of the bf16 HBM `x_hbm`
     and quantize them into slot `mi`. Only the first `nvalid` rows are read: the rest
     are zero rows made on chip (the HBM pad rows are never written nor read)."""
+    if r0 == 0 and pack_ok(PACK_NV[0], k):
+        # (`PACK_NV`: the packed staging of the member's valid rows)
+        stage_x_packed(x_hbm, 0, k, xq, xs, mi, PACK_NV[0], col0=col0)
+        return
     rows = nl.ndarray((PT, k), dtype=nl.bfloat16, buffer=nl.sbuf)
     if nvalid < PT:
         nisa.memset(rows, 0.0)
@@ -273,7 +349,7 @@ def gemm_sb_pre(xq, xs, k, wt, ws, out_sb, n):
 
 
 def gemm(xq, xs, nmt, k, w_mx, s_mx, out_hbm, r0, lo, hi, fp4=False, out_dtype=nl.bfloat16,
-         out_scale=1.0, krow0=0, epilogue=None):
+         out_scale=1.0, krow0=0, epilogue=None, kc0=0):
     """`out[r0 + 128*mi + m, n] = out_scale * sum_k x[m, k] w[n, k]` for the `nmt` staged
     tiles and the output columns `[lo, hi)`.
 
@@ -281,6 +357,7 @@ def gemm(xq, xs, nmt, k, w_mx, s_mx, out_hbm, r0, lo, hi, fp4=False, out_dtype=n
     scale bytes; `krow0` offsets both for a contraction slice (in units of k/4 rows).
     `epilogue(row0, n0, w, o)`, when given, takes each `(128, w)` SBUF result tile `o`
     (rows `row0 ..`, columns `n0 ..`) instead of the store to `out_hbm`.
+    `kc0`: the activation's chunks start at chunk `kc0` of `(xq, xs)`.
     """
     chunks = chunks_of(k)
     nkc = len(chunks)
@@ -296,8 +373,8 @@ def gemm(xq, xs, nmt, k, w_mx, s_mx, out_hbm, r0, lo, hi, fp4=False, out_dtype=n
                 pk = chunks[kc][1] // 4
                 for mi in range(nmt):
                     nisa.nc_matmul_mx(
-                        dst=accs[mi], stationary=xq[0:pk, mi, kc, :], moving=wt[0:pk, j, :],
-                        stationary_scale=xs[0:pk, mi, kc, :], moving_scale=ws[0:pk, j, :],
+                        dst=accs[mi], stationary=xq[0:pk, mi, kc0 + kc, :], moving=wt[0:pk, j, :],
+                        stationary_scale=xs[0:pk, mi, kc0 + kc, :], moving_scale=ws[0:pk, j, :],
                         accumulate=(kc > 0),
                     )
         for mi in range(nmt):

@@ -41,6 +41,7 @@ import nki.isa as nisa
 import nki.language as nl
 
 from . import mk_moe
+from . import moe_tp
 from . import mk_mx as X
 from .mk_common import (
     KTILE,
@@ -110,6 +111,8 @@ CACHE_COPY_SPREAD = True
 #: DMA QoS priority of the attention / world all_reduces (0 = the highest: they are on the
 #: critical path, the weight prefetches / KV writes / cache copies in their shadow are not)
 AR_PRIORITY = 0
+#: the attention / world all_reduces carry the K live rows only (else the padded 128-row tile)
+AR_LIVE_ROWS = True
 #: hc_in_mix of both sublayers split: its sum of squares, mix GEMM and sigmoids on core 1
 #: while core 0 runs the sublayer's hc_in_norm (core 1 idles there), only the Sinkhorn
 #: (~200 dependent instructions) in the following all_reduce's shadow (the whole mix ran
@@ -186,8 +189,11 @@ def draft_body(
     ngroups = heads // hpg
     o_lora = o_lora_total // ngroups
     n_experts = gate_w_t0.shape[1]
-    n_local = w1.shape[1]
-    inter = w1.shape[3]
+    # (`layout.MOE_TP`: the stages' experts in the TP x EP layout, run by `moe_tp`; the sizes below
+    # then only shape the unused EP64 path's scratch)
+    moe_tpl = len(w3.shape) == 3 and tuple(w3.shape[1:]) == (1, 1)
+    n_local = 2 if moe_tpl else w1.shape[1]
+    inter = 8 * moe_tp.HID if moe_tpl else w1.shape[3]
     kpad = pad_to(win + K, KTILE)
     ntab = win + K
     ntab_p = pad_to(ntab, PT)
@@ -209,7 +215,7 @@ def draft_body(
     # each rank its inter / world columns): each rank projects + swiglus its slice, a world
     # all_gather assembles the hidden rows for the replicated down projection (exact: every
     # hidden element is the same dot product and elementwise chain, computed once)
-    sh_cols = sh_w1.shape[2]
+    sh_cols = inter if moe_tpl else sh_w1.shape[2]
     sh_tp = sh_cols != inter
     assert not sh_tp or (sh_cols * world == inter and (inter // PT + 1) // 2 * PT % sh_cols == 0), \
         f"sh_w1 {sh_w1.shape} vs inter {inter}"
@@ -228,6 +234,8 @@ def draft_body(
     assert hpg * ngroups == heads
 
     pid = nl.program_id(0)
+    # (the TP x EP MoE's launch-wide trace-time caches)
+    moe_tp.reset()
     rg_attn = ncc.ReplicaGroup([list(g) for g in groups_attn])
     rg_world = ncc.ReplicaGroup([list(g) for g in groups_world])
     kt = tiles_of(K, pid)             # the draft rows: one partial tile, core 0's
@@ -266,11 +274,12 @@ def draft_body(
     mkvr_s = [nl.ndarray((Lp, hd), dtype=nl.bfloat16, buffer=nl.shared_hbm, name=f"mkvr{s}") for s in range(nstages)]
     mkv_s = [nl.ndarray((Lp, hd), dtype=nl.bfloat16, buffer=nl.shared_hbm, name=f"mkv{s}") for s in range(nstages)]
     # the embedding all_reduce carries the live rows only (a sum of one nonzero row and
-    # zeros: exact in any order); the attention / world all_reduces keep the padded tile
-    # (their fp32 summation order changes with the payload -- measured: 3..12 bf16 ulps of
-    # confidence at in1024_bs10 / in8192_bs1), its pad rows zeroed once
-    Rc = Kp
-    Rw = Kp
+    # zeros: exact in any order); the attention / world all_reduces too with
+    # `AR_LIVE_ROWS` (their fp32 summation order changes with the payload -- measured: 3..12
+    # bf16 ulps of confidence, the drafts unchanged -- for 1/25 of the bytes: K rows of the
+    # 128-row tile), else the padded tile, its pad rows zeroed once
+    Rc = K if AR_LIVE_ROWS else Kp
+    Rw = K if AR_LIVE_ROWS else Kp
     e_loc = nl.ndarray((Re, dim), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="e_loc")
     e_sum = nl.ndarray((Re, dim), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="e_sum")
     st = nl.ndarray((K, width), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="st")
@@ -714,71 +723,83 @@ def draft_body(
             cast_rows(xn2, dbg[0:Kp, 0:dim], kt, dim, nl.float32)
             nisa.core_barrier(data=dbg, cores=(0, 1))
             return ret()
-        # the shared expert first (it needs no routing): its weight streaming overlaps the
-        # router's fp32 GEMM and the expert lists
-        if EACC_ZERO_EARLY:
-            mk_moe.zero_live(eacc, K, dim)
-        lo, hi = _half(inter, pid)
-        if sh_tp:
-            # SH_TP: this rank's gate / up slice (core 0, on chip), then its world all_gather
-            # (in the router's shadow); the down projection after the top-k reads the rows
-            if pid == 0:
-                mk_moe.shared_slice(xn2, dim, K, sh_w1_4[s], sh_s1[s], sh_w3_4[s], sh_s3[s], sh_cols,
-                                    SWIGLU_LIMIT, shs)
-            nisa.core_barrier(data=shs, cores=(0, 1))
-            ncc.all_gather(srcs=[shs], dsts=[shg], replica_group=rg_world, collective_dim=0, priority=AR_PRIORITY)
-        else:
-            X.gemm_rows_shared(xn2, Kp, dim, [(sh_w1_4[s], sh_s1[s], eg, lo, hi), (sh_w3_4[s], sh_s3[s], eu, lo, hi)],
-                               m_live=K)
-            swiglu_rows(eg[0:Kp, lo:hi], eu[0:Kp, lo:hi], None, 0, ey[0:Kp, lo:hi], ptiles, hi - lo, SWIGLU_LIMIT)
-            # The shared expert's weights are replicated on every rank and the model adds its
-            # output ONCE, after the expert all-reduce. Every rank adds it to its partial here,
-            # scaled by 1/world, so the world sum carries it exactly once (a power-of-two
-            # scale of the fp32 partial is exact).
-            X.gemm_rows(ey, Kp, hi - lo, sh_w2_4[s], sh_s2[s], eo32, 0, dim, x_col0=lo, krow0=lo // 4,
-                        out_dtype=nl.float32, out_scale=1.0 / world, m_out=K, m_live=K)
-        # the router logits, the expert columns split between the cores
-        ce0 = n_experts // CORES
-        gemm_fp32(xn2, gate_w_ts[s], logits, kt_all, dim, ce0 if pid == 0 else n_experts - ce0,
-                  c0=0 if pid == 0 else ce0)
-        bar_lg = nisa.core_barrier(data=logits, cores=(0, 1))
-        route_topk(logits, gate_b[s : s + 1], expert_lo, kt_all, n_experts, topk_e, n_local, ROUTE_SCALE, wexp)
-        if not WEXP_PADS_ONCE:
-            zw = nl.ndarray((PT, n_local), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.memset(zw, 0.0)
-            nisa.dma_copy(dst=wexp[K:Kp, :], src=zw[0 : Kp - K, :])
-            nisa.dma_copy(dst=wexp[Kp : Kp + PT, :], src=zw)
-        if sh_tp:
-            # this core's contraction half of the gathered hidden rows, then the (replicated)
-            # down projection as before, scaled by 1/world
-            sched_after(mk_moe.shared_gather(shg, ey, K, sh_cols, lo, hi, [int(r) for r in groups_world[0]],
-                                             inter), bar_lg)
-            X.gemm_rows(ey, Kp, hi - lo, sh_w2_4[s], sh_s2[s], eo32, 0, dim, x_col0=lo, krow0=lo // 4,
-                        out_dtype=nl.float32, out_scale=1.0 / world, m_out=K, m_live=K)
-        # routed experts over the rows that picked them, into the zeroed accumulator
-        lo, hi = _half(inter, pid)
-        mk_moe.routed_experts(pid, n_local, Kp, xn2, wexp, w1_4[s], s1[s], w3_4[s], s3[s],
-                              w2_4[s], s2[s], dim, inter, lo, hi, SWIGLU_LIMIT, eacc, live=K,
-                              zeroed=EACC_ZERO_EARLY)
-        # this core's partial (routed + shared) of the live rows, kept on chip; core 1's
-        # goes through HBM to core 0, which adds the two (core 0's + core 1's, as before)
-        if PARTIAL_SPREAD:
-            bar_w = moe_partial(pid, K, dim, eacc, eo32, part1, cc2_src)
-        else:
-            pa = nl.ndarray((PT, dim), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=pa[0:K, :], src=eacc[0:K, :])
-            pe = nl.ndarray((PT, dim), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=pe[0:K, :], src=eo32[0:K, :])
-            nisa.tensor_tensor(dst=pa[0:K, :], data1=pa[0:K, :], data2=pe[0:K, :], op=nl.add)
-            if pid == 1:
-                nisa.dma_copy(dst=part1[0:K, :], src=pa[0:K, :])
-            nisa.core_barrier(data=part1, cores=(0, 1))
-            if pid == 0:
-                pb = nl.ndarray((PT, dim), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.dma_copy(dst=pb[0:K, :], src=part1[0:K, :])
-                nisa.tensor_tensor(dst=pa[0:K, :], data1=pa[0:K, :], data2=pb[0:K, :], op=nl.add)
-                nisa.dma_copy(dst=cc2_src[0:K, :], src=pa[0:K, :])
+        if moe_tp.is_tp(w1[s], w3[s]):
+            # (`layout.MOE_TP`: the routed and shared experts in the target model's decode TP x EP
+            # layout -- each 8-rank group the 16 experts of its group, each rank 288 hidden columns
+            # of every one -- by its MoE: static slots, both cores' column halves into cc2_src)
+            moe_tp.moe(pid, K, xn2, gate_w_ts[s], gate_b[s : s + 1], expert_lo, w1[s], s1[s], w2[s], s2[s],
+                       sh_w1[s], sh_s1[s], sh_w2[s], sh_s2[s], logits, None, cc2_src, dim, SWIGLU_LIMIT,
+                       ROUTE_SCALE, topk_e)
             bar_w = nisa.core_barrier(data=cc2_src, cores=(0, 1))
+            moe_done = True
+        else:
+            moe_done = False
+        if not moe_done:
+            # the shared expert first (it needs no routing): its weight streaming overlaps the
+            # router's fp32 GEMM and the expert lists
+            if EACC_ZERO_EARLY:
+                mk_moe.zero_live(eacc, K, dim)
+            lo, hi = _half(inter, pid)
+            if sh_tp:
+                # SH_TP: this rank's gate / up slice (core 0, on chip), then its world all_gather
+                # (in the router's shadow); the down projection after the top-k reads the rows
+                if pid == 0:
+                    mk_moe.shared_slice(xn2, dim, K, sh_w1_4[s], sh_s1[s], sh_w3_4[s], sh_s3[s], sh_cols,
+                                        SWIGLU_LIMIT, shs)
+                nisa.core_barrier(data=shs, cores=(0, 1))
+                ncc.all_gather(srcs=[shs], dsts=[shg], replica_group=rg_world, collective_dim=0, priority=AR_PRIORITY)
+            else:
+                X.gemm_rows_shared(xn2, Kp, dim, [(sh_w1_4[s], sh_s1[s], eg, lo, hi), (sh_w3_4[s], sh_s3[s], eu, lo, hi)],
+                                   m_live=K)
+                swiglu_rows(eg[0:Kp, lo:hi], eu[0:Kp, lo:hi], None, 0, ey[0:Kp, lo:hi], ptiles, hi - lo, SWIGLU_LIMIT)
+                # The shared expert's weights are replicated on every rank and the model adds its
+                # output ONCE, after the expert all-reduce. Every rank adds it to its partial here,
+                # scaled by 1/world, so the world sum carries it exactly once (a power-of-two
+                # scale of the fp32 partial is exact).
+                X.gemm_rows(ey, Kp, hi - lo, sh_w2_4[s], sh_s2[s], eo32, 0, dim, x_col0=lo, krow0=lo // 4,
+                            out_dtype=nl.float32, out_scale=1.0 / world, m_out=K, m_live=K)
+            # the router logits, the expert columns split between the cores
+            ce0 = n_experts // CORES
+            gemm_fp32(xn2, gate_w_ts[s], logits, kt_all, dim, ce0 if pid == 0 else n_experts - ce0,
+                      c0=0 if pid == 0 else ce0)
+            bar_lg = nisa.core_barrier(data=logits, cores=(0, 1))
+            route_topk(logits, gate_b[s : s + 1], expert_lo, kt_all, n_experts, topk_e, n_local, ROUTE_SCALE, wexp)
+            if not WEXP_PADS_ONCE:
+                zw = nl.ndarray((PT, n_local), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.memset(zw, 0.0)
+                nisa.dma_copy(dst=wexp[K:Kp, :], src=zw[0 : Kp - K, :])
+                nisa.dma_copy(dst=wexp[Kp : Kp + PT, :], src=zw)
+            if sh_tp:
+                # this core's contraction half of the gathered hidden rows, then the (replicated)
+                # down projection as before, scaled by 1/world
+                sched_after(mk_moe.shared_gather(shg, ey, K, sh_cols, lo, hi, [int(r) for r in groups_world[0]],
+                                                 inter), bar_lg)
+                X.gemm_rows(ey, Kp, hi - lo, sh_w2_4[s], sh_s2[s], eo32, 0, dim, x_col0=lo, krow0=lo // 4,
+                            out_dtype=nl.float32, out_scale=1.0 / world, m_out=K, m_live=K)
+            # routed experts over the rows that picked them, into the zeroed accumulator
+            lo, hi = _half(inter, pid)
+            mk_moe.routed_experts(pid, n_local, Kp, xn2, wexp, w1_4[s], s1[s], w3_4[s], s3[s],
+                                  w2_4[s], s2[s], dim, inter, lo, hi, SWIGLU_LIMIT, eacc, live=K,
+                                  zeroed=EACC_ZERO_EARLY)
+            # this core's partial (routed + shared) of the live rows, kept on chip; core 1's
+            # goes through HBM to core 0, which adds the two (core 0's + core 1's, as before)
+            if PARTIAL_SPREAD:
+                bar_w = moe_partial(pid, K, dim, eacc, eo32, part1, cc2_src)
+            else:
+                pa = nl.ndarray((PT, dim), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=pa[0:K, :], src=eacc[0:K, :])
+                pe = nl.ndarray((PT, dim), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=pe[0:K, :], src=eo32[0:K, :])
+                nisa.tensor_tensor(dst=pa[0:K, :], data1=pa[0:K, :], data2=pe[0:K, :], op=nl.add)
+                if pid == 1:
+                    nisa.dma_copy(dst=part1[0:K, :], src=pa[0:K, :])
+                nisa.core_barrier(data=part1, cores=(0, 1))
+                if pid == 0:
+                    pb = nl.ndarray((PT, dim), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.dma_copy(dst=pb[0:K, :], src=part1[0:K, :])
+                    nisa.tensor_tensor(dst=pa[0:K, :], data1=pa[0:K, :], data2=pb[0:K, :], op=nl.add)
+                    nisa.dma_copy(dst=cc2_src[0:K, :], src=pa[0:K, :])
+                bar_w = nisa.core_barrier(data=cc2_src, cores=(0, 1))
         if use_copy and CACHE_COPY_SPREAD:
             copy_rows_hw(caches[s], c_out[s], pid, after=bar_w, part=(1, 2))
         if s == 0 and stage == 18:

@@ -28,6 +28,7 @@ from .mk_compress import (
     rope_fp4_put,
 )
 from . import mk_moe
+from .. import moe_tp
 from . import mk_mx as X
 from .mk_common import (
     PT,
@@ -335,9 +336,8 @@ def _copy_rows(src, dst, pid, chunk_bytes=CACHE_COPY_CHUNK, dep=None):
 def _barrier(t):
     """`core_barrier` on `t`, executed by BARRIER_ENGINE."""
     if BARRIER_ENGINE is None:
-        nisa.core_barrier(data=t, cores=(0, 1))
-    else:
-        nisa.core_barrier(data=t, cores=(0, 1), engine=BARRIER_ENGINE)
+        return nisa.core_barrier(data=t, cores=(0, 1))
+    return nisa.core_barrier(data=t, cores=(0, 1), engine=BARRIER_ENGINE)
 
 
 def _half(n, pid):
@@ -398,8 +398,10 @@ def layer_decode_r1_idx_tp64(
     assert stage == 9, "the optimized kernel has no staged debug outputs"
     T, hc, dim = stream.shape
     Tp = pad_to(T, PT)
+    # (`mk_mx.PACK_NV`: this block's row tile stages its T valid rows packed)
+    X.PACK_NV[0] = T if Tp == PT else None
     width = hc * dim
-    mix = hca_fn_t.shape[1]
+    mix = hca_fn_t.shape[-1]
     # fp8 / fp4 weights arrive as `[K/4, N]` words (`mk_model.mx_fp8` / `mx_fp4`)
     q_lora = wq_a.shape[1]
     hd = wkv.shape[1]
@@ -412,6 +414,7 @@ def layer_decode_r1_idx_tp64(
     n_experts = gate_w_t.shape[1]
     n_local = w1.shape[0]
     inter = w1.shape[2]
+    tp = moe_tp.is_tp(w1, w3)
     nwin = win_slots.shape[0] // nspans
     read_len = cmp_slots.shape[0] // nspans
     nspan_rows = nwin + read_len
@@ -521,7 +524,7 @@ def layer_decode_r1_idx_tp64(
     eo32 = nl.ndarray((Tp, dim), dtype=nl.float32, buffer=nl.private_hbm)
     eacc = nl.ndarray((Tp + PT, dim), dtype=nl.float32, buffer=nl.private_hbm)
     part = nl.ndarray((CORES, Tp, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="part")
-    Tc2 = CC_ROWS(T, Tp, dim)
+    Tc2 = T if tp else CC_ROWS(T, Tp, dim)
     cc2_src = nl.ndarray((Tc2, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc2_src")
     cc2_dst = nl.ndarray((Tc2, dim), dtype=nl.float32, buffer=nl.shared_hbm, name="cc2_dst")
     qiraw = nl.ndarray((Tp, nh_idx * kd), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="qiraw")
@@ -584,6 +587,15 @@ def layer_decode_r1_idx_tp64(
             _copy_rows(src_c, dst_c, pid)
 
 
+
+    # (`moe_tp.WIN_EARLY`: the slot table's window rows before this step's, gathered now)
+    wl = nwin - win + 1
+    win_early = moe_tp.WIN_EARLY and T == nspans * wl
+    if win_early:
+        for b in range(nspans):
+            d0 = b * nwin if compact else b * nspan_rows
+            gather_rows(window_kv_cache, win_slots[b * nwin : b * nwin + nwin - wl],
+                        kvtab[d0 : d0 + nwin - wl], tiles_of(nwin - wl, (pid + b) % CORES), hd, pair=kvp)
 
     # ------------------------------------------------------------------ 1. hc_in (attention)
     fnT = load_fn_t(hca_fn_t, width, mix)
@@ -655,9 +667,11 @@ def layer_decode_r1_idx_tp64(
     elif PADS_ON_CHIP:
         # the rows the w2 epilogue reads (the scatter-add touches only real rows)
         w2f = SHARED_FIRST and SHARED_W2_FIRST and (Tc2 * 2 <= Tp or (SHARED_W2_SBUF and Tp <= PT))
-        mk_moe.zero_rows(eacc, Tc2 if w2f else Tp, dim)
+        if not tp:
+            mk_moe.zero_rows(eacc, Tc2 if w2f else Tp, dim)
     else:
-        mk_moe.zero_rows(eacc, Tp + PT, dim)
+        if not tp:
+            mk_moe.zero_rows(eacc, Tp + PT, dim)
     _barrier(xn)
 
     # ------------------------------------------------------------------ 2. q / kv projections
@@ -715,10 +729,19 @@ def layer_decode_r1_idx_tp64(
     lo, hi = _half(nh_idx * kd, pid) if nh_idx * kd >= 2 * PT else (0, nh_idx * kd)
     if pid == 0 or nh_idx * kd >= 2 * PT:
         X.gemm_rows(qr, Tp, q_lora, ix_wq_b4, ix_wq_b_s, qiraw, lo, hi, m_valid=T if PADS_ON_CHIP else None)
-    fp32_proj_rows(xn, ix_wproj_t, wiraw, mine, dim, nh_idx)
+    # (`moe_tp.IDXQ_SPLIT`: one row tile -- the index-weight projection on core 1, the queries'
+    # rope / fp4 round trip split between the cores by head halves)
+    iq_split = moe_tp.IDXQ_SPLIT and not tiles_of(T, 1) and nh_idx % 2 == 0
+    wtiles = (tiles_of(T, 0) if pid == 1 else []) if iq_split else mine
+    fp32_proj_rows(xn, ix_wproj_t, wiraw, wtiles, dim, nh_idx)
     _barrier(qiraw)
-    rope_fp4_put(qiraw, mine, nh_idx * kd, kd, nh_idx, freqs, row_pos, 32, False, dst_hbm=qi)
-    for r0, nr in mine:
+    if iq_split:
+        hh = nh_idx // 2
+        rope_fp4_put(qiraw, tiles_of(T, 0), hh * kd, kd, hh, freqs, row_pos, 32, False, dst_hbm=qi,
+                     c0=pid * hh * kd)
+    else:
+        rope_fp4_put(qiraw, mine, nh_idx * kd, kd, nh_idx, freqs, row_pos, 32, False, dst_hbm=qi)
+    for r0, nr in wtiles:
         w = nl.ndarray((PT, nh_idx), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(dst=w[0:nr, :], src=wiraw[r0 : r0 + nr, 0:nh_idx])
         w16 = nl.ndarray((PT, nh_idx), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -829,12 +852,12 @@ def layer_decode_r1_idx_tp64(
         for t_ in sc_srcs:
             _barrier(t_)
         for a_, b_ in zip(sc_srcs, sc_dsts):
-            ncc.all_reduce(srcs=[a_], dsts=[b_], replica_group=rg_attn, op=nl.add)
+            ncc.all_reduce(srcs=[a_], dsts=[b_], replica_group=rg_attn, op=nl.add, priority=moe_tp.AR_PRIORITY)
         mix1()
         index_topk(tuple(sc_dsts), clen, sc16, topk_out, T, Tp, read_len, topk, pid)
     else:
         _barrier(sc_src)
-        ncc.all_reduce(srcs=[sc_src], dsts=[sc_dst], replica_group=rg_attn, op=nl.add)
+        ncc.all_reduce(srcs=[sc_src], dsts=[sc_dst], replica_group=rg_attn, op=nl.add, priority=moe_tp.AR_PRIORITY)
         mix1()
         index_topk(sc_dst, clen, sc16, topk_out, T, Tp, read_len, topk, pid)
     _barrier(topk_out)
@@ -851,13 +874,21 @@ def layer_decode_r1_idx_tp64(
             cmp_gather()
         for b in range(nspans):
             # alternate the cores' (full / partial) window tiles by span
-            gather_rows(window_kv_cache, win_slots[b * nwin : (b + 1) * nwin],
-                        kvtab[b * nwin : (b + 1) * nwin], tiles_of(nwin, (pid + b) % CORES), hd,
-                        pair=kvp)
+            if win_early:
+                if (pid + b) % CORES == 1:
+                    moe_tp.put_rows(kv, b * wl, wl, kvtab, b * nwin + nwin - wl, hd, kvp)
+            else:
+                gather_rows(window_kv_cache, win_slots[b * nwin : (b + 1) * nwin],
+                            kvtab[b * nwin : (b + 1) * nwin], tiles_of(nwin, (pid + b) % CORES), hd,
+                            pair=kvp)
     else:
         for b in range(nspans):
-            gather_rows(window_kv_cache, win_slots[b * nwin : (b + 1) * nwin],
-                        kvtab[b * nspan_rows : b * nspan_rows + nwin], tiles_of(nwin, pid), hd, pair=kvp)
+            if win_early:
+                if (pid + b) % CORES == 1:
+                    moe_tp.put_rows(kv, b * wl, wl, kvtab, b * nspan_rows + nwin - wl, hd, kvp)
+            else:
+                gather_rows(window_kv_cache, win_slots[b * nwin : (b + 1) * nwin],
+                            kvtab[b * nspan_rows : b * nspan_rows + nwin], tiles_of(nwin, pid), hd, pair=kvp)
             if reuse is None:
                 gather_rows(compress_kv_cache, cmp_slots[b * read_len : (b + 1) * read_len],
                             kvtab[b * nspan_rows + nwin : (b + 1) * nspan_rows], tiles_of(read_len, pid), hd,
@@ -1017,7 +1048,7 @@ def layer_decode_r1_idx_tp64(
         nl.fori_loop(nsp * npipe, nstep, step_body)
     if ntok > nstep * U:
         nl.fori_loop(nstep * U, ntok, tok_body)
-    _barrier(o)
+    o_bar = _barrier(o)
 
     # ------------------------------------------------------------------ 5. output projections
     # Inverse rope, grouped wo_a, wo_b (fp32 partial); the MX GEMMs quantize their inputs.
@@ -1031,11 +1062,22 @@ def layer_decode_r1_idx_tp64(
         nisa.memset(pad, 0.0)
         nisa.dma_copy(dst=oq[T:Tp, :], src=pad[0 : Tp - T, :])
     _barrier(oq)
+    # (`mk_mx.PACK_NV`: every group's input columns staged once, packed, as the r2 members'
+    # `WO_A_STAGE_ONCE`)
+    woa_once = (Tp == PT and g_in % X.KC == 0 and X.pack_ok(X.PACK_NV[0], ngroups * g_in)
+                and oq.shape[1] == ngroups * g_in)
+    if woa_once:
+        oxq, oxs = X.alloc_x(1, ngroups * g_in)
+        X.stage_x(oq, 0, ngroups * g_in, oxq, oxs, 0)
     for g in range(ngroups):
         # Column split of the group's `o_lora` outputs across the cores; the group's
         # block of `wo_a` is columns [g*o_lora, (g+1)*o_lora) of the MX layout against
         # the group's `g_in` input columns.
         lo, hi = _half(o_lora, pid)
+        if woa_once:
+            X.gemm(oxq, oxs, 1, g_in, wo_a4, wo_a_s, z, 0, g * o_lora + lo, g * o_lora + hi,
+                   kc0=g * (g_in // X.KC))
+            continue
         X.gemm_rows(oq, Tp, g_in, wo_a4, wo_a_s, z, g * o_lora + lo, g * o_lora + hi, x_col0=g * g_in,
                     m_valid=T if PADS_ON_CHIP else None)
     _barrier(z)
@@ -1052,7 +1094,7 @@ def layer_decode_r1_idx_tp64(
     X.gemm_rows(z, Tp, o_lora_total, wo_b4, wo_b_s, cc_src, lo, hi, out_dtype=nl.float32,
                 epilogue=wo_b_epi)
     _barrier(cc_src)
-    ncc.all_reduce(srcs=[cc_src], dsts=[cc_dst], replica_group=rg_attn, op=nl.add)
+    ncc.all_reduce(srcs=[cc_src], dsts=[cc_dst], replica_group=rg_attn, op=nl.add, priority=moe_tp.AR_PRIORITY)
     pads_ar1 = PADS_AT_AR1 and not EARLY_PADS and Tc2 * 2 <= Tp
     if pads_ar1 and pid == 0:
         pad = nl.ndarray((PT, dim), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -1147,181 +1189,199 @@ def layer_decode_r1_idx_tp64(
         _barrier(xn2)
 
     # ------------------------------------------------------------------ 8. MoE
-    # Router (fp32 GEMM + top-k) split by row tile between the cores, then every core
-    # reads all rows' expert weights for its experts.
-    if ROUTER_COL_SPLIT and (not tiles_of(T, 1)) and (n_experts % 2 == 0) and not mixf1:
-        # one row tile: each core the router GEMM's half of the experts' columns (each
-        # column's accumulation unchanged), then core 0 its top-k
-        nh = n_experts // 2
-        gemm_fp32(xn2, gate_w_t, logits, tiles_of(T, 0), dim, nh, n0=pid * nh)
-        _barrier(logits)
+    if tp:
+        # (the decode TP x EP layout: `moe_tp`; the deployment's path below otherwise)
+        if mixf1:
+            _barrier(xn2)
+        merge_last = None
+        _t2 = []
+
+        def _mid(p):
+            return None
+
+        moe_tp.moe(pid, T, xn2, gate_w_t, gate_b, expert_lo, w1, s1, w2, s2, sh_w1, sh_s1, sh_w2, sh_s2,
+                   logits, part, cc2_src, dim, SWIGLU_LIMIT, ROUTE_SCALE, TOPK_EXPERTS, mid=_mid)
     else:
-        gemm_fp32(xn2, gate_w_t, logits, mine, dim, n_experts)
-    route_topk(logits, gate_b, expert_lo, mine, n_experts, TOPK_EXPERTS, n_local, ROUTE_SCALE, wexp)
-    if pid == 0 and (not EARLY_PADS) and (not pads_ar1):
-        zw = nl.ndarray((PT, n_local), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.memset(zw, 0.0)
-        if T < Tp:
-            nisa.dma_copy(dst=wexp[T:Tp, :], src=zw[0 : Tp - T, :])
-        nisa.dma_copy(dst=wexp[Tp : Tp + PT, :], src=zw)
-    if mixf1:
-        _barrier(xn2)
-    _barrier(wexp)
-    ptiles = tiles_of(Tp, 0) + tiles_of(Tp, 1)
+        # Router (fp32 GEMM + top-k) split by row tile between the cores, then every core
+        # reads all rows' expert weights for its experts.
+        if ROUTER_COL_SPLIT and (not tiles_of(T, 1)) and (n_experts % 2 == 0) and not mixf1:
+            # one row tile: each core the router GEMM's half of the experts' columns (each
+            # column's accumulation unchanged), then core 0 its top-k
+            nh = n_experts // 2
+            gemm_fp32(xn2, gate_w_t, logits, tiles_of(T, 0), dim, nh, n0=pid * nh)
+            _barrier(logits)
+        else:
+            gemm_fp32(xn2, gate_w_t, logits, mine, dim, n_experts)
+        route_topk(logits, gate_b, expert_lo, mine, n_experts, TOPK_EXPERTS, n_local, ROUTE_SCALE, wexp)
+        if pid == 0 and (not EARLY_PADS) and (not pads_ar1):
+            zw = nl.ndarray((PT, n_local), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(zw, 0.0)
+            if T < Tp:
+                nisa.dma_copy(dst=wexp[T:Tp, :], src=zw[0 : Tp - T, :])
+            nisa.dma_copy(dst=wexp[Tp : Tp + PT, :], src=zw)
+        if mixf1:
+            _barrier(xn2)
+        _barrier(wexp)
+        ptiles = tiles_of(Tp, 0) + tiles_of(Tp, 1)
 
-    xst = []
+        xst = []
 
-    def shared_up():
-        # Shared expert: this core's half of the intermediate columns (SwiGLU is
-        # elementwise along it and w2 contracts over it).
+        def shared_up():
+            # Shared expert: this core's half of the intermediate columns (SwiGLU is
+            # elementwise along it and w2 contracts over it).
+            lo, hi = _half(inter, pid)
+            if moe_dense:
+                # the xn2 tile staged once: the shared expert's and every routed expert's
+                # stationary (`gemm_rows_multi`'s staging and GEMMs for its single row tile)
+                xq2, xs2 = X.alloc_x(1, dim)
+                X.stage_x(xn2, 0, dim, xq2, xs2, 0, nvalid=min(PT, T) if PADS_ON_CHIP else PT)
+                xst.append((xq2, xs2))
+                for w_mx, s_mx, o_hbm in ((sh_w1_4, sh_s1, eg), (sh_w3_4, sh_s3, eu)):
+                    X.gemm(xq2, xs2, 1, dim, w_mx, s_mx, o_hbm, 0, lo, hi)
+            else:
+                X.gemm_rows_multi(xn2, Tp, dim, [(sh_w1_4, sh_s1, eg, lo, hi), (sh_w3_4, sh_s3, eu, lo, hi)],
+                                  m_valid=T if PADS_ON_CHIP else None)
+            swiglu_rows(eg[0:Tp, lo:hi], eu[0:Tp, lo:hi], None, 0, ey[0:Tp, lo:hi], ptiles, hi - lo,
+                        SWIGLU_LIMIT)
+
+        w2_sbuf = SHARED_W2_SBUF and Tp <= PT
+        w2_first = SHARED_FIRST and SHARED_W2_FIRST and (Tc2 * 2 <= Tp or w2_sbuf)
+        w2_parked = []
+        if SHARED_FIRST:
+            shared_up()
+            if w2_first and w2_sbuf:
+                # the shared expert's w2 partial (scaled) output tiles kept in SBUF until the
+                # routed accumulator is complete
+                lo, hi = _half(inter, pid)
+
+                def esh_keep(r, n0, w, o):
+                    if r < Tc2:
+                        w2_parked.append((r, n0, w, o))
+
+                X.gemm_rows(ey, Tp, hi - lo, sh_w2_4, sh_s2, None, 0, dim, x_col0=lo, krow0=lo // 4,
+                            out_dtype=nl.float32, out_scale=1.0 / world, epilogue=esh_keep)
+            elif w2_first:
+                # the shared expert's w2 partial (scaled), rows < Tc2 (the only ones merged),
+                # parked in fp32 HBM until the routed accumulator is complete
+                lo, hi = _half(inter, pid)
+                esh = nl.ndarray((Tp, dim), dtype=nl.float32, buffer=nl.private_hbm)
+
+                def esh_epi(r, n0, w, o):
+                    nr = min(PT, Tc2 - r)
+                    if nr > 0:
+                        nisa.dma_copy(dst=esh[r : r + nr, n0 : n0 + w], src=o[0:nr, :])
+
+                X.gemm_rows(ey, Tp, hi - lo, sh_w2_4, sh_s2, esh, 0, dim, x_col0=lo, krow0=lo // 4,
+                            out_dtype=nl.float32, out_scale=1.0 / world, epilogue=esh_epi)
+        # Routed experts, each over the rows that picked it (this core's experts), into
+        # the zeroed fp32 accumulator.
         lo, hi = _half(inter, pid)
+        dense_args = None
         if moe_dense:
-            # the xn2 tile staged once: the shared expert's and every routed expert's
-            # stationary (`gemm_rows_multi`'s staging and GEMMs for its single row tile)
-            xq2, xs2 = X.alloc_x(1, dim)
-            X.stage_x(xn2, 0, dim, xq2, xs2, 0, nvalid=min(PT, T) if PADS_ON_CHIP else PT)
-            xst.append((xq2, xs2))
-            for w_mx, s_mx, o_hbm in ((sh_w1_4, sh_s1, eg), (sh_w3_4, sh_s3, eu)):
-                X.gemm(xq2, xs2, 1, dim, w_mx, s_mx, o_hbm, 0, lo, hi)
-        else:
-            X.gemm_rows_multi(xn2, Tp, dim, [(sh_w1_4, sh_s1, eg, lo, hi), (sh_w3_4, sh_s3, eu, lo, hi)],
-                              m_valid=T if PADS_ON_CHIP else None)
-        swiglu_rows(eg[0:Tp, lo:hi], eu[0:Tp, lo:hi], None, 0, ey[0:Tp, lo:hi], ptiles, hi - lo,
-                    SWIGLU_LIMIT)
+            wexp_sb = nl.ndarray((PT, n_local), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=wexp_sb, src=wexp[0:PT, 0:n_local])
+            acc_sb = nl.ndarray((PT, dim), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(acc_sb, 0.0)
+            dense_args = (xst[0][0], xst[0][1], wexp_sb, acc_sb)
+        mk_moe.routed_experts(pid, n_local, Tp, xn2, wexp, w1_4, s1, w3_4, s3, w2_4, s2,
+                              dim, inter, lo, hi, SWIGLU_LIMIT, eacc, zero_acc=False, dense=dense_args,
+                              nrows=T)
+        if not SHARED_FIRST:
+            shared_up()
+        lo, hi = _half(inter, pid)
+        # The shared expert's weights are replicated on every rank and the model adds its
+        # output ONCE, after the expert all-reduce. Every rank adds it to its partial here,
+        # scaled by 1/world, so the world sum carries it exactly once (a power-of-two
+        # scale of the fp32 partial is exact).
+        # This core's partial, eacc + eo (fp32), is formed in the w2 GEMM's epilogue (eo never
+        # goes through HBM): the other core's rows go to this core's `part` slot, its own rows
+        # to `eo32`; after the barrier each core rejoins its own rows, part[0] + part[1], then
+        # the ranks'. (Do NOT split the all-reduces by rows to overlap them: the collectives'
+        # per-element summation order depends on the message size -- not bit-exact.)
+        other = {r for r, _ in tiles_of(Tp, 1 - pid)}
 
-    w2_sbuf = SHARED_W2_SBUF and Tp <= PT
-    w2_first = SHARED_FIRST and SHARED_W2_FIRST and (Tc2 * 2 <= Tp or w2_sbuf)
-    w2_parked = []
-    if SHARED_FIRST:
-        shared_up()
+        # MERGE_COL_SPLIT: core pid rejoins columns [mlo, mhi) of every row (its own partial's
+        # columns there go to eo32, the rest to its `part` slot for the other core)
+        mlo, mhi = _half(dim, pid)
+
+        def w2_epi(r, n0, w, o, nr=PT):
+            av = nl.ndarray((PT, w), dtype=nl.float32, buffer=nl.sbuf)
+            if moe_dense:
+                # (one row tile: r = 0) the routed sum from its SBUF accumulator
+                assert r == 0
+                nisa.tensor_tensor(dst=av[0:nr, :], data1=dense_args[3][0:nr, n0 : n0 + w], data2=o[0:nr, :],
+                                   op=nl.add, engine=W2_EPI_ENGINE)
+            else:
+                nisa.dma_copy(dst=av[0:nr, :], src=eacc[r : r + nr, n0 : n0 + w])
+                nisa.tensor_tensor(dst=av[0:nr, :], data1=av[0:nr, :], data2=o[0:nr, :], op=nl.add,
+                                   engine=W2_EPI_ENGINE)
+            if MERGE_COL_SPLIT:
+                for a, b in ((n0, min(n0 + w, mlo)), (max(n0, mlo), min(n0 + w, mhi)),
+                             (max(n0, mhi), n0 + w)):
+                    if b > a:
+                        own = mlo <= a and b <= mhi
+                        dst = eo32[r : r + nr, a:b] if own else part[pid, r : r + nr, a:b]
+                        nisa.dma_copy(dst=dst, src=av[0:nr, a - n0 : b - n0])
+                return
+            dst = part[pid, r : r + nr, n0 : n0 + w] if r in other else eo32[r : r + nr, n0 : n0 + w]
+            nisa.dma_copy(dst=dst, src=av[0:nr, :])
+
         if w2_first and w2_sbuf:
-            # the shared expert's w2 partial (scaled) output tiles kept in SBUF until the
-            # routed accumulator is complete
-            lo, hi = _half(inter, pid)
-
-            def esh_keep(r, n0, w, o):
-                if r < Tc2:
-                    w2_parked.append((r, n0, w, o))
-
-            X.gemm_rows(ey, Tp, hi - lo, sh_w2_4, sh_s2, None, 0, dim, x_col0=lo, krow0=lo // 4,
-                        out_dtype=nl.float32, out_scale=1.0 / world, epilogue=esh_keep)
+            # the w2 epilogue over the SBUF-parked tiles (same values and adds)
+            for r, n0, w, o in w2_parked:
+                w2_epi(r, n0, w, o, min(PT, Tc2 - r))
         elif w2_first:
-            # the shared expert's w2 partial (scaled), rows < Tc2 (the only ones merged),
-            # parked in fp32 HBM until the routed accumulator is complete
-            lo, hi = _half(inter, pid)
-            esh = nl.ndarray((Tp, dim), dtype=nl.float32, buffer=nl.private_hbm)
-
-            def esh_epi(r, n0, w, o):
+            # the w2 epilogue over the parked partial (same values and adds as in the GEMM's
+            # epilogue), rows < Tc2
+            wc = min(1024, dim)
+            for r in range(0, Tc2, PT):
                 nr = min(PT, Tc2 - r)
-                if nr > 0:
-                    nisa.dma_copy(dst=esh[r : r + nr, n0 : n0 + w], src=o[0:nr, :])
-
-            X.gemm_rows(ey, Tp, hi - lo, sh_w2_4, sh_s2, esh, 0, dim, x_col0=lo, krow0=lo // 4,
-                        out_dtype=nl.float32, out_scale=1.0 / world, epilogue=esh_epi)
-    # Routed experts, each over the rows that picked it (this core's experts), into
-    # the zeroed fp32 accumulator.
-    lo, hi = _half(inter, pid)
-    dense_args = None
-    if moe_dense:
-        wexp_sb = nl.ndarray((PT, n_local), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=wexp_sb, src=wexp[0:PT, 0:n_local])
-        acc_sb = nl.ndarray((PT, dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.memset(acc_sb, 0.0)
-        dense_args = (xst[0][0], xst[0][1], wexp_sb, acc_sb)
-    mk_moe.routed_experts(pid, n_local, Tp, xn2, wexp, w1_4, s1, w3_4, s3, w2_4, s2,
-                          dim, inter, lo, hi, SWIGLU_LIMIT, eacc, zero_acc=False, dense=dense_args,
-                          nrows=T)
-    if not SHARED_FIRST:
-        shared_up()
-    lo, hi = _half(inter, pid)
-    # The shared expert's weights are replicated on every rank and the model adds its
-    # output ONCE, after the expert all-reduce. Every rank adds it to its partial here,
-    # scaled by 1/world, so the world sum carries it exactly once (a power-of-two
-    # scale of the fp32 partial is exact).
-    # This core's partial, eacc + eo (fp32), is formed in the w2 GEMM's epilogue (eo never
-    # goes through HBM): the other core's rows go to this core's `part` slot, its own rows
-    # to `eo32`; after the barrier each core rejoins its own rows, part[0] + part[1], then
-    # the ranks'. (Do NOT split the all-reduces by rows to overlap them: the collectives'
-    # per-element summation order depends on the message size -- not bit-exact.)
-    other = {r for r, _ in tiles_of(Tp, 1 - pid)}
-
-    # MERGE_COL_SPLIT: core pid rejoins columns [mlo, mhi) of every row (its own partial's
-    # columns there go to eo32, the rest to its `part` slot for the other core)
-    mlo, mhi = _half(dim, pid)
-
-    def w2_epi(r, n0, w, o, nr=PT):
-        av = nl.ndarray((PT, w), dtype=nl.float32, buffer=nl.sbuf)
-        if moe_dense:
-            # (one row tile: r = 0) the routed sum from its SBUF accumulator
-            assert r == 0
-            nisa.tensor_tensor(dst=av[0:nr, :], data1=dense_args[3][0:nr, n0 : n0 + w], data2=o[0:nr, :],
-                               op=nl.add, engine=W2_EPI_ENGINE)
+                for n0 in range(0, dim, wc):
+                    w = min(wc, dim - n0)
+                    o = nl.ndarray((PT, w), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.dma_copy(dst=o[0:nr, :], src=esh[r : r + nr, n0 : n0 + w])
+                    w2_epi(r, n0, w, o, nr)
         else:
-            nisa.dma_copy(dst=av[0:nr, :], src=eacc[r : r + nr, n0 : n0 + w])
-            nisa.tensor_tensor(dst=av[0:nr, :], data1=av[0:nr, :], data2=o[0:nr, :], op=nl.add,
-                               engine=W2_EPI_ENGINE)
+            X.gemm_rows(ey, Tp, hi - lo, sh_w2_4, sh_s2, eo32, 0, dim, x_col0=lo, krow0=lo // 4,
+                        out_dtype=nl.float32, out_scale=1.0 / world, epilogue=w2_epi)
+        ach = min(1024, dim)
+        _barrier(part)
         if MERGE_COL_SPLIT:
-            for a, b in ((n0, min(n0 + w, mlo)), (max(n0, mlo), min(n0 + w, mhi)),
-                         (max(n0, mhi), n0 + w)):
-                if b > a:
-                    own = mlo <= a and b <= mhi
-                    dst = eo32[r : r + nr, a:b] if own else part[pid, r : r + nr, a:b]
-                    nisa.dma_copy(dst=dst, src=av[0:nr, a - n0 : b - n0])
-            return
-        dst = part[pid, r : r + nr, n0 : n0 + w] if r in other else eo32[r : r + nr, n0 : n0 + w]
-        nisa.dma_copy(dst=dst, src=av[0:nr, :])
-
-    if w2_first and w2_sbuf:
-        # the w2 epilogue over the SBUF-parked tiles (same values and adds)
-        for r, n0, w, o in w2_parked:
-            w2_epi(r, n0, w, o, min(PT, Tc2 - r))
-    elif w2_first:
-        # the w2 epilogue over the parked partial (same values and adds as in the GEMM's
-        # epilogue), rows < Tc2
-        wc = min(1024, dim)
-        for r in range(0, Tc2, PT):
-            nr = min(PT, Tc2 - r)
-            for n0 in range(0, dim, wc):
-                w = min(wc, dim - n0)
-                o = nl.ndarray((PT, w), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.dma_copy(dst=o[0:nr, :], src=esh[r : r + nr, n0 : n0 + w])
-                w2_epi(r, n0, w, o, nr)
-    else:
-        X.gemm_rows(ey, Tp, hi - lo, sh_w2_4, sh_s2, eo32, 0, dim, x_col0=lo, krow0=lo // 4,
-                    out_dtype=nl.float32, out_scale=1.0 / world, epilogue=w2_epi)
-    ach = min(1024, dim)
-    _barrier(part)
-    if MERGE_COL_SPLIT:
-        mtiles = [(r0, min(PT, Tc2 - r0)) for r0 in range(0, Tc2, PT)]
-        mcols = [(c0, min(c0 + ach, mhi)) for c0 in range(mlo, mhi, ach)]
-    else:
-        mtiles = tiles_of(Tc2, pid)
-        mcols = [(c * ach, (c + 1) * ach) for c in range(dim // ach)]
-    merge_last = None
-    for r0, nr in mtiles:
-        for c0, c1 in mcols:
-            cw = c1 - c0
-            av = nl.ndarray((PT, ach), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=av[0:nr, 0:cw], src=eo32[r0 : r0 + nr, c0:c1])
-            bv = nl.ndarray((PT, ach), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=bv[0:nr, 0:cw], src=part[1 - pid, r0 : r0 + nr, c0:c1])
-            p0, p1 = (av, bv) if pid == 0 else (bv, av)
-            nisa.tensor_tensor(dst=av[0:nr, 0:cw], data1=p0[0:nr, 0:cw], data2=p1[0:nr, 0:cw], op=nl.add)
-            nisa.dma_copy(dst=cc2_src[r0 : r0 + nr, c0:c1], src=av[0:nr, 0:cw])
-            merge_last = av
-    _barrier(cc2_src)
-    ncc.all_reduce(srcs=[cc2_src], dsts=[cc2_dst], replica_group=rg_world, op=nl.add)
+            mtiles = [(r0, min(PT, Tc2 - r0)) for r0 in range(0, Tc2, PT)]
+            mcols = [(c0, min(c0 + ach, mhi)) for c0 in range(mlo, mhi, ach)]
+        else:
+            mtiles = tiles_of(Tc2, pid)
+            mcols = [(c * ach, (c + 1) * ach) for c in range(dim // ach)]
+        merge_last = None
+        for r0, nr in mtiles:
+            for c0, c1 in mcols:
+                cw = c1 - c0
+                av = nl.ndarray((PT, ach), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=av[0:nr, 0:cw], src=eo32[r0 : r0 + nr, c0:c1])
+                bv = nl.ndarray((PT, ach), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=bv[0:nr, 0:cw], src=part[1 - pid, r0 : r0 + nr, c0:c1])
+                p0, p1 = (av, bv) if pid == 0 else (bv, av)
+                nisa.tensor_tensor(dst=av[0:nr, 0:cw], data1=p0[0:nr, 0:cw], data2=p1[0:nr, 0:cw], op=nl.add)
+                nisa.dma_copy(dst=cc2_src[r0 : r0 + nr, c0:c1], src=av[0:nr, 0:cw])
+                merge_last = av
+    bar_cc2 = _barrier(cc2_src)
+    ncc.all_reduce(srcs=[cc2_src], dsts=[cc2_dst], replica_group=rg_world, op=nl.add, priority=moe_tp.AR_PRIORITY)
     if COMB_AT_AR and mixf1:
         # (core 1's comb_f logits)
         if pid == 1:
-            if SINKHORN_GATED and T < PT and merge_last is not None:
+            if moe_tp.SINK_F_PIN:
+                moe_tp.pin_next_sinkhorn(bar_cc2)
+            elif SINKHORN_GATED and T < PT and merge_last is not None:
                 nisa.dma_copy(dst=t2f1[PT - 1 : PT, 0, 0:1], src=merge_last[0:1, 0:1])
             cbf = sinkhorn_batched(t2f1, 1, hc)
             nisa.dma_copy(dst=comb_f[0:T, 0 : hc * hc], src=cbf[0:T, 0, :])
     elif COMB_AT_AR:
         # hc_in(ffn)'s sinkhorn while the world all-reduce is in flight (comb_f is first
         # read by hc_out(ffn)), off the router / MoE chain
-        gate(t2f, merge_last)
+        if moe_tp.SINK_F_PIN:
+            moe_tp.pin_next_sinkhorn(bar_cc2)
+        else:
+            gate(t2f, merge_last)
         comb_out(t2f, comb_f)
 
     # ------------------------------------------------------------------ 9. hc_out (ffn)

@@ -1699,6 +1699,180 @@ _FUSED_PLANS: dict = {}
 #: the (launch name, why not optimized) `_plan_fused` logged its choice of kernel for
 _FUSED_SEEN: set = set()
 
+#: `DEEPSEEK_V41_MOE_TP` (default 1): a decode step of at most `MOE_TP_MAX_T` rows runs its
+#: optimized fused launches with each block's MoE weights in the TP x EP layout
+#: (`kernels/tp64/moe_tp_layout.py`, read by `fused/<launch>/moe_tp.py`): the routed experts
+#: of each 8-rank group split 8 ways over it, the shared expert over the world, the router
+#: weight in bf16. Built once a block (`moe_tp_map`); every other step (prefill, more rows,
+#: the per-block and generated launches) keeps the deployment's layout.
+_MOE_TP = os.environ.get("DEEPSEEK_V41_MOE_TP", "1") not in ("", "0")
+MOE_TP_MAX_T = 16
+_MOE_NAMES = ("gate_w_t", "gate_b", "expert_lo", "w1", "s1", "w3", "s3", "w2", "s2",
+              "sh_w1", "sh_s1", "sh_w3", "sh_s3", "sh_w2", "sh_s2")
+
+
+def _ckpt_u8(index, key: str) -> torch.Tensor:
+    """A checkpoint tensor of one-byte elements as uint8 (a read-only mmap view)."""
+    t = index.tensor(key)
+    return t.view(torch.uint8) if t.element_size() == 1 else t
+
+
+def moe_tp_map(model, block) -> dict:
+    """`{id(deployment tensor): TP x EP tensor}` for `block`'s MoE weights (`LayerWeights.moe`),
+    made once and cached on the module. The routed slices come from the checkpoint (the group's
+    48 experts, 288 hidden columns of each), checked against this rank's resident copies of its
+    own experts; the shared expert and the router from the block's own weights."""
+    ffn = block.ffn
+    cached = ffn.__dict__.get("_mk_moe_tp_")
+    if cached is not None:
+        return cached
+    from .kernels.tp64 import moe_tp_layout as ML
+
+    t_start = time.perf_counter()
+    lw = model._mk_layer(block)
+    orig = dict(zip(_MOE_NAMES, lw.moe))
+    rank, world = int(model.rank), int(model.world_size)
+    layer = int(block.attn.layer_id)
+    index = model.weight_store.index
+    n_experts = int(orig["gate_w_t"].shape[1])
+    mx = {}
+
+    def get_slice(name, e, h0, h1):
+        mat = "w" + name[1]
+        if mx.get("e") != (e, h0, h1):
+            mx.clear()
+            mx["e"] = (e, h0, h1)
+        if mat not in mx:
+            pre = f"layers.{layer}.ffn.experts.{e}.{mat}"
+            w, sc = _ckpt_u8(index, pre + ".weight"), _ckpt_u8(index, pre + ".scale")
+            if mat == "w2":
+                mx[mat] = mx_fp4(w[:, h0 // 2 : h1 // 2].contiguous(), sc[:, h0 // 32 : h1 // 32].contiguous())
+            else:
+                mx[mat] = mx_fp4(w[h0:h1].contiguous(), sc[h0:h1].contiguous())
+        return mx[mat][0 if name[0] == "w" else 1]
+
+    r = ML.routed(rank, world, n_experts, get_slice)
+    # the checkpoint reads against this rank's resident MX copy of its first own expert
+    e0, ng, (h0, h1) = ML.group_of(rank, n_experts, world)
+    own = int(ffn.experts_start_idx)
+    if e0 <= own < e0 + ng:
+        for name in ("w1", "s1", "w2", "s2"):
+            got = get_slice(name, own, h0, h1)
+            res = _host(orig[name][0])
+            ref = res[:, h0:h1] if name in ("w1", "s1") else res[h0 // (4 if name == "w2" else 32) :
+                                                                 h1 // (4 if name == "w2" else 32)]
+            if not torch.equal(got, ref):
+                raise RuntimeError(f"layer {layer}: the checkpoint's expert {own} {name} slice differs from "
+                                   "the resident copy")
+    s = ML.shared(rank, world, *(_host(orig[n]) for n in ("sh_w1", "sh_s1", "sh_w3", "sh_s3", "sh_w2", "sh_s2")))
+    new = {**r, **s, "gate_w_t": ML.router(_host(orig["gate_w_t"]))}
+    device = orig["w1"].device
+    out = {id(orig[n]): _dev(new[n], device) for n in _MOE_NAMES if n in new}
+    ffn.__dict__["_mk_moe_tp_"] = out
+    if layer in (0, 39) and rank == 0:
+        _mk_log.info("deepseek_v41: layer %d MoE in the TP x EP layout (%.1f s, %.1f MiB on the device)", layer,
+                     time.perf_counter() - t_start, sum(t.numel() * t.element_size() for t in out.values()) / 2**20)
+    return out
+
+
+#: `DEEPSEEK_V41_FN_T_TILED` (default 1): the same decode launches read each block's two hc mix
+#: weights (`fn.T`, fp32 `[hc*dim, mix]`) as `[128, hc*dim/128, mix]` copies (partition p,
+#: K-tile k = row k*128 + p: the members' `load_fn_t` SBUF layout), one contiguous run a
+#: partition for its DMA instead of 96-byte runs (`hc_fn_map`)
+_FN_T_TILED = os.environ.get("DEEPSEEK_V41_FN_T_TILED", "1") not in ("", "0")
+
+
+def hc_fn_map(model, block) -> dict:
+    """`{id(fn.T): tiled copy}` for `block`'s hc mix weights, made once and cached on the block."""
+    cached = block.__dict__.get("_mk_fn_t_")
+    if cached is not None:
+        return cached
+    lw = model._mk_layer(block)
+    out = {}
+    for t in (lw.hc_attn[0], lw.hc_attn[4]):
+        k, mix = t.shape
+        h = _host(t).float().reshape(k // 128, 128, mix).permute(1, 0, 2).contiguous()
+        out[id(t)] = _dev(h, model.device)
+    block.__dict__["_mk_fn_t_"] = out
+    return out
+
+
+#: `DEEPSEEK_V41_ENGRAM_TP` (default 1): the same decode launches read an engram layer's fp8 `wkv`
+#: projection (`[6144, 25600]`, ~157 MB, which every rank streamed whole each step) split over the
+#: 8 ranks of the attention group (`engram_tp_map`; the members all-gather the parts)
+_ENGRAM_TP = os.environ.get("DEEPSEEK_V41_ENGRAM_TP", "1") not in ("", "0")
+ENGRAM_GROUP = 8
+ENGRAM_BLK = 1024
+
+
+def engram_tp_map(model, block) -> dict:
+    """`{id(wkv words / scales): this rank's blocks}`: 1024-column blocks b of the engram
+    projection dealt to the attention-group slot b % 8 (`fused/<launch>/moe_tp.py` `EngramKV`),
+    `ceil(blocks / 8)` a rank (zero padded); made once and cached on the block."""
+    if block.engram is None:
+        return {}
+    cached = block.__dict__.get("_mk_engram_tp_")
+    if cached is not None:
+        return cached
+    lw = model._mk_layer(block)
+    w4, ws = lw.engram[2], lw.engram[3]
+    n = w4.shape[1]
+    assert n % ENGRAM_BLK == 0, n
+    nb = n // ENGRAM_BLK
+    per = -(-nb // ENGRAM_GROUP)
+    slot = int(model.rank) % ENGRAM_GROUP
+    out = {}
+    for t in (w4, ws):
+        h = _host(t)
+        cols = [h[:, b * ENGRAM_BLK : (b + 1) * ENGRAM_BLK] if b < nb else torch.zeros_like(h[:, :ENGRAM_BLK])
+                for b in (slot + ENGRAM_GROUP * i for i in range(per))]
+        out[id(t)] = _dev(torch.cat(cols, dim=1).contiguous(), model.device)
+    block.__dict__["_mk_engram_tp_"] = out
+    return out
+
+
+#: `DEEPSEEK_V41_COMPRESS_BF16` (default 1): the same decode launches read the compressor's and the
+#: indexer's fp32 projection weights (`wkv.T`, `wgate.T`, `weights_proj.T`: bf16 values widened)
+#: as bf16 copies -- exactly the same values -- so their GEMMs (`mk_compress.fp32_proj_rows`) stream
+#: half the bytes and take one tensor-engine pass (`compress_bf16_map`)
+_COMPRESS_BF16 = os.environ.get("DEEPSEEK_V41_COMPRESS_BF16", "1") not in ("", "0")
+
+
+def compress_bf16_map(model, block) -> dict:
+    """`{id(fp32 weight): bf16 copy}` for `block`'s compressor / indexer fp32 projection weights,
+    made once and cached on the block (asserted exact)."""
+    cached = block.__dict__.get("_mk_cmp_bf16_")
+    if cached is not None:
+        return cached
+    lw = model._mk_layer(block)
+    out = {}
+    for i in (1, 2, 6):
+        t = lw.compress[i]
+        if t.dtype != torch.float32 or t.dim() != 2 or t.shape[0] < 128:
+            continue
+        h = _host(t)
+        b = h.to(torch.bfloat16)
+        assert torch.equal(b.float(), h), f"layer {block.attn.layer_id}: compress weight {i} is not bf16-valued"
+        out[id(t)] = _dev(b.contiguous(), model.device)
+    block.__dict__["_mk_cmp_bf16_"] = out
+    return out
+
+
+def _moe_tp_params(model, blocks, params) -> list:
+    """`params` with every block's MoE weights in the TP x EP layout (`moe_tp_map`), its hc mix
+    weights tiled (`hc_fn_map`) and its engram projection split over the attention group
+    (`engram_tp_map`)."""
+    m = {}
+    for block in blocks:
+        m.update(moe_tp_map(model, block))
+        if _FN_T_TILED:
+            m.update(hc_fn_map(model, block))
+        if _ENGRAM_TP:
+            m.update(engram_tp_map(model, block))
+        if _COMPRESS_BF16:
+            m.update(compress_bf16_map(model, block))
+    return [m.get(id(x), x) if isinstance(x, torch.Tensor) else x for x in params]
+
 
 def _plan_fused(model, blocks, stream, pre_mix, step: StepIndices, head: bool,
                 embed: bool = False) -> FusedPlan:
@@ -1771,6 +1945,9 @@ def _plan_fused(model, blocks, stream, pre_mix, step: StepIndices, head: bool,
             _mk_log.info("fused launch %s: the optimized kernel (kernels/tp64/fused/%s)", name, name)
         elif name in mk_kernels.FUSED_LAUNCHES:
             _mk_log.warning("fused launch %s: the generated launch (%s)", name, why)
+    if fk is not None and _MOE_TP and step.phase == "decode" and int(step.T) <= MOE_TP_MAX_T and plan.scheme == "tp64":
+        # (the optimized launches' members read the TP x EP layout: `fused/<launch>/moe_tp.py`)
+        params = _moe_tp_params(model, blocks, params)
     fk = fk or gen
     # the step's own tensors: refilled every step
     dyn = {}
@@ -1967,12 +2144,46 @@ def draft_weights(model) -> list:
     return head + hc + moe, tail
 
 
-def draft_weights_decode(model) -> tuple:
+#: `DEEPSEEK_V41_DRAFT_MOE_TP` (default 1, with `DEEPSEEK_V41_MOE_TP`): the single-sequence decode
+#: drafter's MoE in the TP x EP layout as well (`draft_weights_decode(tp=True)`); the batched entry
+#: keeps the deployment's layout
+_DRAFT_MOE_TP = _MOE_TP and os.environ.get("DEEPSEEK_V41_DRAFT_MOE_TP", "1") not in ("", "0")
+
+
+def _draft_ckpt_slicer(model):
+    """`ckpt(s, name, e, h0, h1)` for the decode drafter's TP x EP layout (`layout.moe_tp`): stage
+    `s`'s expert `e`'s MX tensor `name` at hidden columns [h0, h1), read from the checkpoint (as
+    `moe_tp_map`'s `get_slice`)."""
+    index = model.weight_store.index
+    mx = {}
+
+    def ckpt(s, name, e, h0, h1):
+        mat = "w" + name[1]
+        if mx.get("e") != (s, e, h0, h1):
+            mx.clear()
+            mx["e"] = (s, e, h0, h1)
+        if mat not in mx:
+            pre = f"mtp.{s}.ffn.experts.{e}.{mat}"
+            w, sc = _ckpt_u8(index, pre + ".weight"), _ckpt_u8(index, pre + ".scale")
+            if mat == "w2":
+                mx[mat] = mx_fp4(w[:, h0 // 2 : h1 // 2].contiguous(), sc[:, h0 // 32 : h1 // 32].contiguous())
+            else:
+                mx[mat] = mx_fp4(w[h0:h1].contiguous(), sc[h0:h1].contiguous())
+        return mx[mat][0 if name[0] == "w" else 1]
+
+    return ckpt
+
+
+def draft_weights_decode(model, tp: bool = False) -> tuple:
     """`draft_weights` in the optimized decode drafter's layout (`kernels/tp64/draft_decode/layout.py`:
     `main_proj` and the shared expert's gate / up projections column-sharded over the world, each rank
     its own slice), as two lists in the same order; cached on the model. Made once from this rank's
-    copies through the host (as `draft_weights` is); the prefill drafter keeps `draft_weights`."""
-    cached = model.__dict__.get("_mk_draft_dec_")
+    copies through the host (as `draft_weights` is); the prefill drafter keeps `draft_weights`.
+    `tp`: the stages' MoE in the TP x EP layout as well (`layout.moe_tp`: the single-sequence entry's,
+    `_MOE_TP`), its routed slices from the checkpoint, checked against this rank's resident copy of
+    its first own expert."""
+    key = "_mk_draft_dec_tp_" if tp else "_mk_draft_dec_"
+    cached = model.__dict__.get(key)
     if cached is not None:
         return cached
     pkg = mk_kernels._draft_decode_pkg()
@@ -1982,12 +2193,35 @@ def draft_weights_decode(model) -> tuple:
     weights, tail = model._mk_draft()
     assert len(w_names) == len(weights) and len(t_names) == len(tail), "drafter weight lists vs the kernel signature"
     by_name = dict(zip(w_names + t_names, weights + tail))
-    new = pkg.layout.prepare(int(model.rank), int(model.world_size), "draft_decode_tp64",
-                             {n: _host(t) for n, t in by_name.items()}, None)
+    rank, world = int(model.rank), int(model.world_size)
+    host = {n: _host(t) for n, t in by_name.items()}
+    ckpt = None
+    if tp:
+        t_start = time.perf_counter()
+        from .kernels.tp64 import moe_tp_layout as ML
+
+        ffn0 = model.mtp[0].ffn
+        ckpt = _draft_ckpt_slicer(model)
+        n_experts = int(host["gate_w_t0"].shape[1])
+        e0, ng, (h0, h1) = ML.group_of(rank, n_experts, world)
+        own = int(ffn0.experts_start_idx)
+        if e0 <= own < e0 + ng:
+            for s in range(int(host["w1"].shape[0])):
+                for name in ("w1", "s1", "w3", "s3", "w2", "s2"):
+                    res = host[name][s, 0]
+                    ref = res[:, h0:h1] if name[1] in "13" else res[h0 // (4 if name == "w2" else 32) :
+                                                                   h1 // (4 if name == "w2" else 32)]
+                    if not torch.equal(ckpt(s, name, own, h0, h1), ref):
+                        raise RuntimeError(f"drafter stage {s}: the checkpoint's expert {own} {name} slice "
+                                           "differs from the resident copy")
+    new = pkg.layout.prepare(rank, world, "draft_decode_tp64", host, None, ckpt=ckpt)
     device = weights[0].device
     by_name.update({n: _dev(t, device) for n, t in new.items()})
     out = ([by_name[n] for n in w_names], [by_name[n] for n in t_names])
-    model.__dict__["_mk_draft_dec_"] = out
+    model.__dict__[key] = out
+    if tp and rank == 0:
+        _mk_log.info("deepseek_v41: the decode drafter's MoE in the TP x EP layout (%.1f s)",
+                     time.perf_counter() - t_start)
     return out
 
 
@@ -2035,7 +2269,7 @@ def _run_draft_seq(model, seed_ids, tap, main_hidden, span, paged, meta=None):
         write_slots = _host_slots(paged).reshape(-1)[:length].to(torch.int32).reshape(-1, 1).contiguous().to(device)
     dphase = "prefill" if paged.at_zero else "decode"
     opt = mk_kernels.draft_optimized(dphase, model.mk_plan.scheme)
-    weights, tail = draft_weights_decode(model) if opt else model._mk_draft()
+    weights, tail = draft_weights_decode(model, tp=_DRAFT_MOE_TP) if opt else model._mk_draft()
     K = int(cfg.dspark_block_size)
     stages = list(model.mtp)
     kver = kernel_version(mk_kernels.DRAFT_DECODE_KIND, "tp64") if opt else kernel_version("draft", model.mk_plan.scheme)

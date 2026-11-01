@@ -22,6 +22,7 @@ is plan.json.
 """
 import nki
 
+from . import moe_tp
 from .fused_member import member
 from .r1_idx_decode import r1_idx_decode
 from .r1_decode import r1_decode
@@ -80,6 +81,7 @@ def layers_decode_L24_L31_tp64(
     L31_expert_lo, L31_w1, L31_s1, L31_w3, L31_s3, L31_w2, L31_s2, L31_sh_w1, L31_sh_s1, L31_sh_w3,
     L31_sh_s3, L31_sh_w2, L31_sh_s2
 ):
+    moe_tp.reset()
     # tables / tensors members share (built by the first member that needs them, see
     # SHARE_TABLES in the member kernels)
     share = {}

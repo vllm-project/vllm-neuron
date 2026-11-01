@@ -18,6 +18,8 @@ import nki.collectives as ncc
 import nki.isa as nisa
 import nki.language as nl
 
+from .. import moe_tp
+
 from . import mk_mx as X
 from .blockquant import (  # noqa: F401 - re-exported for the megakernels
     BLK,
@@ -155,12 +157,25 @@ def sinkhorn(t2, nr, hc):
     return b
 
 
+#: `sinkhorn_batched`'s `1 / (sum + eps)` as one ACT instruction (the eps as the reciprocal's
+#: bias: the same fp32 sum + eps feeds the function) instead of a copy with the bias and a
+#: reciprocal: one ACT instruction fewer on each of the 40 normalizations' serial chain.
+SINKHORN_FUSED_EPS = True
+
+#: `sinkhorn_batched`'s row / column scalings as one DVE multiply each, the per-row /
+#: per-column factor read with a 0-step access pattern (the rows: no broadcast copy; the
+#: columns: one instruction instead of one per row). Elementwise: the same products.
+SINKHORN_BCAST_AP = True
+
+
 def sinkhorn_batched(t2all, nt, hc):
     """`sinkhorn` of `nt` row tiles at once: `t2all` is `(PT, nt, hc*hc)` fp32 (tile `t`'s
     `t2` at `[:, t, :]`), the result likewise. Each element goes through the
     instructions `sinkhorn`'s lowering issues for it (DVE reduce over the 4 columns,
     ACT copy with the eps bias, ACT reciprocal, fp32 DVE multiplies / adds), only with
     all tiles and rows in one instruction instead of one per tile (and row)."""
+    if moe_tp.SINKHORN_DVE:
+        return moe_tp.sinkhorn_dve(t2all, nt, hc)
     n = nt * hc
     f32 = nl.float32
     x3 = t2all.reshape((PT, n, hc))
@@ -169,15 +184,23 @@ def sinkhorn_batched(t2all, nt, hc):
         # 1 / (sum over the 4 columns + eps), per (tile, row): (PT, n, 1)
         sm = nl.ndarray((PT, n, 1), dtype=f32, buffer=nl.sbuf)
         nisa.tensor_reduce(dst=sm, op=nl.add, data=src3, axis=(2,), keepdims=True)
+        r = nl.ndarray((PT, n, 1), dtype=f32, buffer=nl.sbuf)
+        if SINKHORN_FUSED_EPS:
+            nisa.activation(dst=r, op=nl.reciprocal, data=sm, bias=HC_EPS, scale=1.0)
+            return r
         se = nl.ndarray((PT, n, 1), dtype=f32, buffer=nl.sbuf)
         nisa.activation(dst=se, op=nl.copy, data=sm, bias=HC_EPS, scale=1.0)
-        r = nl.ndarray((PT, n, 1), dtype=f32, buffer=nl.sbuf)
         nisa.activation(dst=r, op=nl.reciprocal, data=se)
         return r
 
     def rowsum_div(src, dst):
         src3 = src.reshape((PT, n, hc))
         r = recip_rows(src3)
+        if SINKHORN_BCAST_AP:
+            # r read with a 0 step over the 4 columns (no materialized broadcast copy)
+            nisa.tensor_tensor(dst=dst.reshape((PT, n, hc)), data1=src3,
+                               data2=r.ap(pattern=[[n, PT], [1, n], [0, hc]], offset=0), op=nl.multiply)
+            return
         nisa.tensor_tensor(dst=dst.reshape((PT, n, hc)), data1=src3,
                            data2=nl.broadcast_to(r, (PT, n, hc)), op=nl.multiply)
 
@@ -188,10 +211,19 @@ def sinkhorn_batched(t2all, nt, hc):
         nisa.tensor_tensor(dst=cs, data1=s4[:, :, 0, :], data2=s4[:, :, 1, :], op=nl.add)
         for i in range(2, hc):
             nisa.tensor_tensor(dst=cs, data1=cs, data2=s4[:, :, i, :], op=nl.add)
-        ce = nl.ndarray((PT, nt, hc), dtype=f32, buffer=nl.sbuf)
-        nisa.activation(dst=ce, op=nl.copy, data=cs, bias=HC_EPS, scale=1.0)
         d = nl.ndarray((PT, nt, hc), dtype=f32, buffer=nl.sbuf)
-        nisa.activation(dst=d, op=nl.reciprocal, data=ce)
+        if SINKHORN_FUSED_EPS:
+            nisa.activation(dst=d, op=nl.reciprocal, data=cs, bias=HC_EPS, scale=1.0)
+        else:
+            ce = nl.ndarray((PT, nt, hc), dtype=f32, buffer=nl.sbuf)
+            nisa.activation(dst=ce, op=nl.copy, data=cs, bias=HC_EPS, scale=1.0)
+            nisa.activation(dst=d, op=nl.reciprocal, data=ce)
+        if SINKHORN_BCAST_AP:
+            # every row i of each matrix times d in one instruction (d read with a 0 step over i)
+            nisa.tensor_tensor(dst=d4, data1=s4,
+                               data2=d.ap(pattern=[[nt * hc, PT], [hc, nt], [0, hc], [1, hc]], offset=0),
+                               op=nl.multiply)
+            return
         for i in range(hc):
             nisa.tensor_tensor(dst=d4[:, :, i, :], data1=s4[:, :, i, :], data2=d, op=nl.multiply)
 
@@ -201,7 +233,9 @@ def sinkhorn_batched(t2all, nt, hc):
     mx = nl.ndarray((PT, n, 1), dtype=f32, buffer=nl.sbuf)
     nisa.tensor_reduce(dst=mx, op=nl.max, data=x3, axis=(2,), keepdims=True)
     dif = nl.ndarray((PT, n, hc), dtype=f32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=dif, data1=x3, data2=nl.broadcast_to(mx, (PT, n, hc)), op=nl.subtract)
+    mxb = (mx.ap(pattern=[[n, PT], [1, n], [0, hc]], offset=0) if SINKHORN_BCAST_AP
+           else nl.broadcast_to(mx, (PT, n, hc)))
+    nisa.tensor_tensor(dst=dif, data1=x3, data2=mxb, op=nl.subtract)
     e = nl.ndarray((PT, n, hc), dtype=f32, buffer=nl.sbuf)
     nisa.activation(dst=e, op=nl.exp, data=dif)
     se = nl.ndarray((PT, n, 1), dtype=f32, buffer=nl.sbuf)
@@ -209,7 +243,9 @@ def sinkhorn_batched(t2all, nt, hc):
     re = nl.ndarray((PT, n, 1), dtype=f32, buffer=nl.sbuf)
     nisa.activation(dst=re, op=nl.reciprocal, data=se)
     a3 = a.reshape((PT, n, hc))
-    nisa.tensor_tensor(dst=a3, data1=e, data2=nl.broadcast_to(re, (PT, n, hc)), op=nl.multiply)
+    reb = (re.ap(pattern=[[n, PT], [1, n], [0, hc]], offset=0) if SINKHORN_BCAST_AP
+           else nl.broadcast_to(re, (PT, n, hc)))
+    nisa.tensor_tensor(dst=a3, data1=e, data2=reb, op=nl.multiply)
     nisa.tensor_scalar(dst=a3, data=a3, op0=nl.add, operand0=HC_EPS)
     colsum_div(a, b)
     for _ in range(SINKHORN_ITERS - 1):
@@ -222,20 +258,115 @@ def sinkhorn_batched(t2all, nt, hc):
 HC_SINKHORN_BATCHED = True
 
 
-def hc_in_consts(base, scale, norm_w, hc, dim, out_chunk=1024, np_=PT):
+def hc_in_consts(base, scale, norm_w, hc, dim, out_chunk=1024, np_=PT, part=None):
     """`hc_in_tile`'s row-invariant operands (`scale`, `base`, `norm_w` rows broadcast
     to `np_` partitions (the call's largest tile), fp32), materialized once for all of a
-    call's tiles."""
+    call's tiles. `part` (`hc_in_tile`'s): only that part's operands ("x": `norm_w`,
+    "c": `scale` / `base`)."""
 
     def mat(t_hbm, col0, n):
         return bcast_dma(t_hbm, col0, n, np_)
 
-    return dict(
-        s0=mat(scale, 0, 1), s1=mat(scale, 1, 1), s2=mat(scale, 2, 1),
-        b0=mat(base, 0, hc), b1=mat(base, hc, hc),
-        b2=mat(base, 2 * hc, hc * hc),
-        w=[mat(norm_w, c * out_chunk, out_chunk) for c in range(dim // out_chunk)],
-    )
+    out = {}
+    if part != "x":
+        out.update(s0=mat(scale, 0, 1), s1=mat(scale, 1, 1), s2=mat(scale, 2, 1),
+                   b0=mat(base, 0, hc), b1=mat(base, hc, hc),
+                   b2=mat(base, 2 * hc, hc * hc))
+    if part != "c":
+        S = hc_in_spread_s(np_, dim) if part == "x" else 1
+        if S > 1:
+            out["ws"] = (np_, S, bcast_dma_spread(norm_w, np_, dim, S))
+        else:
+            out["w"] = [mat(norm_w, c * out_chunk, out_chunk) for c in range(dim // out_chunk)]
+    return out
+
+
+#: `hc_in_tile`'s "x" part (pre-mix + RMS norm) at few rows spread over the partitions:
+#: partition `s * nr + r` holds columns `[s*w, (s+1)*w)` (w = dim / S) of row `r` (S column
+#: blocks, each one affine DMA), so the pre-mix and the norm's scaling run on S times fewer
+#: columns (same per-element operations, operands and engines). The norm's sum of squares
+#: stays one row-major ACT accumulation chain per row (its fp32 order), on the mixed rows
+#: copied back into row layout on chip.
+HC_IN_X_SPREAD = True
+#: Most column blocks `hc_in_tile`'s spread uses (DMAs per operand).
+HC_IN_SPREAD_MAX = 8
+
+
+def hc_in_spread_s(nr, dim):
+    """The spread factor of `hc_in_tile`'s "x" part for an `nr`-row tile (1: not spread)."""
+    if not HC_IN_X_SPREAD:
+        return 1
+    S = 1
+    while (S * 2 <= HC_IN_SPREAD_MAX and nr * S * 2 <= PT and dim % (S * 2) == 0
+           and dim // (S * 2) >= 64):
+        S *= 2
+    return S
+
+
+def bcast_dma_spread(t_hbm, nr, dim, S, dtype=nl.float32):
+    """`t_hbm[0, 0:dim]` in `hc_in_tile`'s spread layout: partition `s * nr + r` holds
+    columns `[s*w, (s+1)*w)` (the same values as `bcast_dma`)."""
+    w = dim // S
+    n = nr * S
+    raw = nl.ndarray((PT, w), dtype=t_hbm.dtype, buffer=nl.sbuf)
+    for s in range(S):
+        nisa.dma_copy(dst=raw[s * nr : (s + 1) * nr, :],
+                      src=t_hbm.ap(pattern=[[0, nr], [1, w]], offset=s * w))
+    if t_hbm.dtype == dtype:
+        return raw
+    t = nl.ndarray((PT, w), dtype=dtype, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=t[0:n, :], src=raw[0:n, :])
+    return t
+
+
+def hc_in_x_spread(r0, nr, x2, pre_mix, norm_w, normed, hc, dim, S, sq_chunk, ws=None, cache=None):
+    """`hc_in_tile`'s "x" part (`normed[r0:r0+nr]`) in the spread layout (`HC_IN_X_SPREAD`)."""
+    width = hc * dim
+    w = dim // S
+    n = nr * S
+    inv_dim = 1.0 / dim
+    if ws is None:
+        ws = bcast_dma_spread(norm_w, nr, dim, S)
+    xs = nl.ndarray((PT, hc, w), dtype=nl.bfloat16, buffer=nl.sbuf)
+    pm = nl.ndarray((PT, hc), dtype=nl.float32, buffer=nl.sbuf)
+    for s in range(S):
+        p0 = s * nr
+        nisa.dma_copy(dst=xs[p0 : p0 + nr, :, :],
+                      src=x2.ap(pattern=[[width, nr], [dim, hc], [1, w]], offset=r0 * width + s * w))
+        nisa.dma_copy(dst=pm[p0 : p0 + nr, :], src=pre_mix[r0 : r0 + nr, 0:hc])
+    # the pre-mix (`hc_in_tile.premix`'s operations): the first product on ACT, the
+    # accumulating ones on DVE, the last writing the bf16 rows
+    acc = nl.ndarray((PT, w), dtype=nl.float32, buffer=nl.sbuf)
+    ys = nl.ndarray((PT, w), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=acc[0:n, :], data=xs[0:n, 0, :], op0=nl.multiply,
+                       operand0=pm[0:n, 0:1], engine=nisa.engine.scalar)
+    for g in range(1, hc):
+        nisa.scalar_tensor_tensor(
+            dst=ys[0:n, :] if g == hc - 1 else acc[0:n, :], data=xs[0:n, g, :], op0=nl.multiply,
+            operand0=pm[0:n, g : g + 1], op1=nl.add, operand1=acc[0:n, :],
+        )
+    if moe_tp.NORM_SPREAD:
+        # (`moe_tp.NORM_SPREAD`: the rows' sums of squares and rstd in the spread layout)
+        rs = moe_tp.spread_rstd(ys, nr, S, "s", w, NORM_EPS, cache)
+    else:
+        # the mixed rows in row layout for the sum of squares (row-major chain, as `norm_ss`)
+        y16 = nl.ndarray((PT, dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+        for s in range(S):
+            nisa.dma_copy(dst=y16[0:nr, s * w : (s + 1) * w], src=ys[s * nr : (s + 1) * nr, 0:w])
+        ss2 = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
+        sum_squares(ss2, y16, nr, dim, sq_chunk)
+        rstd = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
+        rstd[0:nr, :] = rsqrt_newton(nl.add(nl.multiply(ss2[0:nr, 0:1], inv_dim), NORM_EPS))
+        rs = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
+        for s in range(S):
+            nisa.dma_copy(dst=rs[s * nr : (s + 1) * nr, 0:1], src=rstd[0:nr, 0:1])
+    # `norm_chunk`'s operations on the spread rows
+    yv = nl.ndarray((PT, w), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=yv[0:n, :], op=nl.copy, data=ys[0:n, :], scale=rs[0:n, 0:1])
+    o16 = nl.ndarray((PT, w), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=o16[0:n, :], data1=yv[0:n, :], data2=ws[0:n, :], op=nl.multiply)
+    for s in range(S):
+        nisa.dma_copy(dst=normed[r0 : r0 + nr, s * w : (s + 1) * w], src=o16[s * nr : (s + 1) * nr, :])
 
 
 #: PE transposes per PSUM -> SBUF copy in `hc_in_tile`'s mix GEMM.
@@ -263,11 +394,18 @@ HC_IN_INTERLEAVE = True
 #: of one piece per batch (the normed rows gate the router / projections; the GEMM's
 #: coefficients are first read after the next all-reduce).
 HC_IN_XN_FIRST = True
+#: `hc_in_tile(part="c")` (the other core's half, no pre-mix on its DVE): every mix-GEMM
+#: transpose copy on DVE instead of alternating with ACT, whose queue holds the ~20 us sum of
+#: squares chain: an ACT copy behind it stalled the transposes, the stacked loads behind
+#: them (buffer reuse) and so that core's sync queue / arrival at the next barrier.
+HC_IN_C_COPY_DVE = True
+#: HC_IN_C_COPY_DVE only for tiles of at most this many rows.
+HC_IN_C_COPY_DVE_MAX_ROWS = 32
 
 
 def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
                normed, pre, post, comb, sq_chunk=1024, out_chunk=1024, consts=None, xin=None,
-               t2_dst=None):
+               t2_dst=None, part=None, defer=False):
     """One 128-row tile of the hyper-connection sublayer-in (`kernels.hc_in`).
 
     Reads `x2[r0:r0+nr]` (`[T, hc*dim]` bf16 HBM) and `pre_mix`, writes
@@ -278,9 +416,21 @@ def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
     are loaded from `x2`. `t2_dst`: a `(PT, hc*hc)` SBUF view that receives the
     pre-sinkhorn comb logits instead of running the sinkhorn and storing `comb` here
     (the caller runs `sinkhorn_batched` over its tiles).
+    `part`: only one of the tile's two independent halves (the two cores of a pair can
+    each run one, same operations): "x" the pre-mix and the RMS norm (`normed`), "c" the
+    sum of squares, the mix GEMM and the coefficients (`pre` / `post` / `comb`).
+    `defer` (part "c"): the coefficients (everything after the mix GEMM and the sum of
+    squares) are returned as a function for the caller to issue later instead.
     """
+    if part == "x" and hc_in_spread_s(nr, dim) > 1:
+        S = hc_in_spread_s(nr, dim)
+        ws = None
+        if consts is not None and "ws" in consts and consts["ws"][:2] == (nr, S):
+            ws = consts["ws"][2]
+        hc_in_x_spread(r0, nr, x2, pre_mix, norm_w, normed, hc, dim, S, sq_chunk, ws, cache=consts)
+        return
     if consts is None:
-        consts = hc_in_consts(base, scale, norm_w, hc, dim, out_chunk)
+        consts = hc_in_consts(base, scale, norm_w, hc, dim, out_chunk, part=part)
     width = hc * dim
     kpg = dim // PT
     inv_width = 1.0 / width
@@ -294,11 +444,13 @@ def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
             xg.append(nl.ndarray((PT, dim), dtype=nl.bfloat16, buffer=nl.sbuf))
         for g in range(hc):
             nisa.dma_copy(dst=xg[g][0:nr, :], src=x2[r0 : r0 + nr, g * dim : (g + 1) * dim])
-    pm = nl.ndarray((PT, hc), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=pm[0:nr, :], src=pre_mix[r0 : r0 + nr, 0:hc])
+    if part != "c":
+        pm = nl.ndarray((PT, hc), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=pm[0:nr, :], src=pre_mix[r0 : r0 + nr, 0:hc])
 
-    acc = nl.ndarray((PT, dim), dtype=nl.float32, buffer=nl.sbuf)
-    y16 = nl.ndarray((PT, dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+    if part != "c":
+        acc = nl.ndarray((PT, dim), dtype=nl.float32, buffer=nl.sbuf)
+        y16 = nl.ndarray((PT, dim), dtype=nl.bfloat16, buffer=nl.sbuf)
 
     def premix():
         # the first product on ACT (as hc_out's), the accumulating ones on DVE; the last
@@ -314,11 +466,17 @@ def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
                 operand0=pm[0:nr, g : g + 1], op1=nl.add, operand1=acc[0:nr, :],
             )
 
-    ss = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
-    junk = nl.ndarray((PT, sq_chunk), dtype=nl.float32, buffer=nl.sbuf)
+    if part != "x":
+        ss = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
+        junk = nl.ndarray((PT, sq_chunk), dtype=nl.float32, buffer=nl.sbuf)
     nsq = dim // sq_chunk
 
+    bd_ss = [False]
+
     def sumsq():
+        if bd_ss[0]:
+            # (the block-diagonal mix's own sum of squares: `moe_tp.BDMix`)
+            return
         # one uninterrupted ACT accumulation chain
         for g in range(hc):
             for c in range(nsq):
@@ -332,7 +490,8 @@ def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
                     reduce_res=ss[0:nr, 0:1] if last else None,
                 )
 
-    rstd = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
+    if part != "c":
+        rstd = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
 
     def norm_ss():
         ss2 = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -348,6 +507,23 @@ def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
         nisa.tensor_tensor(dst=o16[0:nr, :], data1=yv[0:nr, :], data2=wj, op=nl.multiply)
         nisa.dma_copy(dst=normed[r0 : r0 + nr, lo:hi], src=o16[0:nr, :])
 
+    nout = dim // out_chunk
+    if part == "x":
+        premix()
+        norm_ss()
+        for c in range(nout):
+            norm_chunk(c)
+        return
+    if part == "c":
+        def premix():
+            pass
+
+        def norm_ss():
+            pass
+
+        def norm_chunk(c):
+            pass
+
     # stacked: J = 128 // nr K-chunks of a row group's columns on partitions (one per-row
     # DMA from `x2`), one PE transpose for all J (same stationary values)
     # (with `xin`, the rows are read back from `x2`, where the caller stored them)
@@ -355,7 +531,6 @@ def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
     stack = HC_T_STACK and J >= HC_T_STACK_MIN
     sgroups = [(g, c0, min(J, kpg - c0)) for g in range(hc) for c0 in range(0, kpg, J)] if stack else []
     nbatch = len(sgroups) if stack else hc * cdiv(kpg, HC_T_BATCH)
-    nout = dim // out_chunk
     split = HC_IN_INTERLEAVE and nbatch >= 4 * (nout + 3)
     # interleaved: the pre-mix, the sum of squares and the whole RMS norm of the mixed
     # rows (none needs the mix GEMM) are issued between the GEMM's transpose batches,
@@ -385,7 +560,10 @@ def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
         sumsq()
 
     mixp = nl.ndarray((PT, mix), dtype=nl.float32, buffer=nl.psum)
+    bdm = moe_tp.BDMix(nr, mix, consts) if (stack and moe_tp.bd_stack_ok(nr, mix, J)) else None
+    bd_ss[0] = bdm is not None
     nbt = 0
+    c_copy_dve = part == "c" and HC_IN_C_COPY_DVE and nr <= HC_IN_C_COPY_DVE_MAX_ROWS
     # x2 as 128-column chunks (row r's chunk k at r * (width / 128) + k; a sliced view, so
     # the read is ordered after the caller's stores of the rows)
     x2c = x2.reshape((x2.shape[0] * (width // PT), PT)) if stack else None
@@ -400,12 +578,17 @@ def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
         nisa.nc_transpose(dst=tps[0:PT, 0:n], data=xs[0:n, 0:PT])
         # xT[:, j, r] = tps[:, r * js + j]
         xT = nl.ndarray((PT, J, PT // J), dtype=nl.float32, buffer=nl.sbuf)
-        eng = nisa.scalar_engine if nbt % 2 else nisa.vector_engine
+        eng = (nisa.vector_engine if c_copy_dve
+               else nisa.scalar_engine if nbt % 2 else nisa.vector_engine)
         nisa.tensor_copy(dst=xT[0:PT, 0:js, 0:nr],
                          src=tps.ap(pattern=[[PT, PT], [1, js], [js, nr]]), engine=eng)
         for f in work.get(nbt, []):
             f()
         nbt += 1
+        if bdm is not None:
+            # (`moe_tp.BDMix`: the stacked tile's js K-tiles in one block-diagonal matmul)
+            bdm.add(xT.ap(pattern=[[J * (PT // J), PT], [1, js * nr]], offset=0), js, g * kpg + c0, fnT)
+            continue
         for j in range(js):
             kb = g * kpg + c0 + j
             nisa.nc_matmul(
@@ -421,7 +604,8 @@ def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
                 c = cb + j
                 nisa.nc_transpose(dst=tps[0:PT, j, 0:nr], data=xg[g][0:nr, c * PT : (c + 1) * PT])
             xT = nl.ndarray((PT, HC_T_BATCH, PT), dtype=nl.float32, buffer=nl.sbuf)
-            eng = nisa.scalar_engine if nbt % 2 else nisa.vector_engine
+            eng = (nisa.vector_engine if c_copy_dve
+                   else nisa.scalar_engine if nbt % 2 else nisa.vector_engine)
             nisa.tensor_copy(dst=xT[0:PT, 0:nb_, 0:nr], src=tps[0:PT, 0:nb_, 0:nr], engine=eng)
             for f in work.get(nbt, []):
                 f()
@@ -434,43 +618,50 @@ def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
                     is_stationary_onezero=FP32_BF16_STATIONARY,
                 )
 
-    rs = rsqrt_newton(nl.add(nl.multiply(ss[0:nr, 0:1], inv_width), NORM_EPS))
-    mixv = nl.ndarray((PT, mix), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=mixv[0:nr, :], data=mixp[0:nr, :], op0=nl.multiply, operand0=rs)
+    if bdm is not None:
+        mixp = bdm.finish(ss)
+    def coef():
+        rs = rsqrt_newton(nl.add(nl.multiply(ss[0:nr, 0:1], inv_width), NORM_EPS))
+        mixv = nl.ndarray((PT, mix), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=mixv[0:nr, :], data=mixp[0:nr, :], op0=nl.multiply, operand0=rs)
 
-    s0 = consts["s0"][0:nr, 0:1]
-    s1 = consts["s1"][0:nr, 0:1]
-    s2 = consts["s2"][0:nr, 0:1]
-    b0 = consts["b0"][0:nr, 0:hc]
-    b1 = consts["b1"][0:nr, 0:hc]
-    b2 = consts["b2"][0:nr, 0 : hc * hc]
+        s0 = consts["s0"][0:nr, 0:1]
+        s1 = consts["s1"][0:nr, 0:1]
+        s2 = consts["s2"][0:nr, 0:1]
+        b0 = consts["b0"][0:nr, 0:hc]
+        b1 = consts["b1"][0:nr, 0:hc]
+        b2 = consts["b2"][0:nr, 0 : hc * hc]
 
-    t0 = nl.ndarray((PT, hc), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.scalar_tensor_tensor(
-        dst=t0[0:nr, :], data=mixv[0:nr, 0:hc], op0=nl.multiply, operand0=s0,
-        op1=nl.add, operand1=b0,
-    )
-    pre_t = nl.ndarray((PT, hc), dtype=nl.float32, buffer=nl.sbuf)
-    pre_t[0:nr, :] = nl.add(nl.sigmoid(t0[0:nr, :]), HC_EPS)
-    nisa.dma_copy(dst=pre[r0 : r0 + nr, 0:hc], src=pre_t[0:nr, :])
+        t0 = nl.ndarray((PT, hc), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.scalar_tensor_tensor(
+            dst=t0[0:nr, :], data=mixv[0:nr, 0:hc], op0=nl.multiply, operand0=s0,
+            op1=nl.add, operand1=b0,
+        )
+        pre_t = nl.ndarray((PT, hc), dtype=nl.float32, buffer=nl.sbuf)
+        pre_t[0:nr, :] = nl.add(nl.sigmoid(t0[0:nr, :]), HC_EPS)
+        nisa.dma_copy(dst=pre[r0 : r0 + nr, 0:hc], src=pre_t[0:nr, :])
 
-    t1 = nl.ndarray((PT, hc), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.scalar_tensor_tensor(
-        dst=t1[0:nr, :], data=mixv[0:nr, hc : 2 * hc], op0=nl.multiply, operand0=s1,
-        op1=nl.add, operand1=b1,
-    )
-    post_t = nl.ndarray((PT, hc), dtype=nl.float32, buffer=nl.sbuf)
-    post_t[0:nr, :] = nl.multiply(nl.sigmoid(t1[0:nr, :]), 2.0)
-    nisa.dma_copy(dst=post[r0 : r0 + nr, 0:hc], src=post_t[0:nr, :])
+        t1 = nl.ndarray((PT, hc), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.scalar_tensor_tensor(
+            dst=t1[0:nr, :], data=mixv[0:nr, hc : 2 * hc], op0=nl.multiply, operand0=s1,
+            op1=nl.add, operand1=b1,
+        )
+        post_t = nl.ndarray((PT, hc), dtype=nl.float32, buffer=nl.sbuf)
+        post_t[0:nr, :] = nl.multiply(nl.sigmoid(t1[0:nr, :]), 2.0)
+        nisa.dma_copy(dst=post[r0 : r0 + nr, 0:hc], src=post_t[0:nr, :])
 
-    t2 = nl.ndarray((PT, hc * hc), dtype=nl.float32, buffer=nl.sbuf) if t2_dst is None else t2_dst
-    nisa.scalar_tensor_tensor(
-        dst=t2[0:nr, :], data=mixv[0:nr, 2 * hc : 2 * hc + hc * hc],
-        op0=nl.multiply, operand0=s2, op1=nl.add, operand1=b2,
-    )
-    if t2_dst is None:
-        comb_t = sinkhorn(t2, nr, hc)
-        nisa.dma_copy(dst=comb[r0 : r0 + nr, 0 : hc * hc], src=comb_t[0:nr, :])
+        t2 = nl.ndarray((PT, hc * hc), dtype=nl.float32, buffer=nl.sbuf) if t2_dst is None else t2_dst
+        nisa.scalar_tensor_tensor(
+            dst=t2[0:nr, :], data=mixv[0:nr, 2 * hc : 2 * hc + hc * hc],
+            op0=nl.multiply, operand0=s2, op1=nl.add, operand1=b2,
+        )
+        if t2_dst is None:
+            comb_t = sinkhorn(t2, nr, hc)
+            nisa.dma_copy(dst=comb[r0 : r0 + nr, 0 : hc * hc], src=comb_t[0:nr, :])
+
+    if defer and part == "c":
+        return coef
+    coef()
 
     if not split:
         norm_ss()
@@ -486,6 +677,10 @@ def load_fn_t(fn_t, width, mix):
     """`fn.T` (`[hc*dim, mix]` fp32 HBM) resident as `(PT, nk, mix)` fp32 SBUF."""
     nk = width // PT
     fnT = nl.ndarray((PT, nk, mix), dtype=nl.float32, buffer=nl.sbuf)
+    if len(fn_t.shape) == 3:
+        # (the host's tiled copy, `mk_model.hc_fn_map`: one contiguous run a partition)
+        nisa.dma_copy(dst=fnT, src=fn_t, dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
+        return fnT
     if FN_T_HWDGE:
         nisa.dma_copy(dst=fnT, src=fn_t.ap(pattern=[[mix, PT], [PT * mix, nk], [1, mix]]),
                       dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
@@ -516,13 +711,17 @@ def hc_out_spread_s(nr, dim):
     return S if S >= 4 else 1
 
 
-def hc_out_tile_spread(r0, nr, x_hbm, res_hbm, post_hbm, comb_hbm, y_hbm, hc, dim, S):
+def hc_out_tile_spread(r0, nr, x_hbm, res_hbm, post_hbm, comb_hbm, y_hbm, hc, dim, S, c0=0, c1=None):
     """`hc_out_tile`'s values with row `r` on partitions `r*S .. r*S + S - 1`, partition
     `r*S + s` holding columns `[s*w, (s+1)*w)` (w = dim / S) of every stream (same
-    per-element operations, operands and engines)."""
+    per-element operations, operands and engines). `c0` / `c1`: only columns [c0, c1) of
+    each stream (w = (c1 - c0) / S)."""
+    c1 = dim if c1 is None else c1
+    full = c0 == 0 and c1 == dim
+    width = hc * dim
+    dim_full, dim = dim, c1 - c0
     w = dim // S
     n = nr * S
-    width = hc * dim
     post = nl.ndarray((PT, hc), dtype=nl.float32, buffer=nl.sbuf)
     comb = nl.ndarray((PT, hc * hc), dtype=nl.float32, buffer=nl.sbuf)
     rg = nl.ndarray((PT, hc, w), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -533,7 +732,8 @@ def hc_out_tile_spread(r0, nr, x_hbm, res_hbm, post_hbm, comb_hbm, y_hbm, hc, di
         nisa.dma_copy(dst=comb[p0 : p0 + S, :],
                       src=comb_hbm.ap(pattern=[[0, S], [1, hc * hc]], offset=(r0 + r) * hc * hc))
         nisa.dma_copy(dst=rg[p0 : p0 + S, :, :],
-                      src=res_hbm.ap(pattern=[[w, S], [dim, hc], [1, w]], offset=(r0 + r) * width))
+                      src=res_hbm.ap(pattern=[[w, S], [dim_full, hc], [1, w]],
+                                     offset=(r0 + r) * width + c0))
     acc = nl.ndarray((PT, hc, w), dtype=nl.float32, buffer=nl.sbuf)
     for j in range(hc):
         nisa.tensor_scalar(
@@ -554,9 +754,14 @@ def hc_out_tile_spread(r0, nr, x_hbm, res_hbm, post_hbm, comb_hbm, y_hbm, hc, di
                 operand0=comb[0:n, col : col + 1], op1=nl.add, operand1=acc[0:n, j, :],
             )
     # x rows are contiguous: partition r*S + s = flat row r0*S + r*S + s of x as [*, w]
-    xv = x_hbm.reshape((x_hbm.shape[0] * S, w))
     xg = nl.ndarray((PT, w), dtype=nl.bfloat16, buffer=nl.sbuf)
-    nisa.dma_copy(dst=xg[0:n, :], src=xv[r0 * S : r0 * S + n, :])
+    if full:
+        xv = x_hbm.reshape((x_hbm.shape[0] * S, w))
+        nisa.dma_copy(dst=xg[0:n, :], src=xv[r0 * S : r0 * S + n, :])
+    else:
+        for r in range(nr):
+            nisa.dma_copy(dst=xg[r * S : (r + 1) * S, :],
+                          src=x_hbm.ap(pattern=[[w, S], [1, w]], offset=(r0 + r) * dim_full + c0))
     og = nl.ndarray((PT, hc, w), dtype=nl.bfloat16, buffer=nl.sbuf)
     for j in range(hc):
         nisa.scalar_tensor_tensor(
@@ -565,12 +770,84 @@ def hc_out_tile_spread(r0, nr, x_hbm, res_hbm, post_hbm, comb_hbm, y_hbm, hc, di
         )
     for r in range(nr):
         p0 = r * S
-        nisa.dma_copy(dst=y_hbm.ap(pattern=[[w, S], [dim, hc], [1, w]], offset=(r0 + r) * width),
+        nisa.dma_copy(dst=y_hbm.ap(pattern=[[w, S], [dim_full, hc], [1, w]],
+                                   offset=(r0 + r) * width + c0),
                       src=og[p0 : p0 + S, :, :])
 
 
+#: At more rows than the spread takes (nr * 4 > 128) but nr * 2 <= 128, `hc_out_tile`
+#: block-spreads the tile: partition `s * nr + r` holds columns block `s` of row `r` (S = 2
+#: blocks; one affine DMA per block and operand), see `hc_out_tile_bspread`.
+HC_OUT_BSPREAD = True
+#: `hc_out_tile_bspread`'s columns per partition and instruction (at most).
+HC_OUT_BSPREAD_CHUNK = 640
+
+
+def hc_out_bspread_s(nr, dim):
+    """The block-spread factor `hc_out_tile` uses for an `nr`-row tile (1: not spread)."""
+    if not HC_OUT_BSPREAD or nr * 2 > PT or dim % 2 or (dim // 2) % 64:
+        return 1
+    return 2
+
+
+def hc_out_tile_bspread(r0, nr, x_hbm, res_hbm, post_hbm, comb_hbm, y_hbm, hc, dim, S, c0=0,
+                        c1=None):
+    """`hc_out_tile`'s values with partition `s * nr + r` holding columns
+    `[c0 + s*w, c0 + (s+1)*w)` (w = (c1 - c0) / S) of row `r` of every stream (same
+    per-element operations, operands and engines as `hc_out_tile_spread`), in column chunks
+    of at most HC_OUT_BSPREAD_CHUNK."""
+    c1 = dim if c1 is None else c1
+    width = hc * dim
+    w = (c1 - c0) // S
+    n = nr * S
+    nch = cdiv(w, HC_OUT_BSPREAD_CHUNK)
+    while w % nch:
+        nch += 1
+    wc = w // nch
+    post = nl.ndarray((PT, hc), dtype=nl.float32, buffer=nl.sbuf)
+    comb = nl.ndarray((PT, hc * hc), dtype=nl.float32, buffer=nl.sbuf)
+    for s in range(S):
+        p0 = s * nr
+        nisa.dma_copy(dst=post[p0 : p0 + nr, :], src=post_hbm[r0 : r0 + nr, 0:hc])
+        nisa.dma_copy(dst=comb[p0 : p0 + nr, :], src=comb_hbm[r0 : r0 + nr, 0 : hc * hc])
+    for k in range(nch):
+        rg = nl.ndarray((PT, hc, wc), dtype=nl.bfloat16, buffer=nl.sbuf)
+        for s in range(S):
+            nisa.dma_copy(dst=rg[s * nr : (s + 1) * nr, :, :],
+                          src=res_hbm.ap(pattern=[[width, nr], [dim, hc], [1, wc]],
+                                         offset=r0 * width + c0 + s * w + k * wc))
+        acc = nl.ndarray((PT, hc, wc), dtype=nl.float32, buffer=nl.sbuf)
+        for j in range(hc):
+            nisa.tensor_scalar(
+                dst=acc[0:n, j, :], data=rg[0:n, 0, :], op0=nl.multiply,
+                operand0=comb[0:n, j : j + 1], engine=nisa.engine.scalar,
+            )
+            for i in range(1, hc):
+                col = i * hc + j
+                nisa.scalar_tensor_tensor(
+                    dst=acc[0:n, j, :], data=rg[0:n, i, :], op0=nl.multiply,
+                    operand0=comb[0:n, col : col + 1], op1=nl.add, operand1=acc[0:n, j, :],
+                )
+        xg = nl.ndarray((PT, wc), dtype=nl.bfloat16, buffer=nl.sbuf)
+        for s in range(S):
+            nisa.dma_copy(dst=xg[s * nr : (s + 1) * nr, :],
+                          src=x_hbm.ap(pattern=[[dim, nr], [1, wc]],
+                                       offset=r0 * dim + c0 + s * w + k * wc))
+        og = nl.ndarray((PT, hc, wc), dtype=nl.bfloat16, buffer=nl.sbuf)
+        for j in range(hc):
+            nisa.scalar_tensor_tensor(
+                dst=og[0:n, j, :], data=xg[0:n, :], op0=nl.multiply,
+                operand0=post[0:n, j : j + 1], op1=nl.add, operand1=acc[0:n, j, :],
+            )
+        for s in range(S):
+            nisa.dma_copy(dst=y_hbm.ap(pattern=[[width, nr], [dim, hc], [1, wc]],
+                                       offset=r0 * width + c0 + s * w + k * wc),
+                          src=og[s * nr : (s + 1) * nr, :, :])
+
+
 def hc_out_tile(r0, nr, x_hbm, res_hbm, post_hbm, comb_hbm, y_hbm, hc, dim, chunk=1024,
-                x_dtype=nl.float32, keep=False, acc_first=False, acc_only=False, accs_in=None):
+                x_dtype=nl.float32, keep=False, acc_first=False, acc_only=False, accs_in=None,
+                c0=0, c1=None):
     """One 128-row tile of `hc_post` (`kernels.hc_attn_out`):
     `y[t, j, :] = post[t, j] * x[t, :] + sum_i comb[t, i, j] * res[t, i, :]`.
 
@@ -584,20 +861,31 @@ def hc_out_tile(r0, nr, x_hbm, res_hbm, post_hbm, comb_hbm, y_hbm, hc, dim, chun
     result still in flight), then the `post * x` terms. `acc_only`: only those
     accumulators, returned (SBUF); `accs_in`: a previous `acc_only` call's, so only the
     `post * x` terms and the stores run here (a caller pipelines tiles with them).
+    `c0` / `c1`: only columns [c0, c1) of each stream (multiples of `chunk`; `keep`'s
+    tiles hold only those columns).
     """
-    S = hc_out_spread_s(nr, dim)
+    c1 = dim if c1 is None else c1
+    S = hc_out_spread_s(nr, c1 - c0)
+    Sb = hc_out_bspread_s(nr, c1 - c0) if S == 1 else 1
+    if Sb > 1:
+        # block-spread (like the spread: nothing kept, `acc_only` defers the whole tile)
+        if not acc_only:
+            hc_out_tile_bspread(r0, nr, x_hbm, res_hbm, post_hbm, comb_hbm, y_hbm, hc, dim, Sb,
+                                c0, c1)
+        return None
     if S > 1:
         # spread (returns nothing: `keep` rows are read back from `y_hbm`, `acc_only`
         # defers the whole tile to the `accs_in` call)
         if not acc_only:
-            hc_out_tile_spread(r0, nr, x_hbm, res_hbm, post_hbm, comb_hbm, y_hbm, hc, dim, S)
+            hc_out_tile_spread(r0, nr, x_hbm, res_hbm, post_hbm, comb_hbm, y_hbm, hc, dim, S, c0, c1)
         return None
+    assert c0 % chunk == 0 and c1 % chunk == 0
     post = nl.ndarray((PT, hc), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=post[0:nr, :], src=post_hbm[r0 : r0 + nr, 0:hc])
     comb = nl.ndarray((PT, hc * hc), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=comb[0:nr, :], src=comb_hbm[r0 : r0 + nr, 0 : hc * hc])
     ys = [nl.ndarray((PT, dim), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(hc)] if keep else None
-    nch = dim // chunk
+    chs = list(range(c0 // chunk, c1 // chunk))
 
     def acc_of(c):
         col0 = c * chunk
@@ -650,16 +938,16 @@ def hc_out_tile(r0, nr, x_hbm, res_hbm, post_hbm, comb_hbm, y_hbm, hc, dim, chun
             )
 
     if acc_only:
-        return [acc_of(c) for c in range(nch)]
+        return [acc_of(c) for c in chs]
     if accs_in is not None:
-        for c in range(nch):
-            out_of(c, accs_in[c])
+        for k, c in enumerate(chs):
+            out_of(c, accs_in[k])
     elif acc_first:
-        accs = [acc_of(c) for c in range(nch)]
-        for c in range(nch):
-            out_of(c, accs[c])
+        accs = [acc_of(c) for c in chs]
+        for k, c in enumerate(chs):
+            out_of(c, accs[k])
     else:
-        for c in range(nch):
+        for c in chs:
             out_of(c, acc_of(c))
     return ys
 
@@ -894,6 +1182,50 @@ def gather_rows_via(cache_hbm, slots_hbm, via_hbm, dst_hbm, dst_row0, nrows, pid
         rest = [(r0 + a, b) for a, b in tiles_of(nrows - r0, pid, cores)]
         gather_rows(cache_hbm, slots_hbm, dst_hbm[dst_row0 : dst_row0 + nrows], rest, n, pair=pair,
                     via=via_hbm)
+
+
+def gather_rows_batched(cache_hbm, slots_hbm, dst_hbm, nrows, pid, n, cores=2, batch=None, row0=0):
+    """`dst[r] = cache[slots[r]]` for rows `r < nrows` (`gather_rows` without the per-tile
+    `[128, 1]` index loads): the whole 128-row tiles in batches of `G` tiles, core `pid`
+    a contiguous run of batches; their slots loaded 128 tiles a DMA (tile `i` on partition
+    `i % 128`, 512-byte runs) and PE-transposed on chip (fp32, exact for slots < 2^24, as
+    `cmp_gather_onchip`'s), so tile `i`'s index column is column `i % 128`; one gather and
+    one store a batch (the hardware reads the indices column-major: destination slot
+    `(p, g)` gets the batch's row `p * G + g`). The rows past the last whole batch go
+    through `gather_rows` (tiles split like `tiles_of`). `row0`: the rows are
+    `row0 .. row0 + nrows` of both `slots_hbm` and `dst_hbm`."""
+    G = GATHER_VIA_BATCH if batch is None else batch
+    ntl = nrows // PT
+    while G > 1 and (ntl // G < 3 * cores or dst_hbm.shape[0] % G or row0 % G):
+        G //= 2
+    nb = ntl // G
+    b_lo = (nb * pid) // cores
+    b_hi = (nb * (pid + 1)) // cores
+    dst_g = dst_hbm.reshape((dst_hbm.shape[0] // G, G * n)) if nb else None
+    bpc = PT // G  # batches a chunk of 128 tiles
+    for c0 in range(b_lo, b_hi, bpc):
+        cb = min(bpc, b_hi - c0)
+        nt = cb * G
+        t0 = c0 * G  # first tile of the chunk
+        sl = nl.ndarray((PT, PT), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=sl[0:nt, :], src=slots_hbm.ap(pattern=[[PT, nt], [1, PT]], offset=row0 + t0 * PT))
+        slf = nl.ndarray((PT, PT), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=slf[0:nt, :], src=sl[0:nt, :])
+        tps = nl.ndarray((PT, PT), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_transpose(dst=tps[0:PT, 0:nt], data=slf[0:nt, 0:PT])
+        ixT = nl.ndarray((PT, PT), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=ixT[0:PT, 0:nt], src=tps[0:PT, 0:nt])
+        for j in range(cb):
+            t = nl.ndarray((PT, G, n), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=t, src=cache_hbm.ap(pattern=[[n, PT * G], [1, n]], offset=0,
+                                                  vector_offset=ixT[0:PT, j * G : (j + 1) * G],
+                                                  indirect_dim=0))
+            q0 = row0 // G + (c0 + j) * PT
+            nisa.dma_copy(dst=dst_g[q0 : q0 + PT, 0 : G * n], src=t.reshape((PT, G * n)))
+    r0 = nb * G * PT
+    if r0 < nrows:
+        rest = [(row0 + r0 + a, b) for a, b in tiles_of(nrows - r0, pid, cores)]
+        gather_rows(cache_hbm, slots_hbm, dst_hbm, rest, n)
 
 
 #: The attention slot table stores each row's 128-column chunks interleaved in pairs,

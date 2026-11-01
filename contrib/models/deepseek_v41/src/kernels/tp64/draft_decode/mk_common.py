@@ -104,9 +104,84 @@ def bcast_row(hbm_row, n, nr, dtype=nl.float32):
 # --------------------------------------------------------------------------- hyper-connections
 
 
+#: `sinkhorn` with each matrix stored `(hc + 1) x (hc + 1)` (an eps column after every row, an
+#: eps row after the last: a reduce over hc + 1 entries is `sum + eps`): a reduce, a DVE
+#: reciprocal and a multiply a normalization -- 6 dependent DVE instructions an iteration
+#: instead of ~10 (DVE adds, ACT reciprocals). (A fused `(1 / sum) * x` is not an ISA op: DVE
+#: has no divide in `tensor_tensor` / `scalar_tensor_tensor`.)
+SINKHORN_FUSED = True
+
+
+def _sinkhorn_fused(t2, nr, hc, after=None):
+    f32 = nl.float32
+    H = hc + 1
+    G = H * H
+    n2 = hc * hc
+
+    def v3(t):
+        return t.ap(pattern=[[n2, nr], [hc, hc], [1, hc]])
+
+    mx = nl.ndarray((PT, hc), dtype=f32, buffer=nl.sbuf)
+    sched_after(nisa.tensor_reduce(dst=mx[0:nr, :], op=nl.maximum, data=v3(t2), axis=(2,), keepdims=False), after)
+    dlt = nl.ndarray((PT, n2), dtype=f32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=v3(dlt), data1=v3(t2), data2=mx.ap(pattern=[[hc, nr], [1, hc], [0, hc]]),
+                       op=nl.subtract)
+    es = nl.ndarray((PT, n2), dtype=f32, buffer=nl.sbuf)
+    nisa.activation(dst=es[0:nr, :], op=nl.exp, data=dlt[0:nr, :])
+    ssum = nl.ndarray((PT, hc), dtype=f32, buffer=nl.sbuf)
+    nisa.tensor_reduce(dst=ssum[0:nr, :], op=nl.add, data=v3(es), axis=(2,), keepdims=False)
+    rs = nl.ndarray((PT, hc), dtype=f32, buffer=nl.sbuf)
+    nisa.reciprocal(dst=rs[0:nr, :], data=ssum[0:nr, :])
+    a = nl.ndarray((PT, H, H), dtype=f32, buffer=nl.sbuf)
+    b = nl.ndarray((PT, H, H), dtype=f32, buffer=nl.sbuf)
+    nisa.memset(a, HC_EPS)
+    nisa.memset(b, HC_EPS)
+
+    def mat(x):
+        return x.ap(pattern=[[G, nr], [H, hc], [1, hc]], offset=0)
+
+    def rows_b(v):
+        return v.ap(pattern=[[hc, nr], [1, hc], [0, hc]], offset=0)
+
+    def cols_b(v):
+        return v.ap(pattern=[[hc, nr], [0, hc], [1, hc]], offset=0)
+
+    # softmax rows + eps
+    nisa.tensor_tensor(dst=mat(a), data1=v3(es), data2=rows_b(rs), op=nl.multiply)
+    nisa.tensor_scalar(dst=mat(a), data=mat(a), op0=nl.add, operand0=HC_EPS)
+
+    def rowdiv(src, dst):
+        sm = nl.ndarray((PT, hc), dtype=f32, buffer=nl.sbuf)
+        nisa.tensor_reduce(dst=sm[0:nr, :], op=nl.add, data=src.ap(pattern=[[G, nr], [H, hc], [1, H]], offset=0),
+                           axis=(2,))
+        r = nl.ndarray((PT, hc), dtype=f32, buffer=nl.sbuf)
+        nisa.reciprocal(dst=r[0:nr, :], data=sm[0:nr, :])
+        nisa.tensor_tensor(dst=mat(dst), data1=mat(src), data2=rows_b(r), op=nl.multiply)
+
+    def coldiv(src, dst):
+        cs = nl.ndarray((PT, hc), dtype=f32, buffer=nl.sbuf)
+        nisa.tensor_reduce(dst=cs[0:nr, :], op=nl.add, data=src.ap(pattern=[[G, nr], [1, hc], [H, H]], offset=0),
+                           axis=(2,))
+        d = nl.ndarray((PT, hc), dtype=f32, buffer=nl.sbuf)
+        nisa.reciprocal(dst=d[0:nr, :], data=cs[0:nr, :])
+        nisa.tensor_tensor(dst=dst, data1=mat(src), data2=cols_b(d), op=nl.multiply)
+
+    out = nl.ndarray((PT, n2), dtype=f32, buffer=nl.sbuf)
+    if SINKHORN_ITERS == 1:
+        coldiv(a, v3(out))
+        return out
+    coldiv(a, mat(b))
+    for it in range(SINKHORN_ITERS - 1):
+        rowdiv(b, a)
+        coldiv(a, v3(out) if it == SINKHORN_ITERS - 2 else mat(b))
+    return out
+
+
 def sinkhorn(t2, nr, hc, after=None):
     """`softmax(rows) + eps`, then the 20 alternating normalizations of `kernels.hc_in`.
     `after`: schedule the chain (its first instruction; the rest depend on it) after it."""
+    if SINKHORN_FUSED:
+        return _sinkhorn_fused(t2, nr, hc, after)
 
     # Each normalization is a handful of instructions over all hc x hc entries at once
     # (the [nr, hc, hc] view, the sums' reciprocals broadcast by a zero-stride pattern):
@@ -738,11 +813,16 @@ def gemm_fp32(x_hbm, w_t_hbm, out_hbm, tiles, k, n, c0=0):
     """`out[rows, c0:c0+n] = x[rows, k] (bf16) @ w_t[k, c0:c0+n] (fp32)` with **fp32
     operands** on the tensor engine (the router's `matmul(x.float(), w.float().t())`).
     `w_t`'s columns are staged resident as `(PT, k//PT, n)`; `n <= 512`. Each output
-    column is its own accumulation, so a caller may split the columns between cores.
+    column is its own accumulation, so a caller may split the columns between cores. A bf16
+    `w_t` (exact bf16 values) runs bf16 operands.
     """
     nk = k // PT
     N = w_t_hbm.shape[1]
-    wT = nl.ndarray((PT, nk, n), dtype=nl.float32, buffer=nl.sbuf)
+    # (a bf16 weight -- the layout's exact copy of a bf16-valued fp32 router -- runs one bf16
+    # pass: the same exact products, accumulated in fp32 PSUM)
+    bf = w_t_hbm.dtype == nl.bfloat16
+    wdt = nl.bfloat16 if bf else nl.float32
+    wT = nl.ndarray((PT, nk, n), dtype=wdt, buffer=nl.sbuf)
     nisa.dma_copy(dst=wT, src=w_t_hbm.ap(pattern=[[N, PT], [PT * N, nk], [1, n]], offset=c0))
     for r0, nr in tiles:
         x = nl.ndarray((PT, k), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -754,12 +834,15 @@ def gemm_fp32(x_hbm, w_t_hbm, out_hbm, tiles, k, n, c0=0):
             t16 = nl.ndarray((PT, nk, 16), dtype=nl.bfloat16, buffer=nl.sbuf)
             nisa.dma_transpose(dst=t16, src=x.ap(pattern=[[k, 16], [PT, nk], [1, PT]], offset=0),
                                axes=(2, 1, 0))
-            t32 = nl.ndarray((PT, nk, 16), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=t32[0:PT, :, 0:nr], src=t16[0:PT, :, 0:nr])
+            if bf:
+                t32 = t16
+            else:
+                t32 = nl.ndarray((PT, nk, 16), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=t32[0:PT, :, 0:nr], src=t16[0:PT, :, 0:nr])
             for kb in range(nk):
                 nisa.nc_matmul(dst=acc[0:nr, 0:n], stationary=t32[0:PT, kb, 0:nr],
                                moving=wT[0:PT, kb, 0:n], accumulate=(kb > 0),
-                               is_stationary_onezero=FP32_BF16_STATIONARY)
+                               **({} if bf else dict(is_stationary_onezero=FP32_BF16_STATIONARY)))
         # the PE transposes of as many blocks as a PSUM bank holds, one copy a bank
         nrp = -(-nr // 8) * 8
         nb = max(1, min(nk, 1024 // nrp))
@@ -770,13 +853,13 @@ def gemm_fp32(x_hbm, w_t_hbm, out_hbm, tiles, k, n, c0=0):
             for j in range(nb):
                 kb = b0 + j
                 nisa.nc_transpose(dst=tps[0:PT, j, 0:nr], data=x[0:nr, kb * PT : (kb + 1) * PT])
-            xT = nl.ndarray((PT, nb, nrp), dtype=nl.float32, buffer=nl.sbuf)
+            xT = nl.ndarray((PT, nb, nrp), dtype=wdt, buffer=nl.sbuf)
             nisa.tensor_copy(dst=xT[0:PT, 0:nb, 0:nr], src=tps[0:PT, 0:nb, 0:nr])
             for j in range(nb):
                 kb = b0 + j
                 nisa.nc_matmul(dst=acc[0:nr, 0:n], stationary=xT[0:PT, j, 0:nr],
                                moving=wT[0:PT, kb, 0:n], accumulate=(kb > 0),
-                               is_stationary_onezero=FP32_BF16_STATIONARY)
+                               **({} if bf else dict(is_stationary_onezero=FP32_BF16_STATIONARY)))
         o = nl.ndarray((PT, n), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=o[0:nr, :], src=acc[0:nr, :])
         nisa.dma_copy(dst=out_hbm[r0 : r0 + nr, c0 : c0 + n], src=o[0:nr, :])

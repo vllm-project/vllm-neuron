@@ -164,7 +164,10 @@ def fp32_proj_rows(x_hbm, w_t_hbm, out_hbm, tiles, k, n):
     tensor engine (the compressor's `matmul(xf, weight.float().t())`); `n <= 512`.
     `w_t` is staged once per call as `(PT, k//PT, n)` fp32."""
     nk = k // PT
-    wT = nl.ndarray((PT, nk, n), dtype=nl.float32, buffer=nl.sbuf)
+    # (a bf16 weight -- the host's exact copy of a bf16-valued fp32 one -- runs the GEMM in bf16:
+    # the same exact products, half the weight bytes)
+    wdt = nl.bfloat16 if w_t_hbm.dtype == nl.bfloat16 else nl.float32
+    wT = nl.ndarray((PT, nk, n), dtype=wdt, buffer=nl.sbuf)
     nisa.dma_copy(dst=wT, src=w_t_hbm.ap(pattern=[[n, PT], [PT * n, nk], [1, n]]))
     for r0, nr in tiles:
         x = nl.ndarray((PT, k), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -173,7 +176,7 @@ def fp32_proj_rows(x_hbm, w_t_hbm, out_hbm, tiles, k, n):
         for kb in range(nk):
             tps = nl.ndarray((PT, PT), dtype=nl.bfloat16, buffer=nl.psum)
             nisa.nc_transpose(dst=tps[0:PT, 0:nr], data=x[0:nr, kb * PT : (kb + 1) * PT])
-            xT = nl.ndarray((PT, PT), dtype=nl.float32, buffer=nl.sbuf)
+            xT = nl.ndarray((PT, PT), dtype=wdt, buffer=nl.sbuf)
             nisa.tensor_copy(dst=xT[0:PT, 0:nr], src=tps[0:PT, 0:nr])
             nisa.nc_matmul(dst=acc[0:nr, 0:n], stationary=xT[0:PT, 0:nr],
                            moving=wT[0:PT, kb, 0:n], accumulate=(kb > 0))

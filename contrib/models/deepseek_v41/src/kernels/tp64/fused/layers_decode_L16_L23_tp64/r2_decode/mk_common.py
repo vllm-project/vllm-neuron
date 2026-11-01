@@ -18,6 +18,8 @@ import nki.collectives as ncc
 import nki.isa as nisa
 import nki.language as nl
 
+from .. import moe_tp
+
 from . import mk_mx as X
 from .blockquant import (  # noqa: F401 - re-exported for the megakernels
     BLK,
@@ -141,6 +143,8 @@ def sinkhorn_batched(t2all, nt, hc, after=None):
     instructions `sinkhorn`'s lowering issues for it (DVE reduce over the 4 columns,
     ACT copy with the eps bias, ACT reciprocal, fp32 DVE multiplies / adds), only with
     all tiles and rows in one instruction instead of one per tile (and row)."""
+    if moe_tp.SINKHORN_DVE:
+        return moe_tp.sinkhorn_dve(t2all, nt, hc, after)
     n = nt * hc
     f32 = nl.float32
     x3 = t2all.reshape((PT, n, hc))
@@ -264,6 +268,7 @@ def hc_in_consts(base, scale, norm_w, hc, dim, out_chunk=1024, coef=True, w=True
         )
     if w:
         d["w"] = [mat(norm_w, c * out_chunk, out_chunk) for c in range(dim // out_chunk)]
+        d["norm_w"] = norm_w
     return d
 
 
@@ -327,8 +332,12 @@ def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
     inv_width = 1.0 / width
     inv_dim = 1.0 / dim
 
+    # (`moe_tp.HC_MIX_STACK`: the mix half reads its rows from HBM itself)
+    mix_stack = (part == "mix" and xin is None and moe_tp.HC_MIX_STACK and moe_tp.mix_bd_ok(nr, mix))
     if xin is not None:
         xg = xin
+    elif mix_stack:
+        xg = None
     else:
         xg = []
         for g in range(hc):
@@ -421,57 +430,66 @@ def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
         work[8] = [norm_ss]
         for c in range(nout):
             work.setdefault(12 + 4 * c, []).append(lambda c=c: norm_chunk(c))
-    elif part == "mix":
-        sumsq()
-    else:
+    # (`moe_tp.MIX_BD`: the block-diagonal mix GEMM and its sum of squares for few rows)
+    bd = moe_tp.mix_bd_ok(nr, mix) and not split
+    if part == "mix":
+        if not bd:
+            sumsq()
+    elif not split:
         premix()
-        sumsq()
+        if not bd:
+            sumsq()
 
-    mixp = nl.ndarray((PT, mix), dtype=nl.float32, buffer=nl.psum)
-    # few rows: each group's rows transposed by one DMA transpose (`[a, kpg, 128]` ->
-    # `[128, kpg, 16]`; the columns past nr are never read) instead of kpg PE transposes: the tensor engine runs only the matmuls
-    # (blocks of 16 rows: the transpose's output steps must be 32-byte aligned)
-    a_t = 16
-    nq = cdiv(nr, a_t)
-    dma_t = HC_MIX_DMA_T and nr <= HC_MIX_DMA_T_ROWS
-    xTs = []
-    if dma_t:
+    if bd and mix_stack:
+        mixp = moe_tp.hc_mix_hbm(x2, r0, nr, fnT, hc, dim, mix, ss, after=x_after)
+    elif bd:
+        mixp = moe_tp.hc_mix(xg, fnT, nr, hc, dim, mix, consts, ss)
+    else:
+        mixp = nl.ndarray((PT, mix), dtype=nl.float32, buffer=nl.psum)
+        # few rows: each group's rows transposed by one DMA transpose (`[a, kpg, 128]` ->
+        # `[128, kpg, 16]`; the columns past nr are never read) instead of kpg PE transposes: the tensor engine runs only the matmuls
+        # (blocks of 16 rows: the transpose's output steps must be 32-byte aligned)
+        a_t = 16
+        nq = cdiv(nr, a_t)
+        dma_t = HC_MIX_DMA_T and nr <= HC_MIX_DMA_T_ROWS
+        xTs = []
+        if dma_t:
+            for g in range(hc):
+                t16 = nl.ndarray((PT, kpg, nq * a_t), dtype=nl.bfloat16, buffer=nl.sbuf)
+                for q in range(nq):
+                    nisa.dma_transpose(dst=t16[0:PT, :, q * a_t : (q + 1) * a_t],
+                                       src=xg[g].ap(pattern=[[dim, a_t], [PT, kpg], [1, PT]], offset=q * a_t * dim),
+                                       axes=(2, 1, 0))
+                t32 = nl.ndarray((PT, kpg, nq * a_t), dtype=nl.float32, buffer=nl.sbuf)
+                # (`HC_MIX_CAST_DVE`: all on DVE -- on ACT, a cast waiting for its DMA transpose
+                # held up the sum-of-squares chain queued behind it, ~6 us at in1024_bs1)
+                nisa.tensor_copy(dst=t32[0:PT, :, 0:nr], src=t16[0:PT, :, 0:nr],
+                                 engine=nisa.vector_engine if (HC_MIX_CAST_DVE or g % 2 == 0)
+                                 else nisa.scalar_engine)
+                xTs.append(t32)
+        nbt = 0
         for g in range(hc):
-            t16 = nl.ndarray((PT, kpg, nq * a_t), dtype=nl.bfloat16, buffer=nl.sbuf)
-            for q in range(nq):
-                nisa.dma_transpose(dst=t16[0:PT, :, q * a_t : (q + 1) * a_t],
-                                   src=xg[g].ap(pattern=[[dim, a_t], [PT, kpg], [1, PT]], offset=q * a_t * dim),
-                                   axes=(2, 1, 0))
-            t32 = nl.ndarray((PT, kpg, nq * a_t), dtype=nl.float32, buffer=nl.sbuf)
-            # (`HC_MIX_CAST_DVE`: all on DVE -- on ACT, a cast waiting for its DMA transpose
-            # held up the sum-of-squares chain queued behind it, ~6 us at in1024_bs1)
-            nisa.tensor_copy(dst=t32[0:PT, :, 0:nr], src=t16[0:PT, :, 0:nr],
-                             engine=nisa.vector_engine if (HC_MIX_CAST_DVE or g % 2 == 0)
-                             else nisa.scalar_engine)
-            xTs.append(t32)
-    nbt = 0
-    for g in range(hc):
-        for cb in range(0, kpg, HC_T_BATCH):
-            nb_ = min(HC_T_BATCH, kpg - cb)
-            if not dma_t:
-                tps = nl.ndarray((PT, HC_T_BATCH, PT), dtype=nl.bfloat16, buffer=nl.psum)
+            for cb in range(0, kpg, HC_T_BATCH):
+                nb_ = min(HC_T_BATCH, kpg - cb)
+                if not dma_t:
+                    tps = nl.ndarray((PT, HC_T_BATCH, PT), dtype=nl.bfloat16, buffer=nl.psum)
+                    for j in range(nb_):
+                        c = cb + j
+                        nisa.nc_transpose(dst=tps[0:PT, j, 0:nr], data=xg[g][0:nr, c * PT : (c + 1) * PT])
+                    xT = nl.ndarray((PT, HC_T_BATCH, PT), dtype=nl.float32, buffer=nl.sbuf)
+                    eng = nisa.scalar_engine if nbt % 2 else nisa.vector_engine
+                    nisa.tensor_copy(dst=xT[0:PT, 0:nb_, 0:nr], src=tps[0:PT, 0:nb_, 0:nr], engine=eng)
+                for f in work.get(nbt, []):
+                    f()
+                nbt += 1
                 for j in range(nb_):
-                    c = cb + j
-                    nisa.nc_transpose(dst=tps[0:PT, j, 0:nr], data=xg[g][0:nr, c * PT : (c + 1) * PT])
-                xT = nl.ndarray((PT, HC_T_BATCH, PT), dtype=nl.float32, buffer=nl.sbuf)
-                eng = nisa.scalar_engine if nbt % 2 else nisa.vector_engine
-                nisa.tensor_copy(dst=xT[0:PT, 0:nb_, 0:nr], src=tps[0:PT, 0:nb_, 0:nr], engine=eng)
-            for f in work.get(nbt, []):
-                f()
-            nbt += 1
-            for j in range(nb_):
-                kb = g * kpg + cb + j
-                st_ = xTs[g][0:PT, cb + j, 0:nr] if dma_t else xT[0:PT, j, 0:nr]
-                nisa.nc_matmul(
-                    dst=mixp[0:nr, 0:mix], stationary=st_,
-                    moving=fnT[0:PT, kb, 0:mix], accumulate=(kb > 0),
-                    is_stationary_onezero=FP32_BF16_STATIONARY,
-                )
+                    kb = g * kpg + cb + j
+                    st_ = xTs[g][0:PT, cb + j, 0:nr] if dma_t else xT[0:PT, j, 0:nr]
+                    nisa.nc_matmul(
+                        dst=mixp[0:nr, 0:mix], stationary=st_,
+                        moving=fnT[0:PT, kb, 0:mix], accumulate=(kb > 0),
+                        is_stationary_onezero=FP32_BF16_STATIONARY,
+                    )
 
     rs = rsqrt_newton(nl.add(nl.multiply(ss[0:nr, 0:1], inv_width), NORM_EPS))
     mixv = nl.ndarray((PT, mix), dtype=nl.float32, buffer=nl.sbuf)
@@ -524,6 +542,10 @@ def load_fn_t(fn_t, width, mix):
     """`fn.T` (`[hc*dim, mix]` fp32 HBM) resident as `(PT, nk, mix)` fp32 SBUF."""
     nk = width // PT
     fnT = nl.ndarray((PT, nk, mix), dtype=nl.float32, buffer=nl.sbuf)
+    if len(fn_t.shape) == 3:
+        # (the host's tiled copy, `mk_model.hc_fn_map`: one contiguous run a partition)
+        nisa.dma_copy(dst=fnT, src=fn_t, dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
+        return fnT
     if FN_T_HWDGE:
         # (on the sync engine's hardware DGE queue: as a GpSimd DMA the 2 MB load sat in
         # GpSimd's queue between the projections' / attention's DMAs)
@@ -805,6 +827,9 @@ def hc_in_norm_spread(nr, x2, pre_mix, normed, ysc, consts, hc, dim, xs=None, sq
         # block's out_stream stores and the projection weights' DMAs on the sync queue)
         nisa.dma_copy(dst=pm[p0 : p0 + gn, :], src=_sp_bcast(mode, q, nr, S, pre_mix, hc),
                       **(dict(dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.scalar) if PM_LOAD_ACT else {}))
+    # (`moe_tp.NORM_SPREAD`: the RMS norm in the spread layout, from the mixed rows in SBUF)
+    nsp = (moe_tp.NORM_SPREAD and mode == "t" and chunks is None and not ysc_bar and len(xs) == 1
+           and xs[0][1] == W and consts.get("norm_w") is not None)
     for c0, cw, xc in xs:
         # (hc_in_tile's premix, per element)
         acc = nl.ndarray((PT, cw), dtype=nl.float32, buffer=nl.sbuf)
@@ -816,6 +841,9 @@ def hc_in_norm_spread(nr, x2, pre_mix, normed, ysc, consts, hc, dim, xs=None, sq
                 dst=ys[0:P, :] if g == hc - 1 else acc[0:P, :], data=xc[0:P, g, :], op0=nl.multiply,
                 operand0=pm[0:P, g : g + 1], op1=nl.add, operand1=acc[0:P, :],
             )
+        if nsp:
+            moe_tp.norm_spread_t(ys, nr, S, W, normed, consts["norm_w"], NORM_EPS, consts)
+            return
         if mode == "t":
             # (row stride dim = S * W: one uniform-stride DMA)
             nisa.dma_copy(dst=ysc.ap(pattern=[[W, P], [1, cw]], offset=c0), src=ys[0:P, 0:cw],

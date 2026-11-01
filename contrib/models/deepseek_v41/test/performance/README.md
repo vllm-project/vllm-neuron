@@ -19,8 +19,8 @@ reported numbers come from two runs -- see "Reproducing the reported numbers".
 
 ## Reproducing the reported numbers
 
-The current reference reports are `bench_report.opt11.json` (batch 1) and
-`bench_report.opt11_ms10.json` (batch 10), measured 2026-10-31 on a trn3.48xlarge
+The current reference reports are `bench_report.opt12.json` (batch 1) and
+`bench_report.opt12_ms10.json` (batch 10), measured 2026-11-01 on a trn3.48xlarge
 with the DLAMI venv `aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0` and the
 checkpoint at `/mnt/nvme/hf`. Run them one after the other, each with the devices to
 itself:
@@ -33,14 +33,14 @@ cd <vllm-neuron repo root>
 DEEPSEEK_V41_SCHEME=tp64 \
 python contrib/models/deepseek_v41/test/performance/run_bench.py --model /mnt/nvme/hf \
     --dataset-path contrib/models/deepseek_v41/test/performance/sonnet.txt \
-    --report contrib/models/deepseek_v41/test/performance/bench_report.opt11.json \
+    --report contrib/models/deepseek_v41/test/performance/bench_report.opt12.json \
     --bench-timeout 7200 --batch-sizes 1
 
 # batch 10: the same input lengths on ten-sequence engines
 DEEPSEEK_V41_SCHEME=tp64 DEEPSEEK_V41_MAX_NUM_SEQS=10 \
 python contrib/models/deepseek_v41/test/performance/run_bench.py --model /mnt/nvme/hf \
     --dataset-path contrib/models/deepseek_v41/test/performance/sonnet.txt \
-    --report contrib/models/deepseek_v41/test/performance/bench_report.opt11_ms10.json \
+    --report contrib/models/deepseek_v41/test/performance/bench_report.opt12_ms10.json \
     --bench-timeout 7200 --input-lens 512,1024,2048,8192 --batch-sizes 10
 ```
 
@@ -51,7 +51,9 @@ decode drafter `draft_decode`), `DEEPSEEK_V41_FUSED_OPT`
 (`all`), `DEEPSEEK_V41_FUSE_DECODE` (`8` blocks a decode launch),
 `DEEPSEEK_V41_FUSE_EMBED`, `DEEPSEEK_V41_FUSE_HEAD`, `DEEPSEEK_V41_DRAFT_BATCHED`,
 `DEEPSEEK_V41_ONE_RPC_STEP` (synchronous scheduling only), `DEEPSEEK_V41_STEP_PROLOGUE`,
-`DEEPSEEK_V41_ASYNC` and `DEEPSEEK_V41_FUSE_TAIL`; `src/README.md` ("A decode step is a
+`DEEPSEEK_V41_ASYNC`, `DEEPSEEK_V41_FUSE_TAIL`, and (opt12) `DEEPSEEK_V41_MOE_TP`,
+`DEEPSEEK_V41_DRAFT_MOE_TP`, `DEEPSEEK_V41_ENGRAM_TP`, `DEEPSEEK_V41_COMPRESS_BF16`,
+`DEEPSEEK_V41_FN_T_TILED`; `src/README.md` ("A decode step is a
 handful of launches", "A decode step's inputs are made on the device") says what each
 does. The async engine needs this branch's plugin (the runner's `RUNNER_CAPABILITIES`,
 the scheduler's holdbacks); on another the port serves synchronously. `--bench-timeout` only bounds a wedged run. Without

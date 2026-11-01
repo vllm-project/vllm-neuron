@@ -25,6 +25,7 @@ is plan.json.
 """
 import nki
 
+from . import moe_tp
 from .fused_member import member
 from .r2_src_idx_decode import r2_src_idx_decode
 from .r2_decode import r2_decode
@@ -90,6 +91,7 @@ def layers_decode_L08_L15_tp64(
     L15_w3, L15_s3, L15_w2, L15_s2, L15_sh_w1, L15_sh_s1, L15_sh_w3, L15_sh_s3, L15_sh_w2,
     L15_sh_s2
 ):
+    moe_tp.reset()
     # The members (the L00-L07 launch's r2 kernels; L14's is its r2_src_idx with the engram
     # read-out) share, through module hooks set here: an index source's slot table and index
     # tables with the r2 blocks after it (`SHARE_TAB`), each block's output rows' SBUF tiles

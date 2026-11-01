@@ -22,6 +22,7 @@ is plan.json.
 """
 import nki
 
+from . import moe_tp
 from .fused_member import member
 from .r1_idx_decode import r1_idx_decode
 from .r1_decode import r1_decode
@@ -82,6 +83,7 @@ def layers_decode_L32_L39_head_tp64(
     L39_expert_lo, L39_w1, L39_s1, L39_w3, L39_s3, L39_w2, L39_s2, L39_sh_w1, L39_sh_s1, L39_sh_w3,
     L39_sh_s3, L39_sh_w2, L39_sh_s2, head_norm_w, head_head_w, head_vocab_start, head_flags
 ):
+    moe_tp.reset()
     # what the members share across blocks (the slot table / attention index tables of
     # blocks reading the same top-k, see the members' SHARE_SLOT_TABLE)
     share = {}

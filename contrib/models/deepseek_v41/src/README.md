@@ -225,6 +225,68 @@ kernels and weights. `mk_kernels.draft` / `draft_batched` route the decode phase
 `DEEPSEEK_V41_OPT_KERNELS` without `draft_decode` (or `none`) brings the original drafter
 back.
 
+Since 2026-11-01 the drafter is no longer bit-exact: its Sinkhorns take 6 vector-engine
+instructions an iteration on eps-padded matrices (`mk_common._sinkhorn_fused`, `SINKHORN_FUSED`)
+and its attention / world all-reduces carry the live rows instead of the padded 128-row tile
+(`AR_LIVE_ROWS`; their fp32 summation order changes with the payload): the recorded cases' drafted
+tokens and window-cache rows are unchanged, the confidences (unused by the proposer) move by up to
+11 bf16 ulps, and the per-sequence launch is ~7 % faster.
+
+**Decode MoE in a TP x EP layout; the few-row chains (flat scheme).** A bs1 decode step's blocks run
+T = 6 rows (one sequence: the token and its 5 drafts). Two things bounded them: the routed experts'
+imbalance -- in the deployment layout (6 experts a rank) a step's 36 picks hit a few ranks, and the
+world all-reduce after the MoE waited for the busiest -- and chains of tiny dependent instructions
+(the hyper-connections' 20-iteration Sinkhorns above all, ~50 us each on few rows). The optimized
+fused decode launches now, for a decode step of at most `mk_model.MOE_TP_MAX_T` rows:
+
+* run the MoE in a **TP x EP layout** (`fused/<launch>/moe_tp.py`; host layout
+  `kernels/tp64/moe_tp_layout.py`, built once a block by `mk_model.moe_tp_map` from the checkpoint,
+  checked against the resident copy; `DEEPSEEK_V41_MOE_TP=0` keeps the deployment's): 8 groups of 8
+  ranks, a group's 48 experts split 8 ways by hidden columns (288 a rank), the shared expert split
+  over the 64 ranks (one or two 32-column blocks a rank), the router weight in bf16 (exact). Each
+  core runs `SLOTS` statically unrolled slot pairs (a dynamic loop costs ~10 us an iteration on this
+  hardware: every engine drains and handshakes) and a rarely-entered loop for the rest; a slot's
+  weights take 4 DMAs (the scale rows by SWDGE gathers; padding slots name an out-of-bounds id and
+  their DMAs are skipped); the two cores swap the slots' staged activations (`nisa.sendrecv`, the T
+  live columns) and each accumulates every slot's down projection for its half of the output
+  columns in four PSUM banks (`MOE_CS`), so there is neither an SBUF accumulator nor a cross-core
+  combine;
+* run the **Sinkhorn** as 6 vector-engine instructions an iteration (eps-padded 5 x 5 matrices: a
+  reduce over a row is `sum + eps`) instead of ~8 across DVE and ACT, and place each where core 1
+  has slack (hc_in(attn)'s after the attention, schedule-pinned instead of gated by a DMA through
+  the queues);
+* compute hc_in's **mix GEMM** for few rows block-diagonally (J K-tiles a matmul) from rows read
+  straight from HBM and transposed on the tensor engine; the hc mix weights `fn.T` arrive tiled
+  for one contiguous DMA (`mk_model.hc_fn_map`); the RMS norm in the spread layout;
+* split the **engram** layers' fp8 `wkv` projection (`[6144, 25600]`, ~157 MB, which every rank
+  streamed whole) over the attention group and all-gather the parts (`mk_model.engram_tp_map`);
+  read the compressor's fp32 projection weights as their exact bf16 values
+  (`mk_model.compress_bf16_map`); all-reduce the index scores over the T live rows only; give the
+  attention / world all-reduces DMA priority 0.
+
+Only the order of the fp32 sums changes (the down projections' partials across ranks and cores,
+the all-reduces' payloads); every quantized value is the deployment's. The fused launches'
+outputs move by a few percent relative L2 against the bit-exact ones -- what any summation-order
+change makes after fp8 re-quantization -- and the verifier and the integration test pass.
+
+A padding slot (past the group's active experts) must not issue an out-of-bounds dynamic DMA on a
+hardware DGE queue: `oob_mode.skip` works in every single-launch workspace, but in the model -- five
+such launches a step -- it faulted the sequencer (`BAD_OPCODE` on core 1, "missing collectives
+status ... hang after collectives op 1") and hung the first decode step. Pair 0 keeps its hardware-DGE
+loads (nearly always active); the other pairs load their rows by software-DGE gathers whose
+out-of-bounds rows are skipped (`SLOT_SW_FROM`), which is safe. `nki.experimental.if_else` (to skip
+the overflow loop's ~8 us entry / exit when no group overflows) does not compile here.
+
+The single-sequence **decode drafter** runs its three stages' MoE the same way
+(`draft_decode/moe_tp.py`, the launches' copy with `SLOTS` 3: a stage routes 5 rows x top-3 of 128
+experts; `layout.moe_tp`, its routed slices read from the checkpoint by
+`mk_model.draft_weights_decode(tp=True)` and checked against the resident copy;
+`DEEPSEEK_V41_DRAFT_MOE_TP=0` keeps the EP64 layout, as the batched entry always does), its router
+in bf16. The MX matmuls need an even stationary width, so an odd row count runs the expert GEMMs on
+T + 1 rows (the next row is zero, its routing weights zero) and stores T. A bs1 decode step is
+~0.34 ms shorter; the drafted tokens follow the new summation order (one of five recorded draft
+tokens flips at a near-tie).
+
 **A decode step is a handful of launches (flat scheme).** A decode block runs in well
 under a millisecond on the device, while every NEFF execution with collectives costs
 ~1.5 ms of host submission at the least -- more the more IO tensors it has (~5 ms for an
@@ -245,7 +307,8 @@ the step is built from as few launches as keep the device fed:
   a decode step's launch can be replaced by one optimized as a whole -- written out from
   the model's plan and run through an AutoHelix loop on the live server's recorded
   inputs and golden outputs of all 64 ranks (bit-exact: same arithmetic and accumulation
-  order, only scheduling and data movement changed). Each package holds the launch
+  order, only scheduling and data movement changed; since 2026-11-01 the decode launches also
+  change the order of fp32 sums -- "Decode MoE in a TP x EP layout" above). Each package holds the launch
   (`<launch>.py`, the generated launch's parameters and outputs), its own copies of the
   members' kernels (so a loop can change them for that launch: share the slot / index
   tables and index keys across the blocks reading the same top-k, keep the previous

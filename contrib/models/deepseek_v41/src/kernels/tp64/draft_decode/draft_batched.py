@@ -117,6 +117,8 @@ CACHE_COPY_SPREAD = True
 #: DMA QoS priority of the attention / world all_reduces (0 = the highest: they are on the
 #: critical path, the weight prefetches / KV writes / cache copies in their shadow are not)
 AR_PRIORITY = 0
+#: the attention / world all_reduces carry the R live rows only (else the padded tile)
+AR_LIVE_ROWS = True
 #: hc_in_mix of both sublayers split: its sum of squares, mix GEMM and sigmoids on core 1
 #: while core 0 runs the sublayer's hc_in_norm (core 1 idles there), only the Sinkhorn
 #: (~200 dependent instructions) in the following all_reduce's shadow (the whole mix ran
@@ -286,11 +288,12 @@ def draft_body(
     mkvr_s = [nl.ndarray((Lp, hd), dtype=nl.bfloat16, buffer=nl.shared_hbm, name=f"mkvr{s}") for s in range(nstages)]
     mkv_s = [nl.ndarray((Lp, hd), dtype=nl.bfloat16, buffer=nl.shared_hbm, name=f"mkv{s}") for s in range(nstages)]
     # the embedding all_reduce carries the live rows only (a sum of one nonzero row and
-    # zeros: exact in any order); the attention / world all_reduces keep the padded tile
-    # (their fp32 summation order changes with the payload -- measured: 3..12 bf16 ulps of
-    # confidence at in1024_bs10 / in8192_bs1), its pad rows zeroed once
-    Rc = Rp
-    Rw = Rp
+    # zeros: exact in any order); the attention / world all_reduces too with
+    # `AR_LIVE_ROWS` (their fp32 summation order changes with the payload -- measured: 3..12
+    # bf16 ulps of confidence, the drafts unchanged -- for R of the Rp rows' bytes), else
+    # the padded tile, its pad rows zeroed once
+    Rc = R if AR_LIVE_ROWS else Rp
+    Rw = R if AR_LIVE_ROWS else Rp
     e_loc = nl.ndarray((Re, dim), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="e_loc")
     e_sum = nl.ndarray((Re, dim), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="e_sum")
     st = nl.ndarray((R, width), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="st")

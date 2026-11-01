@@ -130,15 +130,17 @@ def fp4_qdq_tile(x, nr, n, blk, e4m3):
 
 
 def rope_fp4_put(src_hbm, tiles, width, head, nheads, freqs_hbm, pos_hbm, blk, e4m3,
-                 cache_hbm=None, slots_hbm=None, dst_hbm=None):
+                 cache_hbm=None, slots_hbm=None, dst_hbm=None, c0=0):
     """For the row tiles: load bf16 rows of `src_hbm[rows, width]`, rope the last 64
     columns of each of `nheads` heads of width `head` at positions `pos_hbm`, fp4
     round-trip (`blk`, `e4m3`) and scatter into `cache_hbm[slots_hbm[row]]`
-    (and, optionally, store to `dst_hbm[rows]`).
+    (and, optionally, store to `dst_hbm[rows]`). `c0`: the columns are `c0 .. c0 + width` of
+    `src_hbm` / `dst_hbm` (no cache scatter).
     """
+    assert c0 == 0 or cache_hbm is None
     for r0, nr in tiles:
         t = nl.ndarray((PT, width), dtype=nl.bfloat16, buffer=nl.sbuf)
-        nisa.dma_copy(dst=t[0:nr, :], src=src_hbm[r0 : r0 + nr, 0:width])
+        nisa.dma_copy(dst=t[0:nr, :], src=src_hbm[r0 : r0 + nr, c0 : c0 + width])
         cos, sin = load_freqs(freqs_hbm, pos_hbm, r0, nr)
         for h in range(nheads):
             rope_inplace(t, nr, h * head + head - 64, cos, sin, False)
@@ -153,7 +155,7 @@ def rope_fp4_put(src_hbm, tiles, width, head, nheads, freqs_hbm, pos_hbm, blk, e
                 src=q[0:nr, :],
             )
         if dst_hbm is not None:
-            nisa.dma_copy(dst=dst_hbm[r0 : r0 + nr, 0:width], src=q[0:nr, :])
+            nisa.dma_copy(dst=dst_hbm[r0 : r0 + nr, c0 : c0 + width], src=q[0:nr, :])
 
 
 # --------------------------------------------------------------------------- compressor
@@ -164,7 +166,10 @@ def fp32_proj_rows(x_hbm, w_t_hbm, out_hbm, tiles, k, n):
     tensor engine (the compressor's `matmul(xf, weight.float().t())`); `n <= 512`.
     `w_t` is staged once per call as `(PT, k//PT, n)` fp32."""
     nk = k // PT
-    wT = nl.ndarray((PT, nk, n), dtype=nl.float32, buffer=nl.sbuf)
+    # (a bf16 weight -- the host's exact copy of a bf16-valued fp32 one -- runs the GEMM in bf16:
+    # the same exact products, half the weight bytes)
+    wdt = nl.bfloat16 if w_t_hbm.dtype == nl.bfloat16 else nl.float32
+    wT = nl.ndarray((PT, nk, n), dtype=wdt, buffer=nl.sbuf)
     nisa.dma_copy(dst=wT, src=w_t_hbm.ap(pattern=[[n, PT], [PT * n, nk], [1, n]]))
     for r0, nr in tiles:
         x = nl.ndarray((PT, k), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -173,7 +178,7 @@ def fp32_proj_rows(x_hbm, w_t_hbm, out_hbm, tiles, k, n):
         for kb in range(nk):
             tps = nl.ndarray((PT, PT), dtype=nl.bfloat16, buffer=nl.psum)
             nisa.nc_transpose(dst=tps[0:PT, 0:nr], data=x[0:nr, kb * PT : (kb + 1) * PT])
-            xT = nl.ndarray((PT, PT), dtype=nl.float32, buffer=nl.sbuf)
+            xT = nl.ndarray((PT, PT), dtype=wdt, buffer=nl.sbuf)
             nisa.tensor_copy(dst=xT[0:PT, 0:nr], src=tps[0:PT, 0:nr])
             nisa.nc_matmul(dst=acc[0:nr, 0:n], stationary=xT[0:PT, 0:nr],
                            moving=wT[0:PT, kb, 0:n], accumulate=(kb > 0))

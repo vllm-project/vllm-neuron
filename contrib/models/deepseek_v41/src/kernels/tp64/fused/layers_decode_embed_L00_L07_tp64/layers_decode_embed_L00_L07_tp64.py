@@ -22,6 +22,7 @@ is plan.json.
 """
 import nki
 
+from . import moe_tp
 from .fused_member import member
 from .head import head_kernel
 from .r0_decode import r0_decode
@@ -89,6 +90,7 @@ def layers_decode_embed_L00_L07_tp64(
     L07_w3, L07_s3, L07_w2, L07_s2, L07_sh_w1, L07_sh_s1, L07_sh_w3, L07_sh_s3, L07_sh_w2,
     L07_sh_s2
 ):
+    moe_tp.reset()
     # Each block's hc_in(attn) pre-mix reads the previous block's output rows from SBUF
     # (`XS_SHARE`: the final hc_out's spread tiles)
     xs_share = {}

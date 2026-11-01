@@ -251,6 +251,10 @@ def load_fn_t(fn_t, width, mix):
     """`fn.T` (`[hc*dim, mix]` fp32 HBM) resident as `(PT, nk, mix)` fp32 SBUF."""
     nk = width // PT
     fnT = nl.ndarray((PT, nk, mix), dtype=nl.float32, buffer=nl.sbuf)
+    if len(fn_t.shape) == 3:
+        # (the host's tiled copy, `mk_model.hc_fn_map`: one contiguous run a partition)
+        nisa.dma_copy(dst=fnT, src=fn_t, dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
+        return fnT
     nisa.dma_copy(dst=fnT, src=fn_t.ap(pattern=[[mix, PT], [PT * mix, nk], [1, mix]]))
     return fnT
 

@@ -18,6 +18,8 @@ import nki.collectives as ncc
 import nki.isa as nisa
 import nki.language as nl
 
+from .. import moe_tp
+
 from . import mk_mx as X
 from .blockquant import (  # noqa: F401 - re-exported for the megakernels
     BLK,
@@ -172,6 +174,8 @@ def sinkhorn_batched(t2all, nt, hc):
     instructions `sinkhorn`'s lowering issues for it (DVE reduce over the 4 columns,
     ACT copy with the eps bias, ACT reciprocal, fp32 DVE multiplies / adds), only with
     all tiles and rows in one instruction instead of one per tile (and row)."""
+    if moe_tp.SINKHORN_DVE:
+        return moe_tp.sinkhorn_dve(t2all, nt, hc)
     n = nt * hc
     f32 = nl.float32
     x3 = t2all.reshape((PT, n, hc))
@@ -315,7 +319,7 @@ def bcast_dma_spread(t_hbm, nr, dim, S, dtype=nl.float32):
     return t
 
 
-def hc_in_x_spread(r0, nr, x2, pre_mix, norm_w, normed, hc, dim, S, sq_chunk, ws=None):
+def hc_in_x_spread(r0, nr, x2, pre_mix, norm_w, normed, hc, dim, S, sq_chunk, ws=None, cache=None):
     """`hc_in_tile`'s "x" part (`normed[r0:r0+nr]`) in the spread layout (`HC_IN_X_SPREAD`)."""
     width = hc * dim
     w = dim // S
@@ -341,17 +345,21 @@ def hc_in_x_spread(r0, nr, x2, pre_mix, norm_w, normed, hc, dim, S, sq_chunk, ws
             dst=ys[0:n, :] if g == hc - 1 else acc[0:n, :], data=xs[0:n, g, :], op0=nl.multiply,
             operand0=pm[0:n, g : g + 1], op1=nl.add, operand1=acc[0:n, :],
         )
-    # the mixed rows in row layout for the sum of squares (row-major chain, as `norm_ss`)
-    y16 = nl.ndarray((PT, dim), dtype=nl.bfloat16, buffer=nl.sbuf)
-    for s in range(S):
-        nisa.dma_copy(dst=y16[0:nr, s * w : (s + 1) * w], src=ys[s * nr : (s + 1) * nr, 0:w])
-    ss2 = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
-    sum_squares(ss2, y16, nr, dim, sq_chunk)
-    rstd = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
-    rstd[0:nr, :] = rsqrt_newton(nl.add(nl.multiply(ss2[0:nr, 0:1], inv_dim), NORM_EPS))
-    rs = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
-    for s in range(S):
-        nisa.dma_copy(dst=rs[s * nr : (s + 1) * nr, 0:1], src=rstd[0:nr, 0:1])
+    if moe_tp.NORM_SPREAD:
+        # (`moe_tp.NORM_SPREAD`: the rows' sums of squares and rstd in the spread layout)
+        rs = moe_tp.spread_rstd(ys, nr, S, "s", w, NORM_EPS, cache)
+    else:
+        # the mixed rows in row layout for the sum of squares (row-major chain, as `norm_ss`)
+        y16 = nl.ndarray((PT, dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+        for s in range(S):
+            nisa.dma_copy(dst=y16[0:nr, s * w : (s + 1) * w], src=ys[s * nr : (s + 1) * nr, 0:w])
+        ss2 = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
+        sum_squares(ss2, y16, nr, dim, sq_chunk)
+        rstd = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
+        rstd[0:nr, :] = rsqrt_newton(nl.add(nl.multiply(ss2[0:nr, 0:1], inv_dim), NORM_EPS))
+        rs = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
+        for s in range(S):
+            nisa.dma_copy(dst=rs[s * nr : (s + 1) * nr, 0:1], src=rstd[0:nr, 0:1])
     # `norm_chunk`'s operations on the spread rows
     yv = nl.ndarray((PT, w), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(dst=yv[0:n, :], op=nl.copy, data=ys[0:n, :], scale=rs[0:n, 0:1])
@@ -419,7 +427,7 @@ def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
         ws = None
         if consts is not None and "ws" in consts and consts["ws"][:2] == (nr, S):
             ws = consts["ws"][2]
-        hc_in_x_spread(r0, nr, x2, pre_mix, norm_w, normed, hc, dim, S, sq_chunk, ws)
+        hc_in_x_spread(r0, nr, x2, pre_mix, norm_w, normed, hc, dim, S, sq_chunk, ws, cache=consts)
         return
     if consts is None:
         consts = hc_in_consts(base, scale, norm_w, hc, dim, out_chunk, part=part)
@@ -463,7 +471,12 @@ def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
         junk = nl.ndarray((PT, sq_chunk), dtype=nl.float32, buffer=nl.sbuf)
     nsq = dim // sq_chunk
 
+    bd_ss = [False]
+
     def sumsq():
+        if bd_ss[0]:
+            # (the block-diagonal mix's own sum of squares: `moe_tp.BDMix`)
+            return
         # one uninterrupted ACT accumulation chain
         for g in range(hc):
             for c in range(nsq):
@@ -547,6 +560,8 @@ def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
         sumsq()
 
     mixp = nl.ndarray((PT, mix), dtype=nl.float32, buffer=nl.psum)
+    bdm = moe_tp.BDMix(nr, mix, consts) if (stack and moe_tp.bd_stack_ok(nr, mix, J)) else None
+    bd_ss[0] = bdm is not None
     nbt = 0
     c_copy_dve = part == "c" and HC_IN_C_COPY_DVE and nr <= HC_IN_C_COPY_DVE_MAX_ROWS
     # x2 as 128-column chunks (row r's chunk k at r * (width / 128) + k; a sliced view, so
@@ -570,6 +585,10 @@ def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
         for f in work.get(nbt, []):
             f()
         nbt += 1
+        if bdm is not None:
+            # (`moe_tp.BDMix`: the stacked tile's js K-tiles in one block-diagonal matmul)
+            bdm.add(xT.ap(pattern=[[J * (PT // J), PT], [1, js * nr]], offset=0), js, g * kpg + c0, fnT)
+            continue
         for j in range(js):
             kb = g * kpg + c0 + j
             nisa.nc_matmul(
@@ -599,6 +618,8 @@ def hc_in_tile(r0, nr, x2, pre_mix, fnT, base, scale, norm_w, hc, dim, mix,
                     is_stationary_onezero=FP32_BF16_STATIONARY,
                 )
 
+    if bdm is not None:
+        mixp = bdm.finish(ss)
     def coef():
         rs = rsqrt_newton(nl.add(nl.multiply(ss[0:nr, 0:1], inv_width), NORM_EPS))
         mixv = nl.ndarray((PT, mix), dtype=nl.float32, buffer=nl.sbuf)
@@ -656,6 +677,10 @@ def load_fn_t(fn_t, width, mix):
     """`fn.T` (`[hc*dim, mix]` fp32 HBM) resident as `(PT, nk, mix)` fp32 SBUF."""
     nk = width // PT
     fnT = nl.ndarray((PT, nk, mix), dtype=nl.float32, buffer=nl.sbuf)
+    if len(fn_t.shape) == 3:
+        # (the host's tiled copy, `mk_model.hc_fn_map`: one contiguous run a partition)
+        nisa.dma_copy(dst=fnT, src=fn_t, dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
+        return fnT
     if FN_T_HWDGE:
         nisa.dma_copy(dst=fnT, src=fn_t.ap(pattern=[[mix, PT], [PT * mix, nk], [1, mix]]),
                       dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)

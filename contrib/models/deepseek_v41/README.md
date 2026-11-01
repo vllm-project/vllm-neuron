@@ -417,6 +417,39 @@ less (-1.5 to -11 %) because it also carries the other requests' prefills. TTFT 
 unchanged (the prefill drafter is the original). Batch-10 texts differ from run to run
 (ten simultaneous arrivals change the batch order), as they did between earlier runs.
 
+**Decode MoE in a TP x EP layout; shorter few-row chains (2026-11-01, flat scheme).** A bs1
+decode step's blocks run 6 rows, and they were bound by the routed experts' imbalance (the
+world all-reduce after the MoE waited for the rank with the most picked experts) and by chains of
+tiny dependent instructions. The optimized fused decode launches now run the MoE of a step of at
+most 16 rows in a TP8 x EP8 layout (8 groups of 8 ranks; a group's 48 experts split 8 ways by
+hidden columns; the shared expert split over the 64 ranks; the router in bf16), the Sinkhorns in
+6 vector-engine instructions an iteration, hc_in's mix block-diagonally, the norms in a spread
+layout, the engram projection split over the attention group, and the single-sequence decode
+drafter runs its MoE the same way (`src/README.md`, "Decode MoE in a TP x EP layout"). Only the
+order of fp32 sums changes, so outputs move at the summation-order level (draft tokens can flip
+at near-ties). The integration test passes. Measured 2026-11-01 on the same stack
+(`test/performance/bench_report.opt12.json` and `.opt12_ms10.json`), against the previous
+reference (`bench_report.opt11*.json`):
+
+| Cell | TTFT p50 ms | TPOT p50 ms | decode tok/s | accept % | median ITL ms |
+|------|-------------|-------------|--------------|----------|---------------|
+| in512_bs1 | 135 (137) | 4.9 (7.8) | 165.1 (114.8) | 53.7 (53.3) | 16.9 |
+| in1024_bs1 | 232 (232) | 5.2 (7.2) | 144.9 (110.6) | 45.3 (49.7) | 17.0 |
+| in2048_bs1 | 418 (417) | 5.1 (7.8) | 117.4 (89.3) | 46.3 (41.4) | 17.2 |
+| in8192_bs1 | 1666 (1667) | 5.6 (8.1) | 54.1 (47.5) | 45.2 (45.6) | 17.8 |
+| in512_bs10 | 712 (716) | 16.5 (16.4) | 423.6 (403.7) | 50.5 (45.8) | 39.5 (40.8) |
+| in1024_bs10 | 1241 (1240) | 20.0 (20.9) | 317.8 (318.5) | 49.9 (47.8) | 40.6 (41.7) |
+| in2048_bs10 | 2240 (2247) | 26.7 (27.0) | 218.1 (213.8) | 44.0 (45.2) | 41.6 (42.9) |
+| in8192_bs10 | 9146 (9162) | 72.6 (73.0) | 69.3 (68.8) | 45.1 (44.7) | 45.1 (46.6) |
+
+(In parentheses: the previous reference.) Batch-1 TPOT is 27-37 % lower (a decode step is ~17-18 ms,
+~25 ms with opt11). Batch 10 runs 60 rows a step, above the TP layout's limit,
+so its MoE keeps the deployment layout and only the block-level changes apply: one step is ~3 %
+shorter. TTFT is unchanged (prefill keeps its kernels). Acceptance moves per cell with the new
+summation order (in1024_bs1 -4.4 points, in2048_bs1 +4.9, in512_bs10 +4.7) but not on average
+(batch 1 47.5 -> 47.6 %, batch 10 45.9 -> 47.4 %; the prose probe 43.7 -> 52.8 % / 42.1 -> 46.2 %);
+the texts are coherent answers to the prompts in every cell.
+
 > **Read this before you deploy.** Every number in this contribution was
 > measured on `vllm-neuron` **0.24.0.1.1.0**, which is the branch the model was
 > developed against. The code is contributed on top of `main`, and the port's

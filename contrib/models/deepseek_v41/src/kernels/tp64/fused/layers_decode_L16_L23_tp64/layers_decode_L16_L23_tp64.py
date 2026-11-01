@@ -19,13 +19,15 @@ Written out from the model's fused plan (`mk_kernels.fused`) and composed from t
 launches' members (not run through a loop of its own): r2 (blocks 16-19) from
 `layers_decode_embed_L00_L07_tp64`, with its table sharing, SBUF hand-over of the output tiles
 and next-block projection prefetch; r1 (21-23) from `layers_decode_L24_L31_tp64`, sharing the
-slot / index tables; r1_src_idx (20) the port's `r1_src_idx_decode`. Validated bit for bit on
-the recorded cases of workspace ~/ds41_fused_L16_L23 (all 64 ranks, 4 configurations).
+slot / index tables; r1_src_idx (20) `layers_decode_L24_L31_tp64`'s optimized r1_idx kernel with the
+kv source's compressor section (since 2026-11-01; it builds the slot / index tables blocks 21-23
+share). Validated on the recorded cases of workspace ~/ds41_fused_L16_L23 (all 64 ranks).
 `mk_kernels.optimized_fused` runs it in place of the generated launch when the model's plan is
 plan.json.
 """
 import nki
 
+from . import moe_tp
 from .fused_member import member
 from .r2_decode import r2_decode
 from .r1_src_idx_decode import r1_src_idx_decode
@@ -88,6 +90,7 @@ def layers_decode_L16_L23_tp64(
     L23_expert_lo, L23_w1, L23_s1, L23_w3, L23_s3, L23_w2, L23_s2, L23_sh_w1, L23_sh_s1, L23_sh_w3,
     L23_sh_s3, L23_sh_w2, L23_sh_s2
 ):
+    moe_tp.reset()
     # the slot / index tables the members share (built by the first member that needs them)
     share = {}
     # r2 members (L00_L07's): the slot / index tables (`r2_decode.SHARE_TAB`), the previous
@@ -193,7 +196,8 @@ def layers_decode_L16_L23_tp64(
             placeholder_int32, placeholder_uint8, placeholder_uint8, placeholder_float32,
             L20_gate_w_t, L20_gate_b, L20_expert_lo, L20_w1, L20_s1, L20_w3, L20_s3, L20_w2,
             L20_s2, L20_sh_w1, L20_sh_s1, L20_sh_w3, L20_sh_s3, L20_sh_w2, L20_sh_s2,
-            L16_groups_attn, L16_groups_world, L20_flags
+            L16_groups_attn, L16_groups_world, L20_flags,
+            share=share,
         )
     # L21 (r1)
     with member(5, r1_decode):

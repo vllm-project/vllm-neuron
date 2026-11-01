@@ -55,8 +55,56 @@ COUNTS_ONCE = True
 #: (2.6 MB of RMW traffic a tile at dim 5120 for an expert with typically 1-3 rows).
 SCATTER_SKIP_PAD = True
 
+#: At one row tile (Tp = 128: T = 6 and T = 60) each picked expert runs over the whole
+#: tile in row order instead of its gathered rows (`run_expert_dense`): the rows are the
+#: caller's one staging of the tile (the shared expert's), the routing weight column is
+#: read in place (0 on the rows that did not pick the expert, so their SwiGLU output and
+#: w2 rows are exactly 0), and the w2 output tiles add straight from PSUM into an SBUF
+#: fp32 accumulator (no gather, no per-expert staging of x, no RMW scatter through HBM,
+#: no zeroed HBM accumulator). Every row's values and adds are the gathered path's.
+#: w1 / w3 / SwiGLU / staging of y run per 512-column tile so each tile's SwiGLU and
+#: quantization overlap the next tile's matmuls.
+DENSE_ONE_TILE = True
+#: `run_expert_dense`'s weight-scale tiles are zeroed by GpSimd (idle there) instead of
+#: the compiler's pick (DVE, busy with the SwiGLU / staging / accumulation): the hardware
+#: DGE's scale DMAs wait on that memset, so a DVE memset queued behind the SwiGLU held
+#: the w2 weight stream back until the w1 / w3 phase was done.
+DENSE_WS_GPSIMD = True
+
 #: Mask rows an instruction compacts (one per GpSimd core: partitions 0, 16, .., 112).
 LANES = 8
+
+
+#: `DENSE_ONE_TILE` with at least this many rows: every local expert's body runs
+#: unconditionally (static code, no `fori_loop`). An expert no row picked adds exact zeros
+#: (its routing column is 0 on every row), and each dynamic loop costs ~8-10 us of
+#: all-engine semaphore rounds, a register load and the activation-table load even when
+#: empty; with many rows most local experts are picked (P = 1 - (1 - 6/384)^T: 0.61 at
+#: T = 60, every expert on the busiest rank), the PE runs the experts back to back and the
+#: next expert's weight DMAs overlap this one's matmuls. Fewer rows keep the loops.
+#: OFF (None): at in1024_bs10 (T = 60) 8.55 ms vs 8.12 with the loops -- the world
+#: all-reduce's skew wait went away (~55 us) but every rank then ran 6 experts at ~37 us
+#: each (~220 us a block), more than the busiest rank's ~4 active ones with the loops.
+DENSE_STATIC_MIN_ROWS = None
+#: (fewer rows) every expert's trip count is loaded before the first expert's loop
+#: instead of in front of each loop.
+DENSE_COUNTS_FIRST = True
+#: `run_expert_dense`'s weight-scale tiles (one per output tile of w1 / w3 / w2) are
+#: allocated and zeroed once, before the first expert's loop, and shared by every expert
+#: (each body's DMAs only write their quadrant rows, the other partitions stay 0):
+#: inside the loop the 16 GpSimd memsets a body (~11 us) gated the scale DMAs, and the
+#: weight data DMAs queued behind those on the same (sync) queue. (Measured neutral at
+#: in1024: an active body stays ~42 us, ~6.5 us of it before the first weight tile lands.)
+DENSE_WS_HOISTED = True
+#: `run_expert_dense` issues tile c+1's w1 / w3 matmuls before tile c's y staging
+#: (transposes, quantize): the PE runs its queue in order and waited ~1.5-2.5 us a tile
+#: for the SwiGLU on the DVE before the transposes (same instructions, same values).
+DENSE_STAGE_SKEW = True
+
+
+def dense_fits(Tp, n_local):
+    """Whether `routed_experts` takes the one-tile dense path (`DENSE_ONE_TILE`)."""
+    return DENSE_ONE_TILE and Tp == PT and n_local <= PT
 
 
 def alloc_lists(n_local, Tp):
@@ -67,8 +115,10 @@ def alloc_lists(n_local, Tp):
 
 
 def build_expert_lists(wexp_hbm, Tp, n_local, glist):
-    """Compact `wexp[0:Tp, e] > 0` into `glist` (see `alloc_lists`)."""
+    """Compact `wexp[0:Tp, e] > 0` into `glist` (see `alloc_lists`); with `glist` None,
+    return each expert's count as a (1, 1) int32 SBUF view instead."""
     nt = Tp // PT
+    cnts = []
     for e0 in range(0, n_local, LANES):
         ne = min(LANES, n_local - e0)
         maskT = nl.ndarray((PT, Tp), dtype=nl.float32, buffer=nl.sbuf)
@@ -85,8 +135,12 @@ def build_expert_lists(wexp_hbm, Tp, n_local, glist):
             nisa.tensor_copy(dst=maskT[:, i * PT : (i + 1) * PT], src=tp)
         nz = nl.ndarray((PT, Tp + 1), dtype=nl.int32, buffer=nl.sbuf)
         nisa.nonzero_with_count(dst=nz, src=maskT, index_offset=0, padding_val=-1)
+        if glist is None:
+            cnts += [nz[16 * q : 16 * q + 1, Tp : Tp + 1] for q in range(ne)]
+            continue
         for q in range(ne):
             nisa.dma_copy(dst=glist[e0 + q : e0 + q + 1, 0 : Tp + 1], src=nz[16 * q : 16 * q + 1, :])
+    return cnts
 
 
 def expert_tiles(glist, e, Tp):
@@ -142,6 +196,121 @@ def swiglu_tile(g16, u16, wcol, y16, inter, limit):
                                operand0=wcol[0:PT, 0:1])
         else:
             nisa.tensor_tensor(dst=y16[:, c0 : c0 + chunk], data1=sg, data2=u, op=nl.multiply)
+
+
+def _mm_tile(xq, xs, chunks, w_mx, s_mx, krow0, n0, w, ws_pre=None):
+    """One fp32 PSUM output tile (columns `n0 .. n0 + w`) of slot 0 of `(xq, xs)` against the
+    fp4 weight: `gemm_sb`'s weight loads and matmuls for that tile, in its order.
+    `ws_pre`: a zeroed `(PT, nkc, w)` scale tile to load into (`DENSE_WS_HOISTED`)."""
+    ps = nl.ndarray((PT, w), dtype=nl.float32, buffer=nl.psum)
+    nkc = len(chunks)
+    for g0 in range(0, nkc, X.WG):
+        ng = min(X.WG, nkc - g0)
+        if ws_pre is not None:
+            assert ng == nkc
+            wt = nl.ndarray((PT, ng, w), dtype=X.FP4_X4, buffer=nl.sbuf)
+            ws = ws_pre
+            X._load_w_into(wt, ws, 0, w_mx, s_mx, chunks, g0, ng, krow0, n0, w, X.GEMM_SB_HWDGE)
+        else:
+            wt, ws = X.load_w_group(w_mx, s_mx, chunks, g0, ng, krow0, n0, w, True,
+                                    hw=X.GEMM_SB_HWDGE,
+                                    ms_engine=nisa.engine.gpsimd if DENSE_WS_GPSIMD else None)
+        for j in range(ng):
+            kc = g0 + j
+            pk = chunks[kc][1] // 4
+            nisa.nc_matmul_mx(
+                dst=ps, stationary=xq[0:pk, 0, kc, :], moving=wt[0:pk, j, :],
+                stationary_scale=xs[0:pk, 0, kc, :], moving_scale=ws[0:pk, j, :],
+                accumulate=(kc > 0),
+            )
+    return ps
+
+
+def _swiglu_cols(g16, u16, wcol, y16, c0, w, limit):
+    """`swiglu_tile`'s arithmetic on the columns `c0 .. c0 + w`."""
+    g = nl.ndarray((PT, w), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=g, data=g16[:, c0 : c0 + w], op0=nl.minimum, operand0=limit)
+    u = nl.ndarray((PT, w), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=u, data=u16[:, c0 : c0 + w], op0=nl.maximum, operand0=-limit,
+                       op1=nl.minimum, operand1=limit)
+    sg = nl.ndarray((PT, w), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=sg, op=nl.silu, data=g)
+    y = nl.ndarray((PT, w), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=y, data1=sg, data2=u, op=nl.multiply)
+    nisa.tensor_scalar(dst=y16[:, c0 : c0 + w], data=y, op0=nl.multiply, operand0=wcol)
+
+
+def alloc_ws_dense(dim, span):
+    """`DENSE_WS_HOISTED`: the zeroed scale tiles of one `run_expert_dense` body:
+    `{("w1" | "w3", kc) | ("w2", i): (PT, nkc, w) uint8}`."""
+    nk1 = len(X.chunks_of(dim))
+    nk2 = len(X.chunks_of(span))
+    wss = {}
+    for kc, (_, w) in enumerate(X.chunks_of(span)):
+        for nm in ("w1", "w3"):
+            wss[(nm, kc)] = nl.ndarray((PT, nk1, w), dtype=nl.uint8, buffer=nl.sbuf)
+    for i, (_, w) in enumerate(X.ntiles_of(dim)):
+        wss[("w2", i)] = nl.ndarray((PT, nk2, w), dtype=nl.uint8, buffer=nl.sbuf)
+    for t in wss.values():
+        nisa.memset(t, 0, engine=nisa.engine.gpsimd)
+    return wss
+
+
+def run_expert_dense(ntiles, e, xq, xs, wall, w1, s1, w3, s3, w2, s2, dim, lo, hi, limit, acc,
+                     wss=None):
+    """Expert `e` over the whole (single) row tile, `ntiles` (0 or 1, a device scalar) times;
+    see `DENSE_ONE_TILE`. `(xq, xs)` slot 0 is the staged tile, `wall` the `(128, n_local)`
+    fp32 routing weights, `acc` the `(128, dim)` fp32 SBUF accumulator, `wss` the
+    `alloc_ws_dense` scale tiles (or None)."""
+    span = hi - lo
+    kch = X.chunks_of(dim)
+    ych = X.chunks_of(span)
+    wsp = (lambda k: wss[k]) if wss is not None else (lambda k: None)
+
+    def body(i):
+        wcol = wall[0:PT, e : e + 1]
+        g16 = nl.ndarray((PT, span), dtype=nl.bfloat16, buffer=nl.sbuf)
+        u16 = nl.ndarray((PT, span), dtype=nl.bfloat16, buffer=nl.sbuf)
+        y16 = nl.ndarray((PT, span), dtype=nl.bfloat16, buffer=nl.sbuf)
+        yq, ys = X.alloc_x(1, span)
+
+        # w1 / w3 output tile c = the w2 contraction chunk c (both 512-wide)
+        def up(kc):
+            c0, w = ych[kc]
+            ps = _mm_tile(xq, xs, kch, w1, s1, 0, lo + c0, w, wsp(("w1", kc)))
+            nisa.tensor_copy(dst=g16[:, c0 : c0 + w], src=ps)
+            ps = _mm_tile(xq, xs, kch, w3, s3, 0, lo + c0, w, wsp(("w3", kc)))
+            nisa.tensor_copy(dst=u16[:, c0 : c0 + w], src=ps)
+            _swiglu_cols(g16, u16, wcol, y16, c0, w, limit)
+
+        def stage(kc):
+            c0, w = ych[kc]
+            pk = w // 4
+            xT = nl.ndarray((PT, PT, 4), dtype=nl.bfloat16, buffer=nl.sbuf)
+            X.interleave_rows(y16, c0, w, xT)
+            nisa.quantize_mx(dst=yq[0:pk, 0, kc, :], src=xT[0:pk, :, :].reshape((pk, PT * 4)),
+                             dst_scale=ys[0:pk, 0, kc, :])
+
+        if DENSE_STAGE_SKEW:
+            up(0)
+            for kc in range(len(ych)):
+                if kc + 1 < len(ych):
+                    up(kc + 1)
+                stage(kc)
+        else:
+            for kc in range(len(ych)):
+                up(kc)
+                stage(kc)
+        for i, (c0, w) in enumerate(X.ntiles_of(dim)):
+            ps = _mm_tile(yq, ys, ych, w2, s2, lo // 4, c0, w, wsp(("w2", i)))
+            nisa.tensor_tensor(dst=acc[:, c0 : c0 + w], data1=acc[:, c0 : c0 + w], data2=ps,
+                               op=nl.add)
+
+    if ntiles is None:
+        # `DENSE_STATIC_MIN_ROWS`: unconditionally, once
+        body(0)
+        return
+    nl.fori_loop(0, ntiles, body)
 
 
 def run_expert(ntiles, e, glist, Tp, x_hbm, wexp_hbm, n_local, w1, s1, w3, s3, w2, s2,
@@ -311,10 +480,38 @@ def run_expert(ntiles, e, glist, Tp, x_hbm, wexp_hbm, n_local, w1, s1, w3, s3, w
 
 
 def routed_experts(pid, n_local, Tp, x_hbm, wexp_hbm, w1, s1, w3, s3, w2, s2, dim, inter, lo, hi,
-                   limit, eacc_hbm, zero_acc=True):
+                   limit, eacc_hbm, zero_acc=True, staged=None, rows=None):
     """Every routed expert, this core taking `inter` columns `[lo, hi)` of each
     (see `run_expert`), into `eacc_hbm` (zeroed here unless `zero_acc` is False: the
-    caller zeroed it). `w1..s2` are the stacked `[E, K/4, N]` x4 views / scales."""
+    caller zeroed it). `w1..s2` are the stacked `[E, K/4, N]` x4 views / scales.
+
+    With `dense_fits(Tp, n_local)` (one row tile) the experts run `run_expert_dense` and
+    the accumulator is returned as an SBUF `(128, dim)` fp32 tile instead (`eacc_hbm` is
+    not used); `staged` is the caller's `(xq, xs)` of `x_hbm`'s rows 0..127 (else staged
+    here; `rows` the real row count, see `DENSE_STATIC_MIN_ROWS`). Otherwise returns None."""
+    if dense_fits(Tp, n_local):
+        static = (DENSE_STATIC_MIN_ROWS is not None and rows is not None
+                  and rows >= DENSE_STATIC_MIN_ROWS)
+        acc = nl.ndarray((PT, dim), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(acc, 0.0)
+        cnts = None if static else build_expert_lists(wexp_hbm, Tp, n_local, None)
+        wall = nl.ndarray((PT, n_local), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=wall, src=wexp_hbm[0:PT, 0:n_local])
+        if staged is None:
+            staged = X.alloc_x(1, dim)
+            X.stage_x(x_hbm, 0, dim, staged[0], staged[1], 0)
+        xq, xs = staged
+        wss = alloc_ws_dense(dim, hi - lo) if DENSE_WS_HOISTED else None
+        nts = [None] * n_local
+        if not static and DENSE_COUNTS_FIRST:
+            nts = [(nisa.scalar_load(cnts[e]) + (PT - 1)) // PT for e in range(n_local)]
+        for e in range(n_local):
+            nt = nts[e]
+            if not static and not DENSE_COUNTS_FIRST:
+                nt = (nisa.scalar_load(cnts[e]) + (PT - 1)) // PT
+            run_expert_dense(nt, e, xq, xs, wall, w1[e], s1[e], w3[e], s3[e], w2[e], s2[e],
+                             dim, lo, hi, limit, acc, wss)
+        return acc
     if zero_acc:
         zero_rows(eacc_hbm, Tp + PT, dim)
     glist = alloc_lists(n_local, Tp)
@@ -332,3 +529,4 @@ def routed_experts(pid, n_local, Tp, x_hbm, wexp_hbm, w1, s1, w3, s3, w2, s2, di
             nt = expert_tiles(glist, e, Tp)
         run_expert(nt, e, glist, Tp, x_hbm, wexp_hbm, n_local, w1[e], s1[e], w3[e], s3[e], w2[e], s2[e],
                    dim, inter, lo, hi, limit, eacc_hbm, rampf)
+    return None
