@@ -31,8 +31,11 @@ vLLM unifies page sizes across groups by enlarging the attention block size. The
 the state page so the enlarged attention block is a whole number of 256-token blocks, and
 the attention metadata splits each manager block back into kernel-sized blocks
 (`--block-size`, 32 by default; 128 is recommended with an FP8 KV cache, see
-[Full-attention prefill](#full-attention-prefill)). With one KV head per rank, a manager block
-is a pure reshape of its kernel blocks. The runner logs the result, for example
+[Full-attention prefill](#full-attention-prefill)). Only a manager block's byte size is fixed;
+its layout is private to attention, which addresses kernel blocks `manager_id * ratio + j`. So
+the runner lays each manager block out as `[ratio, heads, b, Dh]`, which makes the cache at
+kernel-block granularity a pure view for any number of KV heads per rank (Qwen3.5-2B at TP=1
+has 2). The runner logs the result, for example
 `KV cache block_size resolved: cache_config=32, per_group=[1024, 2048, 2048, 2048]`.
 
 ## Dedicated state pool
