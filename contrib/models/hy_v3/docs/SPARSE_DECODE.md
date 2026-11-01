@@ -7,10 +7,10 @@ the history without losing accuracy, before building a fast implementation.
 Status: the study below found no accuracy loss at 12.5% of the blocks. The
 implementation that reads only the kept blocks
 ([Implementation](#implementation)) keeps that accuracy on the full model
-with FP8 KV + MTP (LongBench v2 55% vs 56%, 97/100 same answers, needle
-12/12) and makes 8-request decode steps **20% faster** (ITL 76.7 -> 61.3 ms,
-TPOT 51.0 -> 44.7 ms, +15% output throughput), 4-request steps 3% faster;
-1 request is 7% slower (it stays dense but keeps the summaries up to date).
+with FP8 KV + MTP (LongBench v2 54% vs 56%, 98/100 same answers, needle
+12/12) and makes 8-request decode steps **25% faster** (ITL 76.7 -> 57.2 ms,
+TPOT 51.0 -> 42.9 ms, +20% output throughput), 4-request steps 9% faster;
+1 request is 6% slower (it stays dense but keeps the summaries up to date).
 Off by default.
 
 ## Accuracy study
@@ -87,7 +87,9 @@ summaries from the unpacked values).
 | kept | a fraction of each request's blocks | `sparse_budget_blocks`: the fraction of the decode context bucket, rounded up to a multiple of 256 blocks (0.125 of 2688 -> 512 blocks = 128 groups, 16k tokens): the first group and the last 2 (`HY3_SPARSE_SINK_GROUPS`, `HY3_SPARSE_RECENT_GROUPS`) and the rest by bound (top-k) |
 | decode attention | full-width table, masked | the kept groups' blocks as a [B, 512] block table and `s_prior` 16384: the kernel reads only them. The kept groups are in any order (attention does not depend on it), then the history's last group, then the one after it; a history that fits gets the head of its table |
 
-With MTP the bound is the max over the 4 verify tokens, and the draft layer
+Every `HY3_SPARSE_SELECT_EVERY` (4) layers select; the 3 after each reuse
+its table and mask (all layers share the block table) and only fold their K
+into their summaries. With MTP the bound is the max over the 4 verify tokens, and the draft layer
 selects for its own cache too (`HY3_SPARSE_DRAFT=0` turns that off). Steps
 of fewer than `HY3_SPARSE_MIN_BATCH` (4) requests attend densely (the decode
 NEFFs are per batch bucket): the selection costs about the same at any batch
@@ -165,28 +167,33 @@ Accuracy (`results/sparse_decode/lb_full_fp8mtp_*.json`, needle logs):
 | dense | 56% | | |
 | per block, prefill summaries (c5ab0c9) | 55% | 95/100 | 12/12 (before the verify-token fix) |
 | groups + decode summaries (255fbaf) | 55% | 97/100 | 12/12 |
-| **+ no sort / per-group gather (current)** | **55%** | **97/100** | **12/12** |
+| + no sort / per-group gather (2395994) | 55% | 97/100 | 12/12 |
+| **+ selection every 4 layers (current)** | **54%** | **98/100** | **12/12** |
 
-The differing items are coherent near-ties ("The correct answer is (B)");
-8 unparsable answers in every run.
+The differing items are coherent near-ties ("The correct answer is (B)"; the
+2 of the current version also differ in the per-layer versions); 8
+unparsable answers in every run.
 
 Speed: P/D split, `bench_pd_split.sh "1 4 8"` (85k prompts with a 78k shared
 prefix, 256 output tokens, pass 2; `results/bench/pd_split_85k_nodcp_fp8kv_mtp3`
 and `..._sparse` (c5ab0c9), `..._sparse_g4` (255fbaf), `..._sparse_g4b`
-(current)):
+(2395994), `..._sparse_g4r4` (current)):
 
-| concurrency | ITL dense | c5ab0c9 | 255fbaf | **current** | TPOT dense | 255fbaf | **current** | output tok/s dense / current |
-|---|---|---|---|---|---|---|---|---|
-| 1 | 47.4 ms | 100.5 ms | 50.8 ms | 50.7 ms | 23.4 ms | 24.9 ms | 25.6 ms | 37.9 / 35.2 |
-| 4 | 66.6 ms | 128.1 ms | 66.9 ms | **64.3 ms** | 39.2 ms | 39.3 ms | **37.3 ms** | 92.0 / 93.9 |
-| 8 | 76.7 ms | 137.1 ms | 66.2 ms | **61.3 ms** | 51.0 ms | 47.4 ms | **44.7 ms** | 138.3 / **159.6** |
+| concurrency | ITL dense | c5ab0c9 | 255fbaf | 2395994 | **current** | TPOT dense | 2395994 | **current** | output tok/s dense / current |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 47.4 ms | 100.5 ms | 50.8 ms | 50.7 ms | 50.1 ms | 23.4 ms | 25.6 ms | 24.6 ms | 37.9 / 36.2 |
+| 4 | 66.6 ms | 128.1 ms | 66.9 ms | 64.3 ms | **60.6 ms** | 39.2 ms | 37.3 ms | **36.3 ms** | 92.0 / 97.5 |
+| 8 | 76.7 ms | 137.1 ms | 66.2 ms | 61.3 ms | **57.2 ms** | 51.0 ms | 44.7 ms | **42.9 ms** | 138.3 / **166.2** |
 
 MTP accepts 2.0 tokens per step in every run. TPOT gains less than ITL at 4
 and 8 requests because it also carries the (dense) prefill steps of arriving
 requests that interrupt decode (p99 ITL ~600 ms in all runs). At 1 request
 the step stays dense; the ~3 ms are the Q / K projection and the summary
-update in 80 + 3 layer calls. What is left at 8 requests: the summary gather
-(~4 ms per step) and top-k (~3.6 ms), the Q / K projection (2.4 ms) and the
-update (1.4 ms); the next step is an NKI kernel for the bound and top-k over
-the gathered summaries, and taking K from the decode kernel instead of
-recomputing it (which would also remove the 1-request cost).
+update in 80 + 3 layer calls. An NKI kernel for the selection itself does
+not pay off much: on one core the NKI top-k kernels
+(`vllm_neuron.functional.topk`) are no faster than `torch.topk` at [8, 672],
+and the summary gather is a DMA already (descriptor-bound: 5376 rows of 512
+bytes per layer). What is left: the K projection and summary update in every
+layer (~4 ms per step), which taking K from the decode kernel would remove
+(also the 1-request cost; a framework change), and the selection in every
+4th layer.

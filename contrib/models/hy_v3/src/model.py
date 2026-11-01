@@ -159,6 +159,11 @@ _SPARSE_GROUP = int(os.environ.get("HY3_SPARSE_GROUP", "4"))
 _SPARSE_SINK = int(os.environ.get("HY3_SPARSE_SINK_GROUPS", "1"))
 _SPARSE_RECENT = int(os.environ.get("HY3_SPARSE_RECENT_GROUPS", "2"))
 _SPARSE_MIN_BATCH = int(os.environ.get("HY3_SPARSE_MIN_BATCH", "4"))
+# HY3_SPARSE_SELECT_EVERY=R: layers 0, R, 2R, ... select; the R - 1 layers
+# after each reuse its selection (all layers share the block table). They
+# still fold their K into their own summaries.
+_SPARSE_SELECT_EVERY = int(os.environ.get("HY3_SPARSE_SELECT_EVERY", "4"))
+_SPARSE_SEL_CACHE_KEY = "_hy_v3_sparse_selection"
 
 
 def _is_fp8_kv(cache: torch.Tensor | None) -> bool:
@@ -875,14 +880,17 @@ class HYV3Attention(nn.Module):
         nh, kvh, D = self.num_attention_heads_per_rank, self.num_key_value_heads_per_rank, self.head_dim
         # Q and K as the decode kernel computes them (RMSNorm, QKV projection,
         # QK-norm, RoPE), with BF16 activations and the weight copies of
-        # prepare_sparse_decode (not the kernel's own parameters).
+        # prepare_sparse_decode (not the kernel's own parameters). Without a
+        # selection only K.
         x = X.to(torch.float32).view(B * S, H)
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.rms_norm_eps)
         xn = (x * self.sparse_ln_w.view(1, -1)).to(self.dtype)
-        qk = (xn @ self.sparse_wqk).view(B * S, nh + kvh, D).transpose(0, 1).to(torch.float32)
+        nq = nh if n_sel else 0
+        w = self.sparse_wqk if n_sel else self.sparse_wqk[:, nh * D :]
+        qk = (xn @ w).view(B * S, nq + kvh, D).transpose(0, 1).to(torch.float32)
         qk = qk * torch.rsqrt(qk.pow(2).mean(-1, keepdim=True) + self.q_norm.variance_epsilon)
-        q = qk[:nh] * self.sparse_qnorm_w
-        k = qk[nh:] * self.sparse_knorm_w
+        q = qk[:nq] * self.sparse_qnorm_w
+        k = qk[nq:] * self.sparse_knorm_w
         # RoPE from the positions, not from position_embeddings: reading the
         # cos / sin that also feed the decode kernel (cos_kernel / sin_kernel)
         # in these torch ops gave wrong attention results.
@@ -974,23 +982,31 @@ class HYV3Attention(nn.Module):
             if n_sel >= nb or B < _SPARSE_MIN_BATCH or nb % _SPARSE_GROUP:
                 n_sel = 0
             # >>> EXPERIMENTAL sparse decode: the kernel reads n_sel blocks.
+            reuse = None
+            if n_sel and self.layer_idx % _SPARSE_SELECT_EVERY:
+                reuse = attn_metadata.get(_SPARSE_SEL_CACHE_KEY)
             selected = self._sparse_decode_blocks(
-                X, positions, slot_mapping, block_table, block_size, n_sel
+                X, positions, slot_mapping, block_table, block_size, 0 if reuse is not None else n_sel
             )
         if n_sel:
-            block_table, prior = selected
             S_ctx = n_sel * block_size
-            # History tokens: the kept blocks' (repeated per verify token).
-            prior_pos = prior.view(B, 1) + torch.arange(S_decode, device=X.device).view(1, -1)
-            attention_mask = NF.gen_attention_decode_mask(
-                pos_ids=prior_pos.view(1, B * S_decode).to(torch.float32),
-                bs=B,
-                q_head=self.num_attention_heads_per_rank,
-                s_active=S_decode,
-                s_prior=S_ctx,
-                start_pos=None,
-                block_len=block_size,
-            )
+            if reuse is not None:
+                block_table, attention_mask = reuse
+            else:
+                block_table, prior = selected
+                # History tokens: the kept blocks' (repeated per verify token).
+                prior_pos = prior.view(B, 1) + torch.arange(S_decode, device=X.device).view(1, -1)
+                attention_mask = NF.gen_attention_decode_mask(
+                    pos_ids=prior_pos.view(1, B * S_decode).to(torch.float32),
+                    bs=B,
+                    q_head=self.num_attention_heads_per_rank,
+                    s_active=S_decode,
+                    s_prior=S_ctx,
+                    start_pos=None,
+                    block_len=block_size,
+                )
+                if _SPARSE_SELECT_EVERY > 1:
+                    attn_metadata[_SPARSE_SEL_CACHE_KEY] = (block_table, attention_mask)
 
         # The decode mask is identical for every layer: build it once per step.
         if attention_mask is None:
