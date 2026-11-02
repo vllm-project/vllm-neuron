@@ -1373,9 +1373,10 @@ _FUSE_DECODE = int(os.environ.get("DEEPSEEK_V41_FUSE_DECODE", "8"))
 #: submission delays the device (the later ones are submitted while it runs), so a smaller
 #: first launch starts the device sooner, as long as the second is submitted before the
 #: first finishes. Each grouping is its own set of fused NEFFs.
-#: (round 5 default 8,8,8,16: the last launch is the merged optimized `layers_decode_L24_L39_head_tp64` --
-#: L24-L31 and L32-L39 + head in one kernel, one launch entry / preamble / turnaround fewer a step)
-_FUSE_GROUPS = tuple(int(v) for v in os.environ.get("DEEPSEEK_V41_FUSE_GROUPS", "8,8,8,16").split(",") if v.strip())
+#: (round 5 default 8,16,16: the merged optimized launches `layers_decode_L08_L23_tp64` and
+#: `layers_decode_L24_L39_head_tp64` (`kernels/tp64/fused/merge_launch.py`) -- two launch entries / preambles /
+#: turnarounds fewer a step; 8,32 (one 32-block launch) measured no faster)
+_FUSE_GROUPS = tuple(int(v) for v in os.environ.get("DEEPSEEK_V41_FUSE_GROUPS", "8,16,16").split(",") if v.strip())
 
 
 def _fuse_groups(n: int) -> list:
