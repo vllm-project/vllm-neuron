@@ -32,6 +32,13 @@ from .r2_decode import r2_decode
 from .r2_src_idx_e_decode import r2_src_idx_e_decode
 
 
+#: merged launches (merge_launch.py): the previous part's b1 dict to adopt, the next part's first layer to hand
+#: off to (last layer, its attention tensors, its pre-mix constants), this part's b1 dict
+ADOPT = [None]
+EXTRA_NEXT = [None]
+B1_DICT = [None]
+
+
 @nki.jit
 def layers_decode_L08_L15_tp64(
     L08_stream, L08_pre_mix, L08_hca_fn_t, L08_hca_base, L08_hca_scale, L08_attn_norm_w,
@@ -140,6 +147,21 @@ def layers_decode_L08_L15_tp64(
 
     # L08 (r2_src_idx)
     r2_src_idx_decode.AFTER_WORLD_AR = None if _b1_t(L09_hca_fn_t) else prefetch(L09_wq_a, L09_wq_a_s, L09_wkv, L09_wkv_s, L09_wq_b, L09_wq_b_s)
+    # (merged launch, merge_launch.py: the b1 hand-off across this part's boundaries)
+    _d_own = r2_decode.B1_SHARE["b1"]
+    if ADOPT[0] is not None:
+        _d = ADOPT[0]
+        _d["attn_next"].update(_d_own["attn_next"])
+        _d["next_b1"] |= _d_own["next_b1"]
+        _d["pre_next"].update(_d_own["pre_next"])
+        r2_decode.B1_SHARE["b1"] = _d
+    if EXTRA_NEXT[0] is not None:
+        _last, _aw_n, _pre_n = EXTRA_NEXT[0]
+        _key = id(_loc[f"L{_last:02d}_wq_a_s"]) if f"L{_last:02d}_wq_a_s" in _loc else id(_loc[f"L{_last}_wq_a_s"])
+        r2_decode.B1_SHARE["b1"]["attn_next"][_key] = _aw_n
+        r2_decode.B1_SHARE["b1"]["next_b1"].add(_key)
+        r2_decode.B1_SHARE["b1"]["pre_next"][_key] = _pre_n
+    B1_DICT[0] = r2_decode.B1_SHARE["b1"]
     with member(0, r2_src_idx_decode):
         o0 = r2_src_idx_decode.layer_decode_r2_src_idx_tp64.func(
             L08_stream, L08_pre_mix, L08_hca_fn_t, L08_hca_base, L08_hca_scale, L08_attn_norm_w,

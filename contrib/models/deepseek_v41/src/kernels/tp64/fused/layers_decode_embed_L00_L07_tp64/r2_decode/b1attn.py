@@ -203,18 +203,12 @@ def norm_stage(rows16, nr, n, kp, w_hbm, wT=None):
     nisa.memset(ones, 1.0)
     ps = nl.ndarray((PT, nr), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=ps, stationary=ones, moving=ssp)
-    # rstd = 1 / sqrt(ss / n + eps), one Newton step (`rstd_of` per (partition, row))
+    # rstd = 1 / sqrt(ss / n + eps) (`rstd_of` per (partition, row); no Newton step: the rsqrt is within
+    # 1 fp32 ulp)
     m = nl.ndarray((PT, nr), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=m, data=ps, op0=nl.multiply, operand0=1.0 / n, op1=nl.add, operand1=NORM_EPS)
-    y = nl.ndarray((PT, nr), dtype=nl.float32, buffer=nl.sbuf)
-    y[...] = nl.rsqrt(m)
-    yy = nl.ndarray((PT, nr), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=yy, data1=y, data2=y, op=nl.multiply)
-    c = nl.ndarray((PT, nr), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=c, data1=yy, data2=m, op=nl.multiply)
-    nisa.tensor_scalar(dst=c, data=c, op0=nl.multiply, operand0=-0.5, op1=nl.add, operand1=1.5)
     rs = nl.ndarray((PT, nr), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=rs, data1=y, data2=c, op=nl.multiply)
+    rs[...] = nl.rsqrt(m)
     # the weight transposed: wT[p, kc, j] = w[512 kc + 4 p + j] (zero past n)
     if wT is None:
         wT = norm_w_t(w_hbm, n, kp, nisa.engine.scalar)
@@ -335,8 +329,26 @@ def bcast_rows(row_hbm, n, nr, dtype, eng=None):
     return t
 
 
+#: the rstd as one GpSimd activation `rsqrt(ss / n + eps)` (<= 1 fp32 ulp, measured: the GpSimd rsqrt needs no
+#: Newton step) instead of tensor_scalar -> rsqrt -> the 4-op Newton step on the vector engine
+RSTD_FAST = True
+
+
 def rstd_of(ss, nr, n):
-    """`1 / sqrt(ss / n + eps)` with one Newton step (`mk_common.rsqrt_newton`), `(nr, 1)` fp32."""
+    """`1 / sqrt(ss / n + eps)`, `(nr, 1)` fp32 (`RSTD_FAST`: one GpSimd activation; else with one Newton step,
+    `mk_common.rsqrt_newton`'s arithmetic)."""
+    if RSTD_FAST:
+        r = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
+        if getattr(ss, "buffer", None) is nl.psum:
+            # (GpSimd reads SBUF only: the scaled sum into SBUF on the vector engine first)
+            m = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=m[0:nr, :], data=ss[0:nr, :], op0=nl.multiply, operand0=1.0 / n, op1=nl.add,
+                               operand1=NORM_EPS)
+            nisa.activation(dst=r[0:nr, :], op=nl.rsqrt, data=m[0:nr, :], engine=nisa.engine.gpsimd)
+        else:
+            nisa.activation(dst=r[0:nr, :], op=nl.rsqrt, data=ss[0:nr, :], scale=1.0 / n, bias=NORM_EPS,
+                            engine=nisa.engine.gpsimd)
+        return r
     m = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=m[0:nr, :], data=ss[0:nr, :], op0=nl.multiply, operand0=1.0 / n, op1=nl.add,
                        operand1=NORM_EPS)

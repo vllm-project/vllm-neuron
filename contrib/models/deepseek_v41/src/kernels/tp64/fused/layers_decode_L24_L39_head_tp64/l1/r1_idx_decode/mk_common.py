@@ -64,10 +64,9 @@ def tiles_of(rows, pid, cores=2):
 
 
 def rsqrt_newton(m):
-    """`1 / sqrt(m)` with one Newton step, as `kernels.rmsnorm` does it."""
-    y = nl.rsqrt(m)
-    corr = nl.add(nl.multiply(nl.multiply(m, nl.multiply(y, y)), -0.5), 1.5)
-    return nl.multiply(y, corr)
+    """`1 / sqrt(m)` (round 5: the hardware rsqrt is within 1 fp32 ulp -- no Newton step, which
+    `kernels.rmsnorm` did)."""
+    return nl.rsqrt(m)
 
 
 def sum_squares(dst, src, nr, width, chunk):

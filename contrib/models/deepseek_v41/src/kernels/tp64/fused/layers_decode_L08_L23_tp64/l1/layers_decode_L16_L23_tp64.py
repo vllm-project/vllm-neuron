@@ -40,6 +40,13 @@ INHERIT = [None]
 _HANDOFF = ("attn_next", "next_b1", "pre_next", "S", "xin", "S_src", "gate", "pre", "pref")
 
 
+#: merged launches (merge_launch.py): the previous part's b1 dict to adopt, the next part's first layer to hand
+#: off to (last layer, its attention tensors, its pre-mix constants), this part's b1 dict
+ADOPT = [None]
+EXTRA_NEXT = [None]
+B1_DICT = [None]
+
+
 @nki.jit
 def layers_decode_L16_L23_tp64(
     L16_stream, L16_pre_mix, L16_hca_fn_t, L16_hca_base, L16_hca_scale, L16_attn_norm_w,
@@ -155,6 +162,21 @@ def layers_decode_L16_L23_tp64(
 
     r2_decode.AFTER_WORLD_AR = None if _b1_t(L17_hca_fn_t) else prefetch(L17_wq_a, L17_wq_a_s, L17_wkv, L17_wkv_s, L17_wq_b, L17_wq_b_s)
     # L16 (r2)
+    # (merged launch, merge_launch.py: the b1 hand-off across this part's boundaries)
+    _d_own = share["b1"]
+    if ADOPT[0] is not None:
+        _d = ADOPT[0]
+        _d["attn_next"].update(_d_own["attn_next"])
+        _d["next_b1"] |= _d_own["next_b1"]
+        _d["pre_next"].update(_d_own["pre_next"])
+        share["b1"] = _d
+    if EXTRA_NEXT[0] is not None:
+        _last, _aw_n, _pre_n = EXTRA_NEXT[0]
+        _key = id(_loc[f"L{_last:02d}_wq_a_s"]) if f"L{_last:02d}_wq_a_s" in _loc else id(_loc[f"L{_last}_wq_a_s"])
+        share["b1"]["attn_next"][_key] = _aw_n
+        share["b1"]["next_b1"].add(_key)
+        share["b1"]["pre_next"][_key] = _pre_n
+    B1_DICT[0] = share["b1"]
     with member(0, r2_decode):
         o0 = r2_decode.layer_decode_r2_tp64.func(
             L16_stream, L16_pre_mix, L16_hca_fn_t, L16_hca_base, L16_hca_scale, L16_attn_norm_w,
