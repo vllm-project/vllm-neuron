@@ -1,0 +1,717 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hy3-FP8 on AWS Trainium2：模型、部署与优化历程</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface-1: #fcfcfb;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.10);
+  --good: #006300;
+  --bad: #d03b3b;
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --accent-wash: rgba(42, 120, 214, 0.08);
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface-1: #1a1a19;
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+    --good: #0ca30c;
+    --bad: #e66767;
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+    --accent-wash: rgba(57, 135, 229, 0.12);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface-1: #1a1a19;
+  --text-primary: #f0efec;
+  --text-secondary: #c3c2b7;
+  --text-muted: #898781;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --border: rgba(255, 255, 255, 0.10);
+  --good: #0ca30c;
+  --bad: #e66767;
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+  --accent-wash: rgba(57, 135, 229, 0.12);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--page); color: var(--text-primary);
+  font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Noto Sans CJK SC", sans-serif; }
+body { line-height: 1.55; }
+.slide { min-height: 100vh; padding: 48px 7vw 40px; display: flex; flex-direction: column;
+  justify-content: flex-start; border-bottom: 1px solid var(--border); scroll-snap-align: start; }
+html { scroll-snap-type: y proximity; }
+.slide > .inner { max-width: 1180px; width: 100%; margin: 0 auto; }
+.kicker { font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: var(--text-muted); margin: 0 0 6px; }
+h1 { font-size: 40px; line-height: 1.2; margin: 0 0 12px; font-weight: 650; }
+h2 { font-size: 30px; line-height: 1.25; margin: 0 0 18px; font-weight: 650; }
+h3 { font-size: 18px; margin: 18px 0 8px; font-weight: 600; }
+p, li { font-size: 16px; color: var(--text-secondary); }
+p.lead { font-size: 19px; color: var(--text-secondary); max-width: 900px; }
+strong { color: var(--text-primary); }
+ul { padding-left: 1.2em; margin: 6px 0; }
+li { margin: 3px 0; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em;
+  background: var(--accent-wash); padding: 1px 5px; border-radius: 4px; color: var(--text-primary); }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
+.grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+@media (max-width: 900px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
+.card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; }
+.card h3 { margin-top: 0; }
+table { border-collapse: collapse; width: 100%; font-size: 14.5px; background: var(--surface-1);
+  border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+th { color: var(--text-secondary); font-weight: 600; background: var(--accent-wash); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+tr:last-child td { border-bottom: none; }
+.tag { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border);
+  color: var(--text-secondary); margin-right: 4px; }
+.tag.good::before { content: "✓ "; color: var(--good); font-weight: 700; }
+.tag.bad::before { content: "✕ "; color: var(--bad); font-weight: 700; }
+.tag.neutral::before { content: "• "; color: var(--text-muted); }
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin: 18px 0; }
+@media (max-width: 900px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+.stat { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+.stat .v { font-size: 30px; font-weight: 650; color: var(--text-primary); }
+.stat .l { font-size: 13.5px; color: var(--text-secondary); }
+.stat .d { font-size: 13px; color: var(--good); font-weight: 600; }
+.chart { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 14px 14px 6px; position: relative; }
+.chart .title { font-size: 15px; font-weight: 600; color: var(--text-primary); margin: 0 4px 2px; }
+.chart .sub { font-size: 13px; color: var(--text-muted); margin: 0 4px 8px; }
+.legend { display: flex; gap: 16px; flex-wrap: wrap; margin: 4px 4px 6px; font-size: 13px; color: var(--text-secondary); }
+.legend .key { display: inline-flex; align-items: center; gap: 6px; }
+.legend .sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+.legend .ln { width: 16px; height: 2px; border-radius: 2px; display: inline-block; }
+svg text { fill: var(--text-muted); font-size: 12px; font-family: inherit; }
+svg .lbl { fill: var(--text-secondary); font-size: 12px; }
+svg .lbl-strong { fill: var(--text-primary); font-size: 12.5px; font-weight: 600; }
+.tip { position: absolute; pointer-events: none; background: var(--surface-1); color: var(--text-primary);
+  border: 1px solid var(--border); box-shadow: 0 4px 16px rgba(0,0,0,.12); border-radius: 8px; padding: 8px 10px;
+  font-size: 13px; line-height: 1.45; opacity: 0; transition: opacity .08s; z-index: 5; min-width: 150px; }
+.tip .t { font-weight: 600; margin-bottom: 3px; }
+.tip .row { display: flex; justify-content: space-between; gap: 14px; color: var(--text-secondary); }
+.tip .row b { color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.tip .k { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; }
+details { margin-top: 8px; }
+details summary { cursor: pointer; font-size: 13px; color: var(--text-secondary); margin: 4px; }
+.note { font-size: 13.5px; color: var(--text-muted); }
+.flow { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin: 14px 0; }
+@media (max-width: 900px) { .flow { grid-template-columns: 1fr; } }
+.flow .step { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 14px; color: var(--text-secondary); }
+.flow .step b { display: block; color: var(--text-primary); margin-bottom: 4px; }
+.nav { position: fixed; right: 16px; bottom: 16px; display: flex; gap: 8px; z-index: 10; }
+.nav button { background: var(--surface-1); color: var(--text-primary); border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px 10px; font-size: 13px; cursor: pointer; }
+.pageno { position: fixed; left: 16px; bottom: 16px; font-size: 12px; color: var(--text-muted); }
+.arch { width: 100%; }
+.arch rect.box { fill: var(--surface-1); stroke: var(--axis); stroke-width: 1; }
+.arch rect.hl { fill: var(--accent-wash); stroke: var(--series-1); stroke-width: 1.5; }
+.arch text { fill: var(--text-secondary); font-size: 13px; }
+.arch text.b { fill: var(--text-primary); font-weight: 600; }
+.arch line, .arch path { stroke: var(--axis); stroke-width: 1.5; fill: none; }
+@media print { .nav, .pageno { display: none; } .slide { min-height: auto; page-break-after: always; } }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <button id="prev" aria-label="上一页">↑</button>
+  <button id="next" aria-label="下一页">↓</button>
+  <button id="theme" aria-label="切换深浅色">深 / 浅</button>
+</div>
+<div class="pageno" id="pageno"></div>
+
+<!-- 1. Title -->
+<section class="slide"><div class="inner" style="margin-top:12vh">
+  <p class="kicker">vllm-neuron 0.29 · trn2.48xlarge · contrib/models/hy_v3</p>
+  <h1>Hy3-FP8（295B MoE）在 AWS Trainium2 上的部署与优化</h1>
+  <p class="lead">从上游 <code>hy3-fp8-contrib</code> 分支的基础移植与加速，到 <code>hy3-fp8-opt</code> 分支的 MTP、FP8 KV、sparse decode 与 kernel 优化：模型结构、怎么切分、时间花在哪里、每一步改了什么、效果如何。</p>
+  <div class="stats">
+    <div class="stat"><div class="v">167.5 tok/s</div><div class="l">85k 上下文、8 并发的输出吞吐</div><div class="d">较最初 DCP=8 方案 +44%</div></div>
+    <div class="stat"><div class="v">41.4 ms</div><div class="l">85k、8 并发的 TPOT</div><div class="d">较 DCP=8 方案 −31%</div></div>
+    <div class="stat"><div class="v">13.8 ms</div><div class="l">短上下文、单请求的 TPOT（MTP k=3，MATH-500）</div><div class="d">较 plain decode 26.3 ms −48%</div></div>
+    <div class="stat"><div class="v">97.0%</div><div class="l">MATH-500（no_think，完整模型）</div><div class="d">各项优化后 LongBench v2 与 dense 98/100 一致</div></div>
+  </div>
+  <p class="note">所有数据都来自同一台 trn2.48xlarge（16 颗 Trainium2，64 个逻辑 NeuronCore），对应 commit 与原始 JSON 均在仓库的 <code>results/</code> 下。</p>
+</div></section>
+
+<!-- 2. Model -->
+<section class="slide"><div class="inner">
+  <p class="kicker">1 · 模型结构</p>
+  <h2>tencent/Hy3-FP8：80 层 MoE decoder + 1 层 MTP</h2>
+  <div class="grid2">
+    <div>
+      <table>
+        <tr><th>项</th><th>值</th></tr>
+        <tr><td>总参数</td><td>~295B（MoE），静态 per-tensor FP8 checkpoint</td></tr>
+        <tr><td>层数 / hidden</td><td>80 层，hidden 4096，vocab 120,832</td></tr>
+        <tr><td>Attention</td><td>GQA 64 Q 头 / 8 KV 头，head_dim 128，<strong>QK-norm（RoPE 之前）</strong>，RoPE θ = 11,158,840，最大位置 262,144</td></tr>
+        <tr><td>FFN</td><td>layer 0 为 dense MLP（intermediate 13,312）；layers 1–79 为 MoE</td></tr>
+        <tr><td>MoE</td><td><strong>192 个 routed experts，top-8</strong>（sigmoid 打分 + 仅用于选择的 expert bias），intermediate 1,536，每个专家 FP8 约 18.9 MB；另有 <strong>1 个 shared expert</strong></td></tr>
+        <tr><td>MTP</td><td>1 层 next-n 预测层（<code>model.layers.80</code>）：enorm / hnorm + eh_proj（8192→4096）+ 一个 MoE decoder 层，用作投机解码的 draft</td></tr>
+        <tr><td>量化</td><td>所有线性层：FP8 E4M3 权重 + 标量 weight_scale + 静态 input_scale；embedding、lm_head 为 BF16</td></tr>
+      </table>
+    </div>
+    <div>
+      <svg class="arch" viewBox="0 0 520 430" role="img" aria-label="Hy3 decoder 层结构示意">
+        <rect class="box" x="150" y="10" width="220" height="34" rx="8"/><text x="260" y="32" text-anchor="middle" class="b">Embedding（BF16）</text>
+        <line x1="260" y1="44" x2="260" y2="64"/>
+        <rect class="hl" x="40" y="64" width="440" height="270" rx="12"/>
+        <text x="58" y="86" class="b">× 80 decoder 层</text>
+        <rect class="box" x="70" y="98" width="380" height="28" rx="6"/><text x="260" y="117" text-anchor="middle">RMSNorm</text>
+        <rect class="box" x="70" y="132" width="380" height="52" rx="6"/>
+        <text x="260" y="152" text-anchor="middle" class="b">Attention：QKV（FP8 W8A8）→ QK-norm → RoPE</text>
+        <text x="260" y="172" text-anchor="middle">GQA 64Q / 8KV → O 投影（FP8 W8A8）</text>
+        <rect class="box" x="70" y="190" width="380" height="28" rx="6"/><text x="260" y="209" text-anchor="middle">RMSNorm</text>
+        <rect class="box" x="70" y="224" width="182" height="98" rx="6"/>
+        <text x="161" y="246" text-anchor="middle" class="b">Router（FP32）</text>
+        <text x="161" y="266" text-anchor="middle">sigmoid + bias</text>
+        <text x="161" y="286" text-anchor="middle">top-8 / 192 专家</text>
+        <text x="161" y="306" text-anchor="middle">（layer 0：dense MLP）</text>
+        <rect class="box" x="268" y="224" width="182" height="46" rx="6"/>
+        <text x="359" y="244" text-anchor="middle" class="b">8 个 routed experts</text>
+        <text x="359" y="262" text-anchor="middle">FP8，I=1536</text>
+        <rect class="box" x="268" y="276" width="182" height="46" rx="6"/>
+        <text x="359" y="296" text-anchor="middle" class="b">1 个 shared expert</text>
+        <text x="359" y="314" text-anchor="middle">FP8 W8A8</text>
+        <line x1="260" y1="334" x2="260" y2="354"/>
+        <rect class="box" x="120" y="354" width="280" height="30" rx="8"/><text x="260" y="374" text-anchor="middle" class="b">Final norm → lm_head（BF16）</text>
+        <rect class="box" x="120" y="392" width="280" height="30" rx="8"/><text x="260" y="412" text-anchor="middle">MTP 层（layer 80）→ draft token</text>
+      </svg>
+    </div>
+  </div>
+</div></section>
+
+<!-- 3. Deployment -->
+<section class="slide"><div class="inner">
+  <p class="kicker">2 · 部署</p>
+  <h2>一台 trn2.48xlarge：TP=64 + 完整 EP=64，SPMD</h2>
+  <p>16 颗 Trainium2，64 个逻辑 NeuronCore（LNC=2），每个 24 GiB HBM，NeuronLink 互联（这台实例无 EFA）。一个 vLLM server，每个 NeuronCore 既是一个 TP rank，也是一个 EP rank，所有 rank 跑同一组 NEFF。</p>
+  <table>
+    <tr><th>部分</th><th>切分方式（64 个 rank）</th><th>每个 rank 上</th></tr>
+    <tr><td>Embedding / lm_head（BF16）</td><td>按 vocab 切分；采样在各分片上完成</td><td>1,888 行 / 列</td></tr>
+    <tr><td>Attention（80 层）</td><td>每个 rank 1 个 Q 头；每个 KV 头放在 8 个相邻 rank 上（KV 复制 8 份）</td><td>QKV 4096×384，O 128×4096</td></tr>
+    <tr><td>Dense MLP（layer 0）</td><td>intermediate 按 rank 切分</td><td>208，补齐到 256</td></tr>
+    <tr><td>Router</td><td>复制</td><td>完整 4096×192</td></tr>
+    <tr><td>Routed experts（layers 1–79）</td><td>EP：整个专家为单位，rank r 持有专家 3r、3r+1、3r+2</td><td>3 个专家，每层 56.6 MB</td></tr>
+    <tr><td>Shared expert</td><td>prefill：每个 rank 一份完整副本；decode：另一份按 8 个 rank 一组切 8 份</td><td>完整 + 1/8</td></tr>
+    <tr><td>MTP 层</td><td>和 decoder 层相同；与主模型共享 embedding、lm_head、final norm</td><td></td></tr>
+  </table>
+  <div class="grid2" style="margin-top:16px">
+    <div class="card">
+      <h3>每层的数据流</h3>
+      <ul>
+        <li><strong>Prefill（序列并行）：</strong>层间每个 rank 持有 1/64 的 token；attention 前 all-gather，O 投影后 reduce-scatter；MoE 再 all-gather token 和路由权重，各 rank 只算自己 3 个专家，最后 reduce-scatter 合并。每个 4096-token chunk 有 161 次 reduce-scatter（每次 128 MB）。</li>
+        <li><strong>Decode：</strong>每个 rank 持有全部 token；attention 算自己那个头，all-reduce；router 复制；只算被路由到本 rank 的专家；routed 和 shared 的部分结果合并成一次 all-reduce。每步 161 次 all-reduce。</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>HBM 预算（每个 rank，85k、8 并发配置）</h3>
+      <ul>
+        <li>权重 6.29 GiB（复制的 KV 头、router、shared expert 让它大于 checkpoint 的 1/64）</li>
+        <li>KV cache 13.47 GiB：FP8，每个 rank 存 1 个 KV 头 × 81 层，每 token 20.7 KB → 697k token = 8 个 86k 请求</li>
+        <li>NEFF 代码 2.21 GiB（随 bucket 数和 MTP 图增长）+ scratch 0.25 GiB</li>
+        <li>合计约 22.4 / 24 GiB；KV_CAP 再高就放不下 decode NEFF</li>
+      </ul>
+    </div>
+  </div>
+</div></section>
+
+<!-- 4. Numerics -->
+<section class="slide"><div class="inner">
+  <p class="kicker">3 · 数值精度</p>
+  <h2>哪些是 FP8 运算，哪些是 BF16 / FP32</h2>
+  <div class="grid2">
+    <table>
+      <tr><th>部分</th><th>权重</th><th>激活</th><th>实际计算</th></tr>
+      <tr><td>QKV / O 投影</td><td>FP8</td><td>FP8（静态 scale）</td><td><strong>FP8 × FP8</strong>（W8A8）</td></tr>
+      <tr><td>Dense MLP、shared expert</td><td>FP8</td><td>FP8（静态 scale）</td><td><strong>FP8 × FP8</strong>（W8A8）</td></tr>
+      <tr><td>Routed experts（decode，moe_tkg）</td><td>FP8</td><td>BF16</td><td>BF16 × FP8（TRN2 上 kernel 不使用 input_scale）</td></tr>
+      <tr><td>Routed experts（prefill，moe_cte）</td><td>FP8</td><td>BF16</td><td>BF16 × FP8（本次优化前会先把权重 CAST 成 BF16）</td></tr>
+      <tr><td>Router、norm、softmax</td><td>BF16/FP32</td><td>FP32</td><td>FP32</td></tr>
+      <tr><td>Embedding、lm_head、MTP eh_proj</td><td>BF16</td><td>BF16</td><td>BF16</td></tr>
+      <tr><td>KV cache</td><td colspan="3">FP8 E4M3，每层一个静态 K / V scale（自行在 Neuron 上标定）；decode kernel 直接读 FP8；prefill 先复制成 BF16 再算</td></tr>
+    </table>
+    <div class="card">
+      <h3>两处需要特别处理的地方</h3>
+      <ul>
+        <li><strong>FP8 范围：</strong>checkpoint 是 OCP e4m3（最大 448），TRN2 kernel 的 e4m3 上限是 240。加载时所有 FP8 权重 ×0.5，scale ×2 补偿，对正常值是精确的。</li>
+        <li><strong>KV scale：</strong>checkpoint 不带 KV scale。用服务化的 W8A8 模型在 BF16 KV 下跑校准集，读取 cache 里写入的 absmax 得到每层 scale（约 16 秒），并做成可分发的 profile；MTP 层也有自己的 scale。</li>
+      </ul>
+      <h3>和 GPU 常见做法的差别</h3>
+      <p>GPU（Hopper/Blackwell）的 FP8 tensor core 要求两个输入都是 FP8，所以 MoE 一般做 W8A8。TRN2 的 TensorE 可以直接做 BF16 × FP8，所以 MoE 不量化激活也能省掉权重转换。实测 W8A8 版本反而更慢、误差更大（见后文）。</p>
+    </div>
+  </div>
+</div></section>
+
+<!-- 5. Contrib phase -->
+<section class="slide"><div class="inner">
+  <p class="kicker">4 · 上游 hy3-fp8-contrib 分支</p>
+  <h2>基础移植与第一批加速</h2>
+  <div class="grid3">
+    <div class="card"><h3>移植</h3><ul>
+      <li>自写的 static-FP8 模型（<code>HYV3ForCausalLM</code>），通过 vLLM plugin 注册，不改动 contrib 之外的文件</li>
+      <li>SP prefill、TP attention、EP MoE、DCP；在 0.29 上验证：4 层真实权重模型对 HF FP32 logits cosine ≥ 0.9993</li>
+      <li>MATH-500 no_think：<strong>97.0%</strong></li>
+    </ul></div>
+    <div class="card"><h3>从 0.24 升级到 0.29</h3><ul>
+      <li>neuronx-cc 2.28 修复了"分段 attention + 带寄存器循环的 kernel 不能在同一个图里"的问题 → prefill MoE 可以用 hybrid kernel（动态 block 数），16k TTFT 4.40 → 2.61 s</li>
+      <li>prefill bucket 不再必须等于 KV 分段大小 → 多 bucket（512…8192），短 prompt 不再补齐到 2048</li>
+      <li>c=127、1k 输入：输出吞吐 378 → 773 tok/s</li>
+    </ul></div>
+    <div class="card"><h3>decode 只算被路由的专家</h3><ul>
+      <li>profile：batch 1 decode 中 routed experts 占 45%（12.6 / 27.8 ms）。每个 rank 都算自己的 3 个专家，但一个 token 的 8 个专家在每个 rank 上最多命中 1–2 个</li>
+      <li><code>moe_tkg_hits</code> / <code>_batch</code>（从 nkilib 派生）：只读命中的专家权重，用运行时循环</li>
+      <li>c=1 TPOT <strong>26.3 → 22.1 ms</strong>；c=4（4-token 步）52.1 → 34.1 ms，吞吐 +50%</li>
+    </ul></div>
+  </div>
+  <div class="grid2" style="margin-top:14px">
+    <div class="card"><h3>长上下文与 FP8 KV</h3><ul>
+      <li>256k 配置：DCP=8 把复制的 KV 头切成 8 份，KV 容量 260k → 2.08M token，8 个长请求并发；needle 12/12</li>
+      <li>FP8 KV cache：标定 per-layer scale + packed K 布局，KV 字节减半；有严格的验收门槛（精度、显存）</li>
+      <li>固定的真实文本测试集：85k 输入、78k 共享前缀（92%），以及 prefill / decode 分开测的 P/D split 测试</li>
+    </ul></div>
+    <div class="card"><h3>这个阶段的基线（85k，P/D split，pass 2）</h3>
+      <table>
+        <tr><th>配置</th><th class="num">TPOT c1/c4/c8</th><th class="num">c8 吞吐</th></tr>
+        <tr><td>BF16 KV，DCP=8</td><td class="num">31.9 / 48.2 / 60.0 ms</td><td class="num">116.4 tok/s</td></tr>
+        <tr><td>BF16 KV，无 DCP（只放得下 4 个请求）</td><td class="num">35.2 / 69.8 / 72.7 ms</td><td class="num">44 tok/s</td></tr>
+        <tr><td>FP8 KV，无 DCP</td><td class="num">33.8 / 59.6 / 75.4 ms</td><td class="num">94.9 tok/s</td></tr>
+      </table>
+    </div>
+  </div>
+</div></section>
+
+<!-- 6. MTP -->
+<section class="slide"><div class="inner">
+  <p class="kicker">5 · hy3-fp8-opt：MTP 投机解码</p>
+  <h2>用 checkpoint 自带的 MTP 层当 draft</h2>
+  <div class="grid2">
+    <div class="card"><h3>实现</h3><ul>
+      <li><strong>框架侧（单独的 PR）：</strong>vllm-neuron 新增 MTP proposer，以及给外部模型的注册钩子；target 把最后一层 norm 之前的 hidden state 交给 draft</li>
+      <li><strong>模型侧：</strong>draft 模型复用 decoder 层；每个 decode 步 = 一个 target NEFF（每个请求验证 1+k 个 token，在设备上做 rejection sampling）+ 一个 draft NEFF（MTP 层跑 k 次）</li>
+      <li>draft 的 KV 也支持 FP8（单独标定 MTP 层的 scale）</li>
+      <li>MTP 的 verify 步是 4×并发个 token，所以 hits kernel 的上限设成 4×(k+1)</li>
+    </ul>
+    <p class="note">限制：MTP 和 DCP 不能同时开（已整理 issue 草稿）。</p></div>
+    <div>
+      <table>
+        <tr><th>短上下文，MATH-500，greedy</th><th class="num">TPOT c=1</th><th class="num">tok/s c=1</th><th class="num">TPOT c=4</th><th class="num">tok/s c=4</th></tr>
+        <tr><td>plain，moe_tkg</td><td class="num">26.3 ms</td><td class="num">38</td><td class="num">53.2 ms</td><td class="num">72</td></tr>
+        <tr><td>plain，moe_tkg_hits</td><td class="num">21.7 ms</td><td class="num">45</td><td class="num">34.0 ms</td><td class="num">111</td></tr>
+        <tr><td><strong>MTP k=3 + hits（上限 16）</strong></td><td class="num"><strong>13.8 ms</strong></td><td class="num"><strong>70</strong></td><td class="num"><strong>17.1 ms</strong></td><td class="num"><strong>216</strong></td></tr>
+        <tr><td>MTP k=4 + hits</td><td class="num">13.8 ms</td><td class="num">70</td><td class="num">17.0 ms</td><td class="num">218</td></tr>
+      </table>
+      <p class="note">MATH-500 greedy 下每个 draft 位置的接受率为 85 / 60 / 34 / 16%，k=3 每步约产出 2.8 个 token；k=4 的第 4 个位置只有 16%，基本没有收益。85k 长上下文的 ShareGPT 文本（temperature 0.9）下，每步约产出 2.0 个 token。</p>
+    </div>
+  </div>
+  <h3>85k 长上下文：FP8 KV + MTP3，不开 DCP，在所有并发下都优于 DCP=8</h3>
+  <table>
+    <tr><th>85k，P/D split，pass 2</th><th class="num">TPOT c1 / c4 / c8</th><th class="num">输出吞吐 c1 / c4 / c8</th></tr>
+    <tr><td>BF16 KV，DCP=8</td><td class="num">31.9 / 48.2 / 60.0 ms</td><td class="num">28.9 / 75.0 / 116.4</td></tr>
+    <tr><td><strong>FP8 KV + MTP k=3，无 DCP</strong></td><td class="num"><strong>23.4 / 39.2 / 51.0 ms</strong></td><td class="num"><strong>37.9 / 92.0 / 138.3</strong></td></tr>
+  </table>
+  <p>FP8 KV 让 8 个 85k 请求能同时放进 HBM；MTP 每步产出约 2 个 token，步长只变长 11–40%。</p>
+</div></section>
+
+<!-- 7. Profile 85k -->
+<section class="slide"><div class="inner">
+  <p class="kicker">6 · 耗时分析（85k，FP8 KV + MTP3）</p>
+  <h2>时间花在哪里</h2>
+  <div class="grid2">
+    <div class="chart" id="chart-breakdown">
+      <p class="title">一个 decode 步的耗时构成</p>
+      <p class="sub">device profile，rank 0，layers 1–79 按 collective 切分阶段（ms）</p>
+    </div>
+    <div>
+      <table>
+        <tr><th>阶段</th><th class="num">时间</th><th>主要结论</th></tr>
+        <tr><td>冷启动 prefill 85k（21 × 4096）</td><td class="num">14.34 s</td><td>attention 48%（随上下文线性增长：每个 chunk 89 → 560 ms），MoE 36%（每个 chunk 恒定约 245 ms），等待最慢 rank 7%</td></tr>
+        <tr><td>decode，1 个请求</td><td class="num">47.5 ms</td><td>MoE 35%，<strong>等待最慢 rank 20%</strong>（各 rank 命中的专家数不同），attention 27%</td></tr>
+        <tr><td>decode，6 个请求（batch-8 NEFF）</td><td class="num">76.6 ms</td><td><strong>attention 55%</strong>（8 × 85k 历史），MoE 30%，等待约 0</td></tr>
+      </table>
+      <ul>
+        <li>真正的通信（同样大小的 attention collective）只占 3–4%，NEFF 之间没有 host 间隙</li>
+        <li>负载不均衡真实存在，但不是 85k 下的主要开销</li>
+        <li>长上下文、高并发时 <strong>attention 是大头</strong> → 后面 sparse decode 的出发点</li>
+      </ul>
+    </div>
+  </div>
+</div></section>
+
+<!-- 8. Experiments not adopted -->
+<section class="slide"><div class="inner">
+  <p class="kicker">7 · 评估过但没有采用的方案</p>
+  <h2>测过、有数据，但不划算</h2>
+  <table>
+    <tr><th>方案</th><th>结果</th><th>结论</th></tr>
+    <tr><td>8 并发 MTP verify 步（32 token）也用 hits kernel（MAX_T=32）</td><td class="num">c8 TPOT 51.0 → 56.0 ms，吞吐 138 → 127</td><td><span class="tag bad">变慢</span>32 个 token 几乎命中每个本地专家，hits 省不了权重读取，只多了运行时循环和跨 rank 等待</td></tr>
+    <tr><td>EP=32（每组 6 个专家，expert TP=2）</td><td class="num">c1 23.4 → 22.4 ms；c8 51.0 → 53.3 ms；prefill 慢 13%</td><td><span class="tag bad">不采用</span>单请求的命中均衡只略有改善，半宽专家拖慢 prefill 和 8 请求步</td></tr>
+    <tr><td>EPLB：静态专家摆放</td><td>热门专家依赖请求；最忙 rank 的 prefill token 是平均的 4.3–4.5 倍，拟合的摆放只能消除约 9%</td><td><span class="tag bad">不值得</span>约省 0.6 ms / 47.5 ms 步、prefill 的 1%</td></tr>
+    <tr><td>Attention DP</td><td>需要框架层支持，0.29 启动时就拒绝</td><td><span class="tag neutral">暂缓</span></td></tr>
+    <tr><td>DCP + MTP</td><td>两者不能同时开（GPU 版 vLLM 也有同样的问题）</td><td><span class="tag neutral">已整理 issue 草稿</span>选 FP8 KV + MTP、不开 DCP</td></tr>
+  </table>
+</div></section>
+
+<!-- 9. Sparse study -->
+<section class="slide"><div class="inner">
+  <p class="kicker">8 · Sparse decode attention（实验性，默认关闭）</p>
+  <h2>先做精度研究：decode 只看 12.5% 的 KV block，精度不变</h2>
+  <div class="grid2">
+    <div class="card"><h3>方法（Quest 风格）</h3><ul>
+      <li>每个 32-token block 保存 K 的逐维 min / max</li>
+      <li>上界 <code>max q·k ≤ relu(q)·max + min(q,0)·min</code>，按上界选 top block；总是保留第一个 block 和最近的 block</li>
+      <li>保留的 block 压缩成更窄的 block table，交给未改动的 decode kernel，kernel 只读这些 block</li>
+      <li>只用于 decode；prefill 保持 dense（needle 这类信息是在 prefill 读进去的）</li>
+    </ul></div>
+    <table>
+      <tr><th>decode 看多少 block</th><th class="num">needle</th><th class="num">64-token 续写与 dense 一致</th><th class="num">LongBench v2</th><th class="num">与 dense 答案一致</th></tr>
+      <tr><td>全部（dense）</td><td class="num">12/12</td><td class="num">—</td><td class="num">57%</td><td class="num">—</td></tr>
+      <tr><td>50%</td><td class="num">12/12</td><td class="num">18/19</td><td class="num">59%</td><td class="num">98%</td></tr>
+      <tr><td>25%</td><td class="num">12/12</td><td class="num">19/19</td><td class="num">60%</td><td class="num">97%</td></tr>
+      <tr><td><strong>12.5%</strong></td><td class="num"><strong>12/12</strong></td><td class="num"><strong>19/19</strong></td><td class="num"><strong>60%</strong></td><td class="num"><strong>97%</strong></td></tr>
+      <tr><td>只保留开头 + 最近 4 个 block（对照组）</td><td class="num">0/12</td><td class="num">4/19</td><td class="num"></td><td class="num"></td></tr>
+    </table>
+  </div>
+  <p class="note">研究阶段的实现每一步仍读全部 K，只验证精度，不提速。对照组说明是"按上界选 block"保住了精度。</p>
+</div></section>
+
+<!-- 10. Sparse fast implementation -->
+<section class="slide"><div class="inner">
+  <p class="kicker">8 · Sparse decode：从"慢 2 倍"到"快 25%"</p>
+  <h2>四轮迭代</h2>
+  <table>
+    <tr><th>版本</th><th>改了什么</th><th class="num">ITL c8</th><th class="num">TPOT c1 / c4 / c8</th></tr>
+    <tr><td>dense（FP8 KV + MTP3）</td><td>基线</td><td class="num">76.7 ms</td><td class="num">23.4 / 39.2 / 51.0</td></tr>
+    <tr><td>c5ab0c9</td><td>摘要存在 KV 旁边，每层用 torch 选 512 个 block（top-511 + sort）；<strong>修掉一个 bug</strong>：MTP 的 4 个 verify token 跨 block 边界时，kernel 会经 block table 读回之前的 verify token，所以历史之后的那个 block 必须留在表里</td><td class="num">137.1 ms</td><td class="num">49.4 / 69.2 / 81.5</td></tr>
+    <tr><td>255fbaf</td><td>以 128-token group 为单位选（672 选 127）；decode 时也更新摘要（修掉回收 block 带旧摘要的问题）；batch &lt; 4 时保持 dense</td><td class="num">66.2 ms</td><td class="num">24.9 / 39.3 / 47.4</td></tr>
+    <tr><td>2395994</td><td>按 profile 去掉 sort、空摘要处理，block id 改为按 group 整行 gather</td><td class="num">61.3 ms</td><td class="num">25.6 / 37.3 / 44.7</td></tr>
+    <tr><td><strong>6f152cd</strong></td><td><strong>每 4 层选一次</strong>（所有层共用同一张 block table），其余 3 层只更新自己的摘要</td><td class="num"><strong>57.2 ms</strong></td><td class="num"><strong>24.6 / 36.3 / 42.9</strong></td></tr>
+  </table>
+  <div class="grid2" style="margin-top:14px">
+    <div class="card"><h3>profile 指出的瓶颈（255fbaf，5 请求一步）</h3><ul>
+      <li>NKI attention kernel 从约 38 ms 降到 12.9 ms：只读 1/5 的 block 确实有效</li>
+      <li>但 torch 里的选择本身要 16.2 ms：gather 摘要 4.3、top-k 3.6、sort 2.6、空摘要处理 3.5、gather block id 2.2</li>
+      <li>单核测：NKI top-k 并不比 <code>torch.topk</code> 快，摘要 gather 已经是 DMA → 不写融合 NKI kernel，改为跨层复用选择</li>
+    </ul></div>
+    <div class="card"><h3>精度（完整模型，0.125）</h3><ul>
+      <li>LongBench v2：54–55%，dense 56%；与 dense 答案一致 <strong>97–98/100</strong>，不一致的都是正常作答的近似平局</li>
+      <li>needle 12/12</li>
+      <li>修 bug 前：LongBench 前 78 题少答对 5 题，其中 3 题无法解析出答案，但 needle 仍是 12/12——只看 needle 测不出这个 bug</li>
+    </ul></div>
+  </div>
+</div></section>
+
+<!-- 11. Prefill kernels -->
+<section class="slide"><div class="inner">
+  <p class="kicker">9 · Prefill：两处 kernel 问题</p>
+  <h2>找到了两个热点，修好了一个</h2>
+  <div class="grid2">
+    <div class="card"><h3>① 分段 attention 按 32-token block 逐个加载 V</h3>
+      <ul>
+        <li>完整命中 prefix cache 的 85k 请求：一次 prefill 460 ms，attention 311 ms，其中 nkilib <code>attention_segmented_cte</code> 逐 block 发 V 的 DMA 占 254 ms（每层约 2656 次小 DMA）</li>
+        <li>尝试：把 BF16 副本合并成 128-token block → c8 TPOT 42.9 → 37.8 ms</li>
+        <li><span class="tag bad">已撤回</span>needle 只过 5/12：kernel 按 <code>prior_tokens &gt;&gt; log2(block)</code> 定位当前 chunk，要求已缓存长度是 block 的倍数，而 prefix cache 按 32 token 命中</li>
+        <li>需要改 nkilib（按 token 偏移定位当前 chunk），属于框架 PR</li>
+      </ul>
+    </div>
+    <div class="card"><h3>② Prefill MoE 先把 FP8 权重转成 BF16</h3>
+      <ul>
+        <li>4096 chunk 里 routed experts 79 ms，其中 Vector 引擎上 <code>CAST fp8→bf16</code> 合计 63 ms</li>
+        <li>nkilib 的 hybrid kernel 不支持激活量化；用 block 量化路径做的 W8A8 版本：kernel 0.88 ms，误差 3.8e-2 <span class="tag bad">不采用</span></li>
+        <li><strong>最终方案：</strong>拷贝 nkilib 的 kernel，关掉权重转换，让 TensorE 直接算 BF16 × FP8 → <strong>输出逐位相同</strong>，单核 1.14 → 0.54 ms</li>
+        <li>在图里：routed experts 79 → 53 ms/chunk，chunk 451 → 426 ms；c8 TPOT 42.9 → <strong>41.4 ms</strong> <span class="tag good">已提交 69d3cd5</span></li>
+      </ul>
+    </div>
+  </div>
+</div></section>
+
+<!-- 12. Evolution -->
+<section class="slide"><div class="inner">
+  <p class="kicker">10 · 演进总览（85k，78k 共享前缀，输出 256，P/D split pass 2）</p>
+  <h2>每一步的效果</h2>
+  <div class="grid2">
+    <div class="chart" id="chart-tpot">
+      <p class="title">TPOT（ms，越低越好）</p>
+      <p class="sub">MTP 后每步产出约 2 个 token；BF16 KV 不开 DCP 时 c8 实际只有 4 个请求在跑</p>
+    </div>
+    <div class="chart" id="chart-tput">
+      <p class="title">8 并发的输出吞吐（tok/s，越高越好）</p>
+      <p class="sub">同一测试，c8 pass 2</p>
+    </div>
+  </div>
+</div></section>
+
+<!-- 13. Current status -->
+<section class="slide"><div class="inner">
+  <p class="kicker">11 · 现状与下一步</p>
+  <h2>当前最优配置与剩余瓶颈</h2>
+  <div class="grid2">
+    <div>
+      <table>
+        <tr><th>85k，当前最优</th><th class="num">c1</th><th class="num">c4</th><th class="num">c8</th></tr>
+        <tr><td>TPOT</td><td class="num">24.7 ms</td><td class="num">35.7 ms</td><td class="num">41.4 ms</td></tr>
+        <tr><td>每步 ITL（约 2.0 token/步）</td><td class="num">50.1 ms</td><td class="num">60.5 ms</td><td class="num">57.2 ms</td></tr>
+        <tr><td>纯 decode 每 token</td><td class="num">25.0 ms</td><td class="num">30.2 ms</td><td class="num">28.4 ms</td></tr>
+        <tr><td>输出吞吐</td><td class="num">36.0</td><td class="num">97.9</td><td class="num">167.5</td></tr>
+      </table>
+      <p class="note">FP8 KV + MTP k=3 + sparse decode（<code>HY3_SPARSE_DECODE=0.125</code>，每 4 层选一次）+ prefill MoE 不转换权重。只看单请求延迟时，关掉 sparse 更快（c1 TPOT 23.4 ms）。TPOT 和纯 decode 的差距来自测试中新请求的 prefill 打断 decode，真正的 P/D 分离部署里没有这部分。</p>
+    </div>
+    <div class="card"><h3>剩余瓶颈与下一步</h3><ul>
+      <li><strong>decode MoE（c8 每步约 25 ms）：</strong>受指令开销和多引擎之间等待限制，需要 kernel 层面优化</li>
+      <li><strong>sparse 的 K 投影 + 摘要更新（每步约 4 ms，也是 c1 慢 5% 的原因）：</strong>改为直接使用 decode kernel 算出的 K，需要框架 PR</li>
+      <li><strong>prefill attention：</strong>修 nkilib 分段 kernel 的 V 加载（已测出潜力：c8 TPOT 再降约 12%）；更长远是 prefill sparse / FP8 attention，需要先做精度研究</li>
+      <li><strong>需要上游的改动：</strong>DCP + MTP 兼容；Neuron 上 prefill 和 decode 不能同在一步</li>
+    </ul></div>
+  </div>
+</div></section>
+
+<script>
+const PAL = ["--series-1", "--series-2", "--series-3", "--series-4"];
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs = {}, parent) {
+  const e = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function tipBox(host) {
+  const t = document.createElement("div");
+  t.className = "tip";
+  host.appendChild(t);
+  return t;
+}
+function showTip(tip, host, evt, html) {
+  tip.innerHTML = html;
+  tip.style.opacity = 1;
+  const r = host.getBoundingClientRect();
+  let x = evt.clientX - r.left + 14, y = evt.clientY - r.top + 14;
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  if (x + w > r.width - 4) x = evt.clientX - r.left - w - 14;
+  if (y + h > r.height - 4) y = evt.clientY - r.top - h - 14;
+  tip.style.left = x + "px";
+  tip.style.top = y + "px";
+}
+function hideTip(tip) { tip.style.opacity = 0; }
+function legend(host, items, kind) {
+  const L = document.createElement("div");
+  L.className = "legend";
+  items.forEach((name, i) => {
+    const k = document.createElement("span");
+    k.className = "key";
+    const s = document.createElement("span");
+    s.className = kind === "line" ? "ln" : "sw";
+    s.style.background = `var(${PAL[i]})`;
+    k.appendChild(s);
+    k.appendChild(document.createTextNode(name));
+    L.appendChild(k);
+  });
+  host.appendChild(L);
+}
+function tableView(host, head, rows) {
+  const d = document.createElement("details");
+  d.innerHTML = "<summary>数据表</summary>";
+  const t = document.createElement("table");
+  t.innerHTML = "<tr>" + head.map((h, i) => `<th class="${i ? "num" : ""}">${h}</th>`).join("") + "</tr>" +
+    rows.map(r => "<tr>" + r.map((c, i) => `<td class="${i ? "num" : ""}">${c}</td>`).join("") + "</tr>").join("");
+  d.appendChild(t);
+  host.appendChild(d);
+}
+function niceMax(v) { const p = Math.pow(10, Math.floor(Math.log10(v))); const m = v / p; return (m <= 2 ? 2 : m <= 5 ? 5 : 10) * p; }
+
+// Stacked horizontal bars
+function stackedH(host, cfg) {
+  legend(host, cfg.segments, "bar");
+  const W = 560, rowH = 46, top = 8, left = 132, right = 70, H = top + cfg.rows.length * rowH + 30;
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", role: "img", "aria-label": cfg.aria }, null);
+  host.appendChild(svg);
+  const tip = tipBox(host);
+  const max = niceMax(Math.max(...cfg.rows.map(r => r.values.reduce((a, b) => a + b, 0))));
+  const sx = (v) => left + v / max * (W - left - right);
+  for (let t = 0; t <= max; t += max / 4) {
+    el("line", { x1: sx(t), x2: sx(t), y1: top, y2: H - 24, stroke: css("--grid"), "stroke-width": 1 }, svg);
+    el("text", { x: sx(t), y: H - 8, "text-anchor": "middle" }, svg).textContent = Math.round(t);
+  }
+  cfg.rows.forEach((r, i) => {
+    const y = top + i * rowH + (rowH - 22) / 2;
+    el("text", { x: left - 10, y: y + 15, "text-anchor": "end", class: "lbl" }, svg).textContent = r.name;
+    let acc = 0;
+    const total = r.values.reduce((a, b) => a + b, 0);
+    r.values.forEach((v, j) => {
+      const x0 = sx(acc), x1 = sx(acc + v);
+      const last = j === r.values.length - 1;
+      const w = Math.max(0, x1 - x0 - (last ? 0 : 2));
+      const path = last && w > 4
+        ? `M${x0},${y} h${w - 4} a4,4 0 0 1 4,4 v14 a4,4 0 0 1 -4,4 h${-(w - 4)} z`
+        : `M${x0},${y} h${w} v22 h${-w} z`;
+      const p = el("path", { d: path, fill: `var(${PAL[j]})` }, svg);
+      const hit = el("rect", { x: x0, y: y - 8, width: Math.max(w, 6), height: 38, fill: "transparent" }, svg);
+      const html = `<div class="t">${r.name}</div>` + r.values.map((vv, k) =>
+        `<div class="row"><span><span class="k" style="background:var(${PAL[k]})"></span>${cfg.segments[k]}</span><b>${vv.toFixed(1)} ms</b></div>`).join("") +
+        `<div class="row"><span>合计</span><b>${total.toFixed(1)} ms</b></div>`;
+      hit.addEventListener("mousemove", (e) => showTip(tip, host, e, html));
+      hit.addEventListener("mouseleave", () => hideTip(tip));
+      acc += v;
+    });
+    el("text", { x: sx(total) + 8, y: y + 15, class: "lbl-strong" }, svg).textContent = total.toFixed(1) + " ms";
+  });
+  tableView(host, ["", ...cfg.segments, "合计"], cfg.rows.map(r => [r.name, ...r.values.map(v => v.toFixed(1)), r.values.reduce((a, b) => a + b, 0).toFixed(1)]));
+}
+
+// Line chart over ordinal x
+function lineChart(host, cfg) {
+  legend(host, cfg.series.map(s => s.name), "line");
+  const W = 560, H = 340, left = 84, right = 54, top = 14, bottom = 88;
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", role: "img", "aria-label": cfg.aria }, null);
+  host.appendChild(svg);
+  const tip = tipBox(host);
+  const n = cfg.x.length;
+  const max = niceMax(Math.max(...cfg.series.flatMap(s => s.values)));
+  const sx = (i) => left + i * (W - left - right) / (n - 1);
+  const sy = (v) => top + (1 - v / max) * (H - top - bottom);
+  for (let t = 0; t <= max; t += max / 4) {
+    el("line", { x1: left, x2: W - right, y1: sy(t), y2: sy(t), stroke: css("--grid"), "stroke-width": 1 }, svg);
+    el("text", { x: left - 8, y: sy(t) + 4, "text-anchor": "end" }, svg).textContent = Math.round(t);
+  }
+  cfg.x.forEach((lab, i) => {
+    const g = el("text", { x: sx(i), y: H - bottom + 18, "text-anchor": "end", transform: `rotate(-35 ${sx(i)} ${H - bottom + 18})` }, svg);
+    g.textContent = lab;
+  });
+  const cross = el("line", { x1: 0, x2: 0, y1: top, y2: H - bottom, stroke: css("--axis"), "stroke-width": 1, opacity: 0 }, svg);
+  cfg.series.forEach((s, j) => {
+    const d = s.values.map((v, i) => `${i ? "L" : "M"}${sx(i)},${sy(v)}`).join(" ");
+    el("path", { d, fill: "none", stroke: `var(${PAL[j]})`, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+    s.values.forEach((v, i) => el("circle", { cx: sx(i), cy: sy(v), r: 4, fill: `var(${PAL[j]})`, stroke: "var(--surface-1)", "stroke-width": 2 }, svg));
+    const lv = s.values[n - 1];
+    el("text", { x: sx(n - 1) + 9, y: sy(lv) + 4, class: "lbl" }, svg).textContent = `${s.name} ${lv}`;
+  });
+  for (let i = 0; i < n; i++) {
+    const w = (W - left - right) / (n - 1);
+    const hit = el("rect", { x: sx(i) - w / 2, y: top, width: w, height: H - top - bottom, fill: "transparent" }, svg);
+    const html = `<div class="t">${cfg.x[i]}</div>` + cfg.series.map((s, j) =>
+      `<div class="row"><span><span class="k" style="background:var(${PAL[j]})"></span>${s.name}</span><b>${s.values[i].toFixed(1)} ${cfg.unit}</b></div>`).join("") +
+      (cfg.notes && cfg.notes[i] ? `<div class="row" style="margin-top:3px"><span>${cfg.notes[i]}</span></div>` : "");
+    hit.addEventListener("mousemove", (e) => { cross.setAttribute("x1", sx(i)); cross.setAttribute("x2", sx(i)); cross.setAttribute("opacity", 1); showTip(tip, host, e, html); });
+    hit.addEventListener("mouseleave", () => { cross.setAttribute("opacity", 0); hideTip(tip); });
+  }
+  tableView(host, ["版本", ...cfg.series.map(s => s.name)], cfg.x.map((x, i) => [x, ...cfg.series.map(s => s.values[i])]));
+}
+
+// Vertical bars, one series
+function barChart(host, cfg) {
+  const W = 560, H = 340, left = 84, right = 14, top = 22, bottom = 88;
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", role: "img", "aria-label": cfg.aria }, null);
+  host.appendChild(svg);
+  const tip = tipBox(host);
+  const n = cfg.x.length;
+  const max = niceMax(Math.max(...cfg.values));
+  const band = (W - left - right) / n;
+  const bw = Math.min(24, band * 0.6);
+  const sy = (v) => top + (1 - v / max) * (H - top - bottom);
+  for (let t = 0; t <= max; t += max / 4) {
+    el("line", { x1: left, x2: W - right, y1: sy(t), y2: sy(t), stroke: css("--grid"), "stroke-width": 1 }, svg);
+    el("text", { x: left - 8, y: sy(t) + 4, "text-anchor": "end" }, svg).textContent = Math.round(t);
+  }
+  const best = cfg.values.indexOf(Math.max(...cfg.values));
+  cfg.values.forEach((v, i) => {
+    const cx = left + band * i + band / 2, x = cx - bw / 2, y = sy(v), h = sy(0) - y;
+    const path = `M${x},${sy(0)} v${-(h - 4)} a4,4 0 0 1 4,-4 h${bw - 8} a4,4 0 0 1 4,4 v${h - 4} z`;
+    el("path", { d: path, fill: "var(--series-1)" }, svg);
+    if (i === best || i === 0 || i === 3) el("text", { x: cx, y: y - 6, "text-anchor": "middle", class: i === best ? "lbl-strong" : "lbl" }, svg).textContent = v;
+    const lab = el("text", { x: cx, y: H - bottom + 18, "text-anchor": "end", transform: `rotate(-35 ${cx} ${H - bottom + 18})` }, svg);
+    lab.textContent = cfg.x[i];
+    const hit = el("rect", { x: cx - band / 2, y: top, width: band, height: H - top - bottom, fill: "transparent" }, svg);
+    const html = `<div class="t">${cfg.x[i]}</div><div class="row"><span>c8 输出吞吐</span><b>${v.toFixed(1)} tok/s</b></div>` +
+      (cfg.notes && cfg.notes[i] ? `<div class="row" style="margin-top:3px"><span>${cfg.notes[i]}</span></div>` : "");
+    hit.addEventListener("mousemove", (e) => showTip(tip, host, e, html));
+    hit.addEventListener("mouseleave", () => hideTip(tip));
+  });
+  tableView(host, ["版本", "c8 输出吞吐 (tok/s)"], cfg.x.map((x, i) => [x, cfg.values[i]]));
+}
+
+const MILESTONES = ["BF16 KV DCP=8", "BF16 KV 无DCP", "FP8 KV", "FP8 KV+MTP3", "+sparse 首版", "+128-token group", "+去掉 sort", "+每4层选一次", "+prefill MoE fp8w"];
+const NOTES = ["contrib 分支基线", "c8 实际只有 4 个请求并发", "8 个请求能同时放下", "每步约 2.0 个 token", "c5ab0c9：torch 选择开销太大", "255fbaf", "2395994", "6f152cd", "69d3cd5，当前"];
+
+function render() {
+  for (const id of ["chart-breakdown", "chart-tpot", "chart-tput"]) {
+    const h = document.getElementById(id);
+    [...h.children].forEach(c => { if (!c.classList.contains("title") && !c.classList.contains("sub")) c.remove(); });
+  }
+  stackedH(document.getElementById("chart-breakdown"), {
+    aria: "decode 步耗时构成：1 个请求与 6 个请求",
+    segments: ["attention", "MoE 计算", "MoE collective（含等待）", "其他（AR、MTP draft 等）"],
+    rows: [
+      { name: "1 个请求", values: [12.9, 16.8, 11.4, 6.4] },
+      { name: "6 个请求", values: [41.9, 23.1, 2.4, 9.2] },
+    ],
+  });
+  lineChart(document.getElementById("chart-tpot"), {
+    aria: "各版本 TPOT 变化", unit: "ms", x: MILESTONES, notes: NOTES,
+    series: [
+      { name: "c1", values: [31.9, 35.2, 33.8, 23.4, 49.4, 24.9, 25.6, 24.6, 24.7] },
+      { name: "c4", values: [48.2, 69.8, 59.6, 39.2, 69.2, 39.3, 37.3, 36.3, 35.7] },
+      { name: "c8", values: [60.0, 72.7, 75.4, 51.0, 81.5, 47.4, 44.7, 42.9, 41.4] },
+    ],
+  });
+  barChart(document.getElementById("chart-tput"), {
+    aria: "各版本 8 并发输出吞吐", x: MILESTONES, notes: NOTES,
+    values: [116.4, 44.0, 94.9, 138.3, 88.2, 150.5, 159.6, 166.2, 167.5],
+  });
+}
+render();
+
+// navigation & theme
+const slides = [...document.querySelectorAll(".slide")];
+function current() {
+  const mid = window.scrollY + window.innerHeight / 3;
+  let k = 0;
+  slides.forEach((s, i) => { if (s.offsetTop <= mid) k = i; });
+  return k;
+}
+function go(d) { const k = Math.max(0, Math.min(slides.length - 1, current() + d)); slides[k].scrollIntoView({ behavior: "smooth" }); }
+document.getElementById("prev").onclick = () => go(-1);
+document.getElementById("next").onclick = () => go(1);
+document.addEventListener("keydown", (e) => {
+  if (["ArrowDown", "PageDown", "ArrowRight", " "].includes(e.key)) { e.preventDefault(); go(1); }
+  if (["ArrowUp", "PageUp", "ArrowLeft"].includes(e.key)) { e.preventDefault(); go(-1); }
+});
+const pn = document.getElementById("pageno");
+const upd = () => { pn.textContent = `${current() + 1} / ${slides.length}`; };
+window.addEventListener("scroll", upd); upd();
+document.getElementById("theme").onclick = () => {
+  const r = document.documentElement;
+  const dark = r.dataset.theme ? r.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  r.dataset.theme = dark ? "light" : "dark";
+  render();
+};
+</script>
+</body>
+</html>

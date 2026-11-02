@@ -7,7 +7,11 @@ with a static per-tensor FP8 checkpoint. All linear layers run with the
 checkpoint's FP8 weights; the KV cache is BF16.
 
 The architecture, kernel mapping and feature status are in
-[src/README.md](src/README.md).
+[src/README.md](src/README.md). A slide-deck summary (in Chinese: model,
+how it is split over the 64 ranks, where the time goes, and each
+optimization with its measured effect) is
+[docs/PRESENTATION.html](docs/PRESENTATION.html), a self-contained page to
+open in a browser.
 
 > **Note:** Contrib models are community contributions and may have limited
 > testing or performance optimization compared to the officially-supported
