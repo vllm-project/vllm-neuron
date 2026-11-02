@@ -202,3 +202,105 @@ def test_padding_requests_get_no_history():
     q = torch.randn(1, 2, 1, D, generator=g)
     _, prior = sparse_select_blocks(q, k_sum, table, torch.tensor([500, 0]), BS, GROUP, 12, 1, 1)
     assert int(prior[1]) == 0
+
+
+# ---- sparse prefill (HY3_SPARSE_PREFILL) ----
+
+from hy_v3_neuron.model import sparse_prefill_blocks  # noqa: E402
+
+
+def _prefill_setup(prior, nt_blocks, n_blocks, g, hot=None):
+    """Summaries of `prior` tokens of a request, and a chunk of nt_blocks blocks after them."""
+    table = _table(n_blocks, g)
+    k = torch.randn(KVH, n_blocks * BS, D, generator=g)
+    if hot is not None:
+        k[0, hot[0]] = hot[1]
+    k_sum = _empty()
+    slots = torch.full((n_blocks * BS,), -1)
+    slots[:prior] = _slots(table, range(prior))
+    update_k_summary_prefill(k_sum, k, slots, table, BS, GROUP)
+    return table, k, k_sum
+
+
+def test_sparse_prefill_short_history_is_dense():
+    g = torch.Generator().manual_seed(8)
+    prior, nt = 5 * BS, 4  # 5 prior blocks (1 complete group), a 4-block chunk
+    table, _, k_sum = _prefill_setup(prior, nt, 64, g)
+    q = torch.randn(2, nt * BS, D, generator=g)
+    blocks, kept = sparse_prefill_blocks(q, k_sum, table, torch.tensor([[prior]]), torch.ones(nt * BS, dtype=torch.bool),
+                                         BS, GROUP, 16, 1, 1)
+    assert int(kept) == prior
+    assert blocks[: 5 + nt].tolist() == table[: 5 + nt].tolist()  # prior blocks, then the chunk's
+
+
+def test_sparse_prefill_keeps_sink_recent_hot_and_the_incomplete_group():
+    g = torch.Generator().manual_seed(9)
+    prior, nt = 41 * BS, 4  # 10 complete groups + 1 block of group 10
+    q = torch.randn(2, nt * BS, D, generator=g)
+    table, _, k_sum = _prefill_setup(prior, nt, 64, g, hot=(5 * L + 7, q[:, 3].mean(0) * 30))
+    blocks, kept = sparse_prefill_blocks(q, k_sum, table, torch.tensor([[prior]]), torch.ones(nt * BS, dtype=torch.bool),
+                                         BS, GROUP, 16, 1, 2)  # 4 groups: sink, 2 recent, 1 by bound
+    row = table.tolist()
+    want = [b for gi in (0, 5, 8, 9) for b in row[gi * GROUP : (gi + 1) * GROUP]] + [row[40]]
+    assert int(kept) == len(want) * BS
+    assert blocks[: len(want)].tolist() == want
+    assert blocks[len(want) : len(want) + nt].tolist() == row[41 : 41 + nt]
+
+
+def test_sparse_prefill_ignores_padding_queries():
+    g = torch.Generator().manual_seed(11)
+    prior, nt = 40 * BS, 4  # 10 complete groups
+    T = nt * BS
+    q = torch.randn(2, T, D, generator=g)
+    q[:, -1] = 0
+    q[0, -1, 0] = 100  # only the padding query points at the hot group
+    hot_k = torch.zeros(D)
+    hot_k[0] = 50
+    table, _, k_sum = _prefill_setup(prior, nt, 64, g, hot=(5 * L + 7, hot_k))
+    args = (k_sum, table, torch.tensor([[prior]]))
+    valid = torch.ones(T, dtype=torch.bool)
+    blocks, _ = sparse_prefill_blocks(q, *args, valid, BS, GROUP, 16, 1, 2)
+    assert table[5 * GROUP].item() in blocks.tolist()
+    valid[-1] = False
+    blocks, kept = sparse_prefill_blocks(q, *args, valid, BS, GROUP, 16, 1, 2)
+    q_real = q.clone()
+    q_real[:, -1] = q[:, 0]  # the same chunk with a real query in the padding slot
+    want, want_kept = sparse_prefill_blocks(q_real, *args, torch.ones(T, dtype=torch.bool), BS, GROUP, 16, 1, 2)
+    assert blocks.tolist() == want.tolist() and int(kept) == int(want_kept)
+
+
+def test_sparse_prefill_attention_matches_the_kept_tokens():
+    """The compacted copy through the segmented attention (CPU path) = attention over the kept tokens."""
+    import vllm_neuron.functional as NF
+    from hy_v3_neuron.model import _request_blocks_bf16
+
+    g = torch.Generator().manual_seed(10)
+    prior, nt = 24 * BS, 4  # 6 groups of history, a 128-token chunk
+    T = nt * BS
+    table, k, k_sum = _prefill_setup(prior, nt, 64, g)
+    q = torch.randn(1, T, D, generator=g)
+    blocks, kept = sparse_prefill_blocks(q, k_sum, table, torch.tensor([[prior]]), torch.ones(T, dtype=torch.bool),
+                                         BS, GROUP, 12, 1, 1)  # 3 groups of history
+    # The cache holds the history and the chunk's own K / V.
+    kc = torch.zeros(NBLK, KVH, BS, D)
+    vc = torch.zeros(NBLK, KVH, BS, D)
+    v = torch.randn(KVH, 64 * BS, D, generator=g)
+    for pos in range(prior + T):
+        kc[table[pos // BS], :, pos % BS] = k[:, pos]
+        vc[table[pos // BS], :, pos % BS] = v[:, pos]
+    k_attn, v_attn, local = _request_blocks_bf16(kc.to(torch.bfloat16), vc.to(torch.bfloat16),
+                                                  blocks.view(1, -1).to(torch.int32), False, torch.bfloat16)
+    out = NF.segmented_attention(q.to(torch.bfloat16), k_cache=k_attn, v_cache=v_attn, block_tables=local,
+                                 prior_tokens=kept, block_size=BS, kv_segment_size=128, scale=D ** -0.5,
+                                 tp_q=True, tp_out=False).float()
+    # Reference: the kept prior positions, then causal attention within the chunk.
+    row = table.tolist()
+    kept_pos = [p for p in range(prior) if row[p // BS] in blocks[: int(kept) // BS].tolist()]
+    assert len(kept_pos) == int(kept)
+    ref = torch.empty(T, D)
+    for i in range(T):
+        ks = torch.cat([k[0, kept_pos], k[0, prior : prior + i + 1]]).to(torch.bfloat16).float()
+        vs = torch.cat([v[0, kept_pos], v[0, prior : prior + i + 1]]).to(torch.bfloat16).float()
+        w = torch.softmax((q[0, i].to(torch.bfloat16).float() @ ks.T) * D ** -0.5, dim=0)
+        ref[i] = w @ vs
+    torch.testing.assert_close(out.view(T, D), ref, atol=2e-2, rtol=2e-2)

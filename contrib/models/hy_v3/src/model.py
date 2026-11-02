@@ -169,6 +169,14 @@ _SPARSE_MIN_BATCH = int(os.environ.get("HY3_SPARSE_MIN_BATCH", "4"))
 # still fold their K into their own summaries.
 _SPARSE_SELECT_EVERY = int(os.environ.get("HY3_SPARSE_SELECT_EVERY", "4"))
 _SPARSE_SEL_CACHE_KEY = "_hy_v3_sparse_selection"
+# EXPERIMENTAL block-sparse prefill attention (docs/SPARSE_DECODE.md, "Sparse prefill"):
+# HY3_SPARSE_PREFILL=<fraction> lets a segmented prefill chunk (FP8 KV, no DCP)
+# attend to at most that fraction of the context bucket's blocks of its prior
+# context (rounded up like the decode budget), chosen per layer and chunk with the
+# decode's group summaries: a group's score is its largest bound over the
+# chunk's queries. The kept prior blocks and the chunk's own blocks make the
+# BF16 copy the segmented kernel reads.
+_SPARSE_PREFILL = float(os.environ.get("HY3_SPARSE_PREFILL", "0") or 0)
 
 
 def _is_fp8_kv(cache: torch.Tensor | None) -> bool:
@@ -198,7 +206,7 @@ def bind_attention_kv(
     attn.k_cache = k_cache
     attn.v_cache = v_cache
     attn.fp8_packed = packed
-    if sparse and _SPARSE_DECODE > 0 and attn.dcp_size == 1:
+    if sparse and (_SPARSE_DECODE > 0 or _SPARSE_PREFILL > 0) and attn.dcp_size == 1:
         # [blocks, (min, max), kvh, D]: a group's summary lives at the row of
         # its first block. Empty: min > max.
         shape = (v_cache.shape[0], v_cache.shape[1], v_cache.shape[-1])
@@ -408,7 +416,7 @@ def prepare_sparse_decode(layer, device, from_weights: bool = True) -> None:
     ``from_weights=False`` (CPU compile) allocates placeholders.
     """
     attn = layer.self_attn
-    if _SPARSE_DECODE <= 0 or attn.dcp_size > 1:
+    if (_SPARSE_DECODE <= 0 and _SPARSE_PREFILL <= 0) or attn.dcp_size > 1:
         return
     nh, kvh = attn.num_attention_heads_per_rank, attn.num_key_value_heads_per_rank
     D, H = attn.head_dim, attn.hidden_size
@@ -476,6 +484,54 @@ def sparse_select_blocks(q, k_sum, block_table, n_hist, block_size, group, n_sel
     fill = n - L * (nsv - 1)  # tokens in the history's last group
     prior = torch.where(dense, n, L * (k_g - 2) + fill).view(B)
     return compact.to(block_table.dtype), prior
+
+
+def sparse_prefill_blocks(q, k_sum, block_row, prior, valid, block_size, group, n_sel, sink, recent):
+    """EXPERIMENTAL (HY3_SPARSE_PREFILL): the blocks a segmented prefill chunk reads.
+
+    q: [nh, T, D] (QK-norm + RoPE), k_sum: [blocks, 2, kvh, D], block_row: [nb]
+    the request's block table, prior: [1, 1] int32 tokens before the chunk (a
+    multiple of block_size), valid: [T] real (not padding) queries. Each complete
+    prior group is scored with its largest Quest bound over the chunk's queries;
+    the first ``sink`` and last ``recent`` complete groups, the incomplete last
+    one and the ``n_sel / group - recent - sink`` best others are kept (all
+    of them when they fit). Returns ``blocks`` [n_sel + group + T / block_size]
+    -- the kept prior blocks in order, then the chunk's blocks, then filler --
+    and the kept prior tokens [1, 1] int32, which is where the segmented kernel
+    finds the chunk in that layout.
+    """
+    nh, T, D = q.shape
+    kvh = k_sum.shape[2]
+    t = block_row.to(torch.long)
+    nb = t.shape[0]
+    ns, L, k_g = nb // group, block_size * group, n_sel // group
+    summ = k_sum[torch.clamp(t.view(ns, group)[:, 0], min=0)].to(torch.float32)  # [ns, 2, kvh, D]
+    # Padding queries (at the end of the chunk) repeat the first one, so they never raise the max.
+    qg = torch.where(valid.view(1, T, 1), q, q[:, :1]).to(torch.float32).reshape(kvh, (nh // kvh) * T, D)
+    # Both halves of the bound in one matmul: [relu(q), min(q, 0)] . [max, min].
+    qq = torch.cat([torch.clamp(qg, min=0), torch.clamp(qg, max=0)], dim=-1)
+    ss = torch.cat([summ[:, 1], summ[:, 0]], dim=-1).permute(1, 2, 0)  # [kvh, 2D, ns]
+    score = torch.bmm(qq, ss).amax(dim=(0, 1))  # [ns]
+    p = prior.reshape(()).to(torch.long)
+    full = torch.div(p, L, rounding_mode="floor")  # complete prior groups
+    pb = torch.div(p, block_size, rounding_mode="floor")  # prior blocks
+    idx = torch.arange(ns, device=q.device)
+    cand = idx < full
+    forced = (idx < sink) | (idx >= full - recent)
+    big = torch.finfo(torch.float32).max
+    top = torch.topk(torch.where(cand, torch.where(forced, big, score), -big), k_g, dim=0).indices
+    keep_g = cand & ((idx.view(-1, 1) == top.view(1, -1)).any(dim=1) | (full <= k_g))
+    bidx = torch.arange(nb, device=q.device)
+    in_full = bidx < full * group
+    keep_b = torch.where(in_full, keep_g[bidx // group], bidx < pb)  # blocks of the incomplete group: kept
+    c = keep_b.sum()
+    M = n_sel + group
+    order = torch.sort(torch.where(keep_b, bidx, nb + bidx)).values[:M]
+    nt = T // block_size
+    j = torch.arange(M + nt, device=q.device)
+    src = torch.where(j < c, order[torch.clamp(j, max=M - 1)], torch.where(j < c + nt, pb + j - c, pb))
+    blocks = t[torch.clamp(src, max=nb - 1)].clamp(min=0)
+    return blocks, (c * block_size).view(1, 1).to(torch.int32)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -795,6 +851,7 @@ class HYV3Attention(nn.Module):
             # Segmented prefill over the cache, which now holds this step's tokens.
             k_attn, v_attn = self.k_cache, self.v_cache
             block_table = meta["block_table_tensor"]
+            prior_tokens = meta.get("cached_seq_len")
             if kv_fp8:
                 # <-- FP8 KV: read a BF16 copy of the request's blocks (exact for
                 # FP8 codes). On the installed nkilib (nki 0.7.0) the KV-parallel
@@ -804,6 +861,17 @@ class HYV3Attention(nn.Module):
                 # k * q_k / v * q_v: Q carries the K dequant (_fp8_prefill_q) and
                 # the output the V dequant (linear in V, so after the DCP LSE
                 # combine too; runtime scales, see set_kv_scales).
+                if self.k_sum is not None and _SPARSE_PREFILL > 0 and self.dcp_size == 1:
+                    # >>> EXPERIMENTAL sparse prefill: copy only the kept prior blocks.
+                    nb = block_table.shape[1]
+                    n_sel = sparse_budget_blocks(nb, _SPARSE_PREFILL, _SPARSE_SINK * _SPARSE_GROUP,
+                                                 _SPARSE_RECENT * _SPARSE_GROUP)
+                    if n_sel < nb and nb % _SPARSE_GROUP == 0:
+                        blocks, prior_tokens = sparse_prefill_blocks(
+                            q, self.k_sum, block_table[0], prior_tokens, slot_mapping >= 0, block_size,
+                            _SPARSE_GROUP, n_sel, _SPARSE_SINK, _SPARSE_RECENT,
+                        )
+                        block_table = blocks.view(1, -1).to(block_table.dtype)
                 k_attn, v_attn, block_table = _request_blocks_bf16(
                     self.k_cache, self.v_cache, block_table, self.fp8_packed, self.dtype
                 )
@@ -837,7 +905,7 @@ class HYV3Attention(nn.Module):
                     k_cache=k_attn,
                     v_cache=v_attn,
                     block_tables=block_table,
-                    prior_tokens=meta.get("cached_seq_len"),
+                    prior_tokens=prior_tokens,
                     block_size=block_size,
                     kv_segment_size=kv_segment_size,
                     scale=self.scaling,
@@ -984,8 +1052,8 @@ class HYV3Attention(nn.Module):
             n_sel = sparse_budget_blocks(
                 nb, _SPARSE_DECODE, _SPARSE_SINK * _SPARSE_GROUP, _SPARSE_RECENT * _SPARSE_GROUP
             )
-            if n_sel >= nb or B < _SPARSE_MIN_BATCH or nb % _SPARSE_GROUP:
-                n_sel = 0
+            if _SPARSE_DECODE <= 0 or n_sel >= nb or B < _SPARSE_MIN_BATCH or nb % _SPARSE_GROUP:
+                n_sel = 0  # dense; the summaries are still updated
             # >>> EXPERIMENTAL sparse decode: the kernel reads n_sel blocks.
             reuse = None
             if n_sel and self.layer_idx % _SPARSE_SELECT_EVERY:

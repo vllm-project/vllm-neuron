@@ -16,7 +16,7 @@
 # [1, 4, 8], KV_CAP 0.60 (0.61 with MTP), about 8.1x, and only the 32768
 # decode context bucket below 86016: with all three, the batch-8 decode NEFFs
 # do not fit next to the KV (Allocation Failure at batch 8, 65536).
-# Env: MODEL, PORT, MTP_K, KV_DTYPE, KV_CAP as for serve.sh, HY3_SPARSE_DECODE; with MTP_K,
+# Env: MODEL, PORT, MTP_K, KV_DTYPE, KV_CAP as for serve.sh, HY3_SPARSE_DECODE, HY3_SPARSE_PREFILL; with MTP_K,
 #      HY3_DECODE_HITS_MAX_T defaults to 4 x (MTP_K + 1) (4-request verify steps;
 #      8-request steps keep moe_tkg, which is faster there than hits at 32).
 # Benchmark: bench_pd_split.sh "1 4 8".
@@ -30,10 +30,10 @@ if [ -n "${MTP_K:-}" ]; then
     export HY3_DECODE_HITS_MAX_T=${HY3_DECODE_HITS_MAX_T:-$((4 * (MTP_K + 1)))}
     DEFAULT_KV_CAP=0.61
 fi
-# HY3_SPARSE_DECODE: the K summaries (1/16 of the KV bytes) do not fit next to
+# HY3_SPARSE_DECODE / HY3_SPARSE_PREFILL: the K summaries (1/16 of the KV bytes) do not fit next to
 # the 32768-bucket decode NEFFs (nrt_tensor_allocate at runtime); the sparse
 # kernel reads only the kept blocks, so that bucket gains little.
-if [ -n "${HY3_SPARSE_DECODE:-}" ]; then
+if [ -n "${HY3_SPARSE_DECODE:-}${HY3_SPARSE_PREFILL:-}" ]; then
     CTX_BUCKETS=  # only the max_model_len decode bucket
 fi
 KV_CAP=${KV_CAP:-$DEFAULT_KV_CAP} PREFILL_BUCKETS='[512, 1024, 2048, 4096]' \

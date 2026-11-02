@@ -873,6 +873,7 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 | `scripts/profile_85k.sh` / `scripts/profile_85k_client.py` | device-profiling server (85k FP8 KV + MTP config, fewest NEFFs) and the profiled sessions (cold prefill, 1- and N-request decode) |
 | `scripts/expert_load.sh` / `expert_load_client.py` / `expert_load.py` | capture each token's routed experts (tensor_capture of `moe_route.<layer>`), real-text workload, and the expert-placement simulation (docs/PROFILE_85K.md, "Expert load") |
 | `scripts/sparse_decode_study.sh` / `sparse_decode_eval.py` / `longbench_v2.py` | EXPERIMENTAL block-sparse decode (`HY3_SPARSE_DECODE`, off; same accuracy, 8-request decode steps 25% faster at 85k): server, long-continuation agreement, LongBench v2 multiple choice ([docs/SPARSE_DECODE.md](docs/SPARSE_DECODE.md)) |
+| `scripts/cold_ttft.py` | cold-prefill TTFT (own `cache_salt` per request); with `HY3_SPARSE_PREFILL` (EXPERIMENTAL block-sparse prefill, off; prefix-hit prefills 14% faster, cold 85k prefill 11% slower, [docs/SPARSE_DECODE.md](docs/SPARSE_DECODE.md#sparse-prefill-hy3_sparse_prefillfraction-experimental-off)) |
 | `scripts/profile_analyze.py` | tables for docs/PROFILE_85K.md from neuron-explorer parquet exports: per-phase times and MoE waiting per layer and rank |
 | `scripts/check_mtp_gaps.py` | HF FP32 log-probs at the first token where the plain and MTP runs differ (near-tie or defect) |
 | `scripts/bench_matrix.sh` | `vllm bench serve` matrix, random dataset, a distinct seed per cell so cells never share prefix-cache entries |
