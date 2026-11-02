@@ -290,6 +290,17 @@ prefill graph the routed experts drop from 79 to 53 ms per chunk, a chunk from
 P/D split decode TPOT at 8 requests goes from 42.9 to 41.4 ms (the arriving
 requests' prefill steps are shorter). Details: `results/profile_85k_moe_fp8w/`.
 
+### Decode routed experts: W8A8 does not help
+
+`scripts/tensore_mm_bench.py` times the decode MoE matmul shapes on one core
+(`results/w8a8_decode/`). At T = 32 (8-request MTP verify step) the gate / up
+matmul `moe_tkg` runs, BF16 hidden x FP8 weight with column tiling, costs
+0.078 us per 128-row contraction; with FP8 hidden (W8A8) it is 0.243 us
+untiled (the BF16 rate) and 0.149 us with `double_row`, which cannot be
+combined with column tiling. The down projection is bound by loading its FP8
+weight tile; FP8 instead of BF16 hidden changes nothing measurable. W8A8 would
+only add the activation quantization, so the decode MoE stays W8A16.
+
 ## Reproduce
 
 ```bash

@@ -882,6 +882,7 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 | `scripts/bench_prefix_fixed.sh` | prefix-cache benchmark over `bench_data/prefix` (85k input, 92% shared prefix): warm-up request, one `cache_salt` per run, hit rate from `/metrics` |
 | `scripts/bench_pd_split.sh` | prefill-only (output 1) and decode-only (replay twice) split over `bench_data/prefix`, with per-cell `cache_salt`, hit rates and MTP acceptance |
 | `src/kernels/moe_cte_fp8w.py`, `bwmm_shard_on_I_fp8w.py` | prefill routed experts: nkilib's `shard_on_i_hybrid` with the FP8 weight tiles fed to the matmul (no BF16 copy; identical output, routed experts -33% per prefill chunk; `HY3_MOE_CTE_FP8W=0` for the nkilib kernel; [docs/PROFILE_85K.md](docs/PROFILE_85K.md)) |
+| `scripts/tensore_mm_bench.py` | one-core TensorE cost of the decode MoE matmul shapes, BF16 x FP8 vs FP8 x FP8 (W8A8, with and without `double_row`): W8A8 is not faster there (`results/w8a8_decode/`, docs/PROFILE_85K.md) |
 | `scripts/profile_attn_breakdown.py` | attention-module time of a profiled decode step by model.py function (sparse-decode profile, [docs/SPARSE_DECODE.md](docs/SPARSE_DECODE.md)) |
 | `scripts/sparse_select_bench.py` | single-core timing of the sparse-decode block selection variants ([docs/SPARSE_DECODE.md](docs/SPARSE_DECODE.md)) |
 | `scripts/serve_85k.sh` | 85k-context config without DCP (max_model_len 86016, 4 requests at once), for MTP on `bench_data/prefix` |

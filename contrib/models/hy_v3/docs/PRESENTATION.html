@@ -268,7 +268,7 @@ svg .lbl-strong { fill: var(--text-primary); font-size: 12.5px; font-weight: 600
   </table>
   <div class="grid2 gap">
     <div class="card"><h3>FP8 范围</h3><p>checkpoint 是 OCP e4m3（最大 448），TRN2 kernel 的 e4m3 上限是 240。加载时所有 FP8 权重 ×0.5，scale ×2 补偿，对正常值是精确的。</p></div>
-    <div class="card"><h3>和 GPU 的差别</h3><p>Hopper/Blackwell 的 FP8 tensor core 要求两个输入都是 FP8，所以 GPU 上一般做 W8A8。TRN2 的 TensorE 可以直接做 BF16 × FP8，所以 W8A16 也不需要先转换权重。是否值得改成 W8A8，见第 9 章。</p></div>
+    <div class="card"><h3>和 GPU 的差别</h3><p>Hopper/Blackwell 的 FP8 tensor core 要求两个输入都是 FP8，所以 GPU 上一般做 W8A8。TRN2 的 TensorE 可以直接做 BF16 × FP8，而且 decode 的小 batch 下 FP8 × FP8 并不更快，所以 MoE 保持 W8A16（见第 9 章的实测）。</p></div>
   </div>
 </section>
 
@@ -378,7 +378,7 @@ svg .lbl-strong { fill: var(--text-primary); font-size: 12.5px; font-weight: 600
     <tr><td>EPLB：静态专家摆放</td><td>热门专家随请求变化；最忙 rank 的 prefill token 是平均的 4.3–4.5 倍，拟合的摆放只能消除约 9%</td><td><span class="tag bad">不值得</span> 约省 0.6 ms / 47.5 ms 步，prefill 约 1%</td></tr>
     <tr><td>Attention DP</td><td>0.29 启动时就拒绝，需要框架层支持</td><td><span class="tag neutral">暂缓</span></td></tr>
     <tr><td>DCP + MTP</td><td>两者不能同时开（GPU 版 vLLM 也有同样的问题）</td><td><span class="tag neutral">已整理 issue 草稿</span> 选 FP8 KV + MTP、不开 DCP</td></tr>
-    <tr><td>Prefill MoE 的 W8A8</td><td>kernel 0.88 ms（W8A16 不转换权重的版本 0.54 ms），误差 3.8e-2</td><td><span class="tag bad">不采用</span> 详见第 9 章</td></tr>
+    <tr><td>MoE 的 W8A8（prefill 与 decode）</td><td>prefill：kernel 0.88 ms（不转换权重的 W8A16 版本 0.54 ms），误差 3.8e-2；decode：FP8 × FP8 不比 BF16 × FP8 快</td><td><span class="tag bad">不采用</span> 详见第 9 章</td></tr>
   </table>
 </section>
 
@@ -514,33 +514,33 @@ svg .lbl-strong { fill: var(--text-primary); font-size: 12.5px; font-weight: 600
 <!-- 14 W8A8 decode -->
 <section class="slide">
   <p class="kicker">9 · W8A8（一）：decode</p>
-  <h2>decode 的 W8A8：分析过，<span style="color:var(--bad)">尚未实现，也没有测过</span></h2>
+  <h2>decode 的 W8A8：单核实测，<span style="color:var(--bad)">矩阵乘不会变快</span></h2>
   <div class="grid2">
     <div>
       <table>
-        <tr><th>decode 里的 GEMM</th><th>现在</th><th>改成 W8A8 需要</th></tr>
-        <tr><td>QKV / O 投影</td><td><b>已是 W8A8</b></td><td>—</td></tr>
-        <tr><td>Shared expert、dense MLP（TKG kernel）</td><td>W8A16</td><td>改 nkilib 的 MLP TKG kernel（它在 FP8 输入上编译不过）</td></tr>
-        <tr><td>Routed experts（<code>moe_tkg</code>，c8 每步约 25 ms，最大的一块）</td><td>W8A16</td><td>改 nkilib：TRN2 上 kernel 明确忽略激活 scale</td></tr>
+        <tr><th>gate / up（T = 32，8 请求 MTP verify 步）<br>stationary = hidden [128, T]，moving = FP8 权重 [128, 512]</th><th class="num">每 128 行收缩</th></tr>
+        <tr class="hl"><td><b>现在：BF16 hidden + column tiling</b>（moe_tkg 的写法，128/T 条并排）</td><td class="num"><b>0.078 µs</b></td></tr>
+        <tr><td>BF16 hidden，不 tiling</td><td class="num">0.237 µs</td></tr>
+        <tr><td>W8A8：FP8 hidden，不 tiling</td><td class="num">0.243 µs</td></tr>
+        <tr><td>W8A8：FP8 hidden + <code>double_row</code>（不能与 tiling 同时用）</td><td class="num">0.149 µs</td></tr>
       </table>
-      <h3 class="gap">routed experts 的 profile（c5，batch-8 NEFF，每步合计）</h3>
-      <table>
-        <tr><th>指标</th><th class="num">数值</th></tr>
-        <tr><td>kernel 时间（约 80 层）</td><td class="num">25.7 ms</td></tr>
-        <tr><td>HBM 读取（基本都是 FP8 专家权重）</td><td class="num">4.81 GB → 约 187 GB/s</td></tr>
-        <tr><td>TensorE 忙碌（MATMUL + LDWEIGHTS）</td><td class="num">11.1 ms</td></tr>
-        <tr><td>Vector / Scalar 忙碌（逐元素运算等）</td><td class="num">12.8 / 7.6 ms</td></tr>
-        <tr><td>算力：310 GFLOP（3 个本地专家 × 32 个 token）</td><td class="num">约 28 TFLOPS</td></tr>
+      <table class="gap">
+        <tr><th>down：stationary = FP8 权重 [128, 128]，moving = hidden [128, T]</th><th class="num">每 128 行收缩</th></tr>
+        <tr><td>BF16 hidden（现在）</td><td class="num">0.032–0.043 µs</td></tr>
+        <tr><td>W8A8：FP8 hidden</td><td class="num">0.033–0.034 µs</td></tr>
       </table>
+      <p class="note">脚本 <code>scripts/tensore_mm_bench.py</code>：每个变体是一个 NKI kernel，连续发 8192 / 1024 条 matmul，用两者的时间差算每条的耗时（需 <code>NKI_DISABLE_TRACE_CACHE=1</code>）。</p>
     </div>
-    <div class="card"><h3>为什么暂时没做</h3><ul>
-      <li>decode 的 MoE <b>既不受带宽限制，也不受算力限制</b>：带宽只用到约 187 GB/s，算力也远低于峰值；瓶颈是每步约 42 万条小指令的开销，以及多个引擎之间的等待</li>
-      <li>W8A8 能让矩阵乘的吞吐约翻倍，但只影响 TensorE 那 11 ms，最多省一半；Vector 上的 12.8 ms 不变，激活量化还会让它多一点工作</li>
-      <li><b>估计：</b>c8 每步约省 2–5 ms（4–8%）</li>
-      <li>和 prefill 不同：decode 的 <code>moe_tkg</code> 本来就把 FP8 权重直接送进 TensorE（BF16 × FP8），没有可以去掉的权重转换</li>
-      <li>要做就得改 nkilib 的 kernel（框架层面），而且要重新验证精度：我们在 prefill 上测到，激活量化让单层误差从 4e-3 升到 3.8e-2</li>
+    <div class="card"><h3>结论</h3><ul>
+      <li><b>FP8 × FP8 本身不更快：</b>不开 <code>double_row</code> 时，速率和 BF16 × FP8 一样</li>
+      <li><b>double_row 用不上：</b>它让 FP8 吞吐翻倍，但 decode 只有 ≤ 32 个 token，moe_tkg 靠 column tiling 把多条矩阵乘并排塞进 PE 阵列，比 <code>double_row</code> 还快约 2 倍；两者不能同时开。T = 4 时 <code>double_row</code> 直接编译失败</li>
+      <li><b>down 投影受装载权重限制：</b>激活换成 FP8 没有可测的差别（就算有，每步约 9 万条 down 矩阵乘合计也不到 1 ms）</li>
+      <li>所以 decode 改 W8A8 只会多出激活量化的开销，<b>不实现</b>；decode MoE 保持 W8A16（BF16 × FP8，本来就没有权重转换）</li>
     </ul>
-    <p class="note">如果要做，第一步是在单核上写一个激活按 token 量化的 <code>moe_tkg</code> 变体，对比速度和误差，再决定要不要上完整模型。</p></div>
+    <h3 class="gap">decode MoE 的瓶颈在哪</h3><ul>
+      <li>c5 profile：kernel 25.7 ms / 步，HBM 只用到约 187 GB/s，TensorE 忙 11.1 ms，Vector / Scalar 忙 12.8 / 7.6 ms</li>
+      <li>瓶颈是每步约 42 万条小指令的开销和多引擎之间的等待，不是矩阵乘的算力</li>
+    </ul></div>
   </div>
 </section>
 
@@ -629,7 +629,7 @@ svg .lbl-strong { fill: var(--text-primary); font-size: 12.5px; font-weight: 600
       <p class="note gap">配置：FP8 KV + MTP k=3 + sparse decode（<code>HY3_SPARSE_DECODE=0.125</code>，每 4 层选一次）+ prefill MoE 不转换权重。只看单请求延迟时关掉 sparse 更快（c1 TPOT 23.4 ms）。TPOT 和纯 decode 的差距来自测试中新请求的 prefill 打断 decode，真正的 P/D 分离部署里没有这部分。</p>
     </div>
     <div class="card"><h3>剩余瓶颈与下一步</h3><ul>
-      <li><b>decode MoE（c8 每步约 25 ms）：</b>受指令开销和多引擎之间的等待限制；W8A8 预计只能省 2–5 ms，需要改 kernel</li>
+      <li><b>decode MoE（c8 每步约 25 ms）：</b>受指令开销和多引擎之间的等待限制；W8A8 实测没有收益，要从减少指令数和引擎间同步入手</li>
       <li><b>sparse 的 K 投影 + 摘要更新（每步约 4 ms，也是 c1 慢 5% 的原因）：</b>直接使用 decode kernel 算出的 K，需要框架 PR</li>
       <li><b>prefill attention：</b>修 nkilib 分段 kernel 的 V 加载（已测出潜力：c8 TPOT 再降约 12%）；更长远是 prefill sparse / FP8 attention，需要先做精度研究</li>
       <li><b>需要上游的改动：</b>DCP + MTP 兼容；Neuron 上 prefill 和 decode 不能在同一步执行</li>
