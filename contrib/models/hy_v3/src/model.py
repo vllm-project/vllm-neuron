@@ -23,9 +23,10 @@ Kernel mapping:
     input RMSNorm, pre-RoPE QK-norm, in-kernel KV cache update).
   - Dense MLP / shared expert: ``NF.rmsnorm_quant`` + ``NF.mlp`` (STATIC).
   - Routed experts: torch router (sigmoid + selection-only bias), then
-    ``NF.moe_cte`` (``shard_on_i_hybrid``, per-channel FP8 weight dequant) for
-    prefill and the ``moe_tkg`` kernel (STATIC FP8 weights) for decode. Both run
-    BF16 activations x FP8 weights.
+    ``kernels/moe_cte_fp8w`` (nkilib's ``shard_on_i_hybrid`` with the FP8
+    weight tiles fed to the matmul instead of copied to BF16 first) for prefill
+    and the ``moe_tkg`` kernel (STATIC FP8 weights) for decode. Both run BF16
+    activations x FP8 weights.
 
 FP8 range handling: every FP8 weight is halved at load time to fit TRN2's
 240-capped e4m3, with the scales compensated (see ``weight_loaders.py``).
@@ -82,6 +83,7 @@ from vllm_neuron.vllm.spec_decode.decorator import async_speculative_decoding
 from . import kv_scales
 from .fp8_kv_layout import packed_decode_viable, swizzle_packed_k, unswizzle_packed_k
 from .config import HYV3Config
+from .kernels.moe_cte_fp8w import moe_cte_fp8w
 from .kernels.moe_tkg_hits import moe_tkg_hits
 from .kernels.moe_tkg_hits_batch import moe_tkg_hits_batch
 from .weight_loaders import (
@@ -112,6 +114,9 @@ _MLP_INTERMEDIATE_ALIGN = 128
 
 # Blockwise MoE prefill block size (shard_on_i requires a multiple of 256).
 _MOE_BLOCK_SIZE = 256
+# Prefill routed experts through kernels/moe_cte_fp8w (FP8 weight tiles into the
+# matmul, no BF16 copy; ~2x faster, identical output). 0: nkilib's kernel.
+_MOE_CTE_FP8W = os.environ.get("HY3_MOE_CTE_FP8W", "1") != "0"
 
 # Ranks per group sharing one copy of the shared expert during decode.
 _SHARED_DECODE_SHARDS = 8
@@ -1335,6 +1340,24 @@ def routed_experts_cte(
         if os.environ.get("HY3_MOE_CTE_IMPL") == "shard_on_i"
         else MoECTEImplementation.shard_on_i_hybrid
     )
+    if impl == MoECTEImplementation.shard_on_i_hybrid and _MOE_CTE_FP8W:
+        # nkilib's hybrid kernel copies every FP8 weight tile to BF16 before the
+        # matmul; this copy of it feeds the FP8 tiles to the matmul directly
+        # (same result: the copy is exact and the matmul accumulates in fp32).
+        return wrap_nki(moe_cte_fp8w)[2](
+            conditions=conditions,
+            hidden_states=normed,
+            expert_affinities_masked=masked,
+            gate_up_proj_weight=gate_up_weight,
+            down_proj_weight=down_weight,
+            token_position_to_id=token_position_to_id,
+            block_to_expert=block_to_expert,
+            gate_up_proj_scale=gate_up_scale,
+            down_proj_scale=down_scale,
+            block_size=_MOE_BLOCK_SIZE,
+            num_static_block=num_local_experts,
+            skip_token=True,
+        )[:T]
     return NF.moe_cte(
         implementation=impl,
         num_static_block=num_local_experts,

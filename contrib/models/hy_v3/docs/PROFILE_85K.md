@@ -277,6 +277,19 @@ Communication itself (the same-size attention collectives) is 3-4% of every
 phase measured here, and the NEFFs run back to back, so neither the
 interconnect nor the host is the limit in this configuration.
 
+### Prefill routed experts without the BF16 weight copy
+
+nkilib's `shard_on_i_hybrid` copies every FP8 weight tile to BF16 on the
+vector engine before a BF16 matmul (`CAST`, ~63 ms of the 79 ms routed-expert
+kernel in a 4096-token chunk). `src/kernels/bwmm_shard_on_I_fp8w.py` (a copy of
+nkilib's `bwmm_shard_on_I.py` with that copy switched off) feeds the FP8 tiles
+to the matmul directly, BF16 activations x FP8 weights, with identical output.
+It is the default (`HY3_MOE_CTE_FP8W=0` restores the nkilib kernel). In the
+prefill graph the routed experts drop from 79 to 53 ms per chunk, a chunk from
+451 to 426 ms (-5%; -2% at 80k context, where attention dominates); the 85k
+P/D split decode TPOT at 8 requests goes from 42.9 to 41.4 ms (the arriving
+requests' prefill steps are shorter). Details: `results/profile_85k_moe_fp8w/`.
+
 ## Reproduce
 
 ```bash
