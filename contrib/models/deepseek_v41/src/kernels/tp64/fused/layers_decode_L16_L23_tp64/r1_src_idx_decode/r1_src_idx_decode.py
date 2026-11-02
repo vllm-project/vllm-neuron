@@ -31,6 +31,7 @@ from .mk_compress import (
 )
 from . import mk_moe
 from .. import moe_tp
+from . import b1, b1idx, b1src
 from . import mk_mx as X
 from .mk_common import (
     PT,
@@ -342,6 +343,11 @@ def _half(n, pid):
     return lo, hi
 
 
+#: round 5: a 6-row span's whole block on chip, the stream in SBUF between consecutive such members
+#: (`b1`, the ratio-1 compressor `b1src`, the indexer `b1idx`; the host's 4-d hi | lo fn.T layout)
+B1_FULL = True
+
+
 @nki.jit
 def layer_decode_r1_src_idx_tp64(
     stream, pre_mix,
@@ -371,7 +377,8 @@ def layer_decode_r1_src_idx_tp64(
     # (`mk_mx.PACK_NV`: this block's row tile stages its T valid rows packed)
     X.PACK_NV[0] = T if Tp == PT else None
     width = hc * dim
-    mix = hca_fn_t.shape[-1]
+    # (`mk_model.fn_bd`'s 4-d hi | lo copy for the b1 path: [128, 2, hc * 4, C * mix])
+    mix = hca_fn_t.shape[-1] // (dim // 512) if len(hca_fn_t.shape) == 4 else hca_fn_t.shape[-1]
     # fp8 / fp4 weights arrive as `[K/4, N]` words (`mk_model.mx_fp8` / `mx_fp4`)
     q_lora = wq_a.shape[1]
     hd = wkv.shape[1]
@@ -442,6 +449,30 @@ def layer_decode_r1_src_idx_tp64(
     ffn_pre = nl.ndarray((T, hc), dtype=nl.float32, buffer=nl.shared_hbm)
     topk_out = nl.ndarray((T, topk), dtype=nl.int32, buffer=nl.shared_hbm)
     tap_out = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.shared_hbm)
+    b1_cs = dict(ratio=ratio, wkv_t=cm_wkv_t, wgate_t=cm_wgate_t, norm_w=cm_norm_w, ix_wk=ix_wk, knorm_w=ix_knorm_w,
+                 pos=grp_pos, mslots=grp_mslots, wslots=grp_wslots, write_slots=write_slots, pool_kv=pool_kv,
+                 pool_score=pool_score, ckv=compress_kv_cache, ikc=index_k_cache, freqs=freqs)
+    if (B1_FULL and T == 6 and nspans == 1 and tp and b1.is_bd_fn(hca_fn_t)
+            and b1idx.usable(topk_out, cmp_slots, ix_wproj_t, index_k_cache) and b1src.usable(b1_cs)):
+        # round 5: the whole block on chip (`b1`; the compressor `b1src`, the indexer `b1idx`)
+        ix = dict(wq_b=ix_wq_b4, wq_b_s=ix_wq_b_s, wproj=ix_wproj_t, keys=index_k_cache, clen=clen, out=topk_out,
+                  scale=IDX_SCALE, fresh=True)
+        deferred = b1.block(stream, pre_mix, hca_fn_t, hca_base, hca_scale, attn_norm_w, hcf_fn_t, hcf_base, hcf_scale,
+                            ffn_norm_w, wq_a4, wq_a_s, q_norm_w, wq_b4, wq_b_s, wkv4, wkv_s, kv_norm_w, wo_a4, wo_a_s,
+                            wo_b4, wo_b_s, attn_sink, freqs, row_pos, write_slots, win_slots, cmp_slots, wv, topk_out,
+                            window_kv_cache, compress_kv_cache, gate_w_t, gate_b, expert_lo, w1, s1, w2, s2, sh_w1,
+                            sh_s1, sh_w2, sh_s2, groups_attn, groups_world, share, out_stream, ffn_pre, _barrier,
+                            ix=ix, src=b1_cs)
+        if not deferred:
+            _barrier(out_stream)
+            _barrier(ffn_pre)
+        _barrier(topk_out)
+        return out_stream, ffn_pre, topk_out, tap_out, window_kv_cache, compress_kv_cache, pool_kv, pool_score, index_k_cache
+    if share is not None and share.get("b1", {}).get("S_src") is stream:
+        # (round 5: the previous member left its stream in SBUF for a b1 block and skipped its output
+        # barrier; this path reads them from HBM)
+        _barrier(stream)
+        _barrier(pre_mix)
     if CACHE_COPY_AT_AR:
         # the returned caches as the kernel's own outputs, copied by the kernel at a point
         # of its choosing (returning the inputs makes the compiler copy them at the end,

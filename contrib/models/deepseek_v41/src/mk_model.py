@@ -1373,7 +1373,9 @@ _FUSE_DECODE = int(os.environ.get("DEEPSEEK_V41_FUSE_DECODE", "8"))
 #: submission delays the device (the later ones are submitted while it runs), so a smaller
 #: first launch starts the device sooner, as long as the second is submitted before the
 #: first finishes. Each grouping is its own set of fused NEFFs.
-_FUSE_GROUPS = tuple(int(v) for v in os.environ.get("DEEPSEEK_V41_FUSE_GROUPS", "").split(",") if v.strip())
+#: (round 5 default 8,8,8,16: the last launch is the merged optimized `layers_decode_L24_L39_head_tp64` --
+#: L24-L31 and L32-L39 + head in one kernel, one launch entry / preamble / turnaround fewer a step)
+_FUSE_GROUPS = tuple(int(v) for v in os.environ.get("DEEPSEEK_V41_FUSE_GROUPS", "8,8,8,16").split(",") if v.strip())
 
 
 def _fuse_groups(n: int) -> list:
@@ -1782,16 +1784,49 @@ def moe_tp_map(model, block) -> dict:
 _FN_T_TILED = os.environ.get("DEEPSEEK_V41_FN_T_TILED", "1") not in ("", "0")
 
 
+#: `DEEPSEEK_V41_B1` (default 1): the optimized decode launches' r1 / r2 members (`fused/<launch>/r?_decode`)
+#: run a 6-row span's whole block on chip (`r1_decode/b1.py`: the stream in SBUF between consecutive r1
+#: members, the hyper-connection maps on the tensor engine); they read the block's hc mix weights as the
+#: hi | lo bf16 copy `fn_bd` (the kernel's other row counts rebuild the fp32 values from it)
+_B1 = os.environ.get("DEEPSEEK_V41_B1", "1") not in ("", "0")
+
+
+def _is_b1(lw) -> bool:
+    """Whether `lw`'s block has a b1 path (every decode member kind: r0 / r0_e / r1 / r1_tap / r1_idx /
+    r1_src_idx / r2 / r2_src_idx / r2_src_idx_e, `mk_kernels._KIND`)."""
+    arch = (lw.ratio, int(lw.is_kv_src), int(lw.is_idx_src), int(lw.has_engram), int(lw.tap))
+    return _B1 and arch in ((1, 0, 0, 0, 0), (2, 0, 0, 0, 0), (1, 0, 0, 0, 1), (1, 0, 1, 0, 0), (2, 1, 1, 0, 0),
+                            (0, 0, 0, 0, 0), (0, 0, 0, 1, 0), (2, 1, 1, 1, 0), (1, 1, 1, 0, 0))
+
+
+def fn_bd(t, hc=4, kc=512):
+    """`fn.T` `[hc * dim, mix]` fp32 -> `[128, 2, hc * 4, C * mix]` bf16: `[p, h, i * 4 + q, c * mix + m]`
+    = part h (0: bf16(fn), 1: bf16(fn - hi)) of `fn.T[i * dim + c * 512 + q * 128 + p, m]` (`b1.hc_mix`'s
+    block-diagonal mix GEMM operand; `r1_decode/mk_common.load_fn_t` rebuilds the tiled fp32 copy)."""
+    k, mix = t.shape
+    dim = k // hc
+    C = dim // kc
+    v = t.float().reshape(hc, C, 4, 128, mix).permute(3, 0, 2, 1, 4).reshape(128, hc * 4, C * mix)
+    hi = v.to(torch.bfloat16)
+    lo = (v - hi.float()).to(torch.bfloat16)
+    return torch.stack([hi, lo], dim=1).contiguous()
+
+
 def hc_fn_map(model, block) -> dict:
-    """`{id(fn.T): tiled copy}` for `block`'s hc mix weights, made once and cached on the block."""
+    """`{id(fn.T): tiled copy}` for `block`'s hc mix weights (r1 blocks: `fn_bd`), made once and
+    cached on the block."""
     cached = block.__dict__.get("_mk_fn_t_")
     if cached is not None:
         return cached
     lw = model._mk_layer(block)
+    b1 = _is_b1(lw)
     out = {}
     for t in (lw.hc_attn[0], lw.hc_attn[4]):
         k, mix = t.shape
-        h = _host(t).float().reshape(k // 128, 128, mix).permute(1, 0, 2).contiguous()
+        if b1:
+            h = fn_bd(_host(t))
+        else:
+            h = _host(t).float().reshape(k // 128, 128, mix).permute(1, 0, 2).contiguous()
         out[id(t)] = _dev(h, model.device)
     block.__dict__["_mk_fn_t_"] = out
     return out

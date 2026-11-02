@@ -35,6 +35,7 @@ import nki.language as nl
 
 from . import mk_moe
 from .. import moe_tp
+from . import b1
 from . import mk_mx as X
 from .mk_common import (
     load_freqs,
@@ -330,6 +331,18 @@ def _copy_rows(src, dst, pid, after=None, part=(0, 1)):
         _sched_after(ins, after)
 
 
+#: round 5: a 6-row span's whole block on chip, the stream in SBUF between consecutive such members
+#: (`b1`; with the host's 4-d hi | lo fn.T layout, `mk_model.fn_bd`). `B1_SHARE`: the launch's dict
+#: for it (set by the fused launch: the members' prefetch tables, the stream hand-off)
+B1_FULL = True
+B1_SHARE = None
+
+
+def _b1_barrier(t):
+    """The b1 path's `core_barrier` on `t` (the sync engine: not behind GpSimd's gathers)."""
+    nisa.core_barrier(data=t, cores=(0, 1), engine=nisa.engine.sync)
+
+
 @nki.jit
 def layer_decode_r2_tp64(
     stream, pre_mix,
@@ -354,7 +367,8 @@ def layer_decode_r2_tp64(
     T, hc, dim = stream.shape
     Tp = pad_to(T, PT)
     width = hc * dim
-    mix = hca_fn_t.shape[-1]
+    # (`mk_model.fn_bd`'s 4-d hi | lo copy for the b1 path: [128, 2, hc * 4, C * mix])
+    mix = hca_fn_t.shape[-1] // (dim // 512) if len(hca_fn_t.shape) == 4 else hca_fn_t.shape[-1]
     # fp8 / fp4 weights arrive as `[K/4, N]` words (`mk_model.mx_fp8` / `mx_fp4`)
     q_lora = wq_a.shape[1]
     hd = wkv.shape[1]
@@ -407,6 +421,21 @@ def layer_decode_r2_tp64(
         ik_out = nl.ndarray(index_k_cache.shape, dtype=index_k_cache.dtype, buffer=nl.shared_hbm)
     else:
         wkv_out, ckv_out, ik_out = window_kv_cache, compress_kv_cache, index_k_cache
+    if (B1_FULL and B1_SHARE is not None and not CACHE_COPY_EARLY and T == 6 and nspans == 1 and tp
+            and b1.is_bd_fn(hca_fn_t)):
+        # round 5: the whole block on chip (`b1`)
+        wq_a4, wq_b4, wkv4 = wq_a.view(X.FP8_X4), wq_b.view(X.FP8_X4), wkv.view(X.FP8_X4)
+        wo_a4, wo_b4 = wo_a.view(X.FP8_X4), wo_b.view(X.FP8_X4)
+        deferred = b1.block(stream, pre_mix, hca_fn_t, hca_base, hca_scale, attn_norm_w, hcf_fn_t, hcf_base, hcf_scale,
+                            ffn_norm_w, wq_a4, wq_a_s, q_norm_w, wq_b4, wq_b_s, wkv4, wkv_s, kv_norm_w, wo_a4, wo_a_s,
+                            wo_b4, wo_b_s, attn_sink, freqs, row_pos, write_slots, win_slots, cmp_slots, wv, topk_in,
+                            window_kv_cache, compress_kv_cache, gate_w_t, gate_b, expert_lo, w1, s1, w2, s2, sh_w1,
+                            sh_s1, sh_w2, sh_s2, groups_attn, groups_world, B1_SHARE, out_stream, ffn_pre,
+                            _b1_barrier)
+        if not deferred:
+            _b1_barrier(out_stream)
+            _b1_barrier(ffn_pre)
+        return out_stream, ffn_pre, topk_out, tap_out, wkv_out, ckv_out, pool_kv, pool_score, ik_out
 
     # ------------------------------------------------------------------ scratch
     strm = stream.reshape((T, width))

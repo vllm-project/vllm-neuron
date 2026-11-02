@@ -32,6 +32,7 @@ from .mk_compress import (
 )
 from . import mk_moe
 from .. import moe_tp
+from . import b1, b1eng, b1idx, b1src
 from . import mk_mx as X
 from .mk_common import (
     load_freqs,
@@ -313,6 +314,19 @@ def _ktab_gather(index_k_cache, cmp_slots, ktab, nspans, read_len, pid, kd):
                     ktab[b * read_len : (b + 1) * read_len], tiles_of(read_len, pid), kd)
 
 
+#: round 5: the engram read-out (HBM) then the block on chip (`b1`), its stream left in SBUF for the next
+#: member of the launch's b1 dict `B1_SHARE` (the host's 4-d hi | lo fn.T layout, `mk_model.fn_bd`)
+B1_FULL = True
+B1_SHARE = None
+#: the engram read-out's gate on chip as well (`b1eng`), else the HBM read-out then the block
+B1_ENG = True
+
+
+def _b1_barrier(t):
+    """The b1 path's `core_barrier` on `t` (the sync engine)."""
+    nisa.core_barrier(data=t, cores=(0, 1), engine=nisa.engine.sync)
+
+
 @nki.jit
 def layer_decode_r2_src_idx_e_tp64(
     stream, pre_mix,
@@ -337,7 +351,8 @@ def layer_decode_r2_src_idx_e_tp64(
     T, hc, dim = stream.shape
     Tp = pad_to(T, PT)
     width = hc * dim
-    mix = hca_fn_t.shape[-1]
+    # (`mk_model.fn_bd`'s 4-d hi | lo copy for the b1 path: [128, 2, hc * 4, C * mix])
+    mix = hca_fn_t.shape[-1] // (dim // 512) if len(hca_fn_t.shape) == 4 else hca_fn_t.shape[-1]
     # fp8 / fp4 weights arrive as `[K/4, N]` words (`mk_model.mx_fp8` / `mx_fp4`)
     q_lora = wq_a.shape[1]
     hd = wkv.shape[1]
@@ -406,6 +421,43 @@ def layer_decode_r2_src_idx_e_tp64(
     else:
         wkv_out, ckv_out, ik_out = window_kv_cache, compress_kv_cache, index_k_cache
 
+    b1_cs = dict(ratio=ratio, wkv_t=cm_wkv_t, wgate_t=cm_wgate_t, norm_w=cm_norm_w, ix_wk=ix_wk, knorm_w=ix_knorm_w,
+                 pos=grp_pos, mslots=grp_mslots, wslots=grp_wslots, write_slots=write_slots, pool_kv=pool_kv,
+                 pool_score=pool_score, ckv=compress_kv_cache, ikc=index_k_cache, freqs=freqs)
+    if (B1_FULL and B1_SHARE is not None and T == 6 and nspans == 1 and tp and b1.is_bd_fn(hca_fn_t)
+            and b1idx.usable(topk_out, cmp_slots, ix_wproj_t, index_k_cache) and b1src.usable(b1_cs)):
+        # round 5: the engram read-out, then the whole block on chip (`b1`; `b1src`, `b1idx`)
+        ix = dict(wq_b=ix_wq_b4, wq_b_s=ix_wq_b_s, wproj=ix_wproj_t, keys=index_k_cache, clen=clen, out=topk_out,
+                  scale=IDX_SCALE, fresh=True)
+        if B1_ENG and b1eng.usable(hash_ids, etable, e_wkv4, e_qk, hc, dim):
+            # the read-out's gate on chip too (`b1eng`): the gated stream straight into the block's SBUF layout
+            Lb = B1_SHARE.setdefault("b1", {})
+            b1.consts(Lb, dim // 512)
+            S_prev = Lb["S"] if Lb.get("S_src") is stream else b1.load_stream(stream, dim // 512)
+            S_new = b1eng.readout(pid, Lb, S_prev, hash_ids, etable, erow_start, e_wkv4, e_wkv_s, e_qk, rg_world,
+                                  rg_attn, dim // 512, _b1_barrier)
+            stream0 = stream
+        else:
+            S_new = None
+            stream0 = nl.ndarray((T, width), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="stream0")
+            engram_readout(pid, mine, T, Tp, hc, dim, hash_ids, etable, erow_start, e_wkv4, e_wkv_s, e_qk,
+                           stream.reshape((T, width)), stream0, rg_world, rg_attn=rg_attn)
+        deferred = b1.block(stream0.reshape((T, hc, dim)), pre_mix, hca_fn_t, hca_base, hca_scale, attn_norm_w,
+                            hcf_fn_t, hcf_base, hcf_scale, ffn_norm_w, wq_a4, wq_a_s, q_norm_w, wq_b4, wq_b_s, wkv4,
+                            wkv_s, kv_norm_w, wo_a4, wo_a_s, wo_b4, wo_b_s, attn_sink, freqs, row_pos, write_slots,
+                            win_slots, cmp_slots, wv, topk_out, window_kv_cache, compress_kv_cache, gate_w_t, gate_b,
+                            expert_lo, w1, s1, w2, s2, sh_w1, sh_s1, sh_w2, sh_s2, groups_attn, groups_world, B1_SHARE,
+                            out_stream, ffn_pre, _b1_barrier, S_in=S_new, ix=ix, src=b1_cs)
+        if not deferred:
+            _b1_barrier(out_stream)
+            _b1_barrier(ffn_pre)
+        _b1_barrier(topk_out)
+        return out_stream, ffn_pre, topk_out, tap_out, window_kv_cache, compress_kv_cache, pool_kv, pool_score, index_k_cache
+    if B1_SHARE is not None and B1_SHARE.get("b1", {}).get("S_src") is stream:
+        # (round 5: the previous member left its stream in SBUF for a b1 block and skipped its output
+        # barrier; this path reads them from HBM)
+        _b1_barrier(stream)
+        _b1_barrier(pre_mix)
     # ------------------------------------------------------------------ scratch
     strm = stream.reshape((T, width))
     out2 = out_stream.reshape((T, width))

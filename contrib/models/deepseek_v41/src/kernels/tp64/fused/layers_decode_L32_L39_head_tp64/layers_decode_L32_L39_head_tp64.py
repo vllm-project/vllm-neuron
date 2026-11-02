@@ -87,6 +87,17 @@ def layers_decode_L32_L39_head_tp64(
     # what the members share across blocks (the slot table / attention index tables of
     # blocks reading the same top-k, see the members' SHARE_SLOT_TABLE)
     share = {}
+    # round 5: each b1 member (r1, `r1_decode/b1.py`) prefetches the next one's attention weights,
+    # attention-norm weight and hc_in(attn) constants and leaves it its stream in SBUF
+    _loc = dict(locals())
+    _aw = lambda n: tuple(_loc[f"L{n}_{k}"] for k in ("wq_a", "wq_a_s", "wq_b", "wq_b_s", "wkv", "wkv_s",
+                                                       "wo_a", "wo_a_s", "wo_b", "wo_b_s"))
+    # (the r1_idx members L32 / L36 are b1 blocks too: every consecutive pair)
+    _b1_pairs = [(a, a + 1) for a in range(32, 39)]
+    share["b1"] = {"attn_next": {id(_loc[f"L{a}_wq_a_s"]): _aw(b) for a, b in _b1_pairs},
+                   "next_b1": {id(_loc[f"L{a}_wq_a_s"]) for a, _ in _b1_pairs},
+                   "pre_next": {id(_loc[f"L{a}_wq_a_s"]): tuple(_loc[f"L{b}_{k}"] for k in (
+                       "attn_norm_w", "hca_fn_t", "hca_base", "hca_scale")) for a, b in _b1_pairs}}
     # L32 (r1_idx)
     with member(0, r1_idx_decode):
         o0 = r1_idx_decode.layer_decode_r1_idx_tp64.func(

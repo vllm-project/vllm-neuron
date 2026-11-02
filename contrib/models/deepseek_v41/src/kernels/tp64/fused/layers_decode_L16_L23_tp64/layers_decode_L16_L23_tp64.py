@@ -93,12 +93,44 @@ def layers_decode_L16_L23_tp64(
     moe_tp.reset()
     # the slot / index tables the members share (built by the first member that needs them)
     share = {}
+    # round 5: each b1 member (r1, `r1_decode/b1.py`) prefetches the next one's attention weights,
+    # attention-norm weight and hc_in(attn) constants and leaves it its stream in SBUF
+    _loc = dict(locals())
+    _aw = lambda n: tuple(_loc[f"L{n}_{k}"] for k in ("wq_a", "wq_a_s", "wq_b", "wq_b_s", "wkv", "wkv_s",
+                                                       "wo_a", "wo_a_s", "wo_b", "wo_b_s"))
+    # (round 5: L19 (r2) -> L20 (r1_src_idx) -> L21: one b1 dict, below)
+    _b1_pairs = [(19, 20), (20, 21), (21, 22), (22, 23)]
+    share["b1"] = {"attn_next": {id(_loc[f"L{a}_wq_a_s"]): _aw(b) for a, b in _b1_pairs},
+                   "next_b1": {id(_loc[f"L{a}_wq_a_s"]) for a, _ in _b1_pairs},
+                   "pre_next": {id(_loc[f"L{a}_wq_a_s"]): tuple(_loc[f"L{b}_{k}"] for k in (
+                       "attn_norm_w", "hca_fn_t", "hca_base", "hca_scale")) for a, b in _b1_pairs}}
     # r2 members (L00_L07's): the slot / index tables (`r2_decode.SHARE_TAB`), the previous
     # block's output tiles in SBUF (`XS_SHARE`), and each r2 block's q / kv projection
     # weights loaded by the r2 block before it, after that block's world all-reduce trigger
     # (`r2_decode.prefetch_proj`)
     r2_decode.SHARE_TAB = {}
     r2_decode.XS_SHARE = {}
+
+    # round 5: the r2 members on chip (`r2_decode/b1.py`): each prefetches the next one's attention
+    # weights, attention-norm weight and hc_in(attn) constants and leaves it its stream in SBUF; the
+    # members before them skip the projection prefetch (`PRE_PROJ`, unread by them)
+    _loc = dict(locals())
+    _aw = lambda n: tuple(_loc[f"L{n:02d}_{k}"] for k in ("wq_a", "wq_a_s", "wq_b", "wq_b_s", "wkv", "wkv_s",
+                                                            "wo_a", "wo_a_s", "wo_b", "wo_b_s"))
+    _b1_pairs = [(16, 17), (17, 18), (18, 19)]
+    r2_decode.B1_SHARE = {"b1": {
+        "attn_next": {id(_loc[f"L{a:02d}_wq_a_s"]): _aw(b) for a, b in _b1_pairs},
+        "next_b1": {id(_loc[f"L{a:02d}_wq_a_s"]) for a, _ in _b1_pairs},
+        "pre_next": {id(_loc[f"L{a:02d}_wq_a_s"]): tuple(_loc[f"L{b:02d}_{k}"] for k in (
+            "attn_norm_w", "hca_fn_t", "hca_base", "hca_scale")) for a, b in _b1_pairs}}}
+    # (round 5: one b1 dict for the r2 / r1_src_idx / r1 members: the stream and prefetch hand-offs across)
+    for _k in ("attn_next", "pre_next"):
+        share["b1"][_k].update(r2_decode.B1_SHARE["b1"][_k])
+    share["b1"]["next_b1"] |= r2_decode.B1_SHARE["b1"]["next_b1"]
+    r2_decode.B1_SHARE = share
+
+    def _b1_t(fn):
+        return r2_decode.B1_FULL and L16_stream.shape[0] == 6 and len(fn.shape) == 4
 
     def prefetch(wq_a, wq_a_s, wkv, wkv_s, wq_b=None, wq_b_s=None):
         if not r2_decode.PREFETCH_NEXT_PROJ or L16_stream.shape[0] > r2_decode.PREFETCH_MAX_T:
@@ -109,7 +141,7 @@ def layers_decode_L16_L23_tp64(
                                                                 wq_b=wq_b, wq_b_s=wq_b_s))
         return f
 
-    r2_decode.AFTER_WORLD_AR = prefetch(L17_wq_a, L17_wq_a_s, L17_wkv, L17_wkv_s, L17_wq_b, L17_wq_b_s)
+    r2_decode.AFTER_WORLD_AR = None if _b1_t(L17_hca_fn_t) else prefetch(L17_wq_a, L17_wq_a_s, L17_wkv, L17_wkv_s, L17_wq_b, L17_wq_b_s)
     # L16 (r2)
     with member(0, r2_decode):
         o0 = r2_decode.layer_decode_r2_tp64.func(
@@ -127,7 +159,7 @@ def layers_decode_L16_L23_tp64(
             L16_s3, L16_w2, L16_s2, L16_sh_w1, L16_sh_s1, L16_sh_w3, L16_sh_s3, L16_sh_w2,
             L16_sh_s2, L16_groups_attn, L16_groups_world, L16_flags
         )
-    r2_decode.AFTER_WORLD_AR = prefetch(L18_wq_a, L18_wq_a_s, L18_wkv, L18_wkv_s, L18_wq_b, L18_wq_b_s)
+    r2_decode.AFTER_WORLD_AR = None if _b1_t(L18_hca_fn_t) else prefetch(L18_wq_a, L18_wq_a_s, L18_wkv, L18_wkv_s, L18_wq_b, L18_wq_b_s)
     # L17 (r2)
     with member(1, r2_decode):
         o1 = r2_decode.layer_decode_r2_tp64.func(
@@ -145,7 +177,7 @@ def layers_decode_L16_L23_tp64(
             L17_s2, L17_sh_w1, L17_sh_s1, L17_sh_w3, L17_sh_s3, L17_sh_w2, L17_sh_s2,
             L16_groups_attn, L16_groups_world, L16_flags
         )
-    r2_decode.AFTER_WORLD_AR = prefetch(L19_wq_a, L19_wq_a_s, L19_wkv, L19_wkv_s, L19_wq_b, L19_wq_b_s)
+    r2_decode.AFTER_WORLD_AR = None if _b1_t(L19_hca_fn_t) else prefetch(L19_wq_a, L19_wq_a_s, L19_wkv, L19_wkv_s, L19_wq_b, L19_wq_b_s)
     # L18 (r2)
     with member(2, r2_decode):
         o2 = r2_decode.layer_decode_r2_tp64.func(

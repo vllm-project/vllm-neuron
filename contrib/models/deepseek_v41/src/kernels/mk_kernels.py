@@ -380,6 +380,13 @@ def optimized_fused(name: str, kernels: tuple, plan: tuple, nparams: int, return
     """`(kernel, None)`: the optimized launch `tp64/fused/<name>/` (`@nki.jit`) for this plan
     (`fused`'s arguments), else `(None, why not)` (no such launch, not enabled, or its
     `plan.json` differs from the plan)."""
+    dump = os.environ.get("DEEPSEEK_V41_FUSED_PLAN_DUMP", "")
+    if dump:
+        # (debugging aid: the model's plan of this launch as `plan.json` spells it, for writing an optimized
+        # launch of a new grouping)
+        os.makedirs(dump, exist_ok=True)
+        with open(os.path.join(dump, f"{name}.json"), "w") as fh:
+            json.dump(dict(launch=name, **plan_signature(kernels, plan, nparams, returns)), fh, indent=1)
     if name not in FUSED_LAUNCHES:
         return None, "no optimized launch"
     if name not in _FUSED_ENABLED:

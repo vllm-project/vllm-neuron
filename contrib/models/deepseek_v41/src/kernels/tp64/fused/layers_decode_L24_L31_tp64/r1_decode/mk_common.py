@@ -677,6 +677,22 @@ def load_fn_t(fn_t, width, mix):
     """`fn.T` (`[hc*dim, mix]` fp32 HBM) resident as `(PT, nk, mix)` fp32 SBUF."""
     nk = width // PT
     fnT = nl.ndarray((PT, nk, mix), dtype=nl.float32, buffer=nl.sbuf)
+    if len(fn_t.shape) == 4:
+        # (the b1 members' hi | lo bf16 copy, `mk_model.fn_bd`: [p, h, i * 4 + q, c * mix + m] for row
+        # k * 128 + p, k = i * nc * 4 + c * 4 + q: rebuilt as hi + lo, ~2^-17 of the fp32 value)
+        nq = fn_t.shape[2]
+        nc = fn_t.shape[3] // mix
+        hl = nl.ndarray((PT, 2, nq, nc * mix), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.dma_copy(dst=hl, src=fn_t, dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
+        hc = nq // 4
+        blk = 2 * nq * nc * mix
+        for i in range(hc):
+            nisa.tensor_tensor(dst=fnT.ap(pattern=[[nk * mix, PT], [4 * mix, nc], [mix, 4], [1, mix]], offset=i * nc * 4 * mix),
+                               data1=hl.ap(pattern=[[blk, PT], [mix, nc], [nc * mix, 4], [1, mix]], offset=i * 4 * nc * mix),
+                               data2=hl.ap(pattern=[[blk, PT], [mix, nc], [nc * mix, 4], [1, mix]],
+                                           offset=(nq + i * 4) * nc * mix),
+                               op=nl.add)
+        return fnT
     if len(fn_t.shape) == 3:
         # (the host's tiled copy, `mk_model.hc_fn_map`: one contiguous run a partition)
         nisa.dma_copy(dst=fnT, src=fn_t, dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)

@@ -105,6 +105,30 @@ def layers_decode_L08_L15_tp64(
         m.XS_SHARE = xs_share
         m.AFTER_WORLD_AR = None
 
+    # round 5: the r2 members on chip (`r2_decode/b1.py`): each prefetches the next one's attention
+    # weights, attention-norm weight and hc_in(attn) constants and leaves it its stream in SBUF; the
+    # members before them skip the projection prefetch (`PRE_PROJ`, unread by them)
+    _loc = dict(locals())
+    _aw = lambda n: tuple(_loc[f"L{n:02d}_{k}"] for k in ("wq_a", "wq_a_s", "wq_b", "wq_b_s", "wkv", "wkv_s",
+                                                            "wo_a", "wo_a_s", "wo_b", "wo_b_s"))
+    _b1_pairs = [(8, 9), (9, 10), (10, 11), (11, 12), (12, 13), (13, 14), (14, 15)]
+    r2_decode.B1_SHARE = {"b1": {
+        "attn_next": {id(_loc[f"L{a:02d}_wq_a_s"]): _aw(b) for a, b in _b1_pairs},
+        "next_b1": {id(_loc[f"L{a:02d}_wq_a_s"]) for a, _ in _b1_pairs},
+        "pre_next": {id(_loc[f"L{a:02d}_wq_a_s"]): tuple(_loc[f"L{b:02d}_{k}"] for k in (
+            "attn_norm_w", "hca_fn_t", "hca_base", "hca_scale")) for a, b in _b1_pairs}}}
+    # (round 5: the r2_src_idx_e member on chip too, the same dict)
+    r2_src_idx_e_decode.B1_SHARE = r2_decode.B1_SHARE
+    # (its engram read-out reads the HBM stream -- L13 keeps its output barrier, only prefetches -- unless
+    # the read-out's gate is on chip too, `r2_src_idx_e_decode.B1_ENG`: it reads L13's stream from SBUF)
+    if not r2_src_idx_e_decode.B1_ENG:
+        r2_decode.B1_SHARE["b1"]["next_b1"].discard(id(_loc["L13_wq_a_s"]))
+    # (round 5: the r2_src_idx member on chip too, the same dict: its stream / prefetch hand-off)
+    r2_src_idx_decode.B1_SHARE = r2_decode.B1_SHARE
+
+    def _b1_t(fn):
+        return r2_decode.B1_FULL and L08_stream.shape[0] == 6 and len(fn.shape) == 4
+
     def prefetch(wq_a, wq_a_s, wkv, wkv_s, wq_b=None, wq_b_s=None):
         if not r2_decode.PREFETCH_NEXT_PROJ or L08_stream.shape[0] > r2_decode.PREFETCH_MAX_T:
             return None
@@ -115,7 +139,7 @@ def layers_decode_L08_L15_tp64(
         return f
 
     # L08 (r2_src_idx)
-    r2_src_idx_decode.AFTER_WORLD_AR = prefetch(L09_wq_a, L09_wq_a_s, L09_wkv, L09_wkv_s, L09_wq_b, L09_wq_b_s)
+    r2_src_idx_decode.AFTER_WORLD_AR = None if _b1_t(L09_hca_fn_t) else prefetch(L09_wq_a, L09_wq_a_s, L09_wkv, L09_wkv_s, L09_wq_b, L09_wq_b_s)
     with member(0, r2_src_idx_decode):
         o0 = r2_src_idx_decode.layer_decode_r2_src_idx_tp64.func(
             L08_stream, L08_pre_mix, L08_hca_fn_t, L08_hca_base, L08_hca_scale, L08_attn_norm_w,
@@ -133,7 +157,7 @@ def layers_decode_L08_L15_tp64(
             L08_groups_attn, L08_groups_world, L08_flags
         )
     # L09 (r2)
-    r2_decode.AFTER_WORLD_AR = prefetch(L10_wq_a, L10_wq_a_s, L10_wkv, L10_wkv_s, L10_wq_b, L10_wq_b_s)
+    r2_decode.AFTER_WORLD_AR = None if _b1_t(L10_hca_fn_t) else prefetch(L10_wq_a, L10_wq_a_s, L10_wkv, L10_wkv_s, L10_wq_b, L10_wq_b_s)
     with member(1, r2_decode):
         o1 = r2_decode.layer_decode_r2_tp64.func(
             o0[0], o0[1], L09_hca_fn_t, L09_hca_base, L09_hca_scale, L09_attn_norm_w, L09_hcf_fn_t,
@@ -151,7 +175,7 @@ def layers_decode_L08_L15_tp64(
             L09_flags
         )
     # L10 (r2)
-    r2_decode.AFTER_WORLD_AR = prefetch(L11_wq_a, L11_wq_a_s, L11_wkv, L11_wkv_s, L11_wq_b, L11_wq_b_s)
+    r2_decode.AFTER_WORLD_AR = None if _b1_t(L11_hca_fn_t) else prefetch(L11_wq_a, L11_wq_a_s, L11_wkv, L11_wkv_s, L11_wq_b, L11_wq_b_s)
     with member(2, r2_decode):
         o2 = r2_decode.layer_decode_r2_tp64.func(
             o1[0], o1[1], L10_hca_fn_t, L10_hca_base, L10_hca_scale, L10_attn_norm_w, L10_hcf_fn_t,
@@ -169,7 +193,7 @@ def layers_decode_L08_L15_tp64(
             L09_flags
         )
     # L11 (r2)
-    r2_decode.AFTER_WORLD_AR = prefetch(L12_wq_a, L12_wq_a_s, L12_wkv, L12_wkv_s, L12_wq_b, L12_wq_b_s)
+    r2_decode.AFTER_WORLD_AR = None if _b1_t(L12_hca_fn_t) else prefetch(L12_wq_a, L12_wq_a_s, L12_wkv, L12_wkv_s, L12_wq_b, L12_wq_b_s)
     with member(3, r2_decode):
         o3 = r2_decode.layer_decode_r2_tp64.func(
             o2[0], o2[1], L11_hca_fn_t, L11_hca_base, L11_hca_scale, L11_attn_norm_w, L11_hcf_fn_t,
@@ -187,7 +211,7 @@ def layers_decode_L08_L15_tp64(
             L09_flags
         )
     # L12 (r2)
-    r2_decode.AFTER_WORLD_AR = prefetch(L13_wq_a, L13_wq_a_s, L13_wkv, L13_wkv_s, L13_wq_b, L13_wq_b_s)
+    r2_decode.AFTER_WORLD_AR = None if _b1_t(L13_hca_fn_t) else prefetch(L13_wq_a, L13_wq_a_s, L13_wkv, L13_wkv_s, L13_wq_b, L13_wq_b_s)
     with member(4, r2_decode):
         o4 = r2_decode.layer_decode_r2_tp64.func(
             o3[0], o3[1], L12_hca_fn_t, L12_hca_base, L12_hca_scale, L12_attn_norm_w, L12_hcf_fn_t,
@@ -223,7 +247,7 @@ def layers_decode_L08_L15_tp64(
             L09_flags
         )
     # L14 (r2_src_idx_e)
-    r2_src_idx_e_decode.AFTER_WORLD_AR = prefetch(L15_wq_a, L15_wq_a_s, L15_wkv, L15_wkv_s, L15_wq_b, L15_wq_b_s)
+    r2_src_idx_e_decode.AFTER_WORLD_AR = None if _b1_t(L15_hca_fn_t) else prefetch(L15_wq_a, L15_wq_a_s, L15_wkv, L15_wkv_s, L15_wq_b, L15_wq_b_s)
     with member(6, r2_src_idx_e_decode):
         o6 = r2_src_idx_e_decode.layer_decode_r2_src_idx_e_tp64.func(
             o5[0], o5[1], L14_hca_fn_t, L14_hca_base, L14_hca_scale, L14_attn_norm_w, L14_hcf_fn_t,

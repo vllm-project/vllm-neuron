@@ -381,7 +381,8 @@ def router_logits(pid, T, xn2, gate_w, logits, dim, n_experts, lg_sb=None):
 ROUTE_RCP_DVE = True
 
 
-def route_group(logits, gate_b, glo, T, n_experts, topk, ng, route_scale, lg_sb=None):
+def route_group(logits, gate_b, glo, T, n_experts, topk, ng, route_scale, lg_sb=None, keep=False, sqrt_dve=False,
+                bias_sb=None, lo_sb=None, gather_inbounds=None):
     """The router's selection (`mk_common.route_topk`'s arithmetic) and the group's dense
     routing weights: `(wexp_hbm [128, ng + 1] fp32 private HBM (rows past T and column ng
     zero), alist [1, ng + 1] int32 private HBM (the active local experts ascending, padded with
@@ -395,8 +396,14 @@ def route_group(logits, gate_b, glo, T, n_experts, topk, ng, route_scale, lg_sb=
     sp = nl.ndarray((PT, n_experts), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(dst=sp[0:nr, :], op=nl.softplus, data=lg[0:nr, :])
     scores = nl.ndarray((PT, n_experts), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.activation(dst=scores[0:nr, :], op=nl.sqrt, data=sp[0:nr, :])
-    bb = nl.broadcast_to(nl.load(gate_b[0:1, 0:n_experts], dtype=nl.float32), (nr, n_experts))
+    if sqrt_dve:
+        # (the square root on the vector engine: no ACT table switch after the softplus)
+        nisa.tensor_scalar(dst=scores[0:nr, :], data=sp[0:nr, :], op0=nl.power, operand0=0.5)
+    else:
+        nisa.activation(dst=scores[0:nr, :], op=nl.sqrt, data=sp[0:nr, :])
+    # (`bias_sb`: the bias already on the rows' partitions, fp32 -- loaded early by the caller)
+    bb = bias_sb[0:nr, 0:n_experts] if bias_sb is not None else nl.broadcast_to(
+        nl.load(gate_b[0:1, 0:n_experts], dtype=nl.float32), (nr, n_experts))
     sel = nl.ndarray((PT, n_experts), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=sel[0:nr, :], data1=scores[0:nr, :], data2=bb, op=nl.add)
     best = nl.ndarray((PT, 8), dtype=nl.float32, buffer=nl.sbuf)
@@ -426,7 +433,8 @@ def route_group(logits, gate_b, glo, T, n_experts, topk, ng, route_scale, lg_sb=
     nisa.iota(dst=ei, pattern=[[1, ng]], offset=0, channel_multiplier=0)
     ef = nl.ndarray((PT, ng), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=ef, src=ei)
-    lo = nl.broadcast_to(nl.load(glo[0:1, 0:1], dtype=nl.float32), (nr, 1))
+    # (`lo_sb`: glo on the rows' partitions, fp32 -- loaded early by the caller)
+    lo = lo_sb[0:nr, 0:1] if lo_sb is not None else nl.broadcast_to(nl.load(glo[0:1, 0:1], dtype=nl.float32), (nr, 1))
     nisa.tensor_scalar(dst=ef[0:nr, :], data=ef[0:nr, :], op0=nl.add, operand0=lo)
     # wsb[t, e] = sum_k (idf[t, k] == glo + e) * wts[t, k] (at most one term is nonzero)
     # (columns ng, ng + 1 stay zero: the zero expert's and the padding id's)
@@ -509,12 +517,12 @@ def route_group(logits, gate_b, glo, T, n_experts, topk, ng, route_scale, lg_sb=
             else:
                 src_bc = bc
             nisa.tensor_scalar(dst=sf, data=src_bc, op0=nl.multiply, operand0=16.0, op1=nl.add,
-                               operand1=_scale_rows_base()[:, 0:1])
+                               operand1=_scale_rows_base(gather_inbounds)[:, 0:1])
             # (the out-of-bounds rows clamped to the first row past the scale tensor -- its ng + 1
             # experts' 16 rows -- for the same reason as the padding id)
             nisa.tensor_scalar(dst=sf, data=sf, op0=nl.minimum, operand0=float((ng + 1) * 16))
             sidx = nl.ndarray((PT, S2), dtype=nl.int32, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=sidx, src=sf)
+            ROUTE_END[0] = nisa.tensor_copy(dst=sidx, src=sf)
             slot = (slot, sidx)
             if SLOT_SW_FROM is not None:
                 # the SWDGE slots' weight rows: [p, j] = PT * id_j + p (gate|up) and HID / 4 * id_j + p
@@ -532,12 +540,20 @@ def route_group(logits, gate_b, glo, T, n_experts, topk, ng, route_scale, lg_sb=
                     nisa.tensor_copy(dst=wi, src=wf)
                     rows.append(wi)
                 slot = (slot[0], sidx, rows[0], rows[1])
+                if keep:
+                    slot = slot + (wsb,)
     return wexp, alist, nact, nz, slot
 
 
-def _scale_rows_base():
-    """`[p] = 4 q + r` for the scale partitions p = 32 q + r (r < 4), `BIG_ROW` elsewhere (fp32)."""
-    key = ("scale_rows_base",)
+#: the routing's last vector-engine instruction (the scale rows' index tile), for callers' schedule pins
+ROUTE_END = [None]
+
+
+def _scale_rows_base(inbounds=None):
+    """`[p] = 4 q + r` for the scale partitions p = 32 q + r (r < 4), `BIG_ROW` elsewhere (fp32).
+    `inbounds`: `GATHER_INBOUNDS` for this caller (None: the module's)."""
+    inb = GATHER_INBOUNDS if inbounds is None else inbounds
+    key = ("scale_rows_base", inb)
     if key in CACHE:
         return CACHE[key]
     pi = nl.ndarray((PT, 1), dtype=nl.int32, buffer=nl.sbuf)
@@ -551,7 +567,7 @@ def _scale_rows_base():
     qf = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=qf, src=q)
     v = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
-    if GATHER_INBOUNDS:
+    if inb:
         # every partition a valid row of the slot's expert: the off-quadrant partitions (r >= 4)
         # re-read row 4 q + (r & 3), scale codes the MX matmuls never read
         r3 = nl.ndarray((PT, 1), dtype=nl.int32, buffer=nl.sbuf)
