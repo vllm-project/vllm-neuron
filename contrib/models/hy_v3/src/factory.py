@@ -96,9 +96,17 @@ class HYV3ForCausalLM(nn.Module):
                 raise ValueError("The packed FP8 K cache needs an even --block-size.")
         if parallel.data_parallel_size != 1:
             raise ValueError("Hy3 does not support data parallelism yet.")
-        if vllm_config.speculative_config is not None:
-            raise ValueError("Hy3 does not support speculative decoding (MTP) yet.")
+        spec = vllm_config.speculative_config
+        if spec is not None and spec.method != "mtp":
+            raise ValueError(
+                "Hy3 supports only MTP speculative decoding "
+                f'(--speculative-config \'{{"method": "mtp", ...}}\'); got {spec.method!r}.'
+            )
         dcp = getattr(parallel, "decode_context_parallel_size", 1)
+        if dcp > 1 and spec is not None:
+            raise ValueError(
+                "Hy3 MTP does not support DCP (one decode token per request)."
+            )
         if dcp > 1:
             # DCP shards the sequence across the ranks that hold the same
             # replicated KV head (consecutive TP ranks).

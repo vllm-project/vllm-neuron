@@ -7,6 +7,7 @@ from .factory import HYV3ForCausalLM
 __all__ = ["HYV3Config", "HYV3ForCausalLM", "register"]
 
 ARCHITECTURE = "HYV3ForCausalLM"
+MTP_ARCHITECTURE = "HYV3MTPModel"
 
 
 def register() -> None:
@@ -20,7 +21,8 @@ def register() -> None:
 
     It also adds ``"fp8"`` (the checkpoint's ``quant_method``) to the Neuron
     platform's supported quantizations. The model consumes the FP8 weights and
-    scales itself, so vLLM's own FP8 linear methods are never used.
+    scales itself, so vLLM's own FP8 linear methods are never used. With a
+    vllm-neuron that supports MTP it registers the MTP draft model as well.
     """
     from vllm import ModelRegistry
 
@@ -29,3 +31,13 @@ def register() -> None:
     if "fp8" not in NeuronPlatform.supported_quantization:
         NeuronPlatform.supported_quantization.append("fp8")
     ModelRegistry.register_model(ARCHITECTURE, HYV3ForCausalLM)
+
+    # MTP draft (--speculative-config '{"method": "mtp", ...}'), resolved by
+    # the Neuron MTP proposer. Needs a vllm-neuron with register_neuron_model.
+    try:
+        from vllm_neuron.model.registry import register_neuron_model
+    except ImportError:
+        return
+    from .model_mtp import HYV3MTPForCausalLM
+
+    register_neuron_model(MTP_ARCHITECTURE, HYV3MTPForCausalLM)

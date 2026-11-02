@@ -10,7 +10,7 @@ tencent/Hy3-FP8: ~295B-parameter MoE decoder with a static per-tensor FP8 checkp
 | num_attention_heads | 64 |
 | num_key_value_heads | 8 |
 | head_dim            | 128 |
-| num_hidden_layers   | 80 (+1 MTP layer, not loaded) |
+| num_hidden_layers   | 80 (+1 MTP layer, loaded as the MTP draft) |
 | dense / MoE layers  | layer 0 dense (intermediate 13312), layers 1-79 MoE |
 | experts             | 192 routed (top-8, intermediate 1536) + 1 shared |
 | router              | sigmoid; `expert_bias` used for selection only; renormalized top-k x 2.826 |
@@ -95,8 +95,8 @@ tencent/Hy3-FP8: ~295B-parameter MoE decoder with a static per-tensor FP8 checkp
 | EP                 | ✅ | required at TP=64 (`--enable-expert-parallel`); default full EP=64. `ep_degree=32` (expert TP=2) was validated on vllm-neuron 0.24 (slower than EP=64); `ep_degree` 16 / 8 failed to compile in `moe_cte` there. Not re-tested on 0.29 |
 | DCP (decode context parallel) | ✅ | `--decode-context-parallel-size 8 --cp-kv-cache-interleave-size <block_size>`; 8x KV capacity at TP=64. On 0.29 validated on the 4-layer model (cos >= 0.9988 incl. prefix-cache hits); full-model performance only measured on 0.24 |
 | DP / attention DP / MLP DP | ❌ | rejected at startup |
-| MTP / Eagle3 spec decode | ❌ | |
-| FP8 KV cache       | ✅ | `--kv-cache-dtype fp8` + `"fp8_packed_kv": true`, scales from a KV scale profile (else the checkpoint's, else 1.0; Hy3-FP8 has none); half the KV bytes per token (2x KV capacity). Full model on 0.29: MATH-500 within run-to-run noise of BF16 KV at DCP 1 and 8, KV pool x0.500 exactly; at 85k context TPOT -22% at DCP 1 (see `../README.md`, "FP8 KV cache"). 4-layer logits: `test/integration/test_model.py` |
+| MTP spec decode    | ✅ | `model_mtp.py` (draft `HYV3MTPModel`); needs the vllm-neuron MTP proposer; not with DCP. Eagle3 is not supported |
+| FP8 KV cache       | ✅ | `--kv-cache-dtype fp8` + `"fp8_packed_kv": true`, scales from a KV scale profile (else the checkpoint's, else 1.0; Hy3-FP8 has none); half the KV bytes per token (2x KV capacity). Full model on 0.29: MATH-500 within run-to-run noise of BF16 KV at DCP 1 and 8, KV pool x0.500 exactly; at 85k context TPOT -22% at DCP 1 (see `../README.md`, "FP8 KV cache"). 4-layer logits: `test/integration/test_model.py`. With MTP: `kv_profiles/Hy3-FP8_mtp_neuron.safetensors` (adds the MTP layer's scales) |
 | On-device sampling | ✅ | |
 | Prefix caching (segmented prefill) | ✅ | several prefill buckets can share one `kv_segment_size` |
 

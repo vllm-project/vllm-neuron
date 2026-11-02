@@ -26,6 +26,11 @@ Usage:
     python calibrate_kv_scales_neuron.py samples <tokenizer> kv_calib/full.json out.json.gz
     # 2. calibrate (Neuron venv)
     python calibrate_kv_scales_neuron.py calibrate <Hy3-FP8> samples.json.gz kv_scales.safetensors
+    # 2b. add the MTP layer (model.layers.80) to an 80-layer profile: the same
+    #     run with MTP on (max_tokens=2, so the draft passes run); layers 0-79
+    #     are copied from <base profile> unchanged (decode NEFFs embed them)
+    python calibrate_kv_scales_neuron.py calibrate --mtp <base profile> <Hy3-FP8> \
+        samples.json.gz kv_scales_mtp.safetensors
 """
 
 import gzip
@@ -64,10 +69,16 @@ def write_samples(tokenizer, config, out):
 
 
 def _layers(worker):
+    """The target's decoder layers, then the MTP draft's layer when MTP is on."""
     model = worker.model_runner.model
     if hasattr(model, "_orig_mod"):
         model = model._orig_mod
-    return getattr(getattr(model, "model", model), "layers", [])
+    layers = list(getattr(getattr(model, "model", model), "layers", []))
+    drafter = getattr(worker.model_runner, "drafter", None)
+    if drafter is not None:
+        draft = getattr(drafter.model, "_orig_mod", drafter.model)
+        layers += list(draft.layers)
+    return layers
 
 
 def _slot_view(cache):
@@ -108,7 +119,8 @@ def changed_absmax(worker):
     return out
 
 
-def calibrate(ckpt, samples_path, out):
+def calibrate(ckpt, samples_path, out, base_profile=None):
+    """``base_profile``: MTP mode, see the module docstring (2b)."""
     from vllm import LLM, SamplingParams
 
     with gzip.open(samples_path, "rt") as f:
@@ -126,6 +138,9 @@ def calibrate(ckpt, samples_path, out):
         block_size=32,
         enable_prefix_caching=True,
         num_gpu_blocks_override=8139,
+        speculative_config=(
+            {"method": "mtp", "num_speculative_tokens": 1} if base_profile else None
+        ),
         additional_config={
             "neuron_config": {
                 "num_batched_tokens_buckets": [512, 1024, 2048, 4096, 8192],
@@ -139,7 +154,7 @@ def calibrate(ckpt, samples_path, out):
     t0 = time.time()
     llm.generate(
         [{"prompt_token_ids": s} for s in samples],
-        SamplingParams(max_tokens=1, temperature=0),
+        SamplingParams(max_tokens=2 if base_profile else 1, temperature=0),
     )
     n_tok = sum(map(len, samples))
     print(
@@ -152,7 +167,13 @@ def calibrate(ckpt, samples_path, out):
     v_abs = [max(r[i][1] for r in per_rank) for i in range(n_layers)]
     slots = sorted({tuple(per_rank[0][i][2:]) for i in range(n_layers)})
     print(f"written slots per layer (rank 0, K / V): {slots}")
+    if base_profile:
+        base_meta, k_abs, v_abs = _with_mtp_layer(base_profile, ckpt, k_abs, v_abs, per_rank)
+        n_layers = len(k_abs)
     meta = {
+        **({"mtp_layer": f"layer {n_layers - 1} calibrated with MTP k=1, max_tokens=2; "
+            f"layers 0-{n_layers - 2} copied from {Path(base_profile).name} "
+            f"(sha256 {base_meta['sha256'][:16]})"} if base_profile else {}),
         "target_fp8_max": str(TARGET_FP8_MAX),
         "attn_fingerprints": kv_scales.attn_fingerprints(ckpt, n_layers),
         "method": "neuron: absmax over the BF16 KV cache slots written by a prefill-only run of the "
@@ -176,16 +197,36 @@ def calibrate(ckpt, samples_path, out):
         print(f"layer {i:2d} k_absmax {k_abs[i]:9.4f} v_absmax {v_abs[i]:9.4f}")
 
 
+def _with_mtp_layer(base_profile, ckpt, k_abs, v_abs, per_rank):
+    """Base profile's layers 0..L-1 (as absmax) + the measured MTP layer L."""
+    n = len(k_abs) - 1
+    if per_rank[0][n][2] == 0:
+        raise RuntimeError(f"the MTP layer (row {n}) wrote no KV slots; is MTP on?")
+    q_k, q_v, base_meta = kv_scales.load_profile(base_profile, ckpt, n, TARGET_FP8_MAX)
+    base_k = [TARGET_FP8_MAX / q for q in q_k]
+    base_v = [TARGET_FP8_MAX / q for q in q_v]
+    rk = max(a / b for a, b in zip(k_abs[:n], base_k))
+    rv = max(a / b for a, b in zip(v_abs[:n], base_v))
+    print(f"target layers in this run vs {base_profile}: max ratio K {rk:.3f} V {rv:.3f} "
+          "(1.0 = same calibration; the base values are kept)")
+    return base_meta, base_k + [k_abs[n]], base_v + [v_abs[n]]
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "samples" and len(sys.argv) == 5:
         write_samples(*sys.argv[2:5])
-    elif cmd == "calibrate" and len(sys.argv) == 5:
+    elif cmd == "calibrate" and len(sys.argv) in (5, 7):
         # Callables sent to the workers through collective_rpc are pickled.
         os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
         os.environ.setdefault("NEURON_SKIP_EFA_AFFINITY", "1")
         os.environ.setdefault("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION", "0.45")
-        calibrate(*sys.argv[2:5])
+        if len(sys.argv) == 7:
+            if sys.argv[2] != "--mtp":
+                sys.exit(__doc__)
+            calibrate(*sys.argv[4:7], base_profile=sys.argv[3])
+        else:
+            calibrate(*sys.argv[2:5])
     else:
         sys.exit(__doc__)
 

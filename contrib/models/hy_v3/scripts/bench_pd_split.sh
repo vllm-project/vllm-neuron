@@ -16,7 +16,9 @@
 # /metrics around each run, written into the result JSON.
 # On Neuron prefill and decode never share a step, so the D second pass still
 # stalls decode on each arrival's last-token prefill: read its ITL as the pure
-# decode step (TPOT - ITL is that stall).
+# decode step (TPOT - ITL is that stall). With MTP each streamed chunk is one
+# step of 1..k+1 tokens, so ITL is the step time and TPOT the per-token time;
+# the MTP acceptance (draft / accepted tokens from /metrics) is recorded too.
 # Env: OUT_DIR (default ./results/bench/pd_split), MODEL (tokenizer path / HF id),
 #      BASE_URL (default http://127.0.0.1:8000), PROMPT_DIR (default bench_data/prefix),
 #      CELL (default in85000_p78336), SALT (default run-<unix time>).
@@ -48,10 +50,12 @@ with open(sys.argv[2], "w") as f:
 EOF
 }
 
-bench() {  # bench <out.json> <salt> <vllm bench serve args...>; records the hit rate
+bench() {  # bench <out.json> <salt> <vllm bench serve args...>; records hit rate and MTP acceptance
   local out=$1 salt=$2; shift 2
-  local q0 h0 q1 h1
+  local q0 h0 q1 h1 s0 d0 a0 s1 d1 a1
   q0=$(counter vllm:prefix_cache_queries); h0=$(counter vllm:prefix_cache_hits)
+  s0=$(counter vllm:spec_decode_num_drafts); d0=$(counter vllm:spec_decode_num_draft_tokens)
+  a0=$(counter vllm:spec_decode_num_accepted_tokens)
   vllm bench serve --backend openai-chat \
     --base-url "$BASE_URL" --endpoint /v1/chat/completions \
     --model "$MODEL" --served-model-name hy3 --tokenizer "$MODEL" --trust-remote-code \
@@ -60,18 +64,30 @@ bench() {  # bench <out.json> <salt> <vllm bench serve args...>; records the hit
     --save-result --result-dir "$(dirname "$out")" --result-filename "$(basename "$out")" \
     "$@" 2>&1 | grep -E "Successful|duration|P50 (TTFT|TPOT|ITL)|P99 TTFT|Request throughput"
   q1=$(counter vllm:prefix_cache_queries); h1=$(counter vllm:prefix_cache_hits)
-  python3 - "$out" $((q1 - q0)) $((h1 - h0)) "$salt" <<'EOF'
+  s1=$(counter vllm:spec_decode_num_drafts); d1=$(counter vllm:spec_decode_num_draft_tokens)
+  a1=$(counter vllm:spec_decode_num_accepted_tokens)
+  python3 - "$out" $((q1 - q0)) $((h1 - h0)) "$salt" $((s1 - s0)) $((d1 - d0)) $((a1 - a0)) <<'EOF'
 import json, sys
 path, q, h, salt = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+steps, drafts, accepted = (int(x) for x in sys.argv[5:8])
 with open(path) as f:
     d = json.load(f)
 d["cache_salt"] = salt
 d["prefix_cache_queried_tokens"] = q
 d["prefix_cache_hit_tokens"] = h
 d["prefix_cache_hit_rate"] = h / q if q else 0.0
+if drafts:
+    d["spec_decode_steps"] = steps
+    d["spec_decode_draft_tokens"] = drafts
+    d["spec_decode_accepted_tokens"] = accepted
+    d["spec_decode_acceptance_rate"] = accepted / drafts
+    d["spec_decode_tokens_per_step"] = 1 + accepted / steps
 with open(path, "w") as f:
     json.dump(d, f)
 print(f"measured hit rate (incl. warm-ups) {d['prefix_cache_hit_rate']:.1%} ({h}/{q} tokens)")
+if drafts:
+    print(f"MTP acceptance (incl. warm-ups) {accepted / drafts:.1%}, "
+          f"{1 + accepted / steps:.2f} tokens per step")
 EOF
 }
 

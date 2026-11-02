@@ -23,9 +23,10 @@ Kernel mapping:
     input RMSNorm, pre-RoPE QK-norm, in-kernel KV cache update).
   - Dense MLP / shared expert: ``NF.rmsnorm_quant`` + ``NF.mlp`` (STATIC).
   - Routed experts: torch router (sigmoid + selection-only bias), then
-    ``NF.moe_cte`` (``shard_on_i_hybrid``, per-channel FP8 weight dequant) for
-    prefill and the ``moe_tkg`` kernel (STATIC FP8 weights) for decode. Both run
-    BF16 activations x FP8 weights.
+    ``kernels/moe_cte_fp8w`` (nkilib's ``shard_on_i_hybrid`` with the FP8
+    weight tiles fed to the matmul instead of copied to BF16 first) for prefill
+    and the ``moe_tkg`` kernel (STATIC FP8 weights) for decode. Both run BF16
+    activations x FP8 weights.
 
 FP8 range handling: every FP8 weight is halved at load time to fit TRN2's
 240-capped e4m3, with the scales compensated (see ``weight_loaders.py``).
@@ -37,6 +38,7 @@ ANNOTATION GUIDE:
 """
 
 import logging
+import math
 
 import nki.language as nl
 import os
@@ -54,9 +56,11 @@ from nkilib.core.utils.common_types import (
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.distributed.parallel_state import get_dcp_group, get_tp_group
+from vllm.model_executor.models.interfaces import SupportsEagle3
 
 import vllm_neuron.functional as NF
 import vllm_neuron.nn as neuron_nn
+from vllm_neuron.accuracy.tensor_capture import capture_tensor
 from vllm_neuron.functional.moe.moe_tkg_wrapper import moe_tkg_wrapper
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, paged_slot_indices
 from vllm_neuron.model.neuron_config import NeuronConfig
@@ -74,10 +78,12 @@ from vllm_neuron.utils.weight_loader import (
     set_weight_loader,
     sharding_weight_loader,
 )
+from vllm_neuron.vllm.spec_decode.decorator import async_speculative_decoding
 
 from . import kv_scales
 from .fp8_kv_layout import packed_decode_viable, swizzle_packed_k, unswizzle_packed_k
 from .config import HYV3Config
+from .kernels.moe_cte_fp8w import moe_cte_fp8w
 from .kernels.moe_tkg_hits import moe_tkg_hits
 from .kernels.moe_tkg_hits_batch import moe_tkg_hits_batch
 from .weight_loaders import (
@@ -108,6 +114,9 @@ _MLP_INTERMEDIATE_ALIGN = 128
 
 # Blockwise MoE prefill block size (shard_on_i requires a multiple of 256).
 _MOE_BLOCK_SIZE = 256
+# Prefill routed experts through kernels/moe_cte_fp8w (FP8 weight tiles into the
+# matmul, no BF16 copy; ~2x faster, identical output). 0: nkilib's kernel.
+_MOE_CTE_FP8W = os.environ.get("HY3_MOE_CTE_FP8W", "1") != "0"
 
 # Ranks per group sharing one copy of the shared expert during decode.
 _SHARED_DECODE_SHARDS = 8
@@ -139,9 +148,64 @@ _FP8_KV_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 # kernel is viable, so the fallback write-back can be exercised on every bucket.
 _FORCE_UNPACKED_DECODE = os.environ.get("HY3_FP8_KV_FORCE_UNPACKED_DECODE") == "1"
 
+# EXPERIMENTAL block-sparse decode attention (Quest-style, docs/SPARSE_DECODE.md):
+# HY3_SPARSE_DECODE=<fraction> lets each decode step of a request attend to at
+# most that fraction of the decode context bucket (rounded up to a multiple of
+# 256 blocks), in groups of HY3_SPARSE_GROUP 32-token blocks (128 tokens),
+# chosen per layer by an upper bound of q . k from per-group K min / max
+# summaries kept next to the KV cache (always kept: the first
+# HY3_SPARSE_SINK_GROUPS and the last HY3_SPARSE_RECENT_GROUPS groups). The
+# kept blocks go to the decode kernel as a narrower block table, so it reads
+# only them. Decode steps of fewer than HY3_SPARSE_MIN_BATCH requests stay
+# dense (the selection's fixed cost is more than the attention it saves).
+# No DCP.
+_SPARSE_DECODE = float(os.environ.get("HY3_SPARSE_DECODE", "0") or 0)
+_SPARSE_GROUP = int(os.environ.get("HY3_SPARSE_GROUP", "4"))
+_SPARSE_SINK = int(os.environ.get("HY3_SPARSE_SINK_GROUPS", "1"))
+_SPARSE_RECENT = int(os.environ.get("HY3_SPARSE_RECENT_GROUPS", "2"))
+_SPARSE_MIN_BATCH = int(os.environ.get("HY3_SPARSE_MIN_BATCH", "4"))
+# HY3_SPARSE_SELECT_EVERY=R: layers 0, R, 2R, ... select; the R - 1 layers
+# after each reuse its selection (all layers share the block table). They
+# still fold their K into their own summaries.
+_SPARSE_SELECT_EVERY = int(os.environ.get("HY3_SPARSE_SELECT_EVERY", "4"))
+_SPARSE_SEL_CACHE_KEY = "_hy_v3_sparse_selection"
+
 
 def _is_fp8_kv(cache: torch.Tensor | None) -> bool:
     return cache is not None and cache.dtype in _FP8_KV_DTYPES
+
+
+def bind_attention_kv(
+    attn, name: str, k_cache: torch.Tensor, v_cache: torch.Tensor, sparse: bool = True
+) -> None:
+    """Bind one attention layer's K/V cache (BF16, FP8, or FP8 with packed K)."""
+    k_fp8, v_fp8 = _is_fp8_kv(k_cache), _is_fp8_kv(v_cache)
+    if k_fp8 != v_fp8:
+        raise ValueError(
+            f"{name}: K cache {k_cache.dtype} and V cache {v_cache.dtype} "
+            "must both be FP8 or both BF16"
+        )
+    # Packed K (neuron_config.fp8_packed_kv) is one dim higher than V,
+    # which is never packed.
+    packed = k_cache.dim() == v_cache.dim() + 1
+    if packed and not (k_fp8 and k_cache.dim() == 5 and v_cache.dim() == 4):
+        raise ValueError(
+            f"{name}: unexpected KV layout K {tuple(k_cache.shape)} "
+            f"{k_cache.dtype}, V {tuple(v_cache.shape)} {v_cache.dtype}"
+        )
+    if k_fp8 and attn.kv_scale_t is None:
+        raise RuntimeError(f"{name}: FP8 KV cache bound before its KV scales were loaded")
+    attn.k_cache = k_cache
+    attn.v_cache = v_cache
+    attn.fp8_packed = packed
+    if sparse and _SPARSE_DECODE > 0 and attn.dcp_size == 1:
+        # [blocks, (min, max), kvh, D]: a group's summary lives at the row of
+        # its first block. Empty: min > max.
+        shape = (v_cache.shape[0], v_cache.shape[1], v_cache.shape[-1])
+        attn.k_sum = torch.stack([
+            torch.full(shape, _SUMMARY_EMPTY, dtype=torch.bfloat16, device=v_cache.device),
+            torch.full(shape, -_SUMMARY_EMPTY, dtype=torch.bfloat16, device=v_cache.device),
+        ], dim=1)
 
 
 def _quantize_kv(x: torch.Tensor, q, dtype: torch.dtype) -> torch.Tensor:
@@ -233,6 +297,187 @@ class HYV3RMSNorm(nn.Module):
         return (self.weight * hidden_states).to(input_dtype)
 
 
+_SUMMARY_EMPTY = 3.0e38  # min / max of a group nothing was written to (BF16-representable)
+
+
+def sparse_budget_blocks(nb: int, frac: float, sink: int, recent: int) -> int:
+    """Blocks a sparse decode step attends to for an ``nb``-block context bucket.
+
+    A multiple of 256 blocks (8192 tokens), so that the decode kernel keeps its
+    32-token block: below that it re-splits the cache into smaller blocks,
+    which gave wrong results with the compacted table. ``nb`` (dense) when
+    that is not smaller.
+    """
+    k = -(-(math.ceil(nb * frac) + sink + recent) // 256) * 256
+    return min(k, nb)
+
+
+def update_k_summary_prefill(k_sum, k, slot_mapping, block_row, block_size, group):
+    """Fold one prefill chunk's K into the per-group K min / max.
+
+    k_sum: [blocks, 2, kvh, D], k: [kvh, T, D] (after QK-norm + RoPE),
+    slot_mapping: [T] (-1 = padding), block_row: [nb] the request's block
+    table (one prefill per step). The chunk's tokens are contiguous; a group
+    the chunk starts inside of (a prefix hit that ends inside a group, the
+    re-computed last token) is merged with its summary, the others are
+    written fresh.
+    """
+    kvh, T, D = k.shape
+    L = block_size * group
+    nb = block_row.shape[0]
+    dev = k.device
+    blk, off = paged_slot_indices(slot_mapping, block_size, k_sum.shape[0])
+    valid = slot_mapping >= 0
+    # Logical position of the first token, from where its block is in the table.
+    lb0 = torch.argmax((block_row.to(torch.long) == blk[0]).to(torch.int32))
+    p0 = lb0 * block_size + off[0]
+    r = p0 % L
+    # Shift the tokens by r so that the group boundaries fall on multiples of L.
+    src = torch.arange(T + L, device=dev) - r
+    ok = (src >= 0) & (src < T)
+    src = torch.clamp(src, min=0, max=T - 1)
+    kk = k.permute(1, 0, 2).to(torch.float32)[src]  # [T + L, kvh, D]
+    v = (ok & valid[src]).view(-1, 1, 1)
+    G = T // L + 1
+    gmin = torch.where(v, kk, _SUMMARY_EMPTY).view(G, L, kvh, D).amin(1)
+    gmax = torch.where(v, kk, -_SUMMARY_EMPTY).view(G, L, kvh, D).amax(1)
+    gvalid = v.view(G, L).any(dim=1)
+    gi = torch.arange(G, device=dev)
+    sb = p0 // L + gi
+    key = block_row.to(torch.long)[torch.clamp(sb * group, max=nb - 1)].clamp(min=0)
+    key = torch.where(gvalid, key, 0)  # all-padding groups: the null block
+    cont = ((gi == 0) & (r != 0)).view(G, 1, 1)
+    old = k_sum[key].to(torch.float32)
+    gmin = torch.where(cont, torch.minimum(old[:, 0], gmin), gmin)
+    gmax = torch.where(cont, torch.maximum(old[:, 1], gmax), gmax)
+    k_sum.index_put_((key,), torch.stack([gmin, gmax], dim=1).to(k_sum.dtype))
+
+
+def update_k_summary_decode(k_sum, k, positions, slot_mapping, block_table, block_size, group):
+    """Fold one decode step's K into the per-group K min / max.
+
+    k: [B, S, kvh, D] (after QK-norm + RoPE), positions / slot_mapping: [B * S]
+    (slot -1 = padding). A request's S tokens span at most two groups: the one
+    of its first token (merged, or fresh when that token starts the group) and
+    the next one (fresh). Rejected speculative tokens stay in the summary,
+    which only loosens the bound.
+    """
+    B, S = k.shape[:2]
+    L = block_size * group
+    nb = block_table.shape[1]
+    pos = positions.view(B, S).to(torch.long)
+    valid = slot_mapping.view(B, S) >= 0
+    sb = torch.div(pos, L, rounding_mode="floor")
+    sb0 = sb[:, :1]
+    in_a = (sb == sb0) & valid
+    in_b = (sb != sb0) & valid
+    kk = k.to(torch.float32)
+
+    def reduce(m):
+        m = m.view(B, S, 1, 1)
+        return (torch.where(m, kk, _SUMMARY_EMPTY).amin(dim=1),
+                torch.where(m, kk, -_SUMMARY_EMPTY).amax(dim=1))
+
+    min_a, max_a = reduce(in_a)
+    min_b, max_b = reduce(in_b)
+    t = block_table.to(torch.long)
+    key_a = t.gather(1, torch.clamp(sb0 * group, max=nb - 1)).view(B).clamp(min=0)
+    key_b = t.gather(1, torch.clamp((sb0 + 1) * group, max=nb - 1)).view(B).clamp(min=0)
+    has_a, has_b = in_a.any(dim=1), in_b.any(dim=1)
+    key_a = torch.where(has_a, key_a, 0)  # padding rows: the null block
+    fresh = (pos[:, 0] % L == 0).view(B, 1, 1)
+    old = k_sum[key_a].to(torch.float32)
+    new_a = torch.stack([
+        torch.where(fresh, min_a, torch.minimum(old[:, 0], min_a)),
+        torch.where(fresh, max_a, torch.maximum(old[:, 1], max_a)),
+    ], dim=1)
+    new_b = torch.stack([min_b, max_b], dim=1)
+    # No second group: write the first one twice (same row, same values).
+    key_b = torch.where(has_b, key_b, key_a)
+    new_b = torch.where(has_b.view(B, 1, 1, 1), new_b, new_a)
+    k_sum.index_put_((torch.cat([key_a, key_b]),), torch.cat([new_a, new_b]).to(k_sum.dtype))
+
+
+def prepare_sparse_decode(layer, device, from_weights: bool = True) -> None:
+    """EXPERIMENTAL (HY3_SPARSE_DECODE): own copies of the weights the selection reads.
+
+    The selection computes the decode Q and K in torch. Reading the parameters
+    the decode megakernel also reads (QKV weight, QK-norm and input RMSNorm
+    gammas) from those torch ops gave wrong attention results; separate copies
+    (the Q and K columns dequantized to BF16, ~2 MB per layer and rank) do not.
+    ``from_weights=False`` (CPU compile) allocates placeholders.
+    """
+    attn = layer.self_attn
+    if _SPARSE_DECODE <= 0 or attn.dcp_size > 1:
+        return
+    nh, kvh = attn.num_attention_heads_per_rank, attn.num_key_value_heads_per_rank
+    D, H = attn.head_dim, attn.hidden_size
+    if from_weights:
+        w = attn.qkv_proj_weight.detach().to("cpu")[:, : (nh + kvh) * D].to(torch.float32)
+        sc = attn.qkv_weight_scale.detach().to("cpu").to(torch.float32)[0]
+        w = torch.cat([w[:, : nh * D] * sc[0], w[:, nh * D :] * sc[1]], dim=1)
+        qn = attn.q_norm.weight.detach().to("cpu").clone()
+        kn = attn.k_norm.weight.detach().to("cpu").clone()
+        ln = layer.input_layernorm.weight.detach().to("cpu").clone()
+    else:
+        w, qn, kn, ln = torch.zeros(H, (nh + kvh) * D), torch.ones(D), torch.ones(D), torch.ones(H)
+
+    def param(t, dtype):
+        return nn.Parameter(t.to(dtype).contiguous().to(device), requires_grad=False)
+
+    attn.sparse_wqk = param(w, attn.dtype)
+    attn.sparse_qnorm_w = param(qn, torch.float32)
+    attn.sparse_knorm_w = param(kn, torch.float32)
+    attn.sparse_ln_w = param(ln, torch.float32)
+
+
+def sparse_select_blocks(q, k_sum, block_table, n_hist, block_size, group, n_sel, sink, recent):
+    """The ``n_sel`` blocks a decode step attends to, and the history tokens they hold.
+
+    q: [nh, B, S, D] fp32 (QK-norm + RoPE), k_sum: [blocks, 2, kvh, D],
+    block_table: [B, nb], n_hist: [B] history tokens. A request whose history
+    fits in ``n_sel / group - 1`` groups gets the head of its table (dense).
+    Otherwise every group is scored with the Quest bound
+    max_k q . k <= relu(q) . max + min(q, 0) . min (max over the step's queries
+    and the KV head's query heads); the first ``sink`` and the ``recent`` last
+    groups are always kept. The table ([B, n_sel]) holds the kept groups' blocks
+    in any order, then the history's last group, then the group after it: the
+    kernel reads a step's earlier tokens back through the table (MTP verify),
+    so that one must be in it when they cross into it. Returns the table and
+    the number of history tokens it holds ([B]).
+    """
+    nh, B, S, D = q.shape
+    kvh = k_sum.shape[2]
+    t = block_table.to(torch.long)
+    nb = t.shape[1]
+    ns, L, k_g = nb // group, block_size * group, n_sel // group
+    t3 = t.view(B, ns, group)
+    summ = k_sum[torch.clamp(t3[:, :, 0], min=0)].to(torch.float32)  # [B, ns, 2, kvh, D]
+    qg = q.view(kvh, nh // kvh, B, S, D).permute(2, 0, 1, 3, 4).reshape(B, kvh, -1, D)
+    # Both terms are <= 0 for a group without a summary (min = +3e38,
+    # max = -3e38): it scores very low (or -inf), never NaN.
+    bound = torch.einsum("bhqd,bnhd->bnhq", torch.clamp(qg, min=0), summ[:, :, 1]) + torch.einsum(
+        "bhqd,bnhd->bnhq", torch.clamp(qg, max=0), summ[:, :, 0])
+    score = bound.amax(dim=(2, 3))  # [B, ns]
+    n = n_hist.to(torch.long).view(B, 1)
+    nsv = torch.div(n + L - 1, L, rounding_mode="floor")
+    idx = torch.arange(ns, device=q.device).view(1, ns)
+    big = torch.finfo(torch.float32).max
+    # Candidates: the history groups but the last; sink and recent ones first.
+    cand = idx < nsv - 1
+    forced = (idx < sink) | (idx >= nsv - recent)
+    score = torch.where(cand, torch.where(forced, big, score), -big)
+    top = torch.topk(score, k_g - 2, dim=1).indices  # [B, k_g - 2], any order
+    last = torch.clamp(torch.cat([nsv - 1, nsv], dim=1), min=0, max=ns - 1)
+    dense = nsv <= k_g - 1
+    pick = torch.where(dense, torch.arange(k_g, device=q.device).view(1, k_g), torch.cat([top, last], dim=1))
+    # Whole groups of block ids at a time (one row of `group` ids per kept group).
+    compact = t3[torch.arange(B, device=q.device).view(B, 1), pick].reshape(B, n_sel)
+    fill = n - L * (nsv - 1)  # tokens in the history's last group
+    prior = torch.where(dense, n, L * (k_g - 2) + fill).view(B)
+    return compact.to(block_table.dtype), prior
+
+
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
@@ -295,6 +540,7 @@ class HYV3Attention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.scaling = config.head_dim**-0.5
         self.rms_norm_eps = config.rms_norm_eps
+        self.rope_theta = config.rope_theta  # sparse decode selection (own RoPE)
 
         # >>> PARALLELISM: TP group / head sharding <<<
         self.tp_group = get_tp_group()
@@ -353,6 +599,9 @@ class HYV3Attention(nn.Module):
         self.k_cache = None
         self.v_cache = None
         self.fp8_packed = False
+        # EXPERIMENTAL sparse decode: per-group K min / max ([blocks, 2, kvh, D]),
+        # allocated with the cache (bind_attention_kv) when HY3_SPARSE_DECODE is set.
+        self.k_sum = None
         # FP8 KV quantizing scales q = 1 / dequant (cache = fp8(x * q)), set by
         # load_weights / load_weights_lite (_load_kv_cache_scales); FP8 KV
         # refuses to bind before they are set (kv_scale_t is None).
@@ -535,6 +784,10 @@ class HYV3Attention(nn.Module):
             _write_packed_k(self.k_cache, k_rows, *index)
         else:
             self.k_cache.index_put_(index, k_rows)
+        if self.k_sum is not None:
+            update_k_summary_prefill(
+                self.k_sum, k, slot_mapping, meta["block_table_tensor"][0], block_size, _SPARSE_GROUP
+            )
 
         # Step 4: Attention
         kv_segment_size = meta.get("kv_segment_size")
@@ -621,6 +874,53 @@ class HYV3Attention(nn.Module):
             attn_output = self.tp_group.reduce_scatter(attn_output, dim=0)
         return attn_output.contiguous()
 
+    def _sparse_decode_blocks(self, X, positions, slot_mapping, block_table, block_size, n_sel):
+        """EXPERIMENTAL (HY3_SPARSE_DECODE): fold the step's K into the summaries
+        and, when ``n_sel`` is set, select the ``n_sel`` blocks each request
+        attends to.
+
+        Returns ``(block_table [B, n_sel], history tokens [B])`` or None.
+        """
+        B, S, H = X.shape
+        nh, kvh, D = self.num_attention_heads_per_rank, self.num_key_value_heads_per_rank, self.head_dim
+        # Q and K as the decode kernel computes them (RMSNorm, QKV projection,
+        # QK-norm, RoPE), with BF16 activations and the weight copies of
+        # prepare_sparse_decode (not the kernel's own parameters). Without a
+        # selection only K.
+        x = X.to(torch.float32).view(B * S, H)
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.rms_norm_eps)
+        xn = (x * self.sparse_ln_w.view(1, -1)).to(self.dtype)
+        nq = nh if n_sel else 0
+        w = self.sparse_wqk if n_sel else self.sparse_wqk[:, nh * D :]
+        qk = (xn @ w).view(B * S, nq + kvh, D).transpose(0, 1).to(torch.float32)
+        qk = qk * torch.rsqrt(qk.pow(2).mean(-1, keepdim=True) + self.q_norm.variance_epsilon)
+        q = qk[:nq] * self.sparse_qnorm_w
+        k = qk[nq:] * self.sparse_knorm_w
+        # RoPE from the positions, not from position_embeddings: reading the
+        # cos / sin that also feed the decode kernel (cos_kernel / sin_kernel)
+        # in these torch ops gave wrong attention results.
+        inv_freq = 1.0 / (
+            self.rope_theta ** (torch.arange(0, D, 2, dtype=torch.float32, device=X.device) / D)
+        )
+        freqs = positions.view(-1, 1).to(torch.float32) * inv_freq.view(1, -1)
+        emb = torch.cat((freqs, freqs), dim=-1).unsqueeze(0)  # [1, B * S, D]
+        cos, sin = emb.cos(), emb.sin()
+        q = q * cos + _rotate_half(q) * sin  # [nh, B * S, D]
+        k = k * cos + _rotate_half(k) * sin  # [kvh, B * S, D]
+        out = None
+        if n_sel:
+            # Before this step's K is folded in: the group the step writes is
+            # always kept.
+            out = sparse_select_blocks(
+                q.view(nh, B, S, D), self.k_sum, block_table, positions.view(B, S)[:, 0],
+                block_size, _SPARSE_GROUP, n_sel, _SPARSE_SINK, _SPARSE_RECENT,
+            )
+        update_k_summary_decode(
+            self.k_sum, k.view(kvh, B, S, D).permute(1, 2, 0, 3), positions, slot_mapping,
+            block_table, block_size, _SPARSE_GROUP,
+        )
+        return out
+
     def forward_decode(
         self,
         hidden_states: torch.Tensor,
@@ -677,8 +977,45 @@ class HYV3Attention(nn.Module):
             owner = torch.div(remaining, block_size, rounding_mode="trunc") % W
             dcp_active_mask = (owner == R).float()
 
+        attention_mask = None
+        n_sel = 0
+        if self.k_sum is not None:
+            nb = block_table.shape[1]
+            n_sel = sparse_budget_blocks(
+                nb, _SPARSE_DECODE, _SPARSE_SINK * _SPARSE_GROUP, _SPARSE_RECENT * _SPARSE_GROUP
+            )
+            if n_sel >= nb or B < _SPARSE_MIN_BATCH or nb % _SPARSE_GROUP:
+                n_sel = 0
+            # >>> EXPERIMENTAL sparse decode: the kernel reads n_sel blocks.
+            reuse = None
+            if n_sel and self.layer_idx % _SPARSE_SELECT_EVERY:
+                reuse = attn_metadata.get(_SPARSE_SEL_CACHE_KEY)
+            selected = self._sparse_decode_blocks(
+                X, positions, slot_mapping, block_table, block_size, 0 if reuse is not None else n_sel
+            )
+        if n_sel:
+            S_ctx = n_sel * block_size
+            if reuse is not None:
+                block_table, attention_mask = reuse
+            else:
+                block_table, prior = selected
+                # History tokens: the kept blocks' (repeated per verify token).
+                prior_pos = prior.view(B, 1) + torch.arange(S_decode, device=X.device).view(1, -1)
+                attention_mask = NF.gen_attention_decode_mask(
+                    pos_ids=prior_pos.view(1, B * S_decode).to(torch.float32),
+                    bs=B,
+                    q_head=self.num_attention_heads_per_rank,
+                    s_active=S_decode,
+                    s_prior=S_ctx,
+                    start_pos=None,
+                    block_len=block_size,
+                )
+                if _SPARSE_SELECT_EVERY > 1:
+                    attn_metadata[_SPARSE_SEL_CACHE_KEY] = (block_table, attention_mask)
+
         # The decode mask is identical for every layer: build it once per step.
-        attention_mask = attn_metadata.get(_DECODE_MASK_CACHE_KEY)
+        if attention_mask is None:
+            attention_mask = attn_metadata.get(_DECODE_MASK_CACHE_KEY)
         if attention_mask is None:
             attention_mask = NF.gen_attention_decode_mask(
                 pos_ids=positions.view(1, B * S_decode).to(torch.float32),
@@ -1003,6 +1340,24 @@ def routed_experts_cte(
         if os.environ.get("HY3_MOE_CTE_IMPL") == "shard_on_i"
         else MoECTEImplementation.shard_on_i_hybrid
     )
+    if impl == MoECTEImplementation.shard_on_i_hybrid and _MOE_CTE_FP8W:
+        # nkilib's hybrid kernel copies every FP8 weight tile to BF16 before the
+        # matmul; this copy of it feeds the FP8 tiles to the matmul directly
+        # (same result: the copy is exact and the matmul accumulates in fp32).
+        return wrap_nki(moe_cte_fp8w)[2](
+            conditions=conditions,
+            hidden_states=normed,
+            expert_affinities_masked=masked,
+            gate_up_proj_weight=gate_up_weight,
+            down_proj_weight=down_weight,
+            token_position_to_id=token_position_to_id,
+            block_to_expert=block_to_expert,
+            gate_up_proj_scale=gate_up_scale,
+            down_proj_scale=down_scale,
+            block_size=_MOE_BLOCK_SIZE,
+            num_static_block=num_local_experts,
+            skip_token=True,
+        )[:T]
     return NF.moe_cte(
         implementation=impl,
         num_static_block=num_local_experts,
@@ -1171,10 +1526,12 @@ class HYV3MoE(nn.Module):
         weights = scores[topk] / sum(scores[topk]) * router_scaling_factor
     """
 
-    def __init__(self, config: HYV3Config):
+    def __init__(self, config: HYV3Config, layer_idx: int | None = None):
         super().__init__()
         from vllm.config import get_current_vllm_config
 
+        # Names the routing capture (see forward); None skips it.
+        self.layer_idx = layer_idx
         self.tp_group = get_tp_group()
         self.world_size = self.tp_group.world_size
         self.hidden_size = config.hidden_size
@@ -1330,6 +1687,11 @@ class HYV3MoE(nn.Module):
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
         normed = (x * ln_w.to(torch.float32)).to(hidden_states.dtype)
         affinities, top_k_index = self._route(normed)
+        # Expert load statistics (scripts/expert_load.py): with a neuron_config
+        # tensor_capture active, each rank saves its tokens' top-k experts
+        # (prefill: its SP shard; decode: every token). A no-op otherwise.
+        if self.layer_idx is not None:
+            capture_tensor(f"moe_route.{self.layer_idx}", top_k_index)
 
         if is_prefill:
             # Shared expert: full weights on SP-local tokens, output complete.
@@ -1529,7 +1891,9 @@ class HYV3DecoderLayer(nn.Module):
         )
         self.self_attn = HYV3Attention(config, layer_idx)
         self.mlp = (
-            HYV3MoE(config) if config.is_moe_layer(layer_idx) else HYV3DenseMLP(config)
+            HYV3MoE(config, layer_idx)
+            if config.is_moe_layer(layer_idx)
+            else HYV3DenseMLP(config)
         )
 
     def forward(
@@ -1596,6 +1960,12 @@ class HYV3Model(nn.Module):
         )
         self.rotary_emb = HYV3RotaryEmbedding(config)
 
+        # Hidden states handed to a speculative-decoding draft, set by the
+        # runner via set_aux_hidden_state_layers(). Index i is the input of
+        # layer i; index num_hidden_layers is the last layer's output before
+        # the final norm (the MTP draft applies that norm itself).
+        self.aux_hidden_state_layers: list[int] = []
+
     def forward(
         self,
         input_ids,
@@ -1605,7 +1975,7 @@ class HYV3Model(nn.Module):
         rank=None,
         inputs_embeds=None,
         is_token_ids=None,
-    ):
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         hidden_states = self.embed_tokens(
             input_ids, scatter_tokens=is_prefill, rank=rank
         )
@@ -1625,7 +1995,18 @@ class HYV3Model(nn.Module):
         position_embeddings = self.rotary_emb(
             positions, device=hidden_states.device, dtype=hidden_states.dtype
         )
-        for layer in self.layers:
+
+        # >>> PARALLELISM: SP — prefill states are token shards; gather them
+        # so the draft sees every token. <<<
+        def full_rows(t):
+            if is_prefill and self.world_size > 1:
+                return self.tp_group.all_gather(t, dim=0)
+            return t
+
+        aux_hidden_states = []
+        for idx, layer in enumerate(self.layers):
+            if idx in self.aux_hidden_state_layers:
+                aux_hidden_states.append(full_rows(hidden_states))
             hidden_states = layer(
                 hidden_states,
                 positions,
@@ -1634,12 +2015,74 @@ class HYV3Model(nn.Module):
                 is_decode=not is_prefill,
                 rank=rank,
             )
-        hidden_states = self.norm(hidden_states)
+        # Returning the post-norm states as an extra graph output corrupts the
+        # lm_head rows of the same graph on Neuron for batch > 1 (seen in MTP
+        # verify steps), so hand over the pre-norm states.
+        if len(self.layers) in self.aux_hidden_state_layers:
+            aux_hidden_states.append(full_rows(hidden_states))
+        hidden_states = full_rows(self.norm(hidden_states))
+        return hidden_states, aux_hidden_states
 
-        # >>> PARALLELISM: SP — all-gather the full sequence <<<
-        if is_prefill and self.world_size > 1:
-            hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
-        return hidden_states
+
+def decoder_layer_weight_mappings(
+    layer: "HYV3DecoderLayer", dst: str, src: str, num_experts: int
+) -> dict[str, str | list[str]]:
+    """<-- MODEL-SPECIFIC: parameter -> checkpoint key(s) for one decoder layer.
+
+    ``dst`` is the layer's parameter prefix in the module tree and ``src`` its
+    checkpoint prefix (they differ for the MTP layer: ``layers.0`` <- ``model.layers.80``).
+    """
+    m: dict[str, str | list[str]] = {}
+    a, sa = f"{dst}.self_attn", f"{src}.self_attn"
+    m[f"{a}.qkv_proj_weight"] = [f"{sa}.{n}_proj.weight" for n in "qkv"]
+    m[f"{a}.qkv_weight_scale"] = [f"{sa}.{n}_proj.weight_scale" for n in "qkv"]
+    m[f"{a}.qkv_input_scale"] = [f"{sa}.{n}_proj.input_scale" for n in "qkv"]
+    m[f"{a}.o_proj_weight"] = f"{sa}.o_proj.weight"
+    m[f"{a}.o_weight_scale"] = f"{sa}.o_proj.weight_scale"
+    m[f"{a}.o_input_scale"] = f"{sa}.o_proj.input_scale"
+    m[f"{a}.q_norm.weight"] = f"{sa}.q_norm.weight"
+    m[f"{a}.k_norm.weight"] = f"{sa}.k_norm.weight"
+    m[f"{dst}.input_layernorm.weight"] = f"{src}.input_layernorm.weight"
+    m[f"{dst}.post_attention_layernorm.weight"] = (
+        f"{src}.post_attention_layernorm.weight"
+    )
+
+    def gated_mlp(d: str, s: str):
+        for n in ("gate", "up", "down"):
+            m[f"{d}.{n}_proj_weight"] = f"{s}.{n}_proj.weight"
+            m[f"{d}.{n}_weight_scale"] = f"{s}.{n}_proj.weight_scale"
+        m[f"{d}.gate_up_input_scale"] = [
+            f"{s}.gate_proj.input_scale",
+            f"{s}.up_proj.input_scale",
+        ]
+        m[f"{d}.down_input_scale"] = f"{s}.down_proj.input_scale"
+
+    if isinstance(layer.mlp, HYV3DenseMLP):
+        gated_mlp(f"{dst}.mlp.mlp", f"{src}.mlp")
+        return m
+
+    mp, smp = f"{dst}.mlp", f"{src}.mlp"
+    m[f"{mp}.router_weight"] = f"{smp}.router.gate.weight"
+    m[f"{mp}.expert_bias"] = f"{smp}.expert_bias"
+
+    def experts(proj: str, suffix: str) -> list[str]:
+        return [f"{smp}.experts.{e}.{proj}.{suffix}" for e in range(num_experts)]
+
+    gate_up_s = experts("gate_proj", "weight_scale") + experts(
+        "up_proj", "weight_scale"
+    )
+    m[f"{mp}.gate_up_proj_weight"] = experts("gate_proj", "weight") + experts(
+        "up_proj", "weight"
+    )
+    m[f"{mp}.down_proj_weight"] = experts("down_proj", "weight")
+    m[f"{mp}.gate_up_proj_scale"] = gate_up_s
+    m[f"{mp}.gate_up_proj_scale_tkg"] = gate_up_s
+    m[f"{mp}.down_proj_scale"] = experts("down_proj", "weight_scale")
+    m[f"{mp}.down_proj_scale_tkg"] = experts("down_proj", "weight_scale")
+    gated_mlp(f"{mp}.shared_mlp", f"{smp}.shared_mlp")
+    if layer.mlp.shared_mlp_decode is not None:
+        gated_mlp(f"{mp}.shared_mlp_decode", f"{smp}.shared_mlp")
+    return m
 
 
 # =============================================================================
@@ -1647,8 +2090,14 @@ class HYV3Model(nn.Module):
 # =============================================================================
 
 
-class HYV3ForCausalLM(nn.Module):
-    """Hy3 model with column-parallel LM head."""
+@async_speculative_decoding
+class HYV3ForCausalLM(nn.Module, SupportsEagle3):
+    """Hy3 model with column-parallel LM head.
+
+    As a speculative-decoding target (MTP) it returns the requested auxiliary
+    hidden states with its outputs and verifies drafts with the rejection
+    sampler (same contract as ``llama3/model.py``).
+    """
 
     def __init__(self, config: HYV3Config):
         super().__init__()
@@ -1712,7 +2161,7 @@ class HYV3ForCausalLM(nn.Module):
                 f"Prompt Length ({T}) must be > world_size ({self.world_size}) for SP."
             )
 
-        hidden_states = self.model(
+        hidden_states, aux_hidden_states = self.model(
             input_ids,
             positions,
             attn_metadata,
@@ -1721,13 +2170,15 @@ class HYV3ForCausalLM(nn.Module):
             inputs_embeds=inputs_embeds,
             is_token_ids=is_token_ids,
         )
+        # One device tensor for the draft NEFF (the cat stays in this graph).
+        aux = torch.cat(aux_hidden_states, dim=-1) if aux_hidden_states else None
         hidden_states = torch.index_select(
             hidden_states, dim=0, index=sampling_positions
         )
         logits = self.lm_head(hidden_states)
 
         if self.on_device_sampling_config is None:
-            return logits
+            return logits if aux is None else (logits, aux)
 
         sampled_tokens = self.sampler(
             logits, sampling_params, logit_mask=logit_mask, tp_rank=rank
@@ -1735,7 +2186,30 @@ class HYV3ForCausalLM(nn.Module):
         gathered_logits = (
             self.tp_group.all_gather(logits, dim=1) if self._gather_logits else None
         )
+
+        # >>> SPEC DECODE: verify the drafts on device <<<
+        if spec_decode_metadata is not None:
+            from vllm_neuron.nn.rejection_sampler import rejection_sampler
+
+            accepted = rejection_sampler(spec_decode_metadata, sampled_tokens)
+            return accepted if aux is None else (accepted, aux, gathered_logits)
+
+        if aux is not None:
+            return sampled_tokens, aux, gathered_logits
         return sampled_tokens, gathered_logits
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """Select the hidden states returned for a speculative-decoding draft.
+
+        Index i is the input of layer i; ``num_hidden_layers`` is the last
+        layer's (pre-final-norm) output, which the MTP draft consumes.
+        """
+        if layers is not None:
+            self.model.aux_hidden_state_layers = list(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        # MTP (the only draft Hy3 ships) consumes the final hidden state.
+        return (len(self.model.layers),)
 
     @classmethod
     def from_configs(cls, hf_config: PretrainedConfig, neuron_config: NeuronConfig):
@@ -1765,25 +2239,7 @@ class HYV3ForCausalLM(nn.Module):
                 raise KeyError(f"KV cache for layer {name} not initialized")
             attn = layer.self_attn
             k_cache, v_cache = kv_caches[name]
-            k_fp8, v_fp8 = _is_fp8_kv(k_cache), _is_fp8_kv(v_cache)
-            if k_fp8 != v_fp8:
-                raise ValueError(
-                    f"{name}: K cache {k_cache.dtype} and V cache {v_cache.dtype} "
-                    "must both be FP8 or both BF16"
-                )
-            # Packed K (neuron_config.fp8_packed_kv) is one dim higher than V,
-            # which is never packed.
-            packed = k_cache.dim() == v_cache.dim() + 1
-            if packed and not (k_fp8 and k_cache.dim() == 5 and v_cache.dim() == 4):
-                raise ValueError(
-                    f"{name}: unexpected KV layout K {tuple(k_cache.shape)} "
-                    f"{k_cache.dtype}, V {tuple(v_cache.shape)} {v_cache.dtype}"
-                )
-            if k_fp8 and attn.kv_scale_t is None:
-                raise RuntimeError(f"{name}: FP8 KV cache bound before its KV scales were loaded")
-            attn.k_cache = k_cache
-            attn.v_cache = v_cache
-            attn.fp8_packed = packed
+            bind_attention_kv(attn, name, k_cache, v_cache)
         # The persistent KV pool of this rank (acceptance: KV bytes per cached token).
         k0, v0 = kv_caches["layers.0.self_attn"]
         pool_bytes = sum(
@@ -1800,7 +2256,6 @@ class HYV3ForCausalLM(nn.Module):
     def _weight_mappings(self) -> dict[str, str | list[str]]:
         """<-- MODEL-SPECIFIC: model parameter name -> checkpoint key(s)."""
         cfg = self.config
-        E = cfg.num_experts
         m: dict[str, str | list[str]] = {
             "model.embed_tokens.weight": "model.embed_tokens.weight",
             "lm_head.weight": (
@@ -1810,60 +2265,12 @@ class HYV3ForCausalLM(nn.Module):
             ),
             "model.norm.weight": "model.norm.weight",
         }
-
-        def fp8_linear(dst: str, src: str):
-            m[f"{dst}_weight"] = f"{src}.weight"
-
         for i, layer in enumerate(self.model.layers):
-            p = f"model.layers.{i}"
-            a = f"{p}.self_attn"
-            m[f"{a}.qkv_proj_weight"] = [f"{a}.{n}_proj.weight" for n in "qkv"]
-            m[f"{a}.qkv_weight_scale"] = [f"{a}.{n}_proj.weight_scale" for n in "qkv"]
-            m[f"{a}.qkv_input_scale"] = [f"{a}.{n}_proj.input_scale" for n in "qkv"]
-            m[f"{a}.o_proj_weight"] = f"{a}.o_proj.weight"
-            m[f"{a}.o_weight_scale"] = f"{a}.o_proj.weight_scale"
-            m[f"{a}.o_input_scale"] = f"{a}.o_proj.input_scale"
-            m[f"{a}.q_norm.weight"] = f"{a}.q_norm.weight"
-            m[f"{a}.k_norm.weight"] = f"{a}.k_norm.weight"
-            m[f"{p}.input_layernorm.weight"] = f"{p}.input_layernorm.weight"
-            m[f"{p}.post_attention_layernorm.weight"] = (
-                f"{p}.post_attention_layernorm.weight"
+            m.update(
+                decoder_layer_weight_mappings(
+                    layer, f"model.layers.{i}", f"model.layers.{i}", cfg.num_experts
+                )
             )
-
-            def gated_mlp(dst: str, src: str):
-                for n in ("gate", "up", "down"):
-                    m[f"{dst}.{n}_proj_weight"] = f"{src}.{n}_proj.weight"
-                    m[f"{dst}.{n}_weight_scale"] = f"{src}.{n}_proj.weight_scale"
-                m[f"{dst}.gate_up_input_scale"] = [
-                    f"{src}.gate_proj.input_scale",
-                    f"{src}.up_proj.input_scale",
-                ]
-                m[f"{dst}.down_input_scale"] = f"{src}.down_proj.input_scale"
-
-            if isinstance(layer.mlp, HYV3DenseMLP):
-                gated_mlp(f"{p}.mlp.mlp", f"{p}.mlp")
-                continue
-
-            mp = f"{p}.mlp"
-            m[f"{mp}.router_weight"] = f"{mp}.router.gate.weight"
-            m[f"{mp}.expert_bias"] = f"{mp}.expert_bias"
-
-            def experts(proj: str, suffix: str, mp: str = mp) -> list[str]:
-                return [f"{mp}.experts.{e}.{proj}.{suffix}" for e in range(E)]
-
-            gate_up_w = experts("gate_proj", "weight") + experts("up_proj", "weight")
-            gate_up_s = experts("gate_proj", "weight_scale") + experts(
-                "up_proj", "weight_scale"
-            )
-            m[f"{mp}.gate_up_proj_weight"] = gate_up_w
-            m[f"{mp}.down_proj_weight"] = experts("down_proj", "weight")
-            m[f"{mp}.gate_up_proj_scale"] = gate_up_s
-            m[f"{mp}.gate_up_proj_scale_tkg"] = gate_up_s
-            m[f"{mp}.down_proj_scale"] = experts("down_proj", "weight_scale")
-            m[f"{mp}.down_proj_scale_tkg"] = experts("down_proj", "weight_scale")
-            gated_mlp(f"{mp}.shared_mlp", f"{mp}.shared_mlp")
-            if layer.mlp.shared_mlp_decode is not None:
-                gated_mlp(f"{mp}.shared_mlp_decode", f"{mp}.shared_mlp")
         return m
 
     def load_weights(
@@ -1880,12 +2287,16 @@ class HYV3ForCausalLM(nn.Module):
                     f"Parameter {name} was not loaded from the checkpoint"
                 )
         self._load_kv_cache_scales(checkpoint_path, device)
+        for layer in self.model.layers:
+            prepare_sparse_decode(layer, device)
 
     def load_weights_lite(
         self, checkpoint_path: str, device: torch.device, cache_dir: str | None
     ) -> None:
         """CPU compile: only the KV scales (decode uses them as graph constants)."""
         self._load_kv_cache_scales(checkpoint_path, device)
+        for layer in self.model.layers:
+            prepare_sparse_decode(layer, device, from_weights=False)
 
     def _load_kv_cache_scales(self, checkpoint_path: str, device) -> None:
         """<-- FP8 KV: per-layer K/V cache scales (see ``kv_scales.resolve_kv_scales``).

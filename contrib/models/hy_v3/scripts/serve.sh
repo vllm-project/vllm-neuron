@@ -1,7 +1,7 @@
 #!/bin/bash
 # Serve tencent/Hy3-FP8 on a trn2.48xlarge (TP=64, full EP), prefix caching on.
 #
-# Usage: serve.sh <max_model_len> <max_num_seqs> '<num_seqs_buckets json>' '<decode_ctx_buckets json>'
+# Usage: serve.sh <max_model_len> <max_num_seqs> '<num_seqs_buckets json>' ['<decode_ctx_buckets json>']
 # Env:
 #   MODEL            checkpoint path or HF id (default: tencent/Hy3-FP8)
 #   PREFILL_BUCKETS  prefill (Q) buckets, JSON list (default: [2048]). The largest
@@ -9,6 +9,8 @@
 #   KV_SEGMENTS      kv_segment_size_buckets, JSON list (default: [2048])
 #   DCP              decode context parallel size, 1 or 8 (default: 1)
 #   KV_CAP           VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION (default: 0.45)
+#   MTP_K            MTP speculative tokens per step (default: off; needs a
+#                    vllm-neuron with MTP support)
 #   PORT             API port (default: 8000)
 #   EP               neuron_config.ep_degree (default: full EP=64)
 #   KV_DTYPE         --kv-cache-dtype: auto (BF16, default) or fp8. FP8 takes its KV scales
@@ -37,7 +39,11 @@ fi
 export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=${KV_CAP:-0.45}
 # Needed on instances without EFA devices.
 export NEURON_SKIP_EFA_AFFINITY=${NEURON_SKIP_EFA_AFFINITY:-1}
-exec vllm serve "${MODEL:-tencent/Hy3-FP8}" \
+SPEC_ARGS=()
+if [ -n "${MTP_K:-}" ]; then
+    SPEC_ARGS=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP_K}")
+fi
+exec vllm serve "${MODEL:-tencent/Hy3-FP8}" "${SPEC_ARGS[@]}" \
     --served-model-name hy3 \
     --tensor-parallel-size 64 \
     --enable-expert-parallel \
@@ -55,6 +61,6 @@ exec vllm serve "${MODEL:-tencent/Hy3-FP8}" \
     --additional-config "{\"neuron_config\": {${EP:+\"ep_degree\": $EP,} $PACKED_NC
         \"num_batched_tokens_buckets\": $PREFILL_BUCKETS,
         \"kv_segment_size_buckets\": ${KV_SEGMENTS:-[2048]},
-        \"num_seqs_buckets\": $3,
-        \"decode_context_length_buckets\": $4
+        \"num_seqs_buckets\": $3${4:+,
+        \"decode_context_length_buckets\": $4}
     }}"
