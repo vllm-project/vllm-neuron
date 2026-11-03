@@ -241,9 +241,12 @@ def test_sparse_prefill_keeps_sink_recent_hot_and_the_incomplete_group():
     blocks, kept = sparse_prefill_blocks(q, k_sum, table, torch.tensor([[prior]]), torch.ones(nt * BS, dtype=torch.bool),
                                          BS, GROUP, 16, 1, 2)  # 4 groups: sink, 2 recent, 1 by bound
     row = table.tolist()
-    want = [b for gi in (0, 5, 8, 9) for b in row[gi * GROUP : (gi + 1) * GROUP]] + [row[40]]
-    assert int(kept) == len(want) * BS
-    assert blocks[: len(want)].tolist() == want
+    want = [b for gi in (0, 5, 8, 9) for b in row[gi * GROUP : (gi + 1) * GROUP]]
+    assert int(kept) == (len(want) + 1) * BS
+    got = blocks[: len(want)].view(-1, GROUP).tolist()  # whole groups, any order
+    assert sorted(got) == sorted([want[i : i + GROUP] for i in range(0, len(want), GROUP)])
+    assert blocks[len(want)].item() == row[40]  # the incomplete group's block
+    want = want + [row[40]]
     assert blocks[len(want) : len(want) + nt].tolist() == row[41 : 41 + nt]
 
 

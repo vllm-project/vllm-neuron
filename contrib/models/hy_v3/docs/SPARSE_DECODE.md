@@ -13,8 +13,8 @@ TPOT 51.0 -> 42.9 ms, +20% output throughput), 4-request steps 9% faster;
 1 request is 6% slower (it stays dense but keeps the summaries up to date).
 Off by default. The same selection for the prefill
 ([Sparse prefill](#sparse-prefill-hy3_sparse_prefillfraction-experimental-off),
-`HY3_SPARSE_PREFILL`, off) makes prefix-hit prefills 14% faster and a cold
-85k prefill 11% slower.
+`HY3_SPARSE_PREFILL`, off) makes a cold 85k prefill 15% and prefix-hit
+prefills 29-33% faster; with both, 8-request TPOT 51.8 -> 36.3 ms.
 
 ## Accuracy study
 
@@ -216,7 +216,8 @@ dense. Decode keeps the summaries up to date also when `HY3_SPARSE_DECODE`
 is off (later chunks of a prefix hit read them).
 
 Accuracy (full model, `serve_85k.sh` FP8 KV + MTP k=3, decode dense;
-`results/sparse_prefill/`):
+`results/sparse_prefill/`; measured with the first version, 66777fb, which
+keeps the same blocks as the current one):
 
 | | needle | LongBench v2 | same answer as dense | right -> wrong / wrong -> right | 64-token continuations identical |
 |---|---|---|---|---|---|
@@ -231,28 +232,32 @@ significant at 100 items). 0.25 is the setting measured for speed.
 
 Speed (`scripts/cold_ttft.py` for the cold prompt, `bench_pd_split.sh "1 4 8"`;
 `results/sparse_prefill/cold_ttft_needle.txt`, `results/bench/pd_split_85k_nodcp_fp8kv_mtp3_rerun`
-(dense, same session), `..._sprefill` (prefill 0.25), `..._sprefill_sdecode` (prefill 0.25 + decode 0.125)):
+(dense, same session), `..._sprefill` (prefill 0.25, 66777fb), `..._sprefill_sdecode`
+(prefill 0.25 + decode 0.125, 66777fb), `..._sprefill_sdecode_nosort` (the same, current)):
 
-| | dense | prefill 0.25 | prefill 0.25 + decode 0.125 | decode 0.125 alone |
-|---|---|---|---|---|
-| cold 85k prefill TTFT | 14.34 s | 15.86 s (+11%) | 15.80 s | |
-| P: 78k prefix hit, TTFT c1 / c4 / c8 | 2.14 / 7.69 / 15.32 s | 1.87 / 6.60 / 13.14 s | 1.87 / 6.58 / 13.12 s (-13% / -14% / -14%) | 2.16 / 7.81 / 15.55 s |
-| D pass 2, ITL c1 / c4 / c8 | 47.4 / 66.6 / 76.6 ms | 50.1 / 76.6 / 83.1 ms | 50.1 / 60.6 / 57.3 ms | 50.1 / 60.6 / 57.2 ms |
-| D pass 2, TPOT c1 / c4 / c8 | 23.4 / 39.4 / 51.8 ms | 24.6 / 43.5 / 53.1 ms | 24.9 / 35.9 / **40.8** ms | 24.6 / 36.3 / 42.9 ms |
-| D pass 2, output tok/s c1 / c4 / c8 | 38.0 / 91.7 / 139.6 | 36.1 / 83.5 / 134.2 | 36.2 / 99.4 / **168.8** | |
+| | dense | prefill 0.25 (66777fb) | + decode 0.125 (66777fb) | **+ decode 0.125 (current)** | decode 0.125 alone |
+|---|---|---|---|---|---|
+| cold 85k prefill TTFT | 14.34 s | 15.86 s | 15.80 s | **12.13 s (-15%)** | |
+| P: 78k prefix hit, TTFT c1 / c4 / c8 | 2.14 / 7.69 / 15.32 s | 1.87 / 6.60 / 13.14 s | 1.87 / 6.58 / 13.12 s | **1.52 / 5.19 / 10.34 s (-29% / -33% / -33%)** | 2.16 / 7.81 / 15.55 s |
+| D pass 2, ITL c1 / c4 / c8 | 47.4 / 66.6 / 76.6 ms | 50.1 / 76.6 / 83.1 ms | 50.1 / 60.6 / 57.3 ms | 50.2 / 60.6 / 57.2 ms | 50.1 / 60.6 / 57.2 ms |
+| D pass 2, TPOT c1 / c4 / c8 | 23.4 / 39.4 / 51.8 ms | 24.6 / 43.5 / 53.1 ms | 24.9 / 35.9 / 40.8 ms | 24.9 / **34.2** / **36.3** ms | 24.6 / 36.3 / 42.9 ms |
+| D pass 2, output tok/s c1 / c4 / c8 | 38.0 / 91.7 / 139.6 | 36.1 / 83.5 / 134.2 | 36.2 / 99.4 / 168.8 | 37.3 / **106.0** / **194.2** | |
 
 (decode 0.125 alone: the `..._sparse_g4r4` run above, before the prefill MoE
 change.)
 
-- A prefill on a cached 78k prefix (the 6.7k-token suffix, 2 chunks) is 13-14%
-  faster, so 8 arriving requests' prefills interrupt decode for less time:
-  with sparse decode, 8-request TPOT 42.9 -> 40.8 ms.
-- A cold 85k prefill is 11% *slower*. By the attention model of the cold
-  profile ([PROFILE_85K.md](PROFILE_85K.md): 89 ms + 23.5 ms per 4096 prior
-  tokens per chunk) 0.25 should save ~2.4 s of the 21 chunks; both the cold and
-  the prefix-hit numbers fit an added ~180 ms per chunk (~2 ms per layer),
-  far more than the bound matmul (one [4096, 256] x [256, 672] per layer; fusing
-  its two halves changed nothing), top-k or sort should cost. Not yet profiled.
+- The first version (66777fb) made a cold 85k prefill 11% slower. Its device
+  profile (`results/profile_85k_sparse_prefill/summary.md`) found ~190 ms per
+  chunk in the `torch.sort` of the 2688 block ids (2.2 ms per layer on one
+  core; the profiler files it under `Sampler`, the first call site of the
+  deduplicated custom call). The kept groups need no order, so the current
+  version gathers the top-k groups' blocks directly: selection 2.40 -> 0.27 ms
+  per layer, the same blocks kept.
+- Now a cold 85k prefill is 15% faster and one on a cached 78k prefix (the
+  6.7k-token suffix, 2 chunks) 29-33% faster. Shorter prefills interrupt
+  decode for less time: with sparse decode, 8-request TPOT 42.9 -> 36.3 ms and
+  output 194 tok/s (dense: 51.8 ms, 140 tok/s, +39%). The decode step (ITL)
+  is the sparse-decode one.
 - Prefill alone (decode dense) is not useful: decode pays the summary updates
   (3-10 ms per step) with nothing to gain from them. Use it together with
   `HY3_SPARSE_DECODE`.

@@ -496,7 +496,8 @@ def sparse_prefill_blocks(q, k_sum, block_row, prior, valid, block_size, group, 
     the first ``sink`` and last ``recent`` complete groups, the incomplete last
     one and the ``n_sel / group - recent - sink`` best others are kept (all
     of them when they fit). Returns ``blocks`` [n_sel + group + T / block_size]
-    -- the kept prior blocks in order, then the chunk's blocks, then filler --
+    -- the kept prior blocks (complete groups in any order), then the chunk's
+    blocks, then filler --
     and the kept prior tokens [1, 1] int32, which is where the segmented kernel
     finds the chunk in that layout.
     """
@@ -516,20 +517,19 @@ def sparse_prefill_blocks(q, k_sum, block_row, prior, valid, block_size, group, 
     full = torch.div(p, L, rounding_mode="floor")  # complete prior groups
     pb = torch.div(p, block_size, rounding_mode="floor")  # prior blocks
     idx = torch.arange(ns, device=q.device)
-    cand = idx < full
-    forced = (idx < sink) | (idx >= full - recent)
     big = torch.finfo(torch.float32).max
-    top = torch.topk(torch.where(cand, torch.where(forced, big, score), -big), k_g, dim=0).indices
-    keep_g = cand & ((idx.view(-1, 1) == top.view(1, -1)).any(dim=1) | (full <= k_g))
-    bidx = torch.arange(nb, device=q.device)
-    in_full = bidx < full * group
-    keep_b = torch.where(in_full, keep_g[bidx // group], bidx < pb)  # blocks of the incomplete group: kept
-    c = keep_b.sum()
-    M = n_sel + group
-    order = torch.sort(torch.where(keep_b, bidx, nb + bidx)).values[:M]
-    nt = T // block_size
-    j = torch.arange(M + nt, device=q.device)
-    src = torch.where(j < c, order[torch.clamp(j, max=M - 1)], torch.where(j < c + nt, pb + j - c, pb))
+    forced = (idx < sink) | (idx >= full - recent)
+    score = torch.where(idx < full, torch.where(forced, big, score), -big)
+    top = torch.topk(score, k_g, dim=0).indices  # any order: no sort (a [2688] sort is ~2 ms)
+    # Kept groups' blocks, then the table from the incomplete group on (its
+    # blocks, then the chunk's); with at most k_g complete groups, the table head.
+    j = torch.arange(n_sel + group + T // block_size, device=q.device)
+    head = k_g * group
+    src = torch.where(j < head, top[torch.clamp(j // group, max=k_g - 1)] * group + j % group,
+                      full * group + j - head)
+    dense = full <= k_g
+    src = torch.where(dense, j, src)
+    c = torch.where(dense, pb, head + pb - full * group)
     blocks = t[torch.clamp(src, max=nb - 1)].clamp(min=0)
     return blocks, (c * block_size).view(1, 1).to(torch.int32)
 
