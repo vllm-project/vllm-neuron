@@ -5159,8 +5159,15 @@ class DeepseekV41ForCausalLM(nn.Module):
                     self._async_debug(step, input_ids, prev, kwargs)
             elif fuse_embed:
                 step.embed_ids = mk_model.embed_ids(input_ids, ids_host)
+            # The drafter, with the step's tail, as the last fused launch's last member
+            # (`mk_model._DRAFT_FUSED`): its outputs land in `step.draft_out`.
+            draft = bool(head) and mk_model.drafts_tail(
+                self, step, sampling_positions, spec_decode_metadata, live_lengths, fused=True)
+            if draft:
+                step.draft_in = mk_model.draft_fused_inputs(
+                    self, step, self._async_ids, sampling_positions, spans[0], paged[0])
             stream, pre_mix = mk_model.run_blocks(self, stream, pre_mix, step, dump=dump, head=head,
-                                                  embed=fuse_embed)
+                                                  embed=fuse_embed, draft=draft)
             if not plan.is_last:
                 # Hand off to the next stage; nothing to sample here (the runner's
                 # non-last-stage path ignores the value, which completes with the
@@ -5226,7 +5233,19 @@ class DeepseekV41ForCausalLM(nn.Module):
                 )
         _MOE_LIVE_ROWS[0] = None
 
+        if _MEGAKERNEL and getattr(self._mk_step, "draft_out", None) is not None:
+            # (the last fused launch drafted, `mk_model._DRAFT_FUSED`)
+            return mk_model.fused_draft_result(self, self._mk_step)
         greedy_ids = getattr(self._mk_step, "greedy_ids", None) if _MEGAKERNEL else None
+        tail_ids = self._async_ids if self._async_ids is not None else input_ids
+        if greedy_ids is not None and main_hiddens and mk_model.drafts_tail(
+                self, self._mk_step, sampling_positions, spec_decode_metadata, live_lengths, ids=tail_ids):
+            # The step's tail inside its drafter launch (`mk_model.run_draft_tail`).
+            accepted, self.last_draft = mk_model.run_draft_tail(
+                self, greedy_ids, tail_ids, sampling_positions, main_hiddens, spans[0], paged[0])
+            if mk_model.PROF is not None:
+                mk_model.PROF.mark("sampled", accepted)
+            return accepted
         if greedy_ids is not None and main_hiddens and mk_model.fuses_tail(self, self._mk_step):
             # The step's tail in one graph (`_decode_tail`): verify, the drafts' seeds and
             # taps, the drafter's meta, the taps' concatenation.

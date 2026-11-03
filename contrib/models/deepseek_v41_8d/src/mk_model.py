@@ -768,22 +768,29 @@ if _EXEC_COUNT is not None:
     _NB._lite_execute = _counted_lite_execute
 
 
-def _launch(kernel, launches: dict, slots, params):
+def _launch(kernel, launches: dict, slots, params, fresh: tuple = ()):
     """`entry(kernel)(*params)`, or the same launch straight on its executor (`_DIRECT`):
     `launches` holds the plan's `_DirectLaunch`es (None: stays on the entry) by the shapes
     of the `params` the step fills (`slots`, `(index, ...)`), which pick the NEFF. The
-    first launch of each goes through the entry (`_calibrate`). Returns `(outputs, direct)`."""
+    first launch of each goes through the entry (`_calibrate`). `fresh`: the indices of the
+    outputs that are new tensors every launch (outputs the host or the next step read after later
+    launches may have run: the drafter's). Returns `(outputs, direct)`."""
     dkey = tuple(tuple(params[j].shape) for j, *_ in slots)
     d = launches.get(dkey, _UNSET)
     if d is _UNSET:
+        if _PLAN_LOG:
+            _mk_log.warning("direct launch calibration: %s dkey=%s", getattr(kernel.func, "__name__", kernel), dkey)
         out, launches[dkey] = _calibrate(kernel, params)
         return out, False
     if d is None:
         return entry(kernel)(*params), False
-    d.ex.execute([params[j] for j in d.pmap], d.outs)
+    outs = d.outs
+    if fresh:
+        outs = [torch.empty_like(o) if i in fresh else o for i, o in enumerate(outs)]
+    d.ex.execute([params[j] for j in d.pmap], outs)
     if _EXEC_COUNT is not None:
         _EXEC_COUNT[0] += 1
-    return d.outs, True
+    return outs, True
 
 
 def _host(t: torch.Tensor) -> torch.Tensor:
@@ -1062,6 +1069,14 @@ class StepIndices:
     live_spans: int = -1
     #: `[B, 1]` int32 on the device: the spans' start positions, when `StepPrologue` ran
     dev_starts: torch.Tensor | None = None
+    #: the step prologue's arguments when the first fused launch runs it (`_PROLOGUE_FUSED`), and
+    #: its buffers' key (part of that launch's plan key: the prologue's shapes and flags)
+    pro_params: list | None = None
+    pro_key: tuple | None = None
+    #: the drafter's inputs when the last fused launch runs it (`_DRAFT_FUSED`: `draft_fused_inputs`),
+    #: and its `(accepted, output_ids, confidence)` after that launch
+    draft_in: dict | None = None
+    draft_out: tuple | None = None
 
     def __post_init__(self):
         if self.live_spans < 0:
@@ -1472,6 +1487,13 @@ def embed_ids(input_ids: torch.Tensor, host: torch.Tensor | None = None) -> torc
 _PROLOGUE = os.environ.get("DEEPSEEK_V41_STEP_PROLOGUE", "1") not in ("", "0")
 
 
+#: `DEEPSEEK_V41_PROLOGUE_FUSED` (default 1): the step prologue runs as the first member of the
+#: step's first fused launch (`run_fused`: `step.pro_params`, `mk_kernels.step_prologue_member`)
+#: instead of a launch of its own: one NEFF execution less a step (its model switch, its fixed
+#: execution overhead and the device idle before it). 0: its own launch.
+_PROLOGUE_FUSED = os.environ.get("DEEPSEEK_V41_PROLOGUE_FUSED", "1") not in ("", "0")
+
+
 #: `StepPrologue`'s host-written step meta: this many buffers, used in turn (more than the
 #: steps the engine keeps in flight -- the plugin's block-table staging uses 8 for the same reason)
 _PMETA_RING = 8
@@ -1595,6 +1617,7 @@ class StepPrologue:
         read_lens = {r: step.read_len(r) for r in (1, 2)}
         bs = step.block_size
         bf = self._buffers(B, L, W, read_lens, bs)
+        key = (B, L, W, read_lens[1], read_lens[2], bs)
         # (a fresh host array each step: the upload of the previous one may still read it)
         hdr = bf["hdr"].copy()
         Hw = SK.H + bf["Wp"]
@@ -1611,9 +1634,14 @@ class StepPrologue:
         pmeta.copy_(torch.from_numpy(hdr.reshape(-1, 1)))
         params = [pmeta, bf["prev"] if prev is None else prev, ids, self.history, self.tokmap, self.prod,
                   self.hcol, self.hinv, *bf["outs"], *bf["hashes"], bf["embed"], bf["starts"], bf["flags"]]
-        # (the plan's key: the shapes of the meta, the ids and the compressed tables)
-        out, _ = _launch(self.SK.step_prologue, self.launches, [(0,), (2,), (16,), (25,)], params)
-        self.last_done = out[0] if isinstance(out, (list, tuple)) else out
+        if _PROLOGUE_FUSED:
+            # (the step's first fused launch runs it: `run_fused`; `key` picks that launch's plan)
+            step.pro_params, step.pro_key = params, key
+            self.last_done = bf["embed"]
+        else:
+            # (the plan's key: the shapes of the meta, the ids and the compressed tables)
+            out, _ = _launch(self.SK.step_prologue, self.launches, [(0,), (2,), (16,), (25,)], params)
+            self.last_done = out[0] if isinstance(out, (list, tuple)) else out
         step._by_ratio.update(bf["idx"])
         for k, h in zip(self.hash_keys, bf["hashes"]):
             step._hash_cols[k] = h
@@ -1705,21 +1733,44 @@ class FusedPlan:
     trace: str
     #: the shapes of the step's own tensors -> `_DirectLaunch` / None (`_launch`)
     direct: dict = field(default_factory=dict)
+    #: the launch's last member is the drafter (`_DRAFT_FUSED`): it returns its ids, confidence
+    #: and the step's accepted tokens last
+    draft: bool = False
 
 
 #: (layer ids, phase, T, B, head) -> FusedPlan
 _FUSED_PLANS: dict = {}
+#: `DEEPSEEK_V41_PLAN_LOG=1`: log (rank 0) every fused plan `run_fused` builds and every direct-launch
+#: calibration (`_launch`), with its key: what a step pays on the host the first time it meets a shape
+_PLAN_LOG = os.environ.get("DEEPSEEK_V41_PLAN_LOG", "") not in ("", "0")
 #: the (launch name, why not optimized) `_plan_fused` logged its choice of kernel for
 _FUSED_SEEN: set = set()
 
-#: `DEEPSEEK_V41_MOE_TP` (default 1): a decode step of at most `MOE_TP_MAX_T` rows runs its
+#: `DEEPSEEK_V41_MOE_TP` (default 1): a decode step of at most `moe_tp_max_t()` rows runs its
 #: optimized fused launches with each block's MoE weights in the TP x EP layout
 #: (`kernels/tp32/moe_tp_layout.py`, read by `fused/<launch>/moe_tp.py`): the routed experts
 #: of each 8-rank group split 8 ways over it, the shared expert over the world, the router
 #: weight in bf16. Built once a block (`moe_tp_map`); every other step (prefill, more rows,
 #: the per-block and generated launches) keeps the deployment's layout.
 _MOE_TP = os.environ.get("DEEPSEEK_V41_MOE_TP", "1") not in ("", "0")
-MOE_TP_MAX_T = 16
+#: 8d (`moe_tp_max_t`, `DEEPSEEK_V41_MOE_TP_MAX_T` overrides): 64 rows up to a `MOE_TP_WIDE_CTX`-token context,
+#: else the 16-device port's 16. At 32 ranks a bs10 step (60 rows) is faster in the TP x EP layout too -- its
+#: MoE work is spread over a group's 8 ranks instead of each rank's 12 whole experts, whose busiest rank the
+#: world all-reduce waited for (median ITL in512_bs10 43.9 -> 40.6 ms, in2048_bs10 46.0 -> 42.9) -- but those
+#: launches' NEFFs load at the first such step, after vLLM sized the KV cache, and at an 8448-token context
+#: with ten sequences that load ran out of device memory (2026-11-03).
+_MOE_TP_MAX_T_ENV = os.environ.get("DEEPSEEK_V41_MOE_TP_MAX_T", "")
+MOE_TP_WIDE_CTX = 4096
+
+
+def moe_tp_max_t() -> int:
+    """The most rows a decode step runs its optimized launches in the TP x EP layout with."""
+    if _MOE_TP_MAX_T_ENV:
+        return int(_MOE_TP_MAX_T_ENV)
+    from . import model as M
+
+    ctx = M._COMPRESS_READ_CEILING or 0
+    return 64 if 0 < ctx <= MOE_TP_WIDE_CTX else 16
 #: the layer whose TP x EP copy logged the live device tensors (`DEEPSEEK_V41_HBM_TRACE`)
 _MOE_TP_CENSUS: list = []
 _MOE_NAMES = ("gate_w_t", "gate_b", "expert_lo", "w1", "s1", "w3", "s3", "w2", "s2",
@@ -1934,7 +1985,7 @@ def _moe_tp_params(model, blocks, params) -> list:
 
 
 def _plan_fused(model, blocks, stream, pre_mix, step: StepIndices, head: bool,
-                embed: bool = False) -> FusedPlan:
+                embed: bool = False, draft: bool = False) -> FusedPlan:
     """`run_fused`'s plan, from `layer_args` (see `FusedPlan`). With `embed` member 0 is
     the embedding (the blocks are members 1..), which makes the first block's stream."""
     plan = model.mk_plan
@@ -1944,6 +1995,20 @@ def _plan_fused(model, blocks, stream, pre_mix, step: StepIndices, head: bool,
     taps_at, idx_member = [], None
     s, pm = stream, pre_mix
     off = 0
+    pro = getattr(step, "pro_params", None) if embed else None
+    if pro is not None:
+        # member 0: the step prologue (`_PROLOGUE_FUSED`), writing the index columns, n-gram ids
+        # and token column the members after it read (the same tensors: the same parameters)
+        srcs = []
+        for x in pro:
+            key = ("t", id(x)) if isinstance(x, torch.Tensor) else ("c", x)
+            if key not in pidx:
+                pidx[key] = len(params)
+                params.append(x)
+            srcs.append(("p", pidx[key]))
+        kernels.append(mk_kernels.step_prologue_member())
+        plans.append(tuple(srcs))
+        off = 1
     if embed:
         srcs = []
         for x in [step.embed_ids, *embed_args(model)]:
@@ -1954,7 +2019,7 @@ def _plan_fused(model, blocks, stream, pre_mix, step: StepIndices, head: bool,
             srcs.append(("p", pidx[key]))
         kernels.append(mk_kernels.embed_expand())
         plans.append(tuple(srcs))
-        s, pm, off = _Out(0, 0), _Out(0, 1), 1
+        s, pm, off = _Out(off, 0), _Out(off, 1), off + 1
     for m0, block in enumerate(blocks):
         m = m0 + off
         kernel, args, lw, arch = layer_args(model, block, s, pm, step)
@@ -1987,14 +2052,35 @@ def _plan_fused(model, blocks, stream, pre_mix, step: StepIndices, head: bool,
             srcs.append(("p", pidx[key]))
         kernels.append(mk_kernels.head_greedy())
         plans.append(tuple(srcs))
+    di = step.draft_in if draft else None
+    if di is not None:
+        # the drafter after the head (`_DRAFT_FUSED`): the head's tokens, the step's ids, start and
+        # sampling positions, the taps (earlier launches' as parameters, this launch's members'),
+        # then `run_draft_tail`'s arguments
+        assert head and len(step.taps) + len(taps_at) == 3, (head, len(step.taps), taps_at)
+
+        def par(x):
+            key = ("t", id(x)) if isinstance(x, torch.Tensor) else ("c", x)
+            if key not in pidx:
+                pidx[key] = len(params)
+                params.append(x)
+            return ("p", pidx[key])
+
+        srcs = [("o", n, 0)] + [par(di[k]) for k in ("sids", "starts", "sel")]
+        srcs += [par(t) for t in step.taps] + [("o", m, 3) for m in taps_at]
+        srcs += [par(x) for x in di["rest"]]
+        kernels.append(mk_kernels.draft_tail("decode"))
+        plans.append(tuple(srcs))
     returns = [("o", n - 1, 0), ("o", n - 1, 1)] + [("o", m, 3) for m in taps_at]
     if idx_member is not None:
         returns.append(("o", idx_member, 2))
     if head:
         returns.append(("o", n, 0))
+    if di is not None:
+        returns += [("o", n + 1, 0), ("o", n + 1, 1), ("o", n + 1, 6)]
     ids = [b.attn.layer_id for b in blocks]
-    name = (f"layers_{step.phase}{'_embed' if embed else ''}_L{ids[0]:02d}_L{ids[-1]:02d}"
-            f"{'_head' if head else ''}_{plan.scheme}")
+    name = (f"layers_{step.phase}{'_pro' if pro is not None else ''}{'_embed' if embed else ''}"
+            f"_L{ids[0]:02d}_L{ids[-1]:02d}{'_head' if head else ''}_{plan.scheme}")
     fargs = (name, tuple(kernels), tuple(plans), len(params), tuple(returns))
     gen = mk_kernels.fused(*fargs)
     fk, why = mk_kernels.optimized_fused(*fargs)
@@ -2004,12 +2090,18 @@ def _plan_fused(model, blocks, stream, pre_mix, step: StepIndices, head: bool,
             _mk_log.info("fused launch %s: the optimized kernel (kernels/tp32/fused/%s)", name, name)
         elif name in mk_kernels.FUSED_LAUNCHES:
             _mk_log.warning("fused launch %s: the generated launch (%s)", name, why)
-    if fk is not None and _MOE_TP and step.phase == "decode" and int(step.T) <= MOE_TP_MAX_T and plan.scheme == "tp32":
+    if fk is not None and _MOE_TP and step.phase == "decode" and int(step.T) <= moe_tp_max_t() and plan.scheme == "tp32":
         # (the optimized launches' members read the TP x EP layout: `fused/<launch>/moe_tp.py`)
         params = _moe_tp_params(model, blocks, params)
     fk = fk or gen
     # the step's own tensors: refilled every step
     dyn = {}
+    if pro is not None:
+        # (the prologue's per-step inputs: the host-written meta -- a ring --, the previous step's
+        # rejection rows and the step's ids)
+        for i in range(3):
+            if isinstance(pro[i], torch.Tensor):
+                dyn[id(pro[i])] = ("pre", i)
     if embed:
         dyn[id(step.embed_ids)] = ("ids", None)
     else:
@@ -2023,6 +2115,11 @@ def _plan_fused(model, blocks, stream, pre_mix, step: StepIndices, head: bool,
                 dyn.setdefault(id(t), ("idx", (rkey, f)))
     for hkey, t in step._hash_cols.items():
         dyn.setdefault(id(t), ("hash", hkey))
+    if di is not None:
+        for k in ("sids", "starts", "sel", "table"):
+            dyn.setdefault(id(di[k]), ("dr", k))
+        for i, t in enumerate(step.taps):
+            dyn.setdefault(id(t), ("dtap", i))
     slots = [(j, *dyn[id(x)]) for j, x in enumerate(params) if isinstance(x, torch.Tensor) and id(x) in dyn]
     static = [None if isinstance(x, torch.Tensor) and id(x) in dyn else x for x in params]
     zeros = {id(z) for z in _ZEROS.values()}       # (the blocks may have made one)
@@ -2030,7 +2127,8 @@ def _plan_fused(model, blocks, stream, pre_mix, step: StepIndices, head: bool,
              step.topk if isinstance(step.topk, torch.Tensor) and id(step.topk) in zeros else None)
     trace = (f"tp32/fused/{name}" if fk is not gen
              else ",".join(k.func.__module__.rsplit(".", 2)[-2] for k in kernels))
-    return FusedPlan(fk, gen, name, static, slots, len(taps_at), idx_member, head, after, trace)
+    return FusedPlan(fk, gen, name, static, slots, len(taps_at), idx_member, head, after, trace,
+                     draft=di is not None)
 
 
 def _fill_fused(fp: FusedPlan, stream, pre_mix, step: StepIndices):
@@ -2043,6 +2141,12 @@ def _fill_fused(fp: FusedPlan, stream, pre_mix, step: StepIndices):
             x = step.embed_ids
         elif kind == "topk":
             x = step.topk
+        elif kind == "pre":
+            x = step.pro_params[key] if getattr(step, "pro_params", None) is not None else None
+        elif kind == "dr":
+            x = step.draft_in[key] if step.draft_in is not None else None
+        elif kind == "dtap":
+            x = step.taps[key] if key < len(step.taps) else None
         elif kind == "idx":
             x = getattr(step.for_ratio(*key[0]), key[1])
         else:
@@ -2055,7 +2159,7 @@ def _fill_fused(fp: FusedPlan, stream, pre_mix, step: StepIndices):
 
 @torch._dynamo.disable
 def run_fused(model, blocks, stream: torch.Tensor, pre_mix: torch.Tensor, step: StepIndices,
-              head: bool = False, embed: bool = False):
+              head: bool = False, embed: bool = False, draft: bool = False):
     """`blocks` (consecutive) as one fused launch. Returns `(stream, ffn_pre)` of the last;
     with `head`, the greedy head runs after them in the same launch (`step.greedy_ids`).
 
@@ -2068,12 +2172,14 @@ def run_fused(model, blocks, stream: torch.Tensor, pre_mix: torch.Tensor, step: 
     t0 = time.perf_counter() if PROF is not None else 0.0
     plan = model.mk_plan
     key = (tuple(b.attn.layer_id for b in blocks), step.phase, int(step.T), len(step.spans), bool(head),
-           bool(embed))
+           bool(embed), getattr(step, "pro_key", None) if embed else None, bool(draft))
     fp = _FUSED_PLANS.get(key)
     params = None if fp is None else _fill_fused(fp, stream, pre_mix, step)
     if params is None or _PLAN_CHECK:
         topk_in = step.topk
-        built = _plan_fused(model, blocks, stream, pre_mix, step, head, embed)
+        built = _plan_fused(model, blocks, stream, pre_mix, step, head, embed, draft)
+        if _PLAN_LOG and model.rank == 0:
+            _mk_log.warning("fused plan built: %s key=%s", built.name, key)
         step.topk = topk_in              # (the plan left its members' placeholders there)
         fresh = _fill_fused(built, stream, pre_mix, step)
         if params is not None:
@@ -2099,7 +2205,9 @@ def run_fused(model, blocks, stream: torch.Tensor, pre_mix: torch.Tensor, step: 
     if fcap is not None:
         before = [x.detach().cpu().clone() if isinstance(x, torch.Tensor) else x for x in params]
     if _DIRECT and step.stable and _execute_context() is None:
-        out, direct = _launch(fp.fk, fp.direct, fp.slots, params)
+        nout = 2 + fp.ntaps + (fp.idx_member is not None) + bool(fp.head) + (3 if fp.draft else 0)
+        out, direct = _launch(fp.fk, fp.direct, fp.slots, params,
+                              fresh=(nout - 3, nout - 2, nout - 1) if fp.draft else ())
     else:
         out, direct = entry(fp.fk)(*params), False
     if PROF is not None:
@@ -2114,8 +2222,11 @@ def run_fused(model, blocks, stream: torch.Tensor, pre_mix: torch.Tensor, step: 
     step.taps.extend(out[2 : 2 + fp.ntaps])
     if fp.idx_member is not None:
         step.topk = out[2 + fp.ntaps]
+    nd = 3 if fp.draft else 0
     if fp.head:
-        step.greedy_ids = out[-1]
+        step.greedy_ids = out[len(out) - 1 - nd]
+    if fp.draft:
+        step.draft_out = (out[-1], out[-3], out[-2])
     if fcap is not None:
         _fcapture_save(model, fcap, fp, step, params, before, out)
     if not direct:
@@ -2376,6 +2487,149 @@ def fuses_tail(model, step) -> bool:
             and (len(step.spans) == 1 or _DRAFT_BATCHED))
 
 
+#: `DEEPSEEK_V41_DRAFT_TAIL` (default 1): a fused decode step of one sequence under async
+#: scheduling (`drafts_tail`) verifies its drafts and makes the drafter's meta inside the
+#: drafter launch (`run_draft_tail`, `kernels.mk_kernels.draft_tail`) instead of the tail graph
+#: (`model._decode_tail_graph`) before it: one NEFF execution less a step (the graph's ~50 us
+#: and the ~70 us of device idle and model switch around it). 0: the tail graph.
+_DRAFT_TAIL = os.environ.get("DEEPSEEK_V41_DRAFT_TAIL", "1") not in ("", "0")
+#: `DEEPSEEK_V41_DRAFT_TAIL_DEBUG=1`: log (rank 0, once a reason) whether a step's tail runs in its drafter
+_TAIL_DEBUG = os.environ.get("DEEPSEEK_V41_DRAFT_TAIL_DEBUG", "") not in ("", "0")
+_TAIL_SEEN: set = set()
+
+
+@torch._dynamo.disable
+def drafts_tail(model, step, sampling_positions, spec_decode_metadata, live_lengths, fused=False,
+                ids=None) -> bool:
+    """Whether this step's tail runs in its drafter launch (`run_draft_tail`): a fused decode
+    step (`fuses_tail`) of one span of `n + 1` rows whose `n` (1 .. K) drafts are verified from
+    its own input ids `ids` (the step's rows after the first: the async ids, or the runner's input
+    ids of a synchronous step, which carry the drafts the same way), every row sampled (the
+    sampling positions are the identity there), and the optimized decode drafter. `fused`: asked
+    before the blocks run, whether the drafter (with the tail) can be the last fused launch's last
+    member (`_DRAFT_FUSED`; the head's tokens and the taps are that launch's then)."""
+    if ids is None:
+        ids = getattr(model, "_async_ids", None)
+    K = int(model.config.dspark_block_size)
+    n = (int(spec_decode_metadata.num_draft_tokens[0])
+         if spec_decode_metadata is not None and len(spec_decode_metadata.num_draft_tokens) == 1 else 0)
+    checks = (
+        ("on", _DRAFT_TAIL and (_DRAFT_FUSED or not fused)), ("fuses_tail", fuses_tail(model, step)),
+        ("one span", len(step.spans) == 1),
+        ("drafts", 1 <= n <= K), ("rows", int(live_lengths[0]) == n + 1),
+        ("sampling", sampling_positions is None or (int(sampling_positions.numel()) == n + 1
+                                                     and sampling_positions.dtype in (torch.int32, torch.int64))),
+        ("ids", ids is not None and ids.dtype == torch.int32 and int(ids.numel()) == n + 1),
+        ("greedy", fused or (getattr(step, "greedy_ids", None) is not None
+                             and int(step.greedy_ids.numel()) == n + 1)),
+        ("3 taps", fused or len(step.taps) == 3),
+        ("optimized", mk_kernels.draft_optimized("decode", model.mk_plan.scheme)))
+    bad = next((n for n, ok in checks if not ok), None)
+    if _TAIL_DEBUG and model.rank == 0 and (fused, bad) not in _TAIL_SEEN:
+        _TAIL_SEEN.add((fused, bad))
+        _mk_log.warning("drafts_tail%s: %s", " (fused)" if fused else "",
+                        ("yes" if bad is None else f"no ({bad})")
+                        + f"; ids {None if ids is None else (ids.dtype, tuple(ids.shape), ids._base is not None)}"
+                        + f"; sel {None if sampling_positions is None else (sampling_positions.dtype, tuple(sampling_positions.shape), sampling_positions._base is not None)}")
+    return bad is None
+
+
+def _draft_tail_rest(model, span, paged, ids, sel):
+    """`(starts, sel, table, rest)` for the tail drafter (`run_draft_tail`, `draft_fused_inputs`):
+    the span's start (the prologue's), the sampling positions as the kernel reads them, the block
+    table, and the arguments after the taps (`draft_tail_body`'s `row_pos` .. `flags`)."""
+    cfg = model.config
+    begin, length, _ = span
+    row_pos, write_slots, starts = _prologue_draft_rows(model, begin, length)
+    device = ids.device
+    table = _host_table(paged).to(torch.int32).reshape(-1, 1).contiguous().to(device)
+    keep_alive(table)
+    weights, tail = draft_weights_decode(model, tp=_DRAFT_MOE_TP)
+    K = int(cfg.dspark_block_size)
+    stages = list(model.mtp)
+    flags = (0, K, int(stages[0].attn.window_size), 9, kernel_version(mk_kernels.DRAFT_DECODE_KIND, "tp32"),
+             int(cfg.dspark_noise_token_id), int(cfg.vocab_size), int(cfg.dspark_num_experts_per_tok),
+             int(paged.block_size))
+    caches = [s.attn.window_kv_cache.view(-1, s.attn.head_dim) for s in stages]
+    if sel is None:
+        sels = model.__dict__.setdefault("_mk_tail_sel", {})
+        sel = sels.get(length)
+        if sel is None:
+            sel = sels[length] = _dev(torch.arange(length, dtype=torch.int32), device)
+    elif sel.dtype == torch.int64:
+        # (its int32 words: the kernel reads the low ones. An int64 input itself is narrowed to
+        # int32 by the frontend while the kernel is traced with it as int64)
+        sel = sel.reshape(-1).view(torch.int32)
+    rest = [row_pos, write_slots, table, *weights, *caches, *tail, model._mk_groups_attn, model._mk_groups_full,
+            flags]
+    return starts, sel, table, rest
+
+
+@torch._dynamo.disable
+def run_draft_tail(model, greedy, ids, sel, taps, span, paged):
+    """`_run_draft_seq` with the step's tail in the launch (`drafts_tail`): the drafts verified
+    against the head's tokens `greedy` (`[K + 1, 1]` int32) from the step's input ids `ids`, the
+    meta made from that and the prologue's corrected start, the taps read as given; `sel` the
+    runner's sampling positions (None: every row). Returns
+    `(accepted [1, K + 1] int32 -- the rejection sampler's --, [(output_ids [1, K + 1] int32,
+    None, confidence [1, K] fp32)])`."""
+    K = int(model.config.dspark_block_size)
+    # (the sampling positions: the identity under `drafts_tail` -- one sequence, K drafts, K + 1
+    # rows: vLLM samples every row, `logits_indices = arange(K + 1)` -- as a resident column)
+    starts, sel, table, rest = _draft_tail_rest(model, span, paged, ids, None if _DRAFT_DIRECT else sel)
+    kernel = mk_kernels.draft_tail("decode")
+    if _MK_TRACE and model.mk_plan.stage_rank == 0:
+        _mk_log.warning("mk launch %s span=%s", kernel.func.__name__, span)
+    if _DRAFT_DIRECT and _DIRECT and _execute_context() is None:
+        # straight on its executor (`_launch`): the launch's own tensors as they are (no views),
+        # its three read outputs fresh every step (the host and the next step read them after
+        # later launches may have run)
+        args = [greedy, ids, starts, sel, *taps, *rest]
+        launches = model.__dict__.setdefault("_mk_draft_tail_launches", {})
+        out, _ = _launch(kernel, launches, [(1,)], args, fresh=(0, 1, 6))
+    else:
+        args = [greedy.reshape(-1, 1), ids.reshape(-1, 1), starts, sel, *taps, *rest]
+        out = entry(kernel)(*args)
+    output_ids, confidence, accepted = out[0], out[1], out[6]
+    _track(confidence)
+    return accepted, [(output_ids, None, confidence.reshape(1, K))]
+
+
+#: `DEEPSEEK_V41_DRAFT_DIRECT` (default 1): the tail drafter (`run_draft_tail`) launched straight on
+#: its NEFF executor (`_launch`) instead of through the compiled entry (~2.2 ms of host time a step:
+#: Dynamo's guards, AOTAutograd's wrapper, `_lite_execute`'s fresh outputs). 0: the entry.
+_DRAFT_DIRECT = os.environ.get("DEEPSEEK_V41_DRAFT_DIRECT", "1") not in ("", "0")
+
+
+#: `DEEPSEEK_V41_DRAFT_FUSED` (default 0): with the tail (`drafts_tail`), the drafter is the last
+#: member of the step's last fused launch, after the head (`run_fused(draft=True)`): one NEFF
+#: execution less a step (its model switch, its entry barrier, the device idle before it).
+_DRAFT_FUSED = os.environ.get("DEEPSEEK_V41_DRAFT_FUSED", "0") not in ("", "0")
+
+
+@torch._dynamo.disable
+def fused_draft_result(model, step):
+    """The step's accepted tokens when its last fused launch drafted (`step.draft_out`); the
+    drafts in `model.last_draft` (`run_draft`'s form)."""
+    accepted, output_ids, confidence = step.draft_out
+    model.last_draft = [(output_ids, None, confidence.reshape(1, int(model.config.dspark_block_size)))]
+    if PROF is not None:
+        PROF.mark("sampled", accepted)
+    return accepted
+
+
+@torch._dynamo.disable
+def draft_fused_inputs(model, step, ids, sel, span, paged) -> dict:
+    """`step.draft_in` for the fused drafter (`_plan_fused`): the step's ids, start, sampling
+    positions and block table (refilled every step) and the arguments after the taps. The sampling
+    positions are the identity there (`drafts_tail`: one sequence, K drafts, K + 1 rows -- vLLM samples
+    every row of it, `logits_indices = arange(K + 1)`): the executor's direct launch segfaults on the
+    int32 view of the runner's int64 ones, so the kernel gets a resident identity column."""
+    starts, sel, table, rest = _draft_tail_rest(model, span, paged, ids, None)
+    # (the launch's own tensors as they are: the executor's direct launch takes no views)
+    return {"sids": ids, "starts": starts, "sel": sel, "table": table, "rest": rest}
+
+
 @torch._dynamo.disable
 def run_draft(model, seeds, taps, main_hidden, spans, paged, meta=None):
     """`_draft` for every sequence of the step: `[(output_ids [1, K+1] int32, None,
@@ -2607,7 +2861,7 @@ def _role_tensor(model, value: float) -> torch.Tensor:
     return t
 
 
-def run_blocks(model, stream, pre_mix, step, dump=None, head=False, embed=False):
+def run_blocks(model, stream, pre_mix, step, dump=None, head=False, embed=False, draft=False):
     """This rank's backbone blocks through the megakernels (every block under tp32,
     the stage's five under tp8pp8). Returns `(stream, pre_mix)`; `step.taps` holds
     the DSpark taps on the stage that owns the tapped blocks. `head` (an all-greedy
@@ -2624,7 +2878,8 @@ def run_blocks(model, stream, pre_mix, step, dump=None, head=False, embed=False)
                            "but this step does not fuse (`fuses_embed` and `run_blocks` disagree)")
     for g, end in _fuse_groups(len(blocks)) if fuse else ():
         stream, pre_mix = run_fused(model, blocks[g:end], stream, pre_mix, step,
-                                    head=head and end >= len(blocks), embed=embed and g == 0)
+                                    head=head and end >= len(blocks), embed=embed and g == 0,
+                                    draft=draft and head and end >= len(blocks))
     for layer_id, block in () if fuse else zip(model.block_ids, model.layers.values()):
         stream, pre_mix = run_layer(model, block, stream, pre_mix, step)
         if dump is not None:

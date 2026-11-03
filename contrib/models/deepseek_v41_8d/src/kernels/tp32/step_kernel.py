@@ -260,11 +260,14 @@ def step_prologue_body(
     a_row_pos, a_write_slots, a_win_slots, a_wv,
     b_row_pos, b_write_slots, b_win_slots, b_wv, b_cmp_slots, b_clen, b_grp_pos, b_grp_mslots, b_grp_wslots,
     c_row_pos, c_write_slots, c_win_slots, c_wv, c_cmp_slots, c_clen, c_grp_pos, c_grp_mslots, c_grp_wslots,
-    hash0, hash1, embed_ids, starts, flags,
+    hash0, hash1, embed_ids, starts, flags, both_cores=False,
 ):
     """See the module docstring. `flags` = (B, L, K, Wp, block_size, window, vocab, pad_id,
     ratio_a, ratio_b, ratio_c, read_len_b, read_len_c, kernel_version): combination `a` is
-    uncompressed (ratio 0), `b` / `c` compressed."""
+    uncompressed (ratio 0), `b` / `c` compressed. `both_cores` (the first member of a decode
+    step's first fused launch, `mk_kernels.step_prologue_member`): both cores compute it all and
+    write the same values, so each core's reads in the members after it follow its own writes
+    (no core barrier for the two dozen outputs)."""
     B, L, K, Wp, bs, win, vocab, pad_id, ra, rb, rc, rlen_b, rlen_c, _kver = flags
     assert ra == 0 and rb in (1, 2) and rc in (1, 2)
     T = B * L
@@ -275,7 +278,7 @@ def step_prologue_body(
     nwin = win + L - 1
     pid = nl.program_id(0)
     done = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.shared_hbm)
-    if pid == 0:
+    if pid == 0 or both_cores:
         # ---------------------------------------------------------------- the rows
         hdr, pv = _span_cols(pmeta, prev, B, L, 0, T, Hw, K1)
         st = _starts(hdr, pv, T, K1, vocab)

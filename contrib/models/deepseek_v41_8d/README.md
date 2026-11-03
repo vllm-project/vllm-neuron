@@ -30,6 +30,9 @@ it; the architecture, the megakernels and their history are documented there and
 | fp8 linears' per-op copies | kept beside the MX copies | freed once the MX copy is made (`DEEPSEEK_V41_FREE_PEROP`) |
 | bs1 decode MoE kernel | 4 static expert slots a core | 5 a core, the down GEMM's contraction packed across slots and the two shared blocks in one tile (`b1moe.PACK_DOWN`, `SHARE_PACK`) |
 | Vocabulary shard | 2048 rows a rank | 4096 rows a rank |
+| bs1 decode step | 6 NEFF executions: prologue, 3 fused launches, the verify graph, the drafter | **4**: the prologue inside the first fused launch, the verify inside the drafter launch (`DEEPSEEK_V41_PROLOGUE_FUSED`, `DEEPSEEK_V41_DRAFT_TAIL`) |
+| DSpark drafter kernel (bs1) | as in the 16-device port | the same drafts in ~0.1 ms less (`draft_decode/`: `HC_MIX_STACK_ROWS`, `HEAD_SPLIT`, `KV_ROWS_CORE1`, `BIAS_CAST_ACT`) |
+| Batched drafter (bs10) | shared expert sharded over the world (`layout.SH_TP`) | replicated (at 32 ranks the sharded one drafted worse together with `MAIN_PROJ_TP`) |
 
 Why each change is there:
 
@@ -127,33 +130,50 @@ Validated 2026-11-03 on a `trn3.48xlarge` with the DLAMI venv
 
 Measured 2026-11-03 on devices 0-7 (32 ranks), every optimization at its default
 (`test/performance/bench_report.json`, `bench_report_ms10.json`, per-cell results in
-`test/performance/cells/`; sonnet input, 128 output tokens, greedy). In parentheses: the
-16-device port's last validated run (r5r, commit 8e182aa, 64 ranks):
+`test/performance/cells/`; sonnet input, 128 output tokens, greedy). In parentheses: the first
+8-device version (commit 83d1d76):
 
 | Cell | TTFT p50 ms | TPOT p50 ms | decode tok/s | accept % | median ITL ms |
 |------|-------------|-------------|--------------|----------|---------------|
-| in512_bs1 | 147 (134) | 3.67 (3.77) | 204.8 (205.4) | 51.3 (49.5) | 12.98 (12.70) |
-| in1024_bs1 | 244 (230) | 4.16 (3.71) | 164.9 (181.9) | 43.5 (51.2) | 12.89 (12.63) |
-| in2048_bs1 | 428 (417) | 4.13 (3.84) | 134.1 (142.1) | 44.6 (49.8) | 13.05 (12.68) |
-| in8192_bs1 | 1707 (1662) | 4.31 (4.00) | 56.7 (58.9) | 44.6 (48.0) | 13.49 (13.22) |
-| in512_bs10 | 791 (720) | 20.81 (15.83) | 318.7 (442.7) | 38.6 (48.5) | 43.97 (38.98) |
-| in1024_bs10 | 1311 (1250) | 24.20 (19.50) | 262.1 (329.4) | 40.8 (50.0) | 45.07 (40.08) |
-| in2048_bs10 | 2313 (2249) | 29.03 (26.63) | 190.5 (217.7) | 41.0 (48.3) | 46.03 (41.02) |
-| in8192_bs10 | 9398 (9141) | 75.80 (71.82) | 64.4 (68.5) | 38.9 (44.2) | 49.70 (44.59) |
+| in512_bs1 | 149 (147) | 3.64 (3.67) | 206.7 (204.8) | 51.3 (51.3) | 12.68 (12.98) |
+| in1024_bs1 | 245 (244) | 4.10 (4.16) | 165.9 (164.9) | 43.5 (43.5) | 12.70 (12.89) |
+| in2048_bs1 | 428 (428) | 4.08 (4.13) | 135.1 (134.1) | 44.6 (44.6) | 12.78 (13.05) |
+| in8192_bs1 | 1709 (1707) | 4.23 (4.31) | 56.9 (56.7) | 44.6 (44.6) | 13.25 (13.49) |
+| in512_bs10 | 790 (791) | 17.41 (20.81) | 405.4 (318.7) | 46.1 (38.6) | 39.89 (43.97) |
+| in1024_bs10 | 1314 (1311) | 20.56 (24.20) | 299.7 (262.1) | 45.7 (40.8) | 41.91 (45.07) |
+| in2048_bs10 | 2312 (2313) | 27.05 (29.03) | 214.3 (190.5) | 47.8 (41.0) | 42.61 (46.03) |
+| in8192_bs10 | 9401 (9398) | 75.43 (75.80) | 66.8 (64.4) | 46.6 (38.9) | 49.80 (49.70) |
+
+The 16-device port's last validated run (r5r, commit 8e182aa) for comparison: bs1 TPOT
+3.77 / 3.71 / 3.84 / 4.00 ms (median ITL 12.70 / 12.63 / 12.68 / 13.22), bs10 TPOT 15.83 / 19.50 /
+26.63 / 71.82 ms.
 
 Every cell completed every request, every request emitted its 128 tokens, and the texts are
-coherent answers to the sonnet prompts (they part from the 16-device port's after a
-median 96-274 characters: the reductions run over 32 ranks in a different order). A decode
-step (median ITL) costs 2-3 % more than on 16 devices at batch 1 and ~12 % more at batch 10,
-where every expert is active and a rank streams its 12 whole experts a layer instead of 6.
-TPOT also moves with the draft acceptance of each cell's text.
+coherent answers to the sonnet prompts; at batch 1 they are token-for-token the first 8-device
+version's in every cell (and so is the draft acceptance: the bs1 changes below keep the arithmetic).
+What moved a decode step since that version:
 
-The integration test passes (`test/unit/verifier_reports/tp32_2026-11-03.json`, 9:25 wall):
+- **Batch 1 (-1.5 to -2.3 % median ITL):** a step is four NEFF executions instead of six. The
+  step's verify runs inside the drafter launch (`DEEPSEEK_V41_DRAFT_TAIL`), which the host launches
+  straight on its executor (`DEEPSEEK_V41_DRAFT_DIRECT`), and the step prologue is the first member of
+  the step's first fused launch (`DEEPSEEK_V41_PROLOGUE_FUSED`). The drafter kernel itself is ~0.1 ms
+  shorter (hc_in's mix GEMM without the per-tile PE transposes, the markov token loop split over the
+  two cores, the next stage's KV write off core 0's critical path), with the same drafts; the
+  target's greedy head does its argmax on both cores with one all-gather. Each
+  NEFF switch costs the device ~45-75 us plus a ~50-70 us cross-rank barrier inside the launch.
+- **Batch 10:** the batched drafter keeps the shared expert replicated (`layout.SH_TP` off: with it and
+  `MAIN_PROJ_TP` together at 32 ranks it drafted worse, 39 % acceptance against 47 %), and a 60-row
+  step runs its MoE in the TP x EP layout up to a 4096-token context (`mk_model.moe_tp_max_t()`).
+
+See [`src/README.md`](src/README.md#the-8-device-deployment) for the switches and what was tried and
+dropped.
+
+The integration test passes (`test/unit/verifier_reports/tp32_2026-11-03.json`, 7:58 wall):
 `short-prose`, `smoke-test` and `trivia-capital-france` are token-for-token the 16-device
 port's (32 / 32 / 18 tokens, `...The capital of France is **Paris**.`), and
 `long-needle-2048-0` recalls `5591-C67` with the same 32 tokens up to the sentence after the
 code, then continues `...The maintenance log for sector 159 ...`, one of the continuations the
-16-device port's own validated runs produced.
+16-device port's own validated runs produced; all four are the first 8-device version's texts.
 
 During serving the 32 workers hold `/dev/neuron0` .. `/dev/neuron7` only.
 

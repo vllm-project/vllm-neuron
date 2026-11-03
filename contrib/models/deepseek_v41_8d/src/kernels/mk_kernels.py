@@ -158,6 +158,8 @@ def specialize(body, name: str, consts: tuple) -> object:
     fn = ns[name]
     fn.__module__ = __name__
     fn.__qualname__ = name
+    # (the body's module: `_fused_member` switches its cache-copy flags)
+    fn.body_module = body.__module__
     return nki.jit(fn)
 
 
@@ -205,6 +207,16 @@ def draft(phase: str, scheme: str):
     return specialize(body, f"draft_{phase}_{scheme}", (("phase", phase), ("scheme", scheme)))
 
 
+def draft_tail(phase: str = "decode"):
+    """The flat scheme's per-sequence decode drafter with the step's tail inside
+    (`tp32/draft_decode/draft_seq.draft_tail_body`: the verify of the step's drafts and the
+    drafter's meta on the device in the launch, the three taps as the blocks returned them),
+    launched by `mk_model.run_draft_tail`. Its version kind is `DRAFT_DECODE_KIND`."""
+    assert phase == "decode" and draft_optimized(phase)
+    return specialize(_draft_decode_pkg().draft_seq.draft_tail_body, f"draft_tail_{phase}_tp32",
+                      (("phase", phase), ("scheme", "tp32")))
+
+
 def draft_batched(phase: str):
     """The flat scheme's drafter for every sequence of a step in one launch: the batched
     body (`tp8pp8/draft_kernel.draft_body`, whose groups are the ranks the head and sampler
@@ -228,6 +240,15 @@ def head_greedy():
 
 
 @functools.lru_cache(maxsize=None)
+def step_prologue_member():
+    """The flat scheme's step prologue (`tp32/step_kernel.step_prologue_body`, both cores) as the
+    first member of a decode step's first fused launch (`mk_model.run_fused`, `StepPrologue`)."""
+    from .tp32 import step_kernel
+
+    return specialize(step_kernel.step_prologue_body, "step_prologue_member_tp32", (("both_cores", True),))
+
+
+@functools.lru_cache(maxsize=None)
 def embed_expand():
     """The flat scheme's token embedding and hyper-connection expand
     (`tp32/head_kernel.embed_expand_body`) as the first member of a decode step's first
@@ -247,7 +268,7 @@ def boundary(parity: int):
 #: The module flags that make a decode kernel return copies of the caches it was given
 #: (the r2_decode-based kernels' / the r1_decode-based ones'): off inside a fused launch,
 #: where a member's returned caches are not outputs (the caches are updated in place).
-_CACHE_COPY_FLAGS = ("CACHE_COPY_EARLY", "CACHE_COPY_AT_AR")
+_CACHE_COPY_FLAGS = ("CACHE_COPY_EARLY", "CACHE_COPY_AT_AR", "CACHE_COPY")
 
 
 @contextlib.contextmanager
@@ -255,7 +276,7 @@ def _fused_member(index: int, kernel):
     """Trace member `index` of a fused launch: its named scratch tensors prefixed
     `L<index>_` (a kernel's scratch names are unique only within one block), its unnamed
     shared-HBM ones named `L<index>_out<n>`, and its cache copies off."""
-    mod = sys.modules[kernel.func.__module__]
+    mod = sys.modules[getattr(kernel.func, "body_module", kernel.func.__module__)]
     saved = {f: getattr(mod, f) for f in _CACHE_COPY_FLAGS if hasattr(mod, f)}
     for f in saved:
         setattr(mod, f, False)

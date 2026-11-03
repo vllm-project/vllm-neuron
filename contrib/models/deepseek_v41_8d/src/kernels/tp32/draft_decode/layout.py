@@ -22,6 +22,8 @@ contents and layout (re-shard, transpose, re-tile, re-quantize only if exact), a
 (never of activations, caches, routing or the recorded outputs), and a rank's prepared
 weights may not exceed 1.25x its recorded weight bytes (run.py checks).
 """
+import os
+
 import torch
 
 #: The weight parameters (the same names in both entries).
@@ -32,13 +34,18 @@ WEIGHTS = ['main_proj', 'main_proj_s', 'main_norm_w', 'embed_w', 'vocab_start', 
 #: rank r keeps output columns [r * dim / world, (r + 1) * dim / world) -- the kernel projects
 #: its slice and all_gathers main_x over the world group (whose position p holds rank p's
 #: slice for the recorded groups; the kernel maps any other order)
-MAIN_PROJ_TP = True
+MAIN_PROJ_TP = os.environ.get("DEEPSEEK_V41_DRAFT_MP_TP", "1") not in ("", "0")   # (env: 8d A/B switch)
 
 #: the shared expert's gate / up projections (sh_w1 / sh_s1, sh_w3 / sh_s3: [S, K/4 | K/32, inter],
 #: replicated in the recording) column-sharded: rank r keeps hidden columns
 #: [r * inter / world, (r + 1) * inter / world); the kernel computes its slice of the SwiGLU
 #: hidden rows and all_gathers them over the world group for the replicated down projection
-SH_TP = True
+#: 8d: OFF by default (`DEEPSEEK_V41_DRAFT_SH_TP=1` turns it on). At 32 ranks the batched entry with both
+#: SH_TP and MAIN_PROJ_TP drafts deterministically worse (in512_bs10 acceptance 39 % against 47 % with either
+#: one alone; the drafts are verified, so only speed suffers; core barriers on the two all_gathers' outputs
+#: did not change it); without SH_TP the decode step is as fast (median ITL 43.9 ms either way). The
+#: single-sequence entry never uses SH_TP (its shared expert is in the TP x EP layout, `MOE_TP`).
+SH_TP = os.environ.get("DEEPSEEK_V41_DRAFT_SH_TP", "0") not in ("", "0")
 
 
 #: the routers' fp32 weights (gate_w_t0..2: bf16 values widened) as their exact bf16 copies: the

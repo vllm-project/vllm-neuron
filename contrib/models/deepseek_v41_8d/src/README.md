@@ -47,6 +47,59 @@ shard sizes and timings quoted below as the 64-rank deployment's. What changed f
   exists; `_EXPERT_CACHE_BYTES` / `_ENGRAM_TABLE_BYTES` default to 12 GiB.
 - `DEEPSEEK_V41_HBM_TRACE=1` also logs rank 0's HBM before each block's TP x EP MoE copy
   (`mk_model.moe_tp_map`).
+- `kernels/tp32/draft_decode/layout.py`: `SH_TP` (the batched drafter's shared expert column-sharded
+  over the world) is off by default (`DEEPSEEK_V41_DRAFT_SH_TP=1` turns it on): at 32 ranks the batched
+  entry with both `SH_TP` and `MAIN_PROJ_TP` drafted deterministically worse (in512_bs10 acceptance 39 %
+  against 47 % with either alone; root cause not found). `DEEPSEEK_V41_DRAFT_MP_TP` switches `MAIN_PROJ_TP`.
+- `mk_model.moe_tp_max_t()`: a decode step of up to 64 rows (bs10) runs the TP x EP layout at a
+  context of at most 4096 tokens (16 rows above that, the 16-device port's limit: at an 8448-token
+  context with ten sequences the 60-row launches' NEFFs, loaded after the KV cache is sized, did not
+  fit); `DEEPSEEK_V41_MOE_TP_MAX_T` overrides it.
+
+bs1 decode step (2026-11-03, after the first 8-device version). A step is four NEFF executions where
+it was six -- the first fused launch with the step prologue in it, the L08-L23 and L24-L39 + head
+launches, and the drafter with the step's verify in it:
+
+- **The verify in the drafter launch** (`kernels/tp32/draft_decode/draft_seq.draft_tail_body`,
+  `mk_kernels.draft_tail`, `mk_model.drafts_tail` / `run_draft_tail`, `DEEPSEEK_V41_DRAFT_TAIL`): for a
+  one-sequence decode step (asynchronous or synchronous, 1 .. K drafts) the drafter compares the step's
+  input rows 1 .. n with the fused head's tokens of the rows before them, writes the plugin rejection
+  sampler's `[1, n + 1]` output (-1 past the first mismatch, the bonus when all match) and makes its own
+  meta (the last accepted token, its row, the prologue's start); it reads the three taps as the blocks
+  returned them. That replaces `model._decode_tail_graph` before it (one NEFF execution a step less).
+  The kernel is launched straight on its executor (`DEEPSEEK_V41_DRAFT_DIRECT`; through the compiled
+  entry that was ~2.2 ms of host time a step), its three read outputs fresh every launch, the sampling
+  positions a resident identity column (vLLM samples every row of a one-sequence step: the runner's are
+  `arange(n + 1)`, int64, and the executor's direct launch segfaults on an int32 view of them).
+- **The step prologue as the first fused launch's first member** (`DEEPSEEK_V41_PROLOGUE_FUSED`,
+  `kernels/tp32/fused/layers_decode_pro_embed_L00_L07_tp32/`, `mk_kernels.step_prologue_member`): both
+  cores compute it (`step_prologue_body(both_cores=True)`) and write the same values, so every core's
+  reads in the members after it follow its own writes, with no core barriers. One NEFF execution a step
+  less. `=0` runs the prologue on its own before `layers_decode_embed_L00_L07_tp32`, as before.
+- **The drafter kernel** (`draft_decode/draft_seq.py`, `mk_common.py`; exact: the same drafts,
+  confidences and window rows on the recorded live case, workspace p10 1.741 -> 1.633 ms):
+  `mk_common.HC_MIX_STACK_ROWS` (hc_in's mix GEMM takes x^T from PE transposes of 128-row stacks of the
+  rows' K-tiles, 7 a call for 5 rows instead of 160, the same matmuls in the same order; core 1 ran
+  ~240 us of transposes and fp32 matmuls a stage), `HEAD_SPLIT` (the markov token loop on each core's
+  half of the rank's vocabulary: the logits + pad bias on chip, two argmax candidates a rank in the
+  all-gather), `KV_ROWS_CORE1` (the next stage's main-stream KV write's norm / RoPE / scatter on core 1:
+  on core 0 it ran past the world all-reduce into the next stage's hc_out and norm), `BIAS_CAST_ACT`
+  (the markov bias's bf16 rounding on the scalar engine, pipelined with the vector engine's adds).
+  Two non-exact options stay off: `HC_MIX_SPREAD_ROWS` (the mix in a transpose-free order with the
+  block-diagonal GEMM) and `mk_common.NORM_SS_SPREAD` (hc_in's rms on chip): ~85 us more, but the
+  drafter's MoE routing amplifies the reordered fp32 sums into other drafts, and on the bench that
+  moved acceptance (in512 51.3 -> 48.9 %) and, through the verify rows' MoE slot order, some texts.
+- **The greedy head** in the L24-L39 + head launch (`fused/layers_decode_L24_L39_head_tp32/l1/head/
+  head_kernel.py`; exact): `HEAD_ARGMAX_SPLIT` (the pad mask and the (max, index) on each core's half of
+  the rank's vocabulary, one all-gather of both cores' (value, index) pairs -- `2 * world` candidates a
+  row in vocabulary order -- instead of core 0 over the whole row and two all-gathers) and `HEAD_SPREAD`
+  (the collapse and the norm's elementwise parts on the rows' column blocks over 120 partitions, the
+  sum of squares on the rows as before).
+- `DEEPSEEK_V41_DRAFT_FUSED=1` (off; `run_fused(draft=True)`, `step.draft_in` / `draft_out`): the
+  drafter as the last member of the L24-L39 + head launch. Tried and slower: that launch took longer
+  than its two parts and the drafter gap together (5.92 ms against 4.23 + 1.52) and its 755-tensor IO
+  ring, rebuilt every step for the fresh outputs, cost ~5 ms of host time a step. Its optimized launch
+  is not in the tree (the generated one runs).
 
 ## Architecture
 
@@ -264,7 +317,7 @@ T = 6 rows (one sequence: the token and its 5 drafts). Two things bounded them: 
 imbalance -- in the deployment layout (6 experts a rank) a step's 36 picks hit a few ranks, and the
 world all-reduce after the MoE waited for the busiest -- and chains of tiny dependent instructions
 (the hyper-connections' 20-iteration Sinkhorns above all, ~50 us each on few rows). The optimized
-fused decode launches now, for a decode step of at most `mk_model.MOE_TP_MAX_T` rows:
+fused decode launches now, for a decode step of at most `mk_model.moe_tp_max_t()` rows:
 
 * run the MoE in a **TP x EP layout** (`fused/<launch>/moe_tp.py`; host layout
   `kernels/tp32/moe_tp_layout.py`, built once a block by `mk_model.moe_tp_map` from the checkpoint,

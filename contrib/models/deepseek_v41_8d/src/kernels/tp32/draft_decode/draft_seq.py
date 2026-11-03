@@ -70,6 +70,7 @@ from .mk_common import (
     hc_out_tile,
     moe_partial,
     load_fn_t,
+    mix_spread,
     norm_rows,
     norm_rows_sb,
     pad_to,
@@ -134,6 +135,20 @@ PARTIAL_SPREAD = True
 #: the routed accumulator's live rows zeroed at the start of the MoE section (off that chain)
 WEXP_PADS_ONCE = True
 EACC_ZERO_EARLY = True
+#: the head from the logits on: each core its own vocabulary half (the half its head GEMM wrote):
+#: the fp32 logits plus the pad bias (computed in the prologue) in one op, kept on chip, and each
+#: token's markov bias GEMM, add and (max, index) over the half; the argmax all_gather then
+#: carries both cores' candidates (2 rows a rank, in vocabulary order). Else core 0 converts the
+#: whole row and both cores run the whole token loop.
+HEAD_SPLIT = True
+#: kv_write's per-row work (the norm, RoPE + fp8 round trip, the cache scatter) on core 1: on core 0
+#: (the rows' tile owner) the next stage's kv_write ran past the world all_reduce into that
+#: stage's start, its DVE / ACT / DMA work queued ahead of hc_out and hc_in_norm there (~20 us);
+#: core 1 runs only the (off-path) attention mix at that point
+KV_ROWS_CORE1 = True
+#: the token loop's markov-bias rounding (PSUM fp32 -> bf16) on the scalar engine: it and the DVE's adds
+#: of the bias into the logits row overlap bank by bank (both on the DVE: ~1.2 us a bank, in series)
+BIAS_CAST_ACT = True
 
 
 def _half(n, pid):
@@ -150,6 +165,74 @@ def _log2(n):
     return k
 
 
+def _tail_meta(greedy, sids, starts, sel, K, accepted):
+    """The step's verify on chip (`model._decode_tail_graph` for one sequence, greedy): the
+    `K` drafts (the drafter's block, or fewer at a request's end: the step has `K + 1` rows) are
+    the step's rows 1 .. K (`sids`, the step's input ids), accepted while they equal
+    the target's tokens of the rows before them (`greedy`, the fused head's); `accepted[0, :]`
+    = the target's tokens up to the first mismatch (or the bonus), -1 after, as the plugin's
+    rejection sampler writes them. Returns the drafter's meta `(seed, tap, start)` as a
+    `[1, 3]` fp32 SBUF tile: the last accepted token, its row (the number of accepted drafts)
+    and the span's start. Token ids and rows are exact in fp32. `sel` (the runner's sampling
+    positions, int32 `[T]` or int64 `[T]` -- read as its int32 words, the low ones) picks the
+    head's rows first (`torch.index_select(greedy, 0, sel)`)."""
+    T = K + 1
+    f32 = nl.float32
+    gi = nl.ndarray((1, T), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=gi, src=greedy.ap(pattern=[[T, 1], [1, T]], offset=0))
+    di = nl.ndarray((1, K), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=di, src=sids.ap(pattern=[[T, 1], [1, K]], offset=1))
+    si = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=si, src=starts[0:1, 0:1])
+    gf = nl.ndarray((1, T), dtype=f32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=gf, src=gi)
+    if sel is not None:
+        if sel.dtype == nl.int64:
+            # (an int64 tensor read as its int32 words: the low word of each index first)
+            sel = sel.view(nl.int32)
+        stride = sel.shape[0] // T
+        assert stride * T == sel.shape[0] and stride in (1, 2), (sel.shape, T)
+        xi = nl.ndarray((1, T), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=xi, src=sel.ap(pattern=[[stride * T, 1], [stride, T]], offset=0))
+        xu = nl.ndarray((1, T), dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=xu, src=xi)
+        gs = nl.ndarray((1, T), dtype=f32, buffer=nl.sbuf)
+        nisa.nc_n_gather(dst=gs, data=gf, indices=xu)
+        gf = gs
+    df = nl.ndarray((1, K), dtype=f32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=df, src=di)
+    # the leading matches: eq[j] = prod_{i <= j} (draft i == target i)
+    eq = nl.ndarray((1, K), dtype=f32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=eq, data1=df, data2=gf[0:1, 0:K], op=nl.equal)
+    for j in range(1, K):
+        nisa.tensor_tensor(dst=eq[0:1, j : j + 1], data1=eq[0:1, j : j + 1], data2=eq[0:1, j - 1 : j],
+                           op=nl.multiply)
+    m = nl.ndarray((1, 1), dtype=f32, buffer=nl.sbuf)
+    nisa.tensor_reduce(dst=m, op=nl.add, data=eq, axis=(1,), keepdims=True)
+    ii = nl.ndarray((1, T), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.iota(dst=ii, pattern=[[1, T]], offset=0, channel_multiplier=0)
+    io = nl.ndarray((1, T), dtype=f32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=io, src=ii)
+    # accepted = target where j <= m, -1 after: (t + 1) * (j <= m) - 1
+    keep = nl.ndarray((1, T), dtype=f32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=keep, data=io, op0=nl.less_equal, operand0=m[0:1, 0:1])
+    t1 = nl.ndarray((1, T), dtype=f32, buffer=nl.sbuf)
+    nisa.scalar_tensor_tensor(dst=t1, data=gf, op0=nl.add, operand0=1.0, op1=nl.multiply, operand1=keep)
+    nisa.tensor_scalar(dst=t1, data=t1, op0=nl.add, operand0=-1.0)
+    ai = nl.ndarray((1, T), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=ai, src=t1)
+    nisa.dma_copy(dst=accepted[0:1, 0:T], src=ai)
+    # the seed: the target's token at row m (one nonzero product: exact)
+    oh = nl.ndarray((1, T), dtype=f32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=oh, data=io, op0=nl.equal, operand0=m[0:1, 0:1])
+    nisa.tensor_tensor(dst=oh, data1=oh, data2=gf, op=nl.multiply)
+    mtf = nl.ndarray((1, 3), dtype=f32, buffer=nl.sbuf)
+    nisa.tensor_reduce(dst=mtf[0:1, 0:1], op=nl.add, data=oh, axis=(1,), keepdims=True)
+    nisa.tensor_copy(dst=mtf[0:1, 1:2], src=m)
+    nisa.tensor_copy(dst=mtf[0:1, 2:3], src=si)
+    return mtf
+
+
 def draft_body(
     meta, main_hidden, row_pos, write_slots, block_table,
     main_proj, main_proj_s, main_norm_w, embed_w, vocab_start,
@@ -162,7 +245,7 @@ def draft_body(
     cache0, cache1, cache2,
     fnorm_w, head_w, mk_embed_w, mk_head_w, conf_w,
     groups_attn, groups_world, flags,
-    phase="decode", scheme="tp32",
+    phase="decode", scheme="tp32", tail=None, taps=None,
 ):
     """The drafter, traced with `phase` baked: "prefill" is the `at_zero` step (the
     main-stream KV writes only), "decode" the draft proper. `mk_kernels` makes one
@@ -171,10 +254,12 @@ def draft_body(
     at_zero, K, win, stage, kver, noise_id, vocab_size, topk_e, bs = flags
     assert bool(at_zero) == (phase == "prefill"), f"flags at_zero={at_zero} vs phase {phase}"
     nstages = wq_a.shape[0]
-    L = main_hidden.shape[0]
+    # (`draft_tail_body`: the step's verify in the kernel (`tail`), the three taps as given (`taps`)
+    # instead of the tail graph's meta and concatenation)
+    L = (taps[0] if taps is not None else main_hidden).shape[0]
     Lp = pad_to(L, PT)
     Kp = PT
-    main_in = main_hidden.shape[1]
+    main_in = sum(t.shape[1] for t in taps) if taps is not None else main_hidden.shape[1]
     dim = main_norm_w.shape[1]
     hc = hca_fn_t0.shape[0] // dim
     width = hc * dim
@@ -219,7 +304,8 @@ def draft_body(
     sh_tp = sh_cols != inter
     assert not sh_tp or (sh_cols * world == inter and (inter // PT + 1) // 2 * PT % sh_cols == 0), \
         f"sh_w1 {sh_w1.shape} vs inter {inter}"
-    W8 = max(world, 8)
+    NC = CORES if HEAD_SPLIT else 1    # the argmax candidates a rank (one a core with HEAD_SPLIT)
+    W8 = max(NC * world, 8)
     # the seed's markov embedding rides in the draft embedding's all_reduce (an extra row)
     fold = mrank <= dim
     Re = K + 1 if fold else K
@@ -240,12 +326,15 @@ def draft_body(
     rg_world = ncc.ReplicaGroup([list(g) for g in groups_world])
     kt = tiles_of(K, pid)             # the draft rows: one partial tile, core 0's
     kt_all = tiles_of(K, 0)
+    mix_sp = mix_spread(max(nr for _, nr in kt_all))
     ptiles = tiles_of(Kp, 0) + tiles_of(Kp, 1)
     lt = tiles_of(L, pid)
     ltp = tiles_of(Lp, 0) + tiles_of(Lp, 1)
 
     # ------------------------------------------------------------------ outputs
     output_ids = nl.ndarray((1, K + 1), dtype=nl.int32, buffer=nl.shared_hbm)
+    # (the verify's: the step's L rows are a seed and L - 1 drafts -- K, or fewer at a request's end)
+    accepted = nl.ndarray((1, L), dtype=nl.int32, buffer=nl.shared_hbm) if tail is not None else None
     confidence = nl.ndarray((K, 1), dtype=nl.float32, buffer=nl.shared_hbm)
     dbg = nl.ndarray((Kp, max(width, part + dim)) if stage != 9 else (1, 1),
                      dtype=nl.float32, buffer=nl.shared_hbm)
@@ -328,8 +417,13 @@ def draft_body(
         mid = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.shared_hbm, name="mid")
         mcc_src = nl.ndarray((1, mrank), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="mcc_src")
         mcc_dst = nl.ndarray((1, mrank), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="mcc_dst")
-    g_src = nl.ndarray((1, GW), dtype=nl.float32, buffer=nl.shared_hbm, name="g_src")
-    g_dst = nl.ndarray((world, GW), dtype=nl.float32, buffer=nl.shared_hbm, name="g_dst")
+    g_src = nl.ndarray((NC, GW), dtype=nl.float32, buffer=nl.shared_hbm, name="g_src")
+    g_dst = nl.ndarray((NC * world, GW), dtype=nl.float32, buffer=nl.shared_hbm, name="g_dst")
+    vlo, vhi = _half(part, pid) if HEAD_SPLIT else (0, part)    # this core's vocabulary columns
+    hv = vhi - vlo
+    assert hv % 512 == 0
+    if HEAD_SPLIT:
+        dead_h = nl.ndarray((CORES, hv), dtype=nl.float32, buffer=nl.shared_hbm, name="dead_h")
     memb = nl.ndarray((Kp, mrank), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="memb")
 
     use_copy = CACHE_COPY and stage == 9 and not at_zero
@@ -339,13 +433,21 @@ def draft_body(
         c_out = list(caches)
 
     def ret():
+        if tail is not None:
+            return output_ids, confidence, dbg, c_out[0], c_out[1], c_out[2], accepted
         return output_ids, confidence, dbg, c_out[0], c_out[1], c_out[2]
 
     def main_x():
         """main_x = main_norm(main_proj(main_hidden)) into `mx` (only the KV writes read it)."""
         # the taps' projection: replicated (~80 MB of weights, in the embedding all_reduce's
         # shadow) or column-sharded (MAIN_PROJ_TP: this rank's slice, then an all_gather)
-        cast_rows(main_hidden, mh16, lt, main_in, nl.bfloat16)
+        if taps is not None:
+            c0 = 0
+            for t in taps:
+                cast_rows(t, mh16[:, c0 : c0 + t.shape[1]], lt, t.shape[1], nl.bfloat16)
+                c0 += t.shape[1]
+        else:
+            cast_rows(main_hidden, mh16, lt, main_in, nl.bfloat16)
         if pid == 0 and L < Lp:
             padm = nl.ndarray((PT, main_in), dtype=nl.bfloat16, buffer=nl.sbuf)
             nisa.memset(padm, 0.0)
@@ -388,10 +490,13 @@ def draft_body(
     # ------------------------------------------------------------------ 0. the draft's indices
     # seed, draft_pos = pos + tap, wv = draft_pos - (win - 1): three scalars every core reads.
     if pid == 0:
-        mt = nl.ndarray((1, 3), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=mt, src=meta[0:1, 0:3])
-        mtf = nl.ndarray((1, 3), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=mtf, src=mt)
+        if tail is not None:
+            mtf = _tail_meta(*tail, L - 1, accepted)
+        else:
+            mt = nl.ndarray((1, 3), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=mt, src=meta[0:1, 0:3])
+            mtf = nl.ndarray((1, 3), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=mtf, src=mt)
         s4 = nl.ndarray((1, 4), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(s4, 0.0)
         nisa.tensor_copy(dst=s4[0:1, 0:1], src=mtf[0:1, 0:1])
@@ -516,9 +621,10 @@ def draft_body(
         lo, hi = _half(hd, pid)
         X.gemm_rows(mx, Lp, dim, wkv4[s], wkv_s[s], mkvr, lo, hi, m_live=L, after=after)
         nisa.core_barrier(data=mkvr, cores=(0, 1))
-        norm_rows(mkvr, kv_norm_w[s : s + 1], mkv, lt, hd, qdq=False, chunk=hd)
-        rope_rows(mkv, mkv, lt, hd, hd, 1, freqs, row_pos, inverse=False, qdq=True)
-        scatter_rows(mkv, write_slots, cache, lt, hd)
+        lk = tiles_of(L, CORES - 1 - pid) if KV_ROWS_CORE1 else lt
+        norm_rows(mkvr, kv_norm_w[s : s + 1], mkv, lk, hd, qdq=False, chunk=hd)
+        rope_rows(mkv, mkv, lk, hd, hd, 1, freqs, row_pos, inverse=False, qdq=True)
+        scatter_rows(mkv, write_slots, cache, lk, hd)
         return nisa.core_barrier(data=cache, cores=(0, 1))
 
     if not mp_tp:
@@ -527,7 +633,20 @@ def draft_body(
     bar_kv0 = kv_write(0) if not at_zero and nstages > 0 else None
     # The markov head transposed once, (PT, mrank // PT, part) bf16: weights only, so in
     # the embedding all_reduce's shadow, long before the head needs it.
-    mkT = transpose_pe(mk_head_w, part, mrank)
+    mkT = transpose_pe(mk_head_w, hv, mrank, r0=vlo)
+    if HEAD_SPLIT:
+        # this core's vocabulary columns' pad bias: 0 inside the vocabulary, NEG past it
+        dci = nl.ndarray((1, hv), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.iota(dst=dci, pattern=[[1, hv]], offset=vlo, channel_multiplier=0)
+        dcf = nl.ndarray((1, hv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=dcf, src=dci)
+        dvs = bcast_row(vocab_start[0:1, 0:1], 1, 1)
+        dlive = nl.ndarray((1, hv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=dlive, data=dcf, op0=nl.add, operand0=dvs[0:1, 0:1],
+                           op1=nl.less, operand1=float(vocab_size))
+        ddead = nl.ndarray((1, hv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=ddead, data=dlive, op0=nl.add, operand0=-1.0, op1=nl.multiply, operand1=-NEG)
+        nisa.dma_copy(dst=dead_h[pid : pid + 1, 0:hv], src=ddead)
     if pid == 0:
         e = nl.ndarray((PT, dim), dtype=nl.bfloat16, buffer=nl.sbuf)
         # it waits for the embedding all_reduce: issued from GpSimd after kv_write(0)'s last
@@ -559,7 +678,7 @@ def draft_body(
         # (pre_a / post_a / comb_a) on core 1 in the attention all_reduce's shadow
         if HC_NORM_SPREAD:
             if pid == 0:
-                hc_in_norm_spread(K, cur_st, cur_pre, attn_norm_w[s : s + 1], hc, dim, xn, ysc, rsc)
+                hc_in_norm_spread(K, cur_st, cur_pre, attn_norm_w[s : s + 1], hc, dim, xn, ysc, rsc, store_y=False)
         elif HC_NORM_SPLIT:
             for r0, nr in kt_all:
                 hc_in_norm_split(r0, nr, cur_st, cur_pre, attn_norm_w[s : s + 1], hc, dim, xn, ysc, pid)
@@ -573,9 +692,9 @@ def draft_body(
         if pid == CORES - 1 and HC_MIX_SPLIT_ATTN:
             # the attention coefficients up to the Sinkhorn now, on the core hc_in_norm
             # leaves idle (read only after the attention all_reduce)
-            fnT = load_fn_t(hca_fn_ts[s], width, mix)
+            fnT = load_fn_t(hca_fn_ts[s], width, mix, spread=mix_sp)
             t2a = [hc_in_mix(r0, nr, cur_st, fnT, hca_base[s : s + 1], hca_scale[s : s + 1], hc, dim, mix,
-                             pre_a, post_a, comb_a, sink=False) for r0, nr in kt_all]
+                             pre_a, post_a, comb_a, sink=False, spread=mix_sp) for r0, nr in kt_all]
         nisa.core_barrier(data=xn, cores=(0, 1))
         # ---- projections of the draft rows
         if s == 0 and stage == 11:
@@ -676,10 +795,10 @@ def draft_body(
             for (r0, nr), t2 in zip(kt_all, t2a):
                 hc_in_mix_sink(r0, nr, t2, hc, comb_a, after=bar_cc)
         elif pid == CORES - 1:
-            fnT = load_fn_t(hca_fn_ts[s], width, mix)
+            fnT = load_fn_t(hca_fn_ts[s], width, mix, spread=mix_sp)
             for r0, nr in kt_all:
                 hc_in_mix(r0, nr, cur_st, fnT, hca_base[s : s + 1], hca_scale[s : s + 1], hc, dim, mix,
-                          pre_a, post_a, comb_a)
+                          pre_a, post_a, comb_a, spread=mix_sp)
         nisa.core_barrier(data=pre_a, cores=(0, 1))
         nisa.core_barrier(data=post_a, cores=(0, 1))
         nisa.core_barrier(data=comb_a, cores=(0, 1))
@@ -697,21 +816,21 @@ def draft_body(
         # in the world all_reduce's shadow
         if HC_NORM_SPREAD:
             if pid == 0:
-                hc_in_norm_spread(K, nxt_st, pre_a, ffn_norm_w[s : s + 1], hc, dim, xn2, ysc, rsc)
+                hc_in_norm_spread(K, nxt_st, pre_a, ffn_norm_w[s : s + 1], hc, dim, xn2, ysc, rsc, store_y=False)
         else:
             for r0, nr in kt:
                 hc_in_norm(r0, nr, nxt_st, pre_a, ffn_norm_w[s : s + 1], hc, dim, xn2)
         if pid == CORES - 1 and HC_MIX_SPLIT_FFN:
-            fnT2 = load_fn_t(hcf_fn_ts[s], width, mix)
+            fnT2 = load_fn_t(hcf_fn_ts[s], width, mix, spread=mix_sp)
             t2f = [hc_in_mix(r0, nr, nxt_st, fnT2, hcf_base[s : s + 1], hcf_scale[s : s + 1], hc, dim, mix,
-                             pre_f, post_f, comb_f, sink=False) for r0, nr in kt_all]
+                             pre_f, post_f, comb_f, sink=False, spread=mix_sp) for r0, nr in kt_all]
         elif pid == CORES - 1 and HC_MIX_EARLY:
             # the ffn coefficients now, on the core hc_in_norm leaves idle (they are only
             # read by hc_out after the world all_reduce)
-            fnT2 = load_fn_t(hcf_fn_ts[s], width, mix)
+            fnT2 = load_fn_t(hcf_fn_ts[s], width, mix, spread=mix_sp)
             for r0, nr in kt_all:
                 hc_in_mix(r0, nr, nxt_st, fnT2, hcf_base[s : s + 1], hcf_scale[s : s + 1], hc, dim, mix,
-                          pre_f, post_f, comb_f)
+                          pre_f, post_f, comb_f, spread=mix_sp)
         if pid == 0 and not PADS_ONCE:
             padn2 = nl.ndarray((PT, dim), dtype=nl.bfloat16, buffer=nl.sbuf)
             nisa.memset(padn2, 0.0)
@@ -814,10 +933,10 @@ def draft_body(
         if s + 1 < nstages:
             kv_write(s + 1, after=bar_w)   # the next stage's, in this all_reduce's shadow
         if pid == CORES - 1 and not HC_MIX_EARLY and not HC_MIX_SPLIT_FFN:
-            fnT2 = load_fn_t(hcf_fn_ts[s], width, mix)
+            fnT2 = load_fn_t(hcf_fn_ts[s], width, mix, spread=mix_sp)
             for r0, nr in kt_all:
                 hc_in_mix(r0, nr, nxt_st, fnT2, hcf_base[s : s + 1], hcf_scale[s : s + 1], hc, dim, mix,
-                          pre_f, post_f, comb_f)
+                          pre_f, post_f, comb_f, spread=mix_sp)
         nisa.core_barrier(data=pre_f, cores=(0, 1))
         nisa.core_barrier(data=post_f, cores=(0, 1))
         nisa.core_barrier(data=comb_f, cores=(0, 1))
@@ -874,9 +993,20 @@ def draft_body(
     nisa.core_barrier(data=xhn, cores=(0, 1))
     lo, hi = _half(part, pid)
     bf16_gemm_rows(xhn, head_w, lg, Kp, dim, part, lo, hi)
-    nisa.core_barrier(data=lg, cores=(0, 1))
+    if HEAD_SPLIT:
+        # this core's half (its own GEMM's columns): fp32 logits + the pad bias, on chip
+        l16 = nl.ndarray((PT, hv), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.dma_copy(dst=l16[0:K, :], src=lg[0:K, vlo:vhi])
+        dk = nl.ndarray((PT, hv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=dk[0:K, :], src=dead_h.ap(pattern=[[0, K], [1, hv]], offset=pid * hv))
+        l32h = nl.ndarray((PT, hv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=l32h[0:K, :], data1=l16[0:K, :], data2=dk[0:K, :], op=nl.add)
+        if stage == 4:
+            nisa.dma_copy(dst=lg32[0:K, vlo:vhi], src=l32h[0:K, :])
+    else:
+        nisa.core_barrier(data=lg, cores=(0, 1))
     # fp32 logits, the vocabulary pad (columns past the real vocabulary) pushed to -1e30.
-    if pid == 0:
+    if pid == 0 and not HEAD_SPLIT:
         vs1 = bcast_row(vocab_start[0:1, 0:1], 1, PT)
         for r0, nr in kt_all:
             l16 = nl.ndarray((PT, part), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -895,7 +1025,8 @@ def draft_body(
                                op1=nl.multiply, operand1=-NEG)
             nisa.tensor_tensor(dst=l32[0:nr, :], data1=l32[0:nr, :], data2=dead[0:nr, :], op=nl.add)
             nisa.dma_copy(dst=lg32[r0 : r0 + nr, 0:part], src=l32[0:nr, :])
-    nisa.core_barrier(data=lg32, cores=(0, 1))
+    if not HEAD_SPLIT or stage == 4:
+        nisa.core_barrier(data=lg32, cores=(0, 1))
     if stage == 4:
         cast_rows(lg32, dbg[0:Kp, 0:part], kt, part, nl.float32)
         cast_rows(xh, dbg[0:Kp, part : part + dim], kt, dim, nl.float32)
@@ -929,15 +1060,16 @@ def draft_body(
             tps = nl.ndarray((PT, 1), dtype=nl.bfloat16, buffer=nl.psum)
             nisa.nc_transpose(dst=tps, data=me[0:1, kb * PT : (kb + 1) * PT])
             nisa.tensor_copy(dst=meT[0:PT, kb, 0:1], src=tps)
-        row = nl.ndarray((1, part), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=row, src=lg32[i : i + 1, 0:part])
-        for nb in range(part // 512):
+        row = nl.ndarray((1, hv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=row, src=l32h[i : i + 1, 0:hv] if HEAD_SPLIT else lg32[i : i + 1, 0:part])
+        for nb in range(hv // 512):
             acc = nl.ndarray((1, 512), dtype=nl.float32, buffer=nl.psum)
             for kb in range(mrank // PT):
                 nisa.nc_matmul(dst=acc, stationary=meT[0:PT, kb, 0:1], moving=mkT[0:PT, kb, nb * 512 : (nb + 1) * 512],
                                accumulate=(kb > 0))
             b16 = nl.ndarray((1, 512), dtype=nl.bfloat16, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=b16, src=acc)
+            # (the PSUM -> bf16 rounding on ACT with BIAS_CAST_ACT: it pipelines with the DVE adds)
+            nisa.tensor_copy(dst=b16, src=acc, engine=nisa.engine.scalar if BIAS_CAST_ACT else nisa.engine.unknown)
             # the bf16 bias added straight into the fp32 row (the add reads it as fp32: exact)
             nisa.tensor_tensor(dst=row[0:1, nb * 512 : (nb + 1) * 512], data1=row[0:1, nb * 512 : (nb + 1) * 512],
                                data2=b16, op=nl.add)
@@ -947,6 +1079,9 @@ def draft_body(
         nisa.nc_find_index8(dst=bidx, data=row, vals=best)
         bf = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=bf, src=bidx[0:1, 0:1])
+        if vlo:
+            # (the shard's column: this core's half starts at vlo)
+            nisa.tensor_scalar(dst=bf, data=bf, op0=nl.add, operand0=float(vlo))
         gidx_f = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=gidx_f, data1=bf, data2=vs1, op=nl.add)
         # (max, global index, markov row of the local best token) -> one all_gather
@@ -959,17 +1094,19 @@ def draft_body(
         nisa.tensor_copy(dst=pk[0:1, 0:1], src=best[0:1, 0:1])
         nisa.tensor_copy(dst=pk[0:1, 1:2], src=gidx_f)
         nisa.tensor_copy(dst=pk[0:1, 2:GW], src=el)
-        if pid == 0:
+        if HEAD_SPLIT:
+            nisa.dma_copy(dst=g_src[pid : pid + 1, 0:GW], src=pk)
+        elif pid == 0:
             nisa.dma_copy(dst=g_src[0:1, 0:GW], src=pk)
         nisa.core_barrier(data=g_src, cores=(0, 1))
         ncc.all_gather(srcs=[g_src], dsts=[g_dst], replica_group=rg_world, collective_dim=0, priority=AR_PRIORITY)
         # the global argmax: the highest shard max, ties to the lowest rank (lowest index)
         vrow = nl.ndarray((1, W8), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(vrow, NEG)
-        nisa.dma_copy(dst=vrow[0:1, 0:world], src=g_dst.ap(pattern=[[GW, 1], [GW, world]], offset=0))
+        nisa.dma_copy(dst=vrow[0:1, 0 : NC * world], src=g_dst.ap(pattern=[[GW, 1], [GW, NC * world]], offset=0))
         trow = nl.ndarray((1, W8), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(trow, 0.0)
-        nisa.dma_copy(dst=trow[0:1, 0:world], src=g_dst.ap(pattern=[[GW, 1], [GW, world]], offset=1))
+        nisa.dma_copy(dst=trow[0:1, 0 : NC * world], src=g_dst.ap(pattern=[[GW, 1], [GW, NC * world]], offset=1))
         gbest = nl.ndarray((1, 8), dtype=nl.float32, buffer=nl.sbuf)
         nisa.max8(dst=gbest, src=vrow)
         gidx = nl.ndarray((1, 8), dtype=nl.uint32, buffer=nl.sbuf)
@@ -987,6 +1124,9 @@ def draft_body(
             me = nl.ndarray((1, mrank), dtype=nl.bfloat16, buffer=nl.sbuf)
             nisa.tensor_copy(dst=me, src=wr)
     nisa.core_barrier(data=memb, cores=(0, 1))
+    if HC_NORM_SPREAD and HEAD_NORM_SPLIT:
+        # (core 1's collapsed rows of xh: no read of its own orders their store any more)
+        nisa.core_barrier(data=xh, cores=(0, 1))
     if pid == 0:
         nisa.dma_copy(dst=output_ids[0:1, 0 : K + 1], src=ids_sb)
         # confidence = bf16( [hidden | markov_embed] . proj_w )
@@ -1013,6 +1153,34 @@ def draft_body(
         for c in c_out:
             sched_after(nisa.core_barrier(data=c, cores=(0, 1)), bar_end)
     return ret()
+
+
+def draft_tail_body(
+    greedy, sids, starts, sel, tap0, tap1, tap2, row_pos, write_slots, block_table, main_proj,
+    main_proj_s, main_norm_w, embed_w, vocab_start, hca_fn_t0, hca_fn_t1, hca_fn_t2, hca_base,
+    hca_scale, attn_norm_w, hcf_fn_t0, hcf_fn_t1, hcf_fn_t2, hcf_base, hcf_scale, ffn_norm_w, wq_a,
+    wq_a_s, q_norm_w, wq_b, wq_b_s, wkv, wkv_s, kv_norm_w, wo_a, wo_a_s, wo_b, wo_b_s, attn_sink,
+    freqs, gate_w_t0, gate_w_t1, gate_w_t2, gate_b, expert_lo, w1, s1, w3, s3, w2, s2, sh_w1,
+    sh_s1, sh_w3, sh_s3, sh_w2, sh_s2, cache0, cache1, cache2, fnorm_w, head_w, mk_embed_w,
+    mk_head_w, conf_w, groups_attn, groups_world, flags,
+    phase="decode", scheme="tp32",
+):
+    """`draft_body` with the step's tail in it: the verify of the step's drafts (`greedy` `[T, 1]`
+    int32 the fused head's tokens, `sids` `[T, 1]` int32 the step's input ids, `starts` `[1, 1]`
+    int32 the span's corrected start, `sel` the runner's sampling positions (`_tail_meta`); `T = K + 1`)
+    instead of the tail graph's meta, and the three
+    taps `[T, dim]` fp32 as the blocks returned them instead of their concatenation. One extra
+    output: `accepted [1, K + 1]` int32 (the rejection sampler's)."""
+    return draft_body(
+        None, None, row_pos, write_slots, block_table, main_proj, main_proj_s, main_norm_w,
+        embed_w, vocab_start, hca_fn_t0, hca_fn_t1, hca_fn_t2, hca_base, hca_scale, attn_norm_w,
+        hcf_fn_t0, hcf_fn_t1, hcf_fn_t2, hcf_base, hcf_scale, ffn_norm_w, wq_a, wq_a_s, q_norm_w,
+        wq_b, wq_b_s, wkv, wkv_s, kv_norm_w, wo_a, wo_a_s, wo_b, wo_b_s, attn_sink, freqs,
+        gate_w_t0, gate_w_t1, gate_w_t2, gate_b, expert_lo, w1, s1, w3, s3, w2, s2, sh_w1, sh_s1,
+        sh_w3, sh_s3, sh_w2, sh_s2, cache0, cache1, cache2, fnorm_w, head_w, mk_embed_w, mk_head_w,
+        conf_w, groups_attn, groups_world, flags,
+        phase=phase, scheme=scheme, tail=(greedy, sids, starts, sel), taps=(tap0, tap1, tap2),
+    )
 
 
 #: The generic entry (both phases by the `at_zero` flag).
