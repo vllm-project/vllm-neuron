@@ -1,3 +1,0 @@
-2026-11-01T23:28:58Z INFO 2759368 [root]: /opt/aws_neuronx_venv_torch_neuronx_2_14_0/bin/neuronx-cc compile --help
-2026-11-01T23:28:58Z INFO 2759368 [root]: NeuronX Compiler version 2.28.7631.0+8f7b0cf5 Python version 3.12.3 HWM version 2.28.7631.0+8f7b0cf5 NumPy version 2.5.4
-2026-11-01T23:28:58Z INFO 2759368 [root]: Subcommand returned with exitcode=0
