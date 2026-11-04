@@ -94,8 +94,12 @@ class HYV3ForCausalLM(nn.Module):
                 )
             if packed and vllm_config.cache_config.block_size % 2 != 0:
                 raise ValueError("The packed FP8 K cache needs an even --block-size.")
-        if parallel.data_parallel_size != 1:
-            raise ValueError("Hy3 does not support data parallelism yet.")
+        if parallel.data_parallel_size != 1 and not parallel.enable_expert_parallel:
+            # Attention DP: each replica runs its own TP group; the routed experts
+            # are spread over every replica (EP = TP x DP), see HYV3MoE.
+            raise ValueError("Hy3 data parallelism needs --enable-expert-parallel.")
+        if parallel.data_parallel_size != 1 and getattr(parallel, "decode_context_parallel_size", 1) > 1:
+            raise ValueError("Hy3 does not support data parallelism together with DCP.")
         spec = vllm_config.speculative_config
         if spec is not None and spec.method != "mtp":
             raise ValueError(
@@ -150,7 +154,8 @@ class HYV3ForCausalLM(nn.Module):
             ep_degree = get_neuron_ep_degree()
         else:
             ep_degree = 1
-        expert_tp = tp // ep_degree
+        # Experts are split over every rank of every DP replica.
+        expert_tp = max(1, tp * parallel.data_parallel_size // ep_degree)
         i_per_rank = hf_config.moe_intermediate_size // expert_tp
         if hf_config.num_experts % ep_degree != 0:
             raise ValueError(

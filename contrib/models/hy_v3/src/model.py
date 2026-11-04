@@ -177,6 +177,11 @@ _SPARSE_SEL_CACHE_KEY = "_hy_v3_sparse_selection"
 # chunk's queries. The kept prior blocks and the chunk's own blocks make the
 # BF16 copy the segmented kernel reads.
 _SPARSE_PREFILL = float(os.environ.get("HY3_SPARSE_PREFILL", "0") or 0)
+# Per-layer tensors a KV connector must move along with the KV blocks, keyed like the KV caches
+# ("layers.{i}.self_attn"): the sparse-attention K summaries are blocks-first and indexed by the
+# same block ids, and prefill writes them, so a disaggregated decode needs the prefill node's rows
+# (NeuronMooncakeConnector registers them as extra regions of the layer).
+CONNECTOR_EXTRA_KV_TENSORS: dict[str, torch.Tensor] = {}
 
 
 def _is_fp8_kv(cache: torch.Tensor | None) -> bool:
@@ -214,6 +219,7 @@ def bind_attention_kv(
             torch.full(shape, _SUMMARY_EMPTY, dtype=torch.bfloat16, device=v_cache.device),
             torch.full(shape, -_SUMMARY_EMPTY, dtype=torch.bfloat16, device=v_cache.device),
         ], dim=1)
+        CONNECTOR_EXTRA_KV_TENSORS[name] = attn.k_sum
 
 
 def _quantize_kv(x: torch.Tensor, q, dtype: torch.dtype) -> torch.Tensor:
@@ -1610,6 +1616,23 @@ class HYV3MoE(nn.Module):
 
         # >>> PARALLELISM: EP configuration <<<
         vllm_config = get_current_vllm_config()
+        # >>> PARALLELISM: attention DP (vLLM data parallel, one TP group per DP
+        # replica) with the experts spread over every replica (EP = TP x DP).
+        # Routed experts then see the tokens of all replicas: gathered over the
+        # DP group before the MoE, combined over the whole world after it, and
+        # each replica keeps its own rows (shard_select, a runtime offset). <<<
+        self.dp_size = vllm_config.parallel_config.data_parallel_size
+        self.cross_dp_ep = (
+            self.dp_size > 1 and vllm_config.parallel_config.enable_expert_parallel
+        )
+        if self.cross_dp_ep:
+            from vllm.distributed.parallel_state import get_dp_group
+            from vllm_neuron.parallel.neuron_parallel_state import get_wide_ep_group
+
+            self.dp_group = get_dp_group()
+            self.wide_ep_group = get_wide_ep_group()
+        # Ranks that each compute a share of one token's MoE (the combine's world).
+        self.moe_world_size = self.world_size * (self.dp_size if self.cross_dp_ep else 1)
         if vllm_config.parallel_config.enable_expert_parallel:
             from vllm_neuron.parallel.neuron_parallel_state import (
                 get_neuron_ep_degree,
@@ -1666,8 +1689,8 @@ class HYV3MoE(nn.Module):
         # shared weights per rank with no extra collective.
         self.shared_decode_shards = _SHARED_DECODE_SHARDS
         if (
-            self.world_size % self.shared_decode_shards == 0
-            and self.world_size > self.shared_decode_shards
+            self.moe_world_size % self.shared_decode_shards == 0
+            and self.moe_world_size > self.shared_decode_shards
         ):
             self.shared_mlp_decode = HYV3StaticFP8MLP(
                 config,
@@ -1676,7 +1699,9 @@ class HYV3MoE(nn.Module):
                 num_shards=self.shared_decode_shards,
                 shard_rank=self.tp_group.rank_in_group % self.shared_decode_shards,
             )
-            self.shared_decode_weight = self.shared_decode_shards / self.world_size
+            # Every group of `shards` ranks (with DP: every TP group of every
+            # replica, over the gathered tokens) computes a full copy.
+            self.shared_decode_weight = self.shared_decode_shards / self.moe_world_size
         else:
             self.shared_mlp_decode = None
 
@@ -1750,6 +1775,11 @@ class HYV3MoE(nn.Module):
         return get_neuron_ep_group().rank_in_group_tensor.reshape(1).to(torch.int32)
 
     def forward(self, hidden_states, ln_w, eps, is_prefill, rank):
+        if self.cross_dp_ep and not is_prefill:
+            # >>> PARALLELISM: decode tokens of every DP replica (replicated within
+            # each TP group); the router and the shared-expert shard run on all of
+            # them, and _combine keeps this replica's rows. <<<
+            hidden_states = self._dp_gather(hidden_states)
         # <-- MODEL-SPECIFIC: post-attention RMSNorm feeds router + routed experts
         x = hidden_states.to(torch.float32)
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
@@ -1774,16 +1804,48 @@ class HYV3MoE(nn.Module):
             return self._forward_decode(
                 normed, affinities, top_k_index, rank, shared_partial
             )
+        assert not self.cross_dp_ep, "DP decode needs the sharded shared expert"
         shared_output = self.shared_mlp(hidden_states, ln_w, eps, is_prefill)
         return (
             self._forward_decode(normed, affinities, top_k_index, rank) + shared_output
         )
+
+    def _dp_gather(self, x):
+        """Rows of every DP replica, replica-major: ``[dp_size * rows, ...]``.
+
+        Over the world group, not the DP group: on trn2 the runtime has no
+        collective algorithm for the strided cross-DP replica group
+        ([0, 8, ..., 56] at TP 8, "no_hier no_mesh"). ``x`` is replicated within
+        each TP group, so the world gather holds world_size // dp copies of each
+        replica's rows; keep the first (TP rank 0) of each (world rank =
+        dp_rank * tp + tp_rank).
+        """
+        g = self.wide_ep_group.all_gather(x, dim=0)
+        g = g.view(self.dp_size, self.world_size, *x.shape)[:, 0]
+        return g.reshape(self.dp_size * x.shape[0], *x.shape[1:])
+
+    def _combine(self, output):
+        """Sum the decode partials of every rank that shares the tokens.
+
+        DP: all-reduce over the whole world (every replica holds a share of every
+        token's experts), then keep this replica's rows. Else: the TP all-reduce.
+        """
+        if self.cross_dp_ep:
+            output = self.wide_ep_group.all_reduce(output)
+            # SPMD: the replica offset is a runtime input (the group's rank tensor).
+            return shard_select(output, 0, self.dp_group, n_shards=self.dp_size)
+        if self.world_size > 1:
+            output = self.tp_group.all_reduce(output)
+        return output
 
     def _forward_prefill(self, normed, affinities, rank):
         # >>> PARALLELISM: All-gather tokens + affinities from SP <<<
         if self.world_size > 1:
             affinities = self.tp_group.all_gather(affinities, dim=0)
             normed = self.tp_group.all_gather(normed, dim=0)
+        if self.cross_dp_ep:
+            affinities = self._dp_gather(affinities)
+            normed = self._dp_gather(normed)
 
         # >>> PARALLELISM: keep only this rank's experts <<<
         if self.ep_degree > 1:
@@ -1809,6 +1871,12 @@ class HYV3MoE(nn.Module):
         )
 
         # >>> PARALLELISM: combine expert partials and return to SP <<<
+        if self.cross_dp_ep:
+            output = self.wide_ep_group.all_reduce(output)
+            output = shard_select(output, 0, self.dp_group, n_shards=self.dp_size)
+            if self.world_size > 1:
+                output = shard_select(output, 0, self.tp_group)
+            return output
         if self.world_size > 1:
             output = self.tp_group.reduce_scatter(output, dim=0)
         return output
@@ -1906,23 +1974,17 @@ class HYV3MoE(nn.Module):
             )
             if extra is not None:
                 output = output + extra
-            if self.world_size > 1:
-                output = self.tp_group.all_reduce(output)
-            return output
+            return self._combine(output)
         if self._use_hit_decode(normed.shape[0]):
             output = self._forward_decode_hits(normed, affinities, top_k_index)
             if extra is not None:
                 output = output + extra
-            if self.world_size > 1:
-                output = self.tp_group.all_reduce(output)
-            return output
+            return self._combine(output)
         if self._use_selective_decode(normed.shape[0]):
             output = self._forward_decode_selective(normed, affinities, top_k_index)
             if extra is not None:
                 output = output + extra
-            if self.world_size > 1:
-                output = self.tp_group.all_reduce(output)
-            return output
+            return self._combine(output)
         output = routed_experts_tkg(
             normed,
             affinities,
@@ -1936,9 +1998,7 @@ class HYV3MoE(nn.Module):
         if extra is not None:
             output = output + extra
         # >>> PARALLELISM: combine expert (and sharded shared-expert) partials <<<
-        if self.world_size > 1:
-            output = self.tp_group.all_reduce(output)
-        return output
+        return self._combine(output)
 
 
 # =============================================================================
