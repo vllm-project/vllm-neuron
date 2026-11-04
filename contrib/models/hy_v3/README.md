@@ -118,8 +118,9 @@ print(outputs[0].outputs[0].text)
   whatever the request's real length (vllm-neuron 0.21+ makes this opt-in;
   the NxDI-based 0.2.x bucketed decode by sequence length by default). The
   configs below all set it.
-- Not supported: data parallel / attention DP, MTP together with DCP. They
-  are rejected at startup. FP8 KV cache needs a calibrated KV scale profile
+- Not supported: MTP together with DCP (rejected at startup). Attention DP
+  (`--data-parallel-size` with `--enable-expert-parallel`) is experimental and
+  works without MTP; see "Disaggregated inference (1P1D) and attention DP". FP8 KV cache needs a calibrated KV scale profile
   (the checkpoint ships none); see "FP8 KV cache" below.
 - MTP speculative decoding (`--speculative-config '{"method": "mtp",
   "num_speculative_tokens": 3}'`, `MTP_K=3` for the serve scripts) uses the
@@ -315,6 +316,74 @@ HY3_KV_SCALE_PROFILE=$PWD/kv_scales.safetensors KV_DTYPE=fp8 MODEL=/path/to/Hy3-
   This run is on commit 55772b8 of the change; the later commits (local copies
   of the private helpers, the scale-source order) passed the unit, module and
   integration tests (4/4, two with FP8 KV, the same profile).
+
+## Disaggregated inference (1P1D) and attention DP
+
+### Sparse attention across prefill and decode
+
+The sparse-attention K summaries (`k_sum`) are written by prefill and read by decode, and they
+live next to the KV cache, not in it. `model.py` exposes them as
+`CONNECTOR_EXTRA_KV_TENSORS = {layer name: k_sum}`. The KV connectors of vllm-neuron
+(`NeuronNixlConnector`, `NeuronMooncakeConnector`, vllm-project/vllm-neuron#90)
+register each one as one more region of its layer, so it moves block by block with that layer's
+K and V. Without it a disaggregated decode has empty summaries for the prompt, and sparse decode
+keeps only the sink and recent groups.
+
+Set `HY3_SPARSE_DECODE` / `HY3_SPARSE_PREFILL` on both nodes, because the prefill node writes the
+summaries. A summary row belongs to its group's first block: a decode-side prefix hit that ends
+inside a 128-token group leaves that group's row as it was on the decode node.
+
+**Measured.** Two trn2.48xlarge, prefill TP=64 / decode TP=64, FP8 KV, MTP k=3,
+max_model_len 87040, prefill buckets up to 8192. Workload: 85k-token inputs with a 78k shared
+prefix (92% hit), 1024 output tokens, concurrency 8.
+
+| | TTFT med / P99 (s) | TPOT med / P99 (ms) | output tok/s |
+|---|---|---|---|
+| dense | 2.80 / 13.1 | 42.2 / 49.2 | 171 |
+| sparse decode 0.125 | 3.06 / 13.0 | 26.7 / 30.7 | 255 |
+| sparse decode 0.125 + sparse prefill 0.25 (NIXL) | 2.46 / 10.2 | 26.8 / 31.8 | 261 |
+| the same with Mooncake | 1.96 / 9.7 | 26.1 / 31.8 | 273 |
+
+**Accuracy through PD** (sparse decode 0.125 with `HY3_SPARSE_MIN_BATCH=1`, so single requests
+take the sparse path):
+- needle: 12/12, at 16k-85k and depths 0.1 / 0.5 / 0.9;
+- `sparse_decode_eval.py`: 16/19 continuations identical to the dense PD run. The 3 that differ
+  split at near-ties on repetitive prompts.
+
+### Attention DP on the decode node (experimental)
+
+With `--data-parallel-size D --enable-expert-parallel` (e.g. TP=8 x DP=8 on one trn2.48xlarge)
+each replica runs attention for its own requests over its own TP group, so each KV head is read
+once instead of TP / num_kv_heads times. The routed experts are spread over all TP x DP ranks.
+
+**How the MoE runs on decode:**
+1. It gathers the replicas' tokens over the world group. The strided cross-DP replica group has no
+   collective algorithm on trn2 ("no_hier no_mesh").
+2. It runs the router, the sharded shared expert and the routed experts on all of them.
+3. It all-reduces over the world and keeps its replica's rows (`shard_select`).
+
+The prefill path does the same after its sequence-parallel gather.
+
+**Status.** Correct without MTP: needle and 80/80 requests on the 85k workload. At concurrency 8
+with sparse decode it is slower than TP=64:
+
+| decode, no MTP, sparse decode + prefill | TPOT med (ms) |
+|---|---|
+| TP=64 | 46.2 |
+| TP=8 x DP=8 | 51.7 |
+
+Sparse decode already reads only 1/8 of the history, so there is little replicated KV left to
+save, while DP adds world-wide MoE collectives and 8x larger attention and lm_head shards per
+rank. Its gain is capacity: every replica has its own KV pool.
+
+**With MTP:**
+- The MTP draft's MoE also crosses the replicas, so idle replicas must run a dummy draft. This
+  needs the `_dispatch_dummy_draft` change in `neuron_model_runner.py`, which is part of this
+  change.
+- Serving then still fails: the draft hits an unwarmed shape (`fail_on_recompile` on
+  `layers.80.self_attn`) when the DP padding changes the batch.
+
+So DP + MTP remains future work.
 
 ## Compatibility Matrix
 

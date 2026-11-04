@@ -9865,6 +9865,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         Example:
             >>> self._dispatch_dummy_draft(batch_size=4, ctx_bucket=2048)
         """
+        # An MTP draft is a full decoder layer: with expert parallelism over the DP
+        # replicas its MoE combines over the whole world, so the draft NEFF carries
+        # cross-DP collectives whatever the component DP degrees are.
+        parallel = self.vllm_config.parallel_config
+        mtp_cross_dp_moe = (
+            self.is_mtp_spec
+            and parallel.data_parallel_size > 1
+            and parallel.enable_expert_parallel
+        )
         if not (
             (self.is_eagle3_spec or self.is_mtp_spec)
             and self.drafter is not None
@@ -9872,6 +9881,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 self.neuron_config.embedding_dp_size > 1
                 or self.neuron_config.lm_head_dp_size > 1
                 or self.neuron_config.draft_mlp_dp_size > 1
+                or mtp_cross_dp_moe
             )
         ):
             return
