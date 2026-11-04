@@ -52,6 +52,7 @@ from .model import (
     HYV3RotaryEmbedding,
     bind_attention_kv,
     decoder_layer_weight_mappings,
+    prepare_moe_fused,
     prepare_sparse_decode,
 )
 
@@ -233,6 +234,7 @@ class HYV3MTPForCausalLM(nn.Module):
                 raise RuntimeError(f"MTP parameter {name} was not loaded")
         self._load_kv_cache_scales(checkpoint_path, device)
         prepare_sparse_decode(self.layers[0], device)
+        prepare_moe_fused(self.layers[0], device)
 
     def load_weights_lite(
         self, checkpoint_path: str, device: torch.device, cache_dir: str | None = None
@@ -240,6 +242,7 @@ class HYV3MTPForCausalLM(nn.Module):
         """CPU compile: only the KV scales (decode uses them as graph constants)."""
         self._load_kv_cache_scales(checkpoint_path, device)
         prepare_sparse_decode(self.layers[0], device, from_weights=False)
+        prepare_moe_fused(self.layers[0], device, from_weights=False)
 
     def _load_kv_cache_scales(self, checkpoint_path: str, device) -> None:
         """<-- FP8 KV: the MTP layer's K/V scales, entry ``start_layer_idx`` (80)
