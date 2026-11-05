@@ -499,6 +499,71 @@ batch-8 NEFF) shows where the step went:
 
 The selection in the kernel gives the same tokens as `hy3_route`.
 
+## Prefill: the MoE blockwise mapping on the NKI path (`HY3_MOE_MAP_PAD`, on)
+
+`NF.build_blockwise_mapping` maps each routed token to a 256-token block of its expert for the prefill
+MoE kernel. Its NKI path (`find_nonzero_indices`) needs an even local expert count, because it splits
+the columns over the two cores of the logical NeuronCore. At EP=64, Hy3 has 3 local experts per rank,
+so the mapping fell back to torch ops (`_cumsum_matmul`).
+
+On one core that fallback costs only about 0.1 ms per layer. In the server it runs while the MoE
+all-gathers its 4096 tokens (32 MB), and that all-gather took 1.8 ms instead of the 0.22 ms of the
+same-size attention all-gather. This happened on every rank, so it is not skew: ranks 0 and 36 are
+identical. Over 79 layers it cost about 125 ms of a 637 ms prefill step.
+
+`routed_experts_cte` therefore pads one zero column to the affinities for the mapping. The padded
+expert is never selected and gets no blocks:
+- `masked` stays in the kernel's [T, L] layout;
+- `block_to_expert` is clamped to L - 1 for the empty trailing blocks, which have `conditions` 0.
+
+The kernel's output is bit-identical (relative error 0 on one core against the fallback).
+`HY3_MOE_MAP_PAD=0` keeps the fallback.
+
+**P-only at C = 8** (`scripts/pd/pd_bench_split.sh`, 85k / 92% shared prefix, output 1, 80
+requests):
+
+| prefill configuration | TTFT P50 / P99 | prefill req/s |
+|---|---|---|
+| before (prefill buckets up to 4096) | 10.25 / 11.30 s (1P1D) | 0.78 |
+| prefill buckets up to 8192, no map-pad | 10.03 s (single node) | 0.80 |
+| map-pad | 7.54 / 7.67 s (single node) | 1.07 |
+| **map-pad + buckets up to 8192, prefill KV_CAP 0.45 (the `scripts/pd` prefill defaults now)** | **5.78 / 6.05 s (1P1D)** | **1.38** |
+
+The 8192-token steps need the HBM that a smaller KV pool leaves. With KV_CAP 0.65 they fail to
+allocate. The prefill role of `pd_serve.sh` therefore takes `P_KV_CAP` (default 0.45, 514k tokens)
+and `P_PREFILL_BUCKETS` (default 512..8192), and ignores `KV_CAP`, which applies to decode. The PD
+commands above are unchanged.
+
+### Trn2 vs H100, 1P1D, the same benchmark
+
+**H100 setup.** Two p5.48xlarge (8x H100, 32 EFA each), vLLM 0.29.0 (`scripts/pd/gpu/Dockerfile`:
+`vllm/vllm-openai:v0.29.0` + aws-efa-installer 1.51.0 + GDRCopy 2.6 + Mooncake 0.3.14),
+`scripts/pd/gpu/gpu_serve.sh`.
+- The customer's reference flags: TP=8, `--tool-call-parser hy_v3 --enable-auto-tool-choice
+  --reasoning-parser hy_v3`, `VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm`.
+- max_model_len 87040, vLLM's `MooncakeConnector` over EFA, BF16 KV, no MTP.
+
+**Trn2 setup.** The `scripts/pd` defaults: FP8 KV, MTP k=3, sparse decode 0.125 + sparse prefill
+0.25, decode `HY3_DECODE_MOE_FUSED=1 HY3_DECODE_HITS=0`.
+
+**Shared between the two.** The same proxy file. The same benchmark: `scripts/pd/pd_bench_final.sh`
+(P-only at C = 1 / 4 / 8 / 12, then the end-to-end 1024-output case at C = 8). The same prompt files
+(md5-checked on every host; `in85000_p78336_c12` was generated with `gen_prefix_prompts.py`, which
+regenerates c8 byte-identically). The same `vllm bench serve` (vLLM 0.29.0).
+
+| P-only TTFT P50 / P99 (s) | C = 1 | C = 4 | C = 8 | C = 12 | prefill req/s |
+|---|---|---|---|---|---|
+| Trn2 | 1.13 / 1.20 | 2.95 / 3.38 | **5.78 / 6.05** | 8.71 / 9.52 | 1.37 |
+| H100 | 0.87 / 0.89 | 2.15 / 2.66 | 3.95 / 5.25 | 6.01 / 7.60 | 2.00 |
+
+| end-to-end, 1024 out, C = 8 | TTFT median / P99 | TPOT median / P99 | output tok/s |
+|---|---|---|---|
+| Trn2 | 1.84 / 6.46 s | 19.8 / 22.2 ms | 359 |
+| H100 | 1.17 / 4.41 s | 16.7 / 16.8 ms | 437 |
+
+All runs completed 80/80 (or 10×C) requests, with prefill and decode prefix hits of 92.0-92.2%.
+Results are in `results/pd_prefill/`.
+
 ## Compatibility Matrix
 
 | Instance / Neuron SDK version | 2.33.0      | 2.32 and earlier |
@@ -1066,6 +1131,8 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 | `scripts/bench_fixed.sh` | `vllm bench serve` matrix over the fixed real-text prompts in `bench_data/prompts` (same requests every run) |
 | `scripts/gen_bench_prompts.py` | generates `bench_data/prompts`: sglang-style ShareGPT text cut / repeated to an exact token count |
 | `scripts/bench_prefix_fixed.sh` | prefix-cache benchmark over `bench_data/prefix` (85k input, 92% shared prefix): warm-up request, one `cache_salt` per run, hit rate from `/metrics` |
+| `scripts/pd/pd_bench_final.sh`, `pd_bench_split.sh` | the comparison set: P-only (output 1) at C = 1 / 4 / 8 / 12, then the end-to-end 1024-output case at C = 8 ("Trn2 vs H100") |
+| `scripts/pd/gpu/` | the H100 1P1D reference: Dockerfile (vLLM 0.29.0 + EFA + GDRCopy + Mooncake) and `gpu_serve.sh` |
 | `scripts/pd/` | 1P1D (Mooncake / NIXL) runs on two trn2.48xlarge: servers, proxy, the 85k / 92% bench and the accuracy checks through the proxy ([scripts/pd/README.md](scripts/pd/README.md), "PD test method and results") |
 | `src/kernels/moe_tkg_fused.py` | EXPERIMENTAL fused decode MoE block (`HY3_DECODE_MOE_FUSED=1`): norm + router + routed + shared shard, W8A8 + FP8 double-row; 8-request PD TPOT 26.5 -> 19.9 ms ("Fused decode MoE") |
 | `scripts/bench_pd_split.sh` | prefill-only (output 1) and decode-only (replay twice) split over `bench_data/prefix`, with per-cell `cache_salt`, hit rates and MTP acceptance |

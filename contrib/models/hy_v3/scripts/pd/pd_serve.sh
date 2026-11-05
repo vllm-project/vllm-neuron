@@ -24,7 +24,10 @@
 #               to decode; use pd_proxy.sh with CONNECTOR=NeuronMooncakeConnector) | NixlConnector
 #   BACKEND     NIXL backend, default LIBFABRIC (EFA). Needs an EFA instance for device memory.
 #   MC_BOOTSTRAP_PORT  Mooncake bootstrap server on the prefill side (default 8998)
-#   SEQS, SEQ_BUCKETS, CTX_BUCKETS, KV_CAP   override the per-role defaults below
+#   SEQS, SEQ_BUCKETS, CTX_BUCKETS, KV_CAP   override the per-role defaults below (KV_CAP: decode
+#               and decode-bench only)
+#   P_KV_CAP, P_PREFILL_BUCKETS   the prefill role's KV budget (0.45) and prefill buckets
+#               ([512 .. 8192]); PREFILL_BUCKETS overrides the buckets on either role
 #   SPLIT       1: single-node split, prefill on NeuronCores 0-31 and decode on 32-63 (TP=32,
 #               EP=32 each), side-channel ports 5557 / 5558. Default: one role per node, TP=64.
 #   PORT, NIXL_PORT   override the role's API / NIXL side-channel port
@@ -84,7 +87,11 @@ case "$ROLE" in
   prefill)
     kv_role=kv_producer port=8100 nixl_port=5557
     export VLLM_NEURON_SKIP_DECODE_WARMUP=1
-    seqs=${SEQS:-4} buckets=${SEQ_BUCKETS:-'[1, 4]'} ctx=${CTX_BUCKETS:-} cap=${KV_CAP:-0.65} ;;
+    # 8192-token prefill steps (+3% alone, and what the MoE map-pad fix needs to reach 1.37 req/s
+    # at C=8) need the HBM that a smaller KV pool leaves: P_KV_CAP 0.45 holds 514k tokens, the
+    # running prefills and the prefix cache. (8192 with KV_CAP 0.65 fails to allocate.)
+    pb=${P_PREFILL_BUCKETS:-'[512, 1024, 2048, 4096, 8192]'}
+    seqs=${SEQS:-4} buckets=${SEQ_BUCKETS:-'[1, 4]'} ctx=${CTX_BUCKETS:-} cap=${P_KV_CAP:-0.45} ;;
   decode)
     kv_role=kv_consumer port=8200 nixl_port=5557
     export VLLM_NEURON_SKIP_PREFILL_WARMUP=1
@@ -142,7 +149,7 @@ echo "$(date +%T) pd_serve $ROLE: port ${PORT:-$port}, nixl ${VLLM_NIXL_SIDE_CHA
 echo "kv-transfer-config: $kvt"
 [ -n "${MTP_K:-}" ] && export HY3_DECODE_HITS_MAX_T=${HY3_DECODE_HITS_MAX_T:-$((4 * (MTP_K + 1)))}
 set -f  # the JSON's [ ] must not glob when EXTRA_ARGS is word-split
-export KV_DTYPE KV_CAP=$cap PORT=${PORT:-$port} MODEL PREFILL_BUCKETS=${PREFILL_BUCKETS:-'[512, 1024, 2048, 4096]'}
+export KV_DTYPE KV_CAP=$cap PORT=${PORT:-$port} MODEL PREFILL_BUCKETS=${PREFILL_BUCKETS:-${pb:-'[512, 1024, 2048, 4096]'}}
 export EXTRA_ARGS="$extra ${EXTRA_ARGS:-} --kv-transfer-config $kvt"
 if [ -n "$ctx" ]; then
   exec bash -f "$CODE/contrib/models/hy_v3/scripts/serve.sh" "${MAX_LEN:-86016}" "$seqs" "$buckets" "$ctx"

@@ -115,6 +115,14 @@ _MLP_INTERMEDIATE_ALIGN = 128
 
 # Blockwise MoE prefill block size (shard_on_i requires a multiple of 256).
 _MOE_BLOCK_SIZE = 256
+# NF.build_blockwise_mapping uses nkilib's find_nonzero_indices kernel only for an even local
+# expert count (it splits the columns over the 2 cores of the logical NeuronCore); with 3 local
+# experts (EP64) it falls back to torch ops. On one core the fallback costs ~0.1 ms per layer, but
+# in the server it runs while the MoE all-gathers its tokens and slows that all-gather from 0.22
+# to 1.8 ms on every rank (~125 ms of a 637 ms 4096-token prefill step). Padding one
+# never-selected expert column puts the mapping on the kernel path with the same blocks (the pad
+# gets none); the routed-expert output is bit-identical. HY3_MOE_MAP_PAD=0 keeps the fallback.
+_MOE_MAP_PAD = os.environ.get("HY3_MOE_MAP_PAD", "1") != "0"
 # Prefill routed experts through kernels/moe_cte_fp8w (FP8 weight tiles into the
 # matmul, no BF16 copy; ~2x faster, identical output). 0: nkilib's kernel.
 _MOE_CTE_FP8W = os.environ.get("HY3_MOE_CTE_FP8W", "1") != "0"
@@ -1440,16 +1448,25 @@ def routed_experts_cte(
     """
     T = normed.shape[0]
     num_local_experts = gate_up_weight.shape[0]
+    pad = _MOE_MAP_PAD and num_local_experts % 2 == 1 and tp_degree == 1
+    map_affinities = (
+        torch.nn.functional.pad(local_affinities, (0, 1)) if pad else local_affinities
+    )
     masked, token_position_to_id, block_to_expert, conditions = (
         NF.build_blockwise_mapping(
-            expert_affinities=local_affinities,
-            num_local_experts=num_local_experts,
+            expert_affinities=map_affinities,
+            num_local_experts=num_local_experts + int(pad),
             num_experts_per_token=top_k,
             block_size=_MOE_BLOCK_SIZE,
             moe_group=moe_group,
             tp_degree=tp_degree,
         )
     )
+    if pad:
+        # The padded expert has no blocks: blocks past the real experts' are empty
+        # (conditions 0). Keep the kernel's per-token affinities in the [T, L] layout.
+        masked = local_affinities.reshape(-1, 1)
+        block_to_expert = torch.clamp(block_to_expert, max=num_local_experts - 1)
     # shard_on_i_hybrid always runs `num_static_block` blocks and skips the
     # remaining (worst-case sized) block slots at runtime when they are
     # empty. With few local experts most of the static worst case is
