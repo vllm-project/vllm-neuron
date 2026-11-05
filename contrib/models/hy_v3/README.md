@@ -385,6 +385,120 @@ rank. Its gain is capacity: every replica has its own KV pool.
 
 So DP + MTP remains future work.
 
+## Fused decode MoE (`HY3_DECODE_MOE_FUSED=1`, experimental, off)
+
+`src/kernels/moe_tkg_fused.py` runs the whole decode MoE block of a layer in one NKI kernel,
+on every rank:
+1. the post-attention RMSNorm;
+2. the router (BF16 logits, sigmoid, expert bias, top-8, renormalization, scaling factor);
+3. this rank's routed experts;
+4. the shared expert's decode shard.
+
+The output is the rank's partial, combined by the same all-reduce as before
+(`HYV3MoE._combine`).
+
+**Why it is faster.** At T = 32 (8 requests with MTP k=3) the production path costs 0.34 ms per
+layer: `moe_tkg` at about 200 GB/s of FP8 weights, plus torch ops for the norm and the router.
+The kernel changes three things:
+- **W8A8.** It quantizes the activations with the checkpoint's calibrated static input scales,
+  doubled at load time like every other input scale here. The matmuls then contract 256 rows
+  per pass (`matmul_perf_mode.double_row`); BF16 activations allow only 128.
+- **Long DMA rows.** It reads the weights in `HYV3MoE`'s own layouts, so no extra HBM is used.
+  The two cores of the logical NeuronCore each take one half of H for gate/up, so each DMA row
+  is a full 2 x I bytes. They exchange their partial sums (`sendrecv`), and each core keeps half
+  of I for the activation and the down projection.
+- **No torch ops** between the attention all-reduce and the MoE all-reduce.
+
+The top-8 is a threshold at the 8th largest biased score (`nisa.max8`). `moe_tkg_hits*` stay in
+use where they are chosen today (up to `HY3_DECODE_HITS_MAX_T` tokens); `HY3_DECODE_HITS=0`
+sends every decode size to the fused kernel. The kernel is not used with attention DP.
+
+One NeuronCore, real layer weights (rank-0 shard of EP=64), T = 32. "Latency" means each layer's
+input is the previous layer's output (`test_moe_tkg_fused.py`, `HY3_FUSED_BENCH=1`):
+
+| decode MoE block, per layer | layer-to-layer latency |
+|---|---|
+| production: torch RMSNorm + `hy3_route` + `moe_tkg` + shared `NF.mlp` | 0.339 ms |
+| `moe_tkg_fused` | 0.197 ms |
+
+The time is flat in T. The routed part alone takes 0.127 ms at T = 8 and 16 and 0.142 ms at
+T = 64, while `moe_tkg_hits_batch` takes 0.25 ms once all 3 local experts are hit.
+
+On random inputs the output is 3% (relative L2) from an FP32 fake-quant reference. The same W8A8
+fake-quant is 4% from a BF16 reference.
+
+`HY3_MOE_STATIC_DGE=1` gives the weight streams static DMA descriptors. That brings the one-core
+latency to 0.152 ms, but the descriptors live in HBM: about 1.1 GB more "DMA rings IO" per core
+with decode buckets [1, 4, 8]. At `KV_CAP` 0.61 the decode server then fails its first full step
+with `Failed to allocate ... dma rings io`. It stays off.
+
+### PD test method and results
+
+**Setup.**
+- Two trn2.48xlarge (EFA, SDK 2.33, vLLM 0.29), one per role.
+- vllm-project/vllm-neuron#90 (`NeuronMooncakeConnector`) applied to the checkout.
+- `mooncake-transfer-engine-non-cuda` 0.3.14 installed.
+- `scripts/pd/` (below) drives everything. The sparse K summaries move as extra KV regions
+  (see "Sparse attention across prefill and decode").
+
+```bash
+COMMON="CONNECTOR=NeuronMooncakeConnector KV_DTYPE=fp8 MTP_K=3 KV_CAP=0.61 \
+  HY3_KV_SCALE_PROFILE=$PWD/contrib/models/hy_v3/kv_profiles/Hy3-FP8_mtp_neuron.safetensors \
+  HY3_SPARSE_DECODE=0.125 HY3_SPARSE_PREFILL=0.25 MAX_LEN=87040 MODEL=/path/to/Hy3-FP8"
+# decode node (start first; stays up). Give each HY3_DECODE_MOE_* setting its own
+# VLLM_CACHE_ROOT: the precompile cache does not key on these env flags.
+bash contrib/models/hy_v3/scripts/pd/run_pd.sh fused decode-node $COMMON \
+  HY3_DECODE_MOE_FUSED=1 HY3_DECODE_HITS=0 VLLM_CACHE_ROOT=/path/cache/fused
+# prefill node: prefill server + Mooncake proxy, waits for the decode, then runs the bench
+bash contrib/models/hy_v3/scripts/pd/run_pd.sh fused prefill-node $COMMON \
+  D_HOST=<decode private IP> BENCH=pd_bench OUT_LEN=1024 CONCS=8
+# accuracy through the same pair (needle + sparse_decode_eval)
+bash contrib/models/hy_v3/scripts/pd/run_pd.sh fused_acc prefill-node $COMMON \
+  D_HOST=<decode private IP> BENCH=pd_acc
+```
+
+**Workload.** `pd_bench.sh` runs the 85k / 92% shared-prefix case (`bench_data/prefix`) through
+the proxy:
+- first a smoke request and a needle request;
+- then one warm-up request and 80 requests at concurrency 8, with 1024 output tokens and a new
+  `cache_salt` per run;
+- it reads the prefill and decode prefix-hit rates and the MTP acceptance from the servers'
+  `/metrics`.
+
+**Results**, decode TP=64 / EP=64, prefill TP=64, Mooncake over EFA:
+
+| decode MoE | TTFT med / P99 (s) | TPOT med / P99 (ms) | ITL med (ms) | output tok/s | MTP tok/step |
+|---|---|---|---|---|---|
+| production (torch + `moe_tkg`) | 1.98 / 9.8 | 26.5 / 30.9 | 57.4 | 267 | 2.26 |
+| `HY3_DECODE_MOE_FUSED=1 HY3_DECODE_HITS=0` | 1.95 / 9.9 | **19.9 / 22.6** | **42.7** | **353** | 2.26 |
+| the same, this branch (repeat run) | 1.99 / 9.9 | 20.0 / 22.7 | 42.8 | 343 | 2.23 |
+
+Every run completed 80/80 requests, with prefill and decode prefix hits of 92.1%. The JSON
+outputs are in `results/pd_fused/`.
+
+A device profile of the production path (`scripts/profile_85k.sh`, 5 requests at 85k on the
+batch-8 NEFF) shows where the step went:
+
+| production decode step: 57.2 ms | ms |
+|---|---|
+| target NEFF | 52.7 |
+| MTP draft | 4.6 |
+| routed experts | 23.4 |
+| shared expert | 4.2 |
+| MoE norm + router torch ops | 4.3 |
+| attention | 20.5 |
+
+**Accuracy through PD.**
+- Decode with `HY3_DECODE_HITS=0`, so single requests take the fused kernel too.
+- `HY3_SPARSE_MIN_BATCH` stays at 4: single requests run dense attention.
+
+| | needle (12) | `sparse_decode_eval.py`, 19 greedy continuations |
+|---|---|---|
+| fused MoE | 12/12 | 16/19 identical to the dense PD run (the 3 near-tie items where sparse decode also differs, same split points) |
+| fused MoE vs the torch router in front of the same W8A8 routed experts (development build) | | 19/19 identical |
+
+The selection in the kernel gives the same tokens as `hy3_route`.
+
 ## Compatibility Matrix
 
 | Instance / Neuron SDK version | 2.33.0      | 2.32 and earlier |
@@ -906,7 +1020,9 @@ HY3_CKPT=/path/to/Hy3-FP8 HY3_KV_SCALE_PROFILE=/path/to/kv_scales.safetensors \
 Single-NeuronCore tests of the FP8 MLP (dense layer, shared expert, 8-way decode
 copy; CTE and TKG paths) and the routed experts (`moe_cte` hybrid, `moe_tkg`,
 `moe_tkg_hits` with 0-3 local hits, `moe_tkg_hits_batch` with 2 / 4 tokens),
-and the FP8 KV attention of layer 0 (`test_fp8_kv_attention.py`: cache writes
+the fused decode MoE block (`test_moe_tkg_fused.py`: T = 8 / 32 against
+an FP32 fake-quant reference with the torch router; `HY3_FUSED_BENCH=1` also times 8
+chained layers against the production path), and the FP8 KV attention of layer 0 (`test_fp8_kv_attention.py`: cache writes
 in flash and segmented prefill, two decode steps on the standard, packed and
 packed-fallback layouts, calibrated and unit scales, plus wrong-scale-contract
 controls that must miss). They build the kernel inputs from the real
@@ -950,6 +1066,8 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 | `scripts/bench_fixed.sh` | `vllm bench serve` matrix over the fixed real-text prompts in `bench_data/prompts` (same requests every run) |
 | `scripts/gen_bench_prompts.py` | generates `bench_data/prompts`: sglang-style ShareGPT text cut / repeated to an exact token count |
 | `scripts/bench_prefix_fixed.sh` | prefix-cache benchmark over `bench_data/prefix` (85k input, 92% shared prefix): warm-up request, one `cache_salt` per run, hit rate from `/metrics` |
+| `scripts/pd/` | 1P1D (Mooncake / NIXL) runs on two trn2.48xlarge: servers, proxy, the 85k / 92% bench and the accuracy checks through the proxy ([scripts/pd/README.md](scripts/pd/README.md), "PD test method and results") |
+| `src/kernels/moe_tkg_fused.py` | EXPERIMENTAL fused decode MoE block (`HY3_DECODE_MOE_FUSED=1`): norm + router + routed + shared shard, W8A8 + FP8 double-row; 8-request PD TPOT 26.5 -> 19.9 ms ("Fused decode MoE") |
 | `scripts/bench_pd_split.sh` | prefill-only (output 1) and decode-only (replay twice) split over `bench_data/prefix`, with per-cell `cache_salt`, hit rates and MTP acceptance |
 | `src/kernels/moe_cte_fp8w.py`, `bwmm_shard_on_I_fp8w.py` | prefill routed experts: nkilib's `shard_on_i_hybrid` with the FP8 weight tiles fed to the matmul (no BF16 copy; identical output, routed experts -33% per prefill chunk; `HY3_MOE_CTE_FP8W=0` for the nkilib kernel; [docs/PROFILE_85K.md](docs/PROFILE_85K.md)) |
 | `scripts/tensore_mm_bench.py` | one-core TensorE cost of the decode MoE matmul shapes, BF16 x FP8 vs FP8 x FP8 (W8A8, with and without `double_row`): W8A8 is not faster there (`results/w8a8_decode/`, docs/PROFILE_85K.md) |

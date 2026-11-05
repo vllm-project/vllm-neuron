@@ -86,6 +86,7 @@ from .config import HYV3Config
 from .kernels.moe_cte_fp8w import moe_cte_fp8w
 from .kernels.moe_tkg_hits import moe_tkg_hits
 from .kernels.moe_tkg_hits_batch import moe_tkg_hits_batch
+from .kernels.moe_tkg_fused import moe_tkg_fused
 from .weight_loaders import (
     FP8_DTYPE as _FP8_DTYPE,
 )
@@ -177,6 +178,10 @@ _SPARSE_SEL_CACHE_KEY = "_hy_v3_sparse_selection"
 # chunk's queries. The kept prior blocks and the chunk's own blocks make the
 # BF16 copy the segmented kernel reads.
 _SPARSE_PREFILL = float(os.environ.get("HY3_SPARSE_PREFILL", "0") or 0)
+# EXPERIMENTAL: the whole decode MoE block (post-attention RMSNorm, router, routed experts,
+# shared-expert decode shard) as one NKI kernel with static-FP8 activations and FP8
+# double-row matmuls (kernels/moe_tkg_fused.py). README, "Fused decode MoE".
+_DECODE_MOE_FUSED = os.environ.get("HY3_DECODE_MOE_FUSED", "0") == "1"
 # Per-layer tensors a KV connector must move along with the KV blocks, keyed like the KV caches
 # ("layers.{i}.self_attn"): the sparse-attention K summaries are blocks-first and indexed by the
 # same block ids, and prefill writes them, so a disaggregated decode needs the prefill node's rows
@@ -410,6 +415,50 @@ def update_k_summary_decode(k_sum, k, positions, slot_mapping, block_table, bloc
     key_b = torch.where(has_b, key_b, key_a)
     new_b = torch.where(has_b.view(B, 1, 1, 1), new_b, new_a)
     k_sum.index_put_((torch.cat([key_a, key_b]),), torch.cat([new_a, new_b]).to(k_sum.dtype))
+
+
+def prepare_moe_fused(layer, device, from_weights: bool = True) -> None:
+    """moe_tkg_fused (HY3_DECODE_MOE_FUSED): per-rank constants built from the loaded weights.
+
+    ``moe_fused_scales`` [1, 4 * (L + 1)]: per local expert, then the shared decode shard:
+    gate dequant x input scale, up dequant x input scale / down input scale, down dequant x
+    down input scale (x shared_decode_weight for the shared shard), 1 / input scale.
+    ``moe_router_wT``: the router transposed, BF16 (the checkpoint router is BF16, so exact).
+    ``moe_ebase``: this rank's first local expert id. ``from_weights=False`` (CPU compile)
+    allocates placeholders.
+    """
+    mlp = layer.mlp
+    if not getattr(mlp, "use_moe_fused", False) or mlp.shared_mlp_decode is None:
+        return
+    assert mlp.route_norm, "moe_tkg_fused renormalizes the top-k weights"
+    L = mlp.num_local_experts
+    sh = mlp.shared_mlp_decode
+    f = lambda t: t.detach().to("cpu").float()
+    if from_weights:
+        s_in = f(mlp.gate_up_in_scale_tkg).amax(1)
+        s_din = f(mlp.down_in_scale_tkg)[:, 0]
+        gu = f(mlp.gate_up_proj_scale_tkg)
+        dw = f(mlp.down_proj_scale_tkg)[:, 0]
+        sc = torch.stack([gu[:, 0, 0] * s_in, gu[:, 1, 0] * s_in / s_din, dw * s_din, 1 / s_in], 1)
+        g = lambda t: f(t).reshape(-1)[0]
+        sh_in, sh_din = g(sh.gate_up_input_scale), g(sh.down_input_scale)
+        row = torch.stack([
+            g(sh.gate_weight_scale) * sh_in,
+            g(sh.up_weight_scale) * sh_in / sh_din,
+            g(sh.down_weight_scale) * sh_din * mlp.shared_decode_weight,
+            1 / sh_in,
+        ]).view(1, 4)
+        rw = mlp.router_weight.detach().to("cpu")
+    else:
+        sc, row = torch.ones(L, 4), torch.ones(1, 4)
+        rw = torch.zeros(mlp.total_num_experts, mlp.hidden_size)
+
+    def param(t):
+        return nn.Parameter(t.contiguous().to(device), requires_grad=False)
+
+    mlp.moe_fused_scales = param(torch.cat([sc, row], 0).reshape(1, 4 * (L + 1)))
+    mlp.moe_router_wT = param(rw.to(torch.bfloat16).t())
+    mlp.moe_ebase = param(torch.full((1, 1), float(mlp.ep_rank * L)))
 
 
 def prepare_sparse_decode(layer, device, from_weights: bool = True) -> None:
@@ -1677,6 +1726,12 @@ class HYV3MoE(nn.Module):
         # Decode (moe_tkg STATIC): per-expert scalar dequant scales.
         self.gate_up_proj_scale_tkg = _fp32_param(L, 2, 1)
         self.down_proj_scale_tkg = _fp32_param(L, 1)
+        # moe_tkg_fused: the experts' static activation scales (doubled like every input
+        # scale, see weight_loaders.py). The kernel splits I in halves of whole 256-row pairs.
+        self.use_moe_fused = _DECODE_MOE_FUSED and I_tp % 512 == 0
+        if self.use_moe_fused:
+            self.gate_up_in_scale_tkg = _fp32_param(L, 2)
+            self.down_in_scale_tkg = _fp32_param(L, 1)
 
         # <-- MODEL-SPECIFIC: shared expert(s), full weights on every rank
         shared_size = config.moe_intermediate_size * config.num_shared_experts
@@ -1751,6 +1806,15 @@ class HYV3MoE(nn.Module):
             self.down_proj_scale_tkg,
             ep(expert_scale_loader(L, 1, lambda s: s.view(L, 1))),
         )
+        if self.use_moe_fused:
+            set_weight_loader(
+                self.gate_up_in_scale_tkg,
+                ep(expert_scale_loader(L, 2, lambda s: s.view(L, 2))),
+            )
+            set_weight_loader(
+                self.down_in_scale_tkg,
+                ep(expert_scale_loader(L, 1, lambda s: s.view(L, 1))),
+            )
 
     def _route(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return hy3_route(
@@ -1774,7 +1838,41 @@ class HYV3MoE(nn.Module):
 
         return get_neuron_ep_group().rank_in_group_tensor.reshape(1).to(torch.int32)
 
+    def _use_fused_decode(self, num_tokens: int) -> bool:
+        """moe_tkg_fused for this decode step: up to 128 tokens, with the sharded shared expert,
+        and not where the hits kernels are chosen (HY3_DECODE_HITS=0 sends every decode size
+        here). Not with attention DP (its tokens are gathered across replicas first)."""
+        return (
+            self.use_moe_fused
+            and self.shared_mlp_decode is not None
+            and not self.cross_dp_ep
+            and num_tokens <= 128
+            and not self._use_hit_batch_decode(num_tokens)
+            and not self._use_hit_decode(num_tokens)
+        )
+
     def forward(self, hidden_states, ln_w, eps, is_prefill, rank):
+        if not is_prefill and self._use_fused_decode(hidden_states.shape[0]):
+            # <-- EXPERIMENTAL: norm + router + routed + shared decode shard in one kernel
+            sh = self.shared_mlp_decode
+            output = wrap_nki(moe_tkg_fused)[2](
+                hidden_states.to(ln_w.dtype),
+                ln_w.view(1, -1),
+                self.moe_router_wT,
+                self.expert_bias.view(1, -1),
+                self.moe_ebase,
+                self.gate_up_proj_weight,
+                self.down_proj_weight,
+                sh.gate_proj_weight,
+                sh.up_proj_weight,
+                sh.down_proj_weight,
+                self.moe_fused_scales,
+                eps=eps,
+                route_scale=float(self.router_scaling_factor),
+                top_k=self.num_experts_per_token,
+            )
+            # >>> PARALLELISM: combine expert (and sharded shared-expert) partials <<<
+            return self._combine(output)
         if self.cross_dp_ep and not is_prefill:
             # >>> PARALLELISM: decode tokens of every DP replica (replicated within
             # each TP group); the router and the shared-expert shard run on all of
@@ -2207,6 +2305,11 @@ def decoder_layer_weight_mappings(
     m[f"{mp}.gate_up_proj_scale_tkg"] = gate_up_s
     m[f"{mp}.down_proj_scale"] = experts("down_proj", "weight_scale")
     m[f"{mp}.down_proj_scale_tkg"] = experts("down_proj", "weight_scale")
+    if getattr(layer.mlp, "use_moe_fused", False):
+        m[f"{mp}.gate_up_in_scale_tkg"] = experts("gate_proj", "input_scale") + experts(
+            "up_proj", "input_scale"
+        )
+        m[f"{mp}.down_in_scale_tkg"] = experts("down_proj", "input_scale")
     gated_mlp(f"{mp}.shared_mlp", f"{smp}.shared_mlp")
     if layer.mlp.shared_mlp_decode is not None:
         gated_mlp(f"{mp}.shared_mlp_decode", f"{smp}.shared_mlp")
@@ -2417,6 +2520,7 @@ class HYV3ForCausalLM(nn.Module, SupportsEagle3):
         self._load_kv_cache_scales(checkpoint_path, device)
         for layer in self.model.layers:
             prepare_sparse_decode(layer, device)
+            prepare_moe_fused(layer, device)
 
     def load_weights_lite(
         self, checkpoint_path: str, device: torch.device, cache_dir: str | None
@@ -2425,6 +2529,7 @@ class HYV3ForCausalLM(nn.Module, SupportsEagle3):
         self._load_kv_cache_scales(checkpoint_path, device)
         for layer in self.model.layers:
             prepare_sparse_decode(layer, device, from_weights=False)
+            prepare_moe_fused(layer, device, from_weights=False)
 
     def _load_kv_cache_scales(self, checkpoint_path: str, device) -> None:
         """<-- FP8 KV: per-layer K/V cache scales (see ``kv_scales.resolve_kv_scales``).
