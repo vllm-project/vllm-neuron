@@ -135,6 +135,42 @@ def _pack_consts(ng):
     return OH, CK
 
 
+def _pack_w_consts(ng):
+    """Shape-only constants of the packed down-weight gathers (`DOWN_SW`, once a launch): `OH` [PT, NKT, SLOTS]
+    fp32 = 1 where packed partition P = 128 t + p belongs to slot k = P // 72, and `CK` [PT, NKT] fp32: added to
+    that slot's `wr2` row (72 id + p) it gives 72 id + P - 72 k; past the slots the first row past the tensor
+    (skipped)."""
+    key = ("b1_pack_w", ng, SLOTS, NKT)
+    if key in M.CACHE:
+        return M.CACHE[key]
+    big = float((ng + 1) * KPS)
+    pi = nl.ndarray((PT, NKT), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.iota(dst=pi, pattern=[[PT, NKT]], offset=0, channel_multiplier=1)
+    P = nl.ndarray((PT, NKT), dtype=F32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=P, src=pi)
+    ti = nl.ndarray((PT, NKT), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.iota(dst=ti, pattern=[[PT, NKT]], offset=0, channel_multiplier=0)
+    T128 = nl.ndarray((PT, NKT), dtype=F32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=T128, src=ti)
+    s = nl.ndarray((PT, NKT), dtype=F32, buffer=nl.sbuf)
+    nisa.memset(s, 0.0)
+    for k in range(1, SLOTS + 1):
+        nisa.scalar_tensor_tensor(dst=s, data=P, op0=nl.greater_equal, operand0=float(KPS * k), op1=nl.add, operand1=s)
+    OH = nl.ndarray((PT, NKT, SLOTS), dtype=F32, buffer=nl.sbuf)
+    for k in range(SLOTS):
+        nisa.tensor_scalar(dst=OH[:, :, k], data=s, op0=nl.equal, operand0=float(k))
+    val = nl.ndarray((PT, NKT), dtype=F32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=val, data=s, op0=nl.less, operand0=float(SLOTS))
+    # CK = (128 t - 72 k - big) * valid + big
+    CK = nl.ndarray((PT, NKT), dtype=F32, buffer=nl.sbuf)
+    nisa.scalar_tensor_tensor(dst=CK, data=s, op0=nl.multiply, operand0=-float(KPS), op1=nl.add, operand1=T128)
+    nisa.tensor_scalar(dst=CK, data=CK, op0=nl.subtract, operand0=big)
+    nisa.tensor_tensor(dst=CK, data1=CK, data2=val, op=nl.multiply)
+    nisa.tensor_scalar(dst=CK, data=CK, op0=nl.add, operand0=big)
+    M.CACHE[key] = (OH, CK)
+    return OH, CK
+
+
 def _hw(eng):
     return dict(dge_mode=nisa.dge_mode.hwdge, engine=eng)
 
@@ -285,6 +321,27 @@ DOWN_EARLY = False
 #: SLOTS (every slot its own) or 2 (~35 KB a partition less live SBUF in the MoE -- with the attention's
 #: persistent first-GEMM tile the compiler spilled that tile every block)
 GU_BUFS = 2
+#: the gate|up scale tiles: WS_BUFS slot buffers (>= GU_BUFS; slot s in buffer s % WS_BUFS): the scale
+#: gathers of the slots past GU_BUFS issued before the weight buffer they share is free (their few rows
+#: land through the 4 quadrant DMA rings, behind the weights: one buffer more than the weights lets
+#: each land before its slot's weights)
+WS_BUFS = 3
+#: the down-weight DMAs of the first DOWN_MID slots (j < DOWN_MID) issued between the last two slots' gate|up loads on the
+#: sync queue (the queue idles 5-9 us there: the last load waits for the GEMM two slots before it to free its
+#: buffer); the rest stay behind the last gate|up load (any earlier delays the gate|up stream, iter-3 E1)
+DOWN_MID = 0
+#: slot 1's gate|up weight DMA issued only after slot 0's scale gather (its id re-read from a GpSimd copy made
+#: behind that gather): slot 0's few scale rows then queue on their 4 DMA rings ahead of slot 1's weights
+#: instead of behind them (slot 0's GEMM waited ~4 us for its scales after its weights had landed)
+UP1_AFTER_S0 = True
+#: (PACK_DOWN) the down weights by one SWDGE row gather a packed tile (GpSimd: 2 * NKT gathers a core,
+#: partition p of tile (c, t) <- row 72 id_j + local of the slot j = 2 k + c owning it, `route_group`'s `wr2`
+#: rows; padding slots and the rows past the slots skipped) instead of 2 * (SLOTS + 2) dynamic-offset HWDGE
+#: DMAs on the sync queue (~1.5 us of sync issue each: two expert-id register loads; they paced the stream)
+DOWN_SW = False
+#: the MoE output stored a 512-column tile at a time right behind its evacuation (vector-evacuated
+#: tiles on the sync queue, ACT-evacuated ones on the ACT queue) instead of one store behind the last
+STORE_SPLIT = False
 #: the MoE's first hc_in tail steps (`TICKS["wait"]`) scheduled after the routing (`_ROUTE_END`)
 PIN_TICKS = True
 #: the down weights' DMA queue: "sync" (every slot's on the sync engine) or "split" (sync / ACT by slot:
@@ -337,6 +394,14 @@ def _route_one(pid, T, lg, gate_b, expert_lo, n_experts, topk, ng, route_scale, 
     return wexp, alist, nact, nz, slotw, sidx
 
 
+#: the overflow loop's body free of ACT instructions (its silu on GpSimd, its copies on the vector engine):
+#: the zero-trip loop's preheader otherwise loads the ACT table of the body's silu (~1.3 us, the other
+#: engines' entry rendezvous waiting for it) in every block
+OVF_NO_ACT = False
+OVF_CP = dict(engine=nisa.engine.vector) if OVF_NO_ACT else {}
+OVF_ACT = dict(engine=nisa.engine.gpsimd) if OVF_NO_ACT else {}
+
+
 def _overflow(pid, T, xq, xs, nkc, dim, c0, dh, w13v, s13, w2v, wexp, alist, nact, ng, limit, acc=None, dst=None):
     """The active slots past the static ones (more than 2 * SLOTS active experts in the group) in a
     dynamic loop (zero trips almost always), each pair's down products added into `acc` (`[T, dh]`
@@ -368,16 +433,16 @@ def _overflow(pid, T, xq, xs, nkc, dim, c0, dh, w13v, s13, w2v, wexp, alist, nac
                               moving_scale=ub.ws[:, kc * W13 + NT : (kc + 1) * W13], accumulate=(kc > 0))
         gb = nl.ndarray((T, HID), dtype=BF, buffer=nl.sbuf)
         ubf = nl.ndarray((T, HID), dtype=BF, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=gb[:, 0:T0], src=a0[:, 0:T0])
-        nisa.tensor_copy(dst=ubf[:, 0:T0], src=a0[:, T0:NT])
-        nisa.tensor_copy(dst=gb[:, T0:HID], src=a1[:, 0:r])
-        nisa.tensor_copy(dst=ubf[:, T0:HID], src=a1[:, r : 2 * r])
+        nisa.tensor_copy(dst=gb[:, 0:T0], src=a0[:, 0:T0], **OVF_CP)
+        nisa.tensor_copy(dst=ubf[:, 0:T0], src=a0[:, T0:NT], **OVF_CP)
+        nisa.tensor_copy(dst=gb[:, T0:HID], src=a1[:, 0:r], **OVF_CP)
+        nisa.tensor_copy(dst=ubf[:, T0:HID], src=a1[:, r : 2 * r], **OVF_CP)
         g1 = nl.ndarray((T, HID), dtype=F32, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=g1, data=gb, op0=nl.minimum, operand0=limit)
         u1 = nl.ndarray((T, HID), dtype=F32, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=u1, data=ubf, op0=nl.maximum, operand0=-limit, op1=nl.minimum, operand1=limit)
         s1_ = nl.ndarray((T, HID), dtype=F32, buffer=nl.sbuf)
-        nisa.activation(dst=s1_, op=nl.silu, data=g1)
+        nisa.activation(dst=s1_, op=nl.silu, data=g1, **OVF_ACT)
         v1 = nl.ndarray((T, HID), dtype=F32, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=v1, data1=s1_, data2=u1, op=nl.multiply)
         nisa.tensor_scalar(dst=y1[:, 0:HID], data=v1, op0=nl.multiply, operand0=wc[0:T, 0:1])
@@ -385,7 +450,7 @@ def _overflow(pid, T, xq, xs, nkc, dim, c0, dh, w13v, s13, w2v, wexp, alist, nac
         for j in range(4):
             nisa.nc_transpose(dst=tq[:, j, :], data=y1.ap(pattern=[[KC, T], [4, PT]], offset=j))
         yT1 = nl.ndarray((PT, T, 4), dtype=BF, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=yT1, src=tq.ap(pattern=[[4 * T, PT], [1, T], [T, 4]]))
+        nisa.tensor_copy(dst=yT1, src=tq.ap(pattern=[[4 * T, PT], [1, T], [T, 4]]), **OVF_CP)
         yq1 = nl.ndarray((PT, T), dtype=FP8_X4, buffer=nl.sbuf)
         ys1 = nl.ndarray((PT, T), dtype=nl.uint8, buffer=nl.sbuf)
         nisa.quantize_mx(dst=yq1, src=yT1.reshape((PT, T * 4)), dst_scale=ys1)
@@ -406,7 +471,7 @@ def _overflow(pid, T, xq, xs, nkc, dim, c0, dh, w13v, s13, w2v, wexp, alist, nac
                                   accumulate=(c > 0))
         ot = nl.ndarray((T, dh), dtype=F32, buffer=nl.sbuf)
         for t, a in enumerate(tmp):
-            nisa.tensor_copy(dst=ot[:, t * NT : (t + 1) * NT], src=a)
+            nisa.tensor_copy(dst=ot[:, t * NT : (t + 1) * NT], src=a, **OVF_CP)
         if dst is not None:
             nisa.dma_compute(dst=dst, srcs=[dst, ot], reduce_op=nl.add)
         else:
@@ -501,8 +566,9 @@ def moe(pid, T, xq, xs, xT, gate_w, gate_b, expert_lo, w13, s13, w2, sh13, shs13
     # gate|up of this core's slots j = 2 s + pid side by side: wt[:, kc, s, :]; the down weights of
     # every slot (this core's columns): w2t[:, j, :]
     NB = min(GU_BUFS, SLOTS)
+    NBS = min(max(WS_BUFS, NB), SLOTS)
     wt = nl.ndarray((PT, NB, nkc, W13), dtype=FP4_X4, buffer=nl.sbuf)
-    ws = nl.ndarray((PT, NB, nkc, W13), dtype=nl.uint8, buffer=nl.sbuf)
+    ws = nl.ndarray((PT, NBS, nkc, W13), dtype=nl.uint8, buffer=nl.sbuf)
     # (PACK_DOWN: [core c, packed tile t] at c * NKT + t; else slot j)
     w2t = nl.ndarray((PT, 2 * NKT if PACK_DOWN else S2, dh), dtype=FP4_X4, buffer=nl.sbuf)
     w2s = nl.ndarray((PT, 2 * NKT if PACK_DOWN else S2, dh), dtype=nl.uint8, buffer=nl.sbuf)
@@ -519,6 +585,9 @@ def moe(pid, T, xq, xs, xT, gate_w, gate_b, expert_lo, w13, s13, w2, sh13, shs13
     dq = (q0, q0) if DOWN_Q == "sync" else qs
     sprio = {} if SCALES_PRIO is None else dict(priority=SCALES_PRIO)
     gathers = []
+    # (`DOWN_MID`: the deferred down-weight DMAs, the gate|up load they follow)
+    down_ins = []
+    up_last = [None]
 
     if SCALES_SW == "quad":
         # the quadrants' row indices on partitions 0..3 (a gather's index tile starts at partition 0):
@@ -529,7 +598,7 @@ def moe(pid, T, xq, xs, xT, gate_w, gate_b, expert_lo, w13, s13, w2, sh13, shs13
             nisa.tensor_scalar(dst=t_, data=sidx[0:4, :], op0=nl.add, operand0=4 * q4)
             sidx_q.append(t_)
 
-    def load_up(s):
+    def load_up(s, w=True, sc=True):
         # expert ids[j]'s gate|up rows (slot 0: the contraction halves on both queues) and its scale
         # rows into the quadrant layout (partitions 32 q .. 32 q + 3: scale rows 4 q .. 4 q + 3)
         j = 2 * s + pid
@@ -538,14 +607,26 @@ def moe(pid, T, xq, xs, xT, gate_w, gate_b, expert_lo, w13, s13, w2, sh13, shs13
         else:
             parts = ((0, nkh, qs[0]), (nkh, nkc, qs[1])) if s == 0 else ((0, nkc, qs[s % 2]),)
         for k0, k1, q in parts:
-            nisa.dma_copy(dst=wt[:, s % NB, k0:k1, :], src=w13v.ap(pattern=[[nkc * W13, PT], [W13, k1 - k0], [1, W13]],
-                                                              offset=k0 * W13, scalar_offset=ids[j], indirect_dim=0),
-                          engine=q, **dict(hw, priority=UP_PRIO[s]))
+            if not w:
+                break
+            ui = nisa.dma_copy(dst=wt[:, s % NB, k0:k1, :], src=w13v.ap(pattern=[[nkc * W13, PT], [W13, k1 - k0], [1, W13]],
+                                                                   offset=k0 * W13, scalar_offset=ids[j], indirect_dim=0),
+                               engine=q, **dict(hw, priority=UP_PRIO[s]))
+            if DOWN_MID and s == SLOTS - 2:
+                up_last[0] = ui
+            if DOWN_MID and s == SLOTS - 1 and hasattr(ui, "depends_on"):
+                # (`DOWN_MID`: the first slots' down DMAs between the last two gate|up loads on the sync queue)
+                for di in down_ins:
+                    if di is not None and hasattr(di, "depends_on"):
+                        ui.depends_on(di, kind=nisa.dependency.schedule)
+        if not sc:
+            return
+        sb = s % NBS
         if SCALES_SW == "quad":
             # four SWDGE row gathers onto the scale partitions only (32 q .. 32 q + 3: `sidx`'s rows,
             # in bounds; the zero expert's for padding ids): 16 rows, not 128 rows' worth of bytes
             for q4 in range(4):
-                nisa.dma_copy(dst=ws[32 * q4 : 32 * q4 + 4, s % NB, :, :],
+                nisa.dma_copy(dst=ws[32 * q4 : 32 * q4 + 4, sb, :, :],
                               src=s13r.ap(pattern=[[nks, 4], [W13, nkc], [1, W13]], offset=0,
                                           vector_offset=sidx_q[q4][0:4, j : j + 1], indirect_dim=0),
                               dge_mode=nisa.dge_mode.swdge, oob_mode=nisa.oob_mode.skip)
@@ -554,19 +635,19 @@ def moe(pid, T, xq, xs, xT, gate_w, gate_b, expert_lo, w13, s13, w2, sh13, shs13
             # the expert's 16 scale rows onto the quadrant partitions 32 q .. 32 q + 3: one HWDGE DMA a
             # quadrant (16 rows' bytes, not 128 partitions' as the SWDGE gather)
             for q4 in range(4):
-                nisa.dma_copy(dst=ws[32 * q4 : 32 * q4 + 4, s % NB, :, :],
+                nisa.dma_copy(dst=ws[32 * q4 : 32 * q4 + 4, sb, :, :],
                               src=s13.ap(pattern=[[nks, 4], [W13, nkc], [1, W13]], offset=4 * q4 * nks,
                                          scalar_offset=ids_s[j], indirect_dim=0), engine=qs[(s + q4) % 2], **hw)
             return
         if SCALES_SW:
             # one SWDGE row gather (`sidx`: partition p's scale row, the zero expert's for padding ids)
-            gathers.append(nisa.dma_copy(dst=ws[:, s % NB, :, :],
+            gathers.append(nisa.dma_copy(dst=ws[:, sb, :, :],
                                          src=s13r.ap(pattern=[[nks, PT], [W13, nkc], [1, W13]], offset=0,
                                                      vector_offset=sidx[0:PT, j : j + 1], indirect_dim=0),
                                          dge_mode=nisa.dge_mode.swdge, oob_mode=nisa.oob_mode.skip, **sprio))
             return
         for q4 in range(4):
-            nisa.dma_copy(dst=ws[32 * q4 : 32 * q4 + 4, s % NB, :, :],
+            nisa.dma_copy(dst=ws[32 * q4 : 32 * q4 + 4, sb, :, :],
                           src=s13.ap(pattern=[[nks, 4], [W13, nkc], [1, W13]], offset=4 * q4 * nks,
                                      scalar_offset=ids[j], indirect_dim=0), engine=qs[(s + 1) % 2], **hw)
 
@@ -576,12 +657,18 @@ def moe(pid, T, xq, xs, xT, gate_w, gate_b, expert_lo, w13, s13, w2, sh13, shs13
             # scale rows: one gather a tile, `pack_scales`)
             c, p = j % 2, j // 2
             lo = KPS * p
+            if DOWN_SW:
+                return
             for t in range(lo // PT, (lo + KPS - 1) // PT + 1):
                 a, b = max(lo, PT * t), min(lo + KPS, PT * (t + 1))
-                nisa.dma_copy(dst=w2t[a - PT * t : b - PT * t, c * NKT + t, :],
-                              src=w2v.ap(pattern=[[dim, b - a], [1, dh]], offset=(a - lo) * dim + c0,
-                                         scalar_offset=ids[j], indirect_dim=0),
-                              **dict(hw, engine=dq[j % 2], priority=DOWN_PRIO))
+                di = nisa.dma_copy(dst=w2t[a - PT * t : b - PT * t, c * NKT + t, :],
+                                   src=w2v.ap(pattern=[[dim, b - a], [1, dh]], offset=(a - lo) * dim + c0,
+                                              scalar_offset=ids[j], indirect_dim=0),
+                                   **dict(hw, engine=dq[j % 2], priority=DOWN_PRIO))
+                if j < mid:
+                    down_ins.append(di)
+                    if up_last[0] is not None and hasattr(di, "depends_on"):
+                        di.depends_on(up_last[0], kind=nisa.dependency.schedule)
             return
         nisa.dma_copy(dst=w2t[0:kp, j, :], src=w2v.ap(pattern=[[dim, kp], [1, dh]], offset=c0, scalar_offset=ids[j],
                                                       indirect_dim=0),
@@ -611,6 +698,31 @@ def moe(pid, T, xq, xs, xT, gate_w, gate_b, expert_lo, w13, s13, w2, sh13, shs13
                           src=s13.ap(pattern=[[nks, 4], [1, dh]], offset=4 * q4 * nks + nkc * W13 + c0,
                                      scalar_offset=ids[j], indirect_dim=0), engine=qs[(j + 1) % 2], **hw)
 
+    def pack_weights():
+        # the packed tiles' weight rows: partition p of tile (c, t) <- row wr2[p, j] + CK[p, t] of slot j = 2 k + c
+        # owning it (`_pack_w_consts`), one SWDGE gather a tile (this core's columns)
+        OHw, CKw = _pack_w_consts(ng)
+        big = float((ng + 1) * KPS)
+        wf = nl.ndarray((PT, S2), dtype=F32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=wf, src=wr2)
+        widx = nl.ndarray((PT, 2 * NKT), dtype=nl.int32, buffer=nl.sbuf)
+        for c in range(2):
+            pr = nl.ndarray((PT, NKT, SLOTS), dtype=F32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=pr, data1=OHw, data2=wf.ap(pattern=[[S2, PT], [0, NKT], [2, SLOTS]], offset=c),
+                               op=nl.multiply)
+            ix = nl.ndarray((PT, NKT), dtype=F32, buffer=nl.sbuf)
+            nisa.tensor_reduce(dst=ix, op=nl.add, data=pr, axis=(2,))
+            nisa.tensor_tensor(dst=ix, data1=ix, data2=CKw, op=nl.add)
+            nisa.tensor_scalar(dst=ix, data=ix, op0=nl.minimum, operand0=big)
+            nisa.tensor_copy(dst=widx[:, c * NKT : (c + 1) * NKT], src=ix)
+        w2r = w2v.reshape((w2v.shape[0] * KPS, dim))
+        for k in range(2 * NKT):
+            gathers.append(nisa.dma_copy(dst=w2t[:, k, :],
+                                         src=w2r.ap(pattern=[[dim, PT], [1, dh]], offset=c0,
+                                                    vector_offset=widx[0:PT, k : k + 1], indirect_dim=0),
+                                         dge_mode=nisa.dge_mode.swdge, oob_mode=nisa.oob_mode.skip,
+                                         priority=DOWN_PRIO))
+
     def pack_scales():
         # the packed tiles' scale rows: partition p of tile (c, t) <- row 16 id_j + G % 9 of slot j = 2 k + c
         # owning its packed group G (`_pack_consts`), one SWDGE gather a tile
@@ -634,12 +746,24 @@ def moe(pid, T, xq, xs, xT, gate_w, gate_b, expert_lo, w13, s13, w2, sh13, shs13
 
     if PACK_DOWN:
         assert SCALES_SW is True and SCALES_OOB and not DOWN_EARLY, "PACK_DOWN: SWDGE scale gathers only"
-    for s in range(NB):
-        load_up(s)
+    for s in range(max(NB, NBS)):
+        load_up(s, w=s < NB, sc=s < NBS)
+        if UP1_AFTER_S0 and s == 0 and NB > 1 and SCALES_SW is True and gathers and hasattr(gathers[-1], "depends_on"):
+            # (`UP1_AFTER_S0`: slot 1's expert id re-read from a copy GpSimd makes right behind slot 0's scale
+            # gather: the sync queue issues slot 1's weights only once that gather's descriptors are queued)
+            nz2 = nl.ndarray((1, S2), dtype=nl.int32, buffer=nl.sbuf)
+            cp = nisa.tensor_copy(dst=nz2, src=nz[0:1, 0:S2], engine=nisa.engine.gpsimd)
+            if hasattr(cp, "depends_on"):
+                cp.depends_on(gathers[-1], kind=nisa.dependency.schedule)
+            j1 = 2 + pid
+            ids[j1] = nisa.scalar_load(nz2[0:1, j1 : j1 + 1])
+    mid = DOWN_MID if (PACK_DOWN and not DOWN_SW and not DOWN_EARLY and SLOTS - 2 >= NB) else 0
     for j in ([2 * p + pid for p in range(SLOTS)] + [2 * p + 1 - pid for p in range(SLOTS)] if DOWN_EARLY
-              else range(S2)):
+              else range(mid, S2)):
         load_down(j)
     if PACK_DOWN:
+        if DOWN_SW:
+            pack_weights()
         pack_scales()
     if after_route is not None:
         after_route()
@@ -743,16 +867,23 @@ def moe(pid, T, xq, xs, xT, gate_w, gate_b, expert_lo, w13, s13, w2, sh13, shs13
         a1 = nl.ndarray((T, nt1), dtype=F32, buffer=nl.psum)
         for kc in range(nkc):
             nisa.nc_matmul_mx(dst=a0, stationary=xq[:, kc * T : kc * T + T], moving=wt[:, s_ % NB, kc, 0:NT],
-                              stationary_scale=xs[:, kc * T : kc * T + T], moving_scale=ws[:, s_ % NB, kc, 0:NT],
+                              stationary_scale=xs[:, kc * T : kc * T + T], moving_scale=ws[:, s_ % NBS, kc, 0:NT],
                               accumulate=(kc > 0))
             nisa.nc_matmul_mx(dst=a1, stationary=xq[:, kc * T : kc * T + T], moving=wt[:, s_ % NB, kc, NT:W13],
-                              stationary_scale=xs[:, kc * T : kc * T + T], moving_scale=ws[:, s_ % NB, kc, NT:W13],
+                              stationary_scale=xs[:, kc * T : kc * T + T], moving_scale=ws[:, s_ % NBS, kc, NT:W13],
                               accumulate=(kc > 0))
         nisa.tensor_copy(dst=gu[:, s_ * W13 : s_ * W13 + NT], src=a0, engine=nisa.engine.scalar)
         nisa.tensor_copy(dst=gu[:, s_ * W13 + NT : (s_ + 1) * W13], src=a1, engine=nisa.engine.scalar)
         if s_ + NB < SLOTS:
             # the slot after this one in its buffer (program order: behind this slot's GEMM)
-            load_up(s_ + NB)
+            load_up(s_ + NB, sc=NBS == NB)
+            if mid and s_ + NB == SLOTS - 2:
+                # (`DOWN_MID`: the first slots' down weights behind it, ahead of the last gate|up load)
+                for j in range(mid):
+                    load_down(j)
+        if NBS != NB and s_ + NBS < SLOTS:
+            # (its scale buffer's next slot)
+            load_up(s_ + NBS, w=False)
         tk(TICKS["slot"])
         if DOWN_EARLY and s_ == SLOTS - 1:
             # this core's earlier slots' down products while the last slot's SwiGLU / staging run
@@ -830,17 +961,24 @@ def moe(pid, T, xq, xs, xT, gate_w, gate_b, expert_lo, w13, s13, w2, sh13, shs13
         down_term(*term)
     dacc = dn["acc"]
     o = nl.ndarray((T, dh), dtype=F32, buffer=nl.sbuf)
+    dst = cc2_src[0:T, c0 : c0 + dh]
+    # (`STORE_SPLIT`: each evacuated 512-column tile stored at once by the engine that evacuated it --
+    # the store overlaps the other tiles' evacuations instead of one store behind the last)
+    split = STORE_SPLIT and acc is None and not (M.OVERFLOW and not OVERFLOW_EARLY and OVERFLOW_ACC == "sbuf")
     for t, a in enumerate(dacc):
+        ev = nisa.engine.scalar if t % 2 else nisa.engine.vector
         if acc is None:
-            nisa.tensor_copy(dst=o[:, t * NT : (t + 1) * NT], src=a,
-                             engine=nisa.engine.scalar if t % 2 else nisa.engine.vector)
+            nisa.tensor_copy(dst=o[:, t * NT : (t + 1) * NT], src=a, engine=ev)
         else:
             nisa.tensor_tensor(dst=o[:, t * NT : (t + 1) * NT], data1=a, data2=acc[:, t * NT : (t + 1) * NT], op=nl.add)
-    dst = cc2_src[0:T, c0 : c0 + dh]
+        if split:
+            nisa.dma_copy(dst=cc2_src[0:T, c0 + t * NT : c0 + (t + 1) * NT], src=o[:, t * NT : (t + 1) * NT],
+                          **_hw(q1 if ev == nisa.engine.scalar else q0))
     if M.OVERFLOW and not OVERFLOW_EARLY and OVERFLOW_ACC == "sbuf":
         # the slots past the static ones (more than 2 * SLOTS active experts), added in SBUF
         _overflow(pid, T, xq, xs, nkc, dim, c0, dh, w13v, s13, w2v, wexp, alist, nact, ng, limit, acc=o)
-    nisa.dma_copy(dst=dst, src=o, **_hw(q0))
+    if not split:
+        nisa.dma_copy(dst=dst, src=o, **_hw(q0))
     if M.OVERFLOW and not OVERFLOW_EARLY and OVERFLOW_ACC != "sbuf":
         # the slots past the static ones (more than 2 * SLOTS active experts), added in HBM
         run_ovf = lambda: _overflow(pid, T, xq, xs, nkc, dim, c0, dh, w13v, s13, w2v, wexp, alist, nact, ng, limit,

@@ -101,6 +101,30 @@ launches, and the drafter with the step's verify in it:
   ring, rebuilt every step for the fresh outputs, cost ~5 ms of host time a step. Its optimized launch
   is not in the tree (the generated one runs).
 
+Decode launches optimized on the live recorded launch (2026-11-04). `layers_decode_L24_L39_head_tp32` went
+through four AutoHelix iterations on the live server's recorded launch (all 32 ranks, in1024 bs1 and bs10;
+bit-exact, the outputs and the written cache rows): p10 4.270 -> 3.967 ms at bs1, 15.596 -> 15.536 ms at bs10.
+
+- **The head GEMM in the PE's column-tiling mode** (`l1/head/mk_compress._gemm_ct`): x^T `[128, 32]` is the
+  stationary in 4 column tiles, each taking its own 512-column weight tile (2 x 64 for up to 64 rows), on the
+  head rows K-major (`HEAD_W_KMAJOR` in the launch package: `mk_model.head_kmajor` passes a `[dim / 128, 128,
+  part]` copy, +42 MB a rank). The head's PE time went from 69 to 9.4 us.
+- **The L31 -> L32 hand-off** across the merged launch's two parts (`l0.NEXT_FIRST`, `l1.INHERIT_ALL`), as
+  every other pair of blocks hands over: L31 prefetches L32's first weights and leaves its stream in SBUF.
+- **Scheduling in the members** (`b1.py`, `b1attn.py`, `b1moe.py`): `b1.REST_AFTER_Z` (hc_in's Sinkhorn tail
+  behind the attention's z staging: it delayed the z exchange both cores wait for), `b1attn.PREFETCH_ENG` (the
+  "ar1done" prefetch on the sync queue, behind the AR-8 result load, instead of the ACT queue, where it ran
+  during the AR-8), `b1moe.WS_BUFS = 3` and `UP1_AFTER_S0` (slot 0's scale gather ahead of slot 1's weights on
+  the quadrant DMA rings), `b1.HCF_AT = "ar1done"` (hc_in(ffn)'s constants right behind the AR-8 result load)
+  and `b1.BDM_LOCAL` (hc_mix's diagonal mask made at each use instead of a launch constant the compiler
+  spilled and reloaded late).
+
+The member changes are in the L08-L23 launch and the prologue + L00-L07 launch too; their r0 / r2 members,
+which prefetch at "down", keep the ACT queue (with the sync queue L08-L23 was ~45 us longer). Live, rank 0's
+device time of a bs1 step's launches (system trace, median of 25 steps) went from 2286 / 4232 / 4226 / 1522 us
+(prologue + L00-L07, L08-L23, L24-L39 + head, drafter) to 2252 / 4104 / 3966 / 1522 us; two traces of the same
+NEFF differ by up to ~45 us.
+
 ## Architecture
 
 A decoder-only MoE reasoning model. The pieces with no analogue in the dense
@@ -620,6 +644,7 @@ Pass `quantization="fp8"` or leave it unset. Anything else is rejected by
 | fp8 / fp4 quantized weights | **Working** | The only supported scheme; see above. |
 | `tensor_parallel_size = 64` | **Working** | The tested configuration. |
 | Concurrency (`max_num_seqs > 1`) | **Not supported** | Kept at 1. Uncapped runs stalled mid-decode in the measured pass; the span and `num_seqs` graph axes are bucketed, but the ragged-draft axis is not yet bounded. |
+| Structured outputs (`enable_structured_outputs`) | **Not supported** | Rejected by the factory: a grammar truncates the DSpark drafts and the fused decode launches run full 6-row spans only. The grammar mask itself is laid out on the head's padded vocabulary shards (`_vocab_layout_mask`) and applied to greedy rows too. |
 | Vision tower | **Not supported** | The checkpoint carries one; it is off the tokens-to-logits path and not placed by the floorplan. `factory.py` rejects `mm_encoder_only`. |
 | `--runner generate` | **Not supported** | Rejected by the factory. |
 | Trn3 | **Working** | SDK 2.33 on `trn3.48xlarge`, the integration test passing; see the model README's Trn3 section for what changed. |

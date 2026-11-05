@@ -34,6 +34,10 @@ from .head import head_kernel
 LAST_SHARE = [None]
 INHERIT = [None]
 _HANDOFF = ("attn_next", "next_b1", "pre_next", "S", "xin", "S_src", "gate", "pre", "pref")
+#: merged launches: the previous part's last member handed this part's first one its stream (SBUF),
+#: prefetched weights and constants (`l0.NEXT_FIRST`): inherit those too
+INHERIT_ALL = [False]
+_OWN = ("attn_next", "next_b1", "pre_next")
 
 
 @nki.jit
@@ -108,7 +112,7 @@ def layers_decode_L32_L39_head_tp32(
     if INHERIT[0] is not None:
         # (merged launch: the previous part's launch-level SBUF tiles and tables)
         for _k, _v in INHERIT[0].items():
-            if _k not in _HANDOFF:
+            if _k not in _HANDOFF or (INHERIT_ALL[0] and _k not in _OWN):
                 share["b1"].setdefault(_k, _v)
     # L32 (r1_idx)
     with member(0, r1_idx_decode):

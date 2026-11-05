@@ -253,6 +253,12 @@ def _fc_gather_last(x: torch.Tensor, group_name: str) -> torch.Tensor:
     return _fc_all_gather_tensor(x, x.dim() - 1, group_name)
 
 
+def _gather_mask(mask: torch.Tensor, group_name: str) -> torch.Tensor:
+    """Every rank's columns of a boolean mask, concatenated in rank order (through int32:
+    the collective's dtype)."""
+    return _fc_gather_last(mask.to(torch.int32), group_name) != 0
+
+
 def _group_name(tp_group) -> str:
     """The functional-collective name of a `GroupCoordinator`'s device group."""
     return _fc_resolve_group_name(tp_group.device_group)
@@ -2686,7 +2692,14 @@ def _sample_full_vocab(full: torch.Tensor, sampling_params: torch.Tensor, seeds:
         kk = k.clamp(min=1, max=_SAMPLE_TOPK_WINDOW)
         thr_k = torch.where((k <= 0).unsqueeze(-1), neg, vals.gather(-1, (kk - 1).unsqueeze(-1)))
         top_p = sampling_params[:, 1]
-        cum = torch.cumsum(torch.exp(vals - torch.logsumexp(x, dim=-1, keepdim=True)), dim=-1)
+        # top-p on the distribution top-k leaves, renormalized (vLLM's and the plugin sampler's
+        # order): a top-k row's nucleus is taken over its k candidates, a row without top-k
+        # over the whole vocabulary
+        in_k = (torch.arange(_SAMPLE_TOPK_WINDOW, device=x.device).unsqueeze(0) < kk.unsqueeze(-1)) | (k <= 0).unsqueeze(-1)
+        vals_k = torch.where(in_k, vals, neg)
+        lse = torch.where((k <= 0).unsqueeze(-1), torch.logsumexp(x, dim=-1, keepdim=True),
+                          torch.logsumexp(vals_k, dim=-1, keepdim=True))
+        cum = torch.cumsum(torch.exp(vals_k - lse), dim=-1)
         need = (cum < top_p.unsqueeze(-1)).sum(dim=-1) + 1
         thr_p = vals.gather(-1, (need.clamp(max=_SAMPLE_TOPK_WINDOW) - 1).unsqueeze(-1))
         thr_p = torch.where(((need > _SAMPLE_TOPK_WINDOW) | (top_p >= 1.0)).unsqueeze(-1), neg, thr_p)
@@ -5123,7 +5136,8 @@ class DeepseekV41ForCausalLM(nn.Module):
             # An all-greedy speculative decode step: the last fused launch also runs the
             # head and the argmax (`mk_model.fuses_head`); its logits are never read
             # (the step returns the rejection sampler's tokens).
-            head = (dump is None and not _TRACE_INPUTS and self.sampler is not None
+            # (not under a grammar mask: the in-kernel argmax does not read one)
+            head = (dump is None and not _TRACE_INPUTS and self.sampler is not None and logit_mask is None
                     and sampling_params is not None and sampling_hint is not None
                     and bool(sampling_hint[0]) and spec_decode_metadata is not None
                     and plan.is_last and mk_model.fuses_head(self, step))
@@ -5268,14 +5282,8 @@ class DeepseekV41ForCausalLM(nn.Module):
             )
             return logits
 
-        if logit_mask is not None and self.vocab_pad:
-            full = self.world_size * self.part_vocab_size
-            if logit_mask.shape[-1] < full:
-                pad_shape = list(logit_mask.shape)
-                pad_shape[-1] = full - logit_mask.shape[-1]
-                logit_mask = torch.cat(
-                    [logit_mask, logit_mask.new_zeros(pad_shape)], dim=-1
-                )
+        if logit_mask is not None:
+            logit_mask = self._vocab_layout_mask(logit_mask)
         # `sampling_hint` = (all_greedy, no_top_k, no_top_p), host booleans from the
         # runner's sampling metadata (`NeuronModelRunner`): temperature-sampled rows take
         # the full-vocabulary sampler, an all-greedy step keeps the original graph.
@@ -5661,6 +5669,31 @@ class DeepseekV41ForCausalLM(nn.Module):
         os.makedirs(_DUMP_DIR, exist_ok=True)
         torch.save(tensor[:live_rows].detach().cpu(), os.path.join(_DUMP_DIR, f"step{step}_{name}.pt"))
 
+    def _vocab_layout_mask(self, logit_mask: torch.Tensor) -> torch.Tensor:
+        """The grammar mask in the head's vocabulary layout: `[rows, world * part_vocab_size]`,
+        every rank's `part_vocab_size`-wide shard side by side and the pad columns False, as both
+        samplers read it (the plugin's slices it at `rank * part_vocab_size`, the random path masks
+        the gathered logits with it). The runner hands it full-width (`[rows, vocab_size]`) or, with
+        its lm-head mask sharding (synchronous scheduling), as this rank's slice of an even split of
+        the vocabulary (`vocab_size // world` columns), which does not line up with the head's padded
+        shards: those slices are gathered back first."""
+        vocab = int(self.config.vocab_size)
+        full = self.world_size * self.part_vocab_size
+        width = int(logit_mask.shape[-1])
+        if width == full:
+            return logit_mask
+        if width != vocab:
+            if width * self.world_size != vocab:
+                raise ValueError(
+                    f"logit_mask has {width} columns: expected {vocab} (the vocabulary), "
+                    f"{vocab // self.world_size} (one rank's even share of it) or {full}")
+            logit_mask = _compiled(_gather_mask)(logit_mask, _group_name(self.tp_group))
+        if full > vocab:
+            pad_shape = list(logit_mask.shape)
+            pad_shape[-1] = full - vocab
+            logit_mask = torch.cat([logit_mask, logit_mask.new_zeros(pad_shape)], dim=-1)
+        return logit_mask
+
     def _random_sampler_entry(self, filter_topk: bool):
         """The sampler for steps with temperature-sampled rows, as one compiled graph:
         the shards' logits gathered to the full vocabulary, then `_sample_full_vocab`.
@@ -5715,7 +5748,11 @@ class DeepseekV41ForCausalLM(nn.Module):
                 sampled = sampler.forward(logits_shard, sampling_params, logit_mask, rank)
                 if sampling_params is None:
                     return sampled
-                greedy_ids = _fc_gather_last(logits_shard, group_name).argmax(dim=-1)
+                full = _fc_gather_last(logits_shard, group_name)
+                if logit_mask is not None:
+                    # (the grammar's mask, in the head's vocabulary layout: `_vocab_layout_mask`)
+                    full = full.masked_fill(~logit_mask.to(torch.bool), float("-inf"))
+                greedy_ids = full.argmax(dim=-1)
                 return _greedy_override(sampled, greedy_ids, sampling_params)
 
             fn = self.__dict__["_sampler_entry_fn"] = _compile_fn(sample)

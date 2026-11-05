@@ -78,10 +78,26 @@ GATE_DMAS = True
 #: instead of the gate: every DMA a member traces without an explicit priority at this DMA priority (the
 #: collectives' transfers ahead of the hoisted loads); None: off
 LOW_PRIO = None
+#: hc_in(attn)'s remaining tail steps (`Ticker.rest`, core COEF_A) scheduled after the attention side's z
+#: staging (`b1attn.ANCH["zq"]`): the scheduler otherwise ran ~3-5 us of them ahead of that staging's
+#: copy / quantize on the vector engine, and the other core waited for the z exchange
+REST_AFTER_Z = True
 #: the MoE's static weights issued during the attention side ("r" router, "s" shared expert)
 MST_EARLY = "rs"
 #: ... and behind the attention side
 MST_LATE_ATTN = ""
+#: core COEF_F's hc_in(ffn) constants (`fsb`, ~2 MB): "attn" issued in the attention's `after_gemm`, or
+#: "ar1done" right behind the attention all-reduce's result load and ahead of the next member's weight
+#: prefetch on the same (sync) queue. In the "attn" order the scheduler sank the load behind the
+#: router (its SBUF region overlapped the router's operands), it landed ~5 us later, and the routing's
+#: softplus waited for hc_mix's matmuls on it (its destination reused part of fsb's region): core
+#: COEF_F's routing began ~4 us after the other core's
+HCF_AT = "ar1done"
+#: hc_mix's diagonal mask rebuilt at each use (a GpSimd iota + one vector-engine compare) instead of the
+#: launch's constant tile `L["bdm"]`: the compiler spilled that tile, and its reloads (queued behind the
+#: block's weight loads) held the mix's vector-engine multiply -- and the GEMM reusing the mix's PSUM
+#: tile -- for up to ~15 us
+BDM_LOCAL = True
 BF = nl.bfloat16
 F32 = nl.float32
 
@@ -141,12 +157,14 @@ def consts(L, C):
     msum2 = nl.ndarray((PT, NS), dtype=F32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=msum2[0:NS], data=trow[0:NS], op0=nl.equal, operand0=tcol[0:NS, 0:1])
     mix = 24
-    cj = nl.ndarray((PT, C, mix), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.iota(dst=cj, pattern=[[1, C], [0, mix]], offset=0, channel_multiplier=0)
-    cjf = nl.ndarray((PT, C * mix), dtype=F32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=cjf, src=cj.reshape((PT, C * mix)))
-    bdm = nl.ndarray((PT, C * mix), dtype=F32, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=bdm[0:NP], data=cjf[0:NP], op0=nl.equal, operand0=tcol[0:NP, 1:2])
+    bdm = None
+    if not BDM_LOCAL:
+        cj = nl.ndarray((PT, C, mix), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.iota(dst=cj, pattern=[[1, C], [0, mix]], offset=0, channel_multiplier=0)
+        cjf = nl.ndarray((PT, C * mix), dtype=F32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=cjf, src=cj.reshape((PT, C * mix)))
+        bdm = nl.ndarray((PT, C * mix), dtype=F32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=bdm[0:NP], data=cjf[0:NP], op0=nl.equal, operand0=tcol[0:NP, 1:2])
     ib = nl.ndarray((PT, H0), dtype=F32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=ib[0:NS], data=qrow[0:NS, 0:H0], op0=nl.equal, operand0=tcol[0:NS, 2:3])
     L["msum2"] = msum2
@@ -300,13 +318,16 @@ def x_norm(L, acc, norm_w, C, eng_w, w60=None):
     return xn
 
 
-def hc_consts(fnbd, base, scale, C, eng):
+def hc_consts(fnbd, base, scale, C, eng, after=None, box=None):
     """A sublayer's static hc_in tensors in SBUF (issued early): `fn.T` (block-diagonal hi | lo),
-    the base and the scales broadcast to the 128 partitions."""
+    the base and the scales broadcast to the 128 partitions. `after`: the `fn.T` load scheduled
+    after it; `box`: that load's instruction appended."""
     NS = 2 * H0
     mix = fnbd.shape[3] // C
     fsb = nl.ndarray(tuple(fnbd.shape), dtype=BF, buffer=nl.sbuf)
-    nisa.dma_copy(dst=fsb, src=fnbd, **_hw(eng))
+    ins = _after(nisa.dma_copy(dst=fsb, src=fnbd, **_hw(eng)), after)
+    if box is not None:
+        box.append(ins)
     return fsb, bcast60(base, mix, NS, eng), bcast60(scale, 3, NS, eng)
 
 
@@ -346,6 +367,15 @@ def hc_mix(L, S, consts, C, after=None, parts=False):
     xT = nl.ndarray((PT, 8, NS), dtype=BF, buffer=nl.sbuf)
     nisa.tensor_copy(dst=xT, src=tp)
     mix = fsb.shape[3] // C
+    if BDM_LOCAL:
+        # bdc[p, c'] = (c' == p % C) = sum over t' of (t' C + c' - p == 0) (p < NP = T6 C), broadcast
+        # over the mix columns in the multiply
+        bdi = nl.ndarray((PT, C, T6), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.iota(dst=bdi[0:NP], pattern=[[1, C], [C, T6]], offset=0, channel_multiplier=-1)
+        bde = nl.ndarray((PT, C, T6), dtype=F32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=bde[0:NP], data=bdi[0:NP], op0=nl.equal, operand0=0.0, engine=nisa.engine.vector)
+        bdc = nl.ndarray((PT, C), dtype=F32, buffer=nl.sbuf)
+        nisa.tensor_reduce(dst=bdc[0:NP], op=nl.add, data=bde[0:NP], axis=(2,))
     mp = nl.ndarray((NP, C * mix), dtype=F32, buffer=nl.psum)
     n = 0
     for hl in range(2):
@@ -357,7 +387,12 @@ def hc_mix(L, S, consts, C, after=None, parts=False):
                                    accumulate=(n > 0))
                     n += 1
     dg = nl.ndarray((PT, C * mix), dtype=F32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=dg[0:NP], data1=mp, data2=L["bdm"][0:NP], op=nl.multiply)
+    if BDM_LOCAL:
+        v3 = [[C * mix, NP], [mix, C], [1, mix]]
+        nisa.tensor_tensor(dst=dg.ap(pattern=v3, offset=0), data1=mp.ap(pattern=v3, offset=0),
+                           data2=bdc.ap(pattern=[[C, NP], [1, C], [0, mix]], offset=0), op=nl.multiply)
+    else:
+        nisa.tensor_tensor(dst=dg[0:NP], data1=mp, data2=L["bdm"][0:NP], op=nl.multiply)
     part = nl.ndarray((PT, mix), dtype=F32, buffer=nl.sbuf)
     nisa.tensor_reduce(dst=part[0:NP], op=nl.add, data=dg.ap(pattern=[[C * mix, NP], [1, mix], [mix, C]], offset=0),
                        axis=(2,))
@@ -520,9 +555,9 @@ class Ticker:
         finally:
             _STEP_PIN[0] = None
 
-    def rest(self):
+    def rest(self, after=None):
         while self.gen is not None:
-            self(1)
+            self(1, after=after)
         return self.box[0] if self.box else None
 
 
@@ -721,7 +756,7 @@ def _block(stream, pre_mix, hca_fn_t, hca_base, hca_scale, attn_norm_w, hcf_fn_t
     def after_gemm():
         # the ffn sublayer's static tensors
         st["w60f"] = packed_w(ffn_norm_w, C, BF, eng_w)
-        if pid == COEF_F:
+        if pid == COEF_F and HCF_AT != "ar1done":
             st["hcf"] = hc_consts(hcf_fn_t, hcf_base, hcf_scale, C, eng_w)
         # the MoE's static weights (router, shared expert)
         st["mst"] = b1moe.moe_static(pid, C, gate_w_t, sh_w1, sh_s1, sh_w2, sh_s2, eng_w, bufs=L, parts=MST_EARLY)
@@ -754,7 +789,7 @@ def _block(stream, pre_mix, hca_fn_t, hca_base, hca_scale, attn_norm_w, hcf_fn_t
     # (while the all-reduce is in flight: the coefficients finished and swapped, the shortcut's and
     # hc_out(attn)'s stream parts, the MoE's static weights)
     if pid == COEF_A:
-        coef_a = tick_a.rest()
+        coef_a = tick_a.rest(after=A.ANCH.get("zq") if REST_AFTER_Z else None)
     else:
         coef_a = nl.ndarray((PT, 2 * HC + HC * HC), dtype=F32, buffer=nl.sbuf)
         nisa.memset(coef_a, 0.0)
@@ -764,9 +799,13 @@ def _block(stream, pre_mix, hca_fn_t, hca_base, hca_scale, attn_norm_w, hcf_fn_t
 
     # ---------------------------------------------------------------- hc_in(ffn), hc_out(attn), MoE
     a16 = load_packed(cc_dst, NP, sync)
+    hcb = []
+    if pid == COEF_F and HCF_AT == "ar1done":
+        # (behind the attention all-reduce's result load, ahead of the prefetch: it lands before the router ends)
+        st["hcf"] = hc_consts(hcf_fn_t, hcf_base, hcf_scale, C, eng_w, after=_LP[0], box=hcb)
     if pf_at == "ar1done":
         # (behind the attention all-reduce's result: the DMA queues idle until the experts' loads)
-        a16_ld = _LP[0]
+        a16_ld = hcb[-1] if hcb else _LP[0]
         pd = A.prefetch_next(pid, wq_a_s, share)
         for d in (pd if isinstance(pd, list) else [pd]):
             if d is not None:

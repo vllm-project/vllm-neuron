@@ -18,3 +18,8 @@ the prefill phase keeps the original kernels and weights.
 """
 
 from . import blockquant, draft_batched, draft_seq, layout, mk_common, mk_compress, mk_moe, mk_mx  # noqa: F401
+
+#: the single-sequence entry (`draft_seq`) reads the head rows K-major, `[dim // 128, 128, part]` (= head_w.T):
+#: its head GEMM runs in the PE's column-tiling mode (`mk_compress._gemm_ct`); `mk_model.draft_weights_decode
+#: (kmajor_head=True)` passes the model's copy (`mk_model.head_kmajor`). The batched entry keeps the rows as they are.
+HEAD_W_KMAJOR = True

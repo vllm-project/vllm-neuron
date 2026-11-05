@@ -274,7 +274,8 @@ inter-token latency is one decode step (a streamed chunk per step).
 
 Every request of every cell completed with its 128 tokens, and the texts are coherent answers
 to the prompts. The integration test passed on the same code (10 min against a warm compile
-cache). For scale: the first Trn3 run of this port, one NKI kernel per op, decoded at ~100 ms
+cache). Re-run 2026-11-05 on this tree: the integration texts, every batch-1 text and the batch-1
+acceptance are the same, and the median inter-token latency is within 0.03 ms in every batch-1 cell. For scale: the first Trn3 run of this port, one NKI kernel per op, decoded at ~100 ms
 TPOT and 1060 ms TTFT at 512 input tokens.
 
 ## Example Checkpoints

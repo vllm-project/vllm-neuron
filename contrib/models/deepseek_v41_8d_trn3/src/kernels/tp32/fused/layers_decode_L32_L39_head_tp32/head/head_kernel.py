@@ -37,6 +37,72 @@ NEG = -1.0e30
 #: the head GEMM: no xh / xhn round trips through shared HBM and no core barriers on them
 #: (core 1 waited for core 0's collapse + norm, ~50 us at T = 6).
 HEAD_BOTH_CORES = True
+#: The pad mask and the (max, index) on each core's own half of the rank's vocabulary (the
+#: columns its head GEMM wrote: no barrier before them), and ONE all-gather of both cores'
+#: (value, index) pairs -- `2 * world` candidates a row, in vocabulary order, so the highest
+#: with ties to the lowest index is `argmax`'s token -- instead of core 0 over the whole row and
+#: two all-gathers (values, indices).
+HEAD_ARGMAX_SPLIT = True
+#: The collapse and the final norm's elementwise parts on the rows' column blocks spread over the
+#: partitions (partition r * nblk + b: row r's columns b * w .., the same per-element operations),
+#: the sum of squares on the rows as before (through a private HBM copy of the collapsed rows): a
+#: handful of instructions on 120 partitions instead of ~25 on the step's 6 (~30 us at T = 6).
+HEAD_SPREAD = True
+
+
+def _spread_blocks(nr, ncols):
+    nblk = max(1, PT // nr)
+    while ncols % nblk:
+        nblk -= 1
+    return nblk, ncols // nblk
+
+
+def _collapse_norm_spread(st, pre_mix, norm_w, hc, dim, T, Tp, xhn_c, ch):
+    """`HEAD_SPREAD`: `xhn_c[0:Tp]` = the collapsed, normed rows (zero past T) -- the HEAD_BOTH_CORES
+    path's arithmetic."""
+    nblk, w = _spread_blocks(T, dim)
+    P = T * nblk
+    width = hc * dim
+    pm = nl.ndarray((PT, hc), dtype=nl.float32, buffer=nl.sbuf)
+    rg = nl.ndarray((PT, hc, w), dtype=nl.bfloat16, buffer=nl.sbuf)
+    wn = nl.ndarray((PT, w), dtype=nl.float32, buffer=nl.sbuf)
+    for r in range(T):
+        p0 = r * nblk
+        nisa.dma_copy(dst=pm[p0 : p0 + nblk, :], src=pre_mix.ap(pattern=[[0, nblk], [1, hc]], offset=r * hc))
+        nisa.dma_copy(dst=rg[p0 : p0 + nblk, 0:hc, :], src=st.ap(pattern=[[w, nblk], [dim, hc], [1, w]], offset=r * width))
+        nisa.dma_copy(dst=wn[p0 : p0 + nblk, :], src=norm_w.ap(pattern=[[w, nblk], [1, w]], offset=0))
+    acc = nl.ndarray((PT, w), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=acc[0:P, :], data=rg[0:P, 0, :], op0=nl.multiply, operand0=pm[0:P, 0:1],
+                       engine=nisa.engine.vector)
+    for c in range(1, hc):
+        nisa.scalar_tensor_tensor(dst=acc[0:P, :], data=rg[0:P, c, :], op0=nl.multiply,
+                                  operand0=pm[0:P, c : c + 1], op1=nl.add, operand1=acc[0:P, :])
+    t16 = nl.ndarray((PT, w), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=t16[0:P, :], src=acc[0:P, :])
+    # the sum of squares on the rows (`norm_rows`' chunks and order)
+    yh = nl.ndarray((T, dim), dtype=nl.bfloat16, buffer=nl.private_hbm)
+    nisa.dma_copy(dst=yh.ap(pattern=[[w, P], [1, w]], offset=0), src=t16[0:P, :])
+    yr = nl.ndarray((PT, dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.dma_copy(dst=yr[0:T, :], src=yh[0:T, :])
+    ss = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
+    sum_squares(ss, yr, T, dim, ch)
+    rstd = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
+    rstd[0:T, :] = rsqrt_newton(nl.add(nl.multiply(ss[0:T, 0:1], 1.0 / dim), NORM_EPS))
+    rh = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.private_hbm)
+    nisa.dma_copy(dst=rh[0:T, 0:1], src=rstd[0:T, 0:1])
+    rs = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
+    for r in range(T):
+        nisa.dma_copy(dst=rs[r * nblk : (r + 1) * nblk, 0:1], src=rh.ap(pattern=[[0, nblk], [1, 1]], offset=r))
+    yv = nl.ndarray((PT, w), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=yv[0:P, :], op=nl.copy, data=t16[0:P, :], scale=rs[0:P, 0:1])
+    nisa.tensor_tensor(dst=yv[0:P, :], data1=yv[0:P, :], data2=wn[0:P, :], op=nl.multiply)
+    o16 = nl.ndarray((PT, w), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=o16[0:P, :], src=yv[0:P, :])
+    nisa.dma_copy(dst=xhn_c.ap(pattern=[[w, P], [1, w]], offset=0), src=o16[0:P, :])
+    if T < Tp:
+        z = nl.ndarray((PT, dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.memset(z, 0.0)
+        nisa.dma_copy(dst=xhn_c[T:Tp, :], src=z[0 : Tp - T, :])
 
 
 def _half(n, pid):
@@ -52,8 +118,20 @@ def head_greedy_body(stream, pre_mix, norm_w, head_w, vocab_start, groups_world,
     `vocab_start [1, 1]` int32 this rank's first column."""
     vocab_size, _kver = flags
     T, hc, dim = stream.shape
-    part = head_w.shape[0]
-    assert head_w.shape[1] == dim and part % PT == 0 and T <= PT, (T, part, dim)
+    if len(head_w.shape) == 3:
+        # (`layout.py`: the head rows K-major, `[dim // 128, 128, part]` = head_w.T: the GEMM stages
+        # its weight tiles with plain DMAs instead of DMA transposes)
+        part = head_w.shape[2]
+        assert head_w.shape[0] * head_w.shape[1] == dim and head_w.shape[1] == PT, (head_w.shape, dim)
+        head_w = head_w.reshape((dim, part))
+        kmajor = True
+    else:
+        part = head_w.shape[0]
+        assert head_w.shape[1] == dim, (head_w.shape, dim)
+        kmajor = False
+    assert part % PT == 0 and T <= PT, (T, part, dim)
+    from . import mk_compress as _mc
+    _mc.HEAD_CT_ROWS[0] = T
     world = len(groups_world[0])
     W8 = max(world, 8)
     Tp = pad_to(T, PT)
@@ -71,8 +149,17 @@ def head_greedy_body(stream, pre_mix, norm_w, head_w, vocab_start, groups_world,
     gi_src = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.shared_hbm, name="hd_gi_src")
     gv_dst = nl.ndarray((world * T, 1), dtype=nl.float32, buffer=nl.shared_hbm, name="hd_gv_dst")
     gi_dst = nl.ndarray((world * T, 1), dtype=nl.float32, buffer=nl.shared_hbm, name="hd_gi_dst")
+    # (`HEAD_ARGMAX_SPLIT`: core c's row t at row c * T + t, (value, index); gathered rank-major)
+    g2_src = nl.ndarray((2 * T, 2), dtype=nl.float32, buffer=nl.shared_hbm, name="hd_g2_src")
+    g2_dst = nl.ndarray((world * 2 * T, 2), dtype=nl.float32, buffer=nl.shared_hbm, name="hd_g2_dst")
 
-    if HEAD_BOTH_CORES and Tp == PT:
+    if HEAD_BOTH_CORES and Tp == PT and HEAD_SPREAD and T <= 64:
+        xhn_c = nl.ndarray((Tp, dim), dtype=nl.bfloat16, buffer=nl.private_hbm)
+        ch = 1024 if dim % 1024 == 0 else dim
+        _collapse_norm_spread(st, pre_mix, norm_w, hc, dim, T, Tp, xhn_c, ch)
+        lo, hi = _half(part, pid)
+        bf16_gemm_rows(xhn_c, head_w, lg, Tp, dim, part, lo, hi, kmajor=kmajor)
+    elif HEAD_BOTH_CORES and Tp == PT:
         xhn_c = nl.ndarray((Tp, dim), dtype=nl.bfloat16, buffer=nl.private_hbm)
         ch = 1024 if dim % 1024 == 0 else dim
         for r0, nr in rows:
@@ -107,7 +194,7 @@ def head_greedy_body(stream, pre_mix, norm_w, head_w, vocab_start, groups_world,
             # (rows past T zero: the pad rows the GEMM reads)
             nisa.dma_copy(dst=xhn_c[r0 : r0 + PT, :], src=y16)
         lo, hi = _half(part, pid)
-        bf16_gemm_rows(xhn_c, head_w, lg, Tp, dim, part, lo, hi)
+        bf16_gemm_rows(xhn_c, head_w, lg, Tp, dim, part, lo, hi, kmajor=kmajor)
     # collapse with the last pre_mix (fp32 sum, bf16 out); the pad rows zero
     elif pid == 0:
         for r0, nr in rows:
@@ -136,7 +223,10 @@ def head_greedy_body(stream, pre_mix, norm_w, head_w, vocab_start, groups_world,
             nisa.dma_copy(dst=xhn[T:Tp, :], src=padh[0 : Tp - T, :])
         nisa.core_barrier(data=xhn, cores=(0, 1))
         lo, hi = _half(part, pid)
-        bf16_gemm_rows(xhn, head_w, lg, Tp, dim, part, lo, hi)
+        bf16_gemm_rows(xhn, head_w, lg, Tp, dim, part, lo, hi, kmajor=kmajor)
+    if HEAD_ARGMAX_SPLIT:
+        return _argmax_split(lg, vocab_start, vocab_size, T, part, pid, rows, world, rg_world,
+                             g2_src, g2_dst, ids)
     nisa.core_barrier(data=lg, cores=(0, 1))
 
     # this rank's (max, global index) per row, the vocabulary pad pushed to -1e30
@@ -182,6 +272,65 @@ def head_greedy_body(stream, pre_mix, norm_w, head_w, vocab_start, groups_world,
         trow = nl.ndarray((PT, W8), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(trow, 0.0)
         nisa.dma_copy(dst=trow[0:T, 0:world], src=gi_dst.ap(pattern=[[1, T], [T, world]], offset=0))
+        gbest = nl.ndarray((PT, 8), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.max8(dst=gbest[0:T, :], src=vrow[0:T, :])
+        gidx = nl.ndarray((PT, 8), dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.nc_find_index8(dst=gidx[0:T, :], data=vrow[0:T, :], vals=gbest[0:T, :])
+        tok = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.nc_n_gather(dst=tok[0:T, :], data=trow[0:T, :], indices=gidx[0:T, 0:1])
+        ti = nl.ndarray((PT, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=ti[0:T, :], src=tok[0:T, :])
+        nisa.dma_copy(dst=ids[0:T, 0:1], src=ti[0:T, :])
+    nisa.core_barrier(data=ids, cores=(0, 1))
+    return (ids,)
+
+
+def _argmax_split(lg, vocab_start, vocab_size, T, part, pid, rows, world, rg_world, g2_src, g2_dst, ids):
+    """`HEAD_ARGMAX_SPLIT`: the rows' argmax over the world's vocabulary from each core's half of
+    this rank's logits (`lg` columns `_half(part, pid)`, written by this core's head GEMM)."""
+    lo, hi = _half(part, pid)
+    hv = hi - lo
+    n2 = 2 * world
+    W2 = max(n2, 8)
+    vs = bcast_row(vocab_start[0:1, 0:1], 1, PT)
+    for r0, nr in rows:
+        l16 = nl.ndarray((PT, hv), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.dma_copy(dst=l16[0:nr, :], src=lg[r0 : r0 + nr, lo:hi])
+        l32 = nl.ndarray((PT, hv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=l32[0:nr, :], src=l16[0:nr, :])
+        ci = nl.ndarray((PT, hv), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.iota(dst=ci[0:nr, :], pattern=[[1, hv]], offset=lo, channel_multiplier=0)
+        cf = nl.ndarray((PT, hv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=cf[0:nr, :], src=ci[0:nr, :])
+        live = nl.ndarray((PT, hv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=live[0:nr, :], data=cf[0:nr, :], op0=nl.add, operand0=vs[0:nr, 0:1],
+                           op1=nl.less, operand1=float(vocab_size))
+        dead = nl.ndarray((PT, hv), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=dead[0:nr, :], data=live[0:nr, :], op0=nl.add, operand0=-1.0,
+                           op1=nl.multiply, operand1=-NEG)
+        nisa.tensor_tensor(dst=l32[0:nr, :], data1=l32[0:nr, :], data2=dead[0:nr, :], op=nl.add)
+        best = nl.ndarray((PT, 8), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.max8(dst=best[0:nr, :], src=l32[0:nr, :])
+        bidx = nl.ndarray((PT, 8), dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.nc_find_index8(dst=bidx[0:nr, :], data=l32[0:nr, :], vals=best[0:nr, :])
+        pr = nl.ndarray((PT, 2), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=pr[0:nr, 0:1], src=best[0:nr, 0:1])
+        bf = nl.ndarray((PT, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=bf[0:nr, :], src=bidx[0:nr, 0:1])
+        # (the global index: this half's first column, then the rank's)
+        nisa.tensor_scalar(dst=bf[0:nr, :], data=bf[0:nr, :], op0=nl.add, operand0=float(lo))
+        nisa.tensor_tensor(dst=pr[0:nr, 1:2], data1=bf[0:nr, :], data2=vs[0:nr, 0:1], op=nl.add)
+        nisa.dma_copy(dst=g2_src[pid * T + r0 : pid * T + r0 + nr, 0:2], src=pr[0:nr, :])
+    nisa.core_barrier(data=g2_src, cores=(0, 1))
+    ncc.all_gather(srcs=[g2_src], dsts=[g2_dst], replica_group=rg_world, collective_dim=0)
+    # candidate j = 2 * rank + core of row t is gathered row j * T + t: vocabulary order
+    if pid == 0:
+        vrow = nl.ndarray((PT, W2), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(vrow, NEG)
+        nisa.dma_copy(dst=vrow[0:T, 0:n2], src=g2_dst.ap(pattern=[[2, T], [2 * T, n2]], offset=0))
+        trow = nl.ndarray((PT, W2), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(trow, 0.0)
+        nisa.dma_copy(dst=trow[0:T, 0:n2], src=g2_dst.ap(pattern=[[2, T], [2 * T, n2]], offset=1))
         gbest = nl.ndarray((PT, 8), dtype=nl.float32, buffer=nl.sbuf)
         nisa.max8(dst=gbest[0:T, :], src=vrow[0:T, :])
         gidx = nl.ndarray((PT, 8), dtype=nl.uint32, buffer=nl.sbuf)

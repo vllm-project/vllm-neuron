@@ -1439,6 +1439,20 @@ def head_args(model) -> list:
     return got
 
 
+def head_kmajor(model) -> torch.Tensor:
+    """This rank's head rows K-major, `[dim // 128, 128, part]` (= `head_weight.T`), for the optimized
+    launches whose greedy head reads them so (`HEAD_W_KMAJOR` in the launch package: the weight tiles
+    load with plain DMAs, the GEMM runs in the PE's column-tiling mode). Made once, through the host:
+    the same bytes, re-laid (+42 MB a rank)."""
+    got = model.__dict__.get("_mk_head_kmajor")
+    if got is None:
+        w = model.head_weight
+        part, dim = w.shape
+        got = model.__dict__["_mk_head_kmajor"] = (
+            w.detach().cpu().t().contiguous().reshape(dim // 128, 128, part).to(w.device))
+    return got
+
+
 #: `DEEPSEEK_V41_FUSE_EMBED` (default 1): a decode step's first fused launch embeds the
 #: step's tokens and expands them to the hyper-connection copies itself
 #: (`mk_kernels.embed_expand`) instead of the embedding's all-reduce graph and the
@@ -2093,6 +2107,10 @@ def _plan_fused(model, blocks, stream, pre_mix, step: StepIndices, head: bool,
     if fk is not None and _MOE_TP and step.phase == "decode" and int(step.T) <= moe_tp_max_t() and plan.scheme == "tp32":
         # (the optimized launches' members read the TP x EP layout: `fused/<launch>/moe_tp.py`)
         params = _moe_tp_params(model, blocks, params)
+    if fk is not None and head and mk_kernels.fused_attr(name, "HEAD_W_KMAJOR", False):
+        # (the launch's greedy head reads its rows K-major: `head_kmajor`)
+        hw, hk = model.head_weight, head_kmajor(model)
+        params = [hk if x is hw else x for x in params]
     fk = fk or gen
     # the step's own tensors: refilled every step
     dyn = {}
@@ -2344,19 +2362,21 @@ def _draft_ckpt_slicer(model):
     return ckpt
 
 
-def draft_weights_decode(model, tp: bool = False) -> tuple:
+def draft_weights_decode(model, tp: bool = False, kmajor_head: bool = False) -> tuple:
     """`draft_weights` in the optimized decode drafter's layout (`kernels/tp32/draft_decode/layout.py`:
     `main_proj` and the shared expert's gate / up projections column-sharded over the world, each rank
     its own slice), as two lists in the same order; cached on the model. Made once from this rank's
     copies through the host (as `draft_weights` is); the prefill drafter keeps `draft_weights`.
     `tp`: the stages' MoE in the TP x EP layout as well (`layout.moe_tp`: the single-sequence entry's,
     `_MOE_TP`), its routed slices from the checkpoint, checked against this rank's resident copy of
-    its first own expert."""
-    key = "_mk_draft_dec_tp_" if tp else "_mk_draft_dec_"
+    its first own expert. `kmajor_head`: the head rows K-major (`head_kmajor`), for the single-sequence entry
+    when its package reads them so (`draft_decode.HEAD_W_KMAJOR`)."""
+    pkg = mk_kernels._draft_decode_pkg()
+    kmajor_head = kmajor_head and getattr(pkg, "HEAD_W_KMAJOR", False)
+    key = ("_mk_draft_dec_tp_" if tp else "_mk_draft_dec_") + ("hk_" if kmajor_head else "")
     cached = model.__dict__.get(key)
     if cached is not None:
         return cached
-    pkg = mk_kernels._draft_decode_pkg()
     names = mk_kernels._positional_names(pkg.draft_seq.draft_body)
     w_names = names[names.index("main_proj") : names.index("cache0")]
     t_names = names[names.index("cache2") + 1 : names.index("groups_attn")]
@@ -2388,6 +2408,9 @@ def draft_weights_decode(model, tp: bool = False) -> tuple:
     device = weights[0].device
     by_name.update({n: _dev(t, device) for n, t in new.items()})
     out = ([by_name[n] for n in w_names], [by_name[n] for n in t_names])
+    if kmajor_head:
+        hw = model.head_weight
+        out = (out[0], [head_kmajor(model) if t is hw else t for t in out[1]])
     model.__dict__[key] = out
     if tp and rank == 0:
         _mk_log.info("deepseek_v41: the decode drafter's MoE in the TP x EP layout (%.1f s)",
@@ -2439,7 +2462,7 @@ def _run_draft_seq(model, seed_ids, tap, main_hidden, span, paged, meta=None):
         write_slots = _host_slots(paged).reshape(-1)[:length].to(torch.int32).reshape(-1, 1).contiguous().to(device)
     dphase = "prefill" if paged.at_zero else "decode"
     opt = mk_kernels.draft_optimized(dphase, model.mk_plan.scheme)
-    weights, tail = draft_weights_decode(model, tp=_DRAFT_MOE_TP) if opt else model._mk_draft()
+    weights, tail = draft_weights_decode(model, tp=_DRAFT_MOE_TP, kmajor_head=True) if opt else model._mk_draft()
     K = int(cfg.dspark_block_size)
     stages = list(model.mtp)
     kver = kernel_version(mk_kernels.DRAFT_DECODE_KIND, "tp32") if opt else kernel_version("draft", model.mk_plan.scheme)
@@ -2544,7 +2567,7 @@ def _draft_tail_rest(model, span, paged, ids, sel):
     device = ids.device
     table = _host_table(paged).to(torch.int32).reshape(-1, 1).contiguous().to(device)
     keep_alive(table)
-    weights, tail = draft_weights_decode(model, tp=_DRAFT_MOE_TP)
+    weights, tail = draft_weights_decode(model, tp=_DRAFT_MOE_TP, kmajor_head=True)
     K = int(cfg.dspark_block_size)
     stages = list(model.mtp)
     flags = (0, K, int(stages[0].attn.window_size), 9, kernel_version(mk_kernels.DRAFT_DECODE_KIND, "tp32"),

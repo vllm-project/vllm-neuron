@@ -540,6 +540,7 @@ Pass `quantization="fp8"` or leave it unset. Anything else is rejected by
 | fp8 / fp4 quantized weights | **Working** | The only supported scheme; see above. |
 | `tensor_parallel_size = 64` | **Working** | The tested configuration. |
 | Concurrency (`max_num_seqs > 1`) | **Not supported** | Kept at 1. Uncapped runs stalled mid-decode in the measured pass; the span and `num_seqs` graph axes are bucketed, but the ragged-draft axis is not yet bounded. |
+| Structured outputs (`enable_structured_outputs`) | **Not supported** | Rejected by the factory: a grammar truncates the DSpark drafts and the fused decode launches run full 6-row spans only. The grammar mask itself is laid out on the head's padded vocabulary shards (`_vocab_layout_mask`) and applied to greedy rows too. |
 | Vision tower | **Not supported** | The checkpoint carries one; it is off the tokens-to-logits path and not placed by the floorplan. `factory.py` rejects `mm_encoder_only`. |
 | `--runner generate` | **Not supported** | Rejected by the factory. |
 | Trn3 | **Working** | SDK 2.33 on `trn3.48xlarge`, the integration test passing; see the model README's Trn3 section for what changed. |

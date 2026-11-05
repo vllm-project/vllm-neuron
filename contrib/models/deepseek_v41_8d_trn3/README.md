@@ -32,6 +32,7 @@ different package names (`deepseek_v41` / `deepseek_v41_8d`) and no shared files
 | Vocabulary shard | 2048 rows a rank | 4096 rows a rank |
 | bs1 decode step | 6 NEFF executions: prologue, 3 fused launches, the verify graph, the drafter | **4**: the prologue inside the first fused launch, the verify inside the drafter launch (`DEEPSEEK_V41_PROLOGUE_FUSED`, `DEEPSEEK_V41_DRAFT_TAIL`) |
 | DSpark drafter kernel (bs1) | as in the 16-device port | the same drafts in ~0.1 ms less (`draft_decode/`: `HC_MIX_STACK_ROWS`, `HEAD_SPLIT`, `KV_ROWS_CORE1`, `BIAS_CAST_ACT`) |
+| Fused decode launches | as in the 16-device port | `layers_decode_L24_L39_head_tp32` optimized on its recorded 32-rank launch (the head GEMM column-tiled on K-major head rows, `HEAD_W_KMAJOR`; the L31 -> L32 hand-off; member scheduling fixes, also in the L08-L23 and L00-L07 launches and the other groupings' packages); the single-sequence drafter's head GEMM column-tiled the same way: ~520 us less device time a bs1 step, the same arithmetic |
 | Batched drafter (bs10) | shared expert sharded over the world (`layout.SH_TP`) | replicated (at 32 ranks the sharded one drafted worse together with `MAIN_PROJ_TP`) |
 
 Why each change is there:
@@ -120,7 +121,7 @@ architecture, so load one of them per process.
 | Trn3 (8 devices) | Working | Not tested |
 | Trn2 | Not tested | Not tested |
 
-Validated 2026-11-03 on a `trn3.48xlarge` with the DLAMI venv
+Validated 2026-11-05 on a `trn3.48xlarge` with the DLAMI venv
 `aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0` (vLLM 0.29.0, torch 2.13.0,
 `libtorch-neuronx-lite` 2.13.0.1.0.3112, `neuronx-cc` 2.28.7631.0, `nki` 0.7.0, runtime
 2.35.30.0, driver 2.31.7.0) and this branch's `vllm-neuron`, checkpoint revision
@@ -128,39 +129,40 @@ Validated 2026-11-03 on a `trn3.48xlarge` with the DLAMI venv
 
 ## Performance
 
-Measured 2026-11-03 on devices 0-7 (32 ranks) with every optimization at its default and the
+Measured 2026-11-05 on devices 0-7 (32 ranks) with every optimization at its default and the
 stack above, by `test/performance/run_bench.py` (see [Testing](#speed-performance)): sonnet
 prompts, 128 output tokens, greedy, one server per input length, warmed before it is measured.
 A batch-1 cell sends 8 requests one at a time; a batch-10 cell sends 10 concurrent requests to
 an engine built for ten, and its output tok/s is their aggregate. `accept %` is the share of
 DSpark drafts accepted; the median inter-token latency is one decode step. In parentheses: the
-16-device port on all 16 devices (`deepseek_v41_trn3`, measured 2026-11-02 the same way):
+16-device port on all 16 devices (`deepseek_v41_trn3`, measured the same day the same way):
 
 | Cell | TTFT p50 ms | TPOT p50 ms | output tok/s | accept % | median ITL ms |
 |------|-------------|-------------|--------------|----------|---------------|
-| in512_bs1 | 149 (134) | 3.64 (3.77) | 206.7 (205.4) | 51.3 (49.5) | 12.68 (12.70) |
-| in1024_bs1 | 245 (230) | 4.10 (3.71) | 165.9 (181.9) | 43.5 (51.2) | 12.70 (12.63) |
-| in2048_bs1 | 428 (417) | 4.08 (3.84) | 135.1 (142.1) | 44.6 (49.8) | 12.78 (12.68) |
-| in8192_bs1 | 1709 (1662) | 4.23 (4.00) | 56.9 (58.9) | 44.6 (48.0) | 13.25 (13.22) |
-| in512_bs10 | 790 (720) | 17.41 (15.83) | 405.4 (442.7) | 46.1 (48.5) | 39.89 (38.98) |
-| in1024_bs10 | 1314 (1250) | 20.56 (19.50) | 299.7 (329.4) | 45.7 (50.0) | 41.91 (40.08) |
-| in2048_bs10 | 2312 (2249) | 27.05 (26.63) | 214.3 (217.7) | 47.8 (48.3) | 42.61 (41.02) |
-| in8192_bs10 | 9401 (9141) | 75.43 (71.82) | 66.8 (68.5) | 46.6 (44.2) | 49.80 (44.59) |
+| in512_bs1 | 147 (134) | 3.47 (3.74) | 214.8 (207.9) | 51.3 (49.5) | 12.10 (12.67) |
+| in1024_bs1 | 244 (231) | 3.95 (3.72) | 171.1 (182.4) | 43.5 (51.2) | 12.14 (12.63) |
+| in2048_bs1 | 427 (418) | 3.89 (3.85) | 138.9 (141.9) | 44.6 (49.8) | 12.19 (12.67) |
+| in8192_bs1 | 1715 (1659) | 4.06 (4.00) | 57.2 (59.0) | 44.6 (48.0) | 12.77 (13.21) |
+| in512_bs10 | 785 (714) | 17.68 (16.99) | 405.5 (432.1) | 45.7 (46.7) | 40.35 (39.01) |
+| in1024_bs10 | 1312 (1240) | 20.91 (19.36) | 294.5 (335.7) | 44.9 (49.2) | 41.20 (39.89) |
+| in2048_bs10 | 2300 (2236) | 27.03 (26.64) | 214.3 (218.4) | 47.8 (48.5) | 43.28 (41.18) |
+| in8192_bs10 | 9403 (9149) | 80.55 (71.51) | 64.6 (68.9) | 46.6 (48.1) | 49.74 (44.61) |
 
-On half the devices a batch-1 decode step takes as long as on all sixteen (median ITL within
-1 %): the 8-device-only changes in the table at the top (the four-execution step, the packed
-decode MoE, the drafter) offset the doubled routed experts and engram rows a rank. Batch-1
-TPOT differs through the draft acceptance (in1024: 43.5 against 51.2 %), not the step time.
-Batch 10 is 2-12 % slower a step, and prefill 3-11 % slower.
-Every request of every cell completed with its 128 tokens, and the texts are coherent answers
-to the prompts. See [`src/README.md`](src/README.md#the-8-device-deployment) for the switches
-and what was tried and dropped.
+A batch-1 decode step is ~0.5 ms shorter on these 8 devices than on all sixteen (median ITL -3.3 to
+-4.5 %): the 8-device-only changes in the table at the top -- the four-execution step, the packed decode
+MoE, the decode launches optimized on their recorded 32-rank launch, the drafter -- more than offset the
+doubled routed experts and engram rows a rank. Batch-1 TPOT differs through the draft acceptance (in1024:
+43.5 against 51.2 %), not the step time. Batch 10 is 3-12 % slower a step and prefill 2-10 % slower; bs10
+acceptance moves from run to run with the batch's arrival order (42-48 % over the runs of this code),
+and bs10 TPOT with it. Every request of every cell completed with its 128 tokens, and the texts are
+coherent answers to the prompts. See [`src/README.md`](src/README.md#the-8-device-deployment) for the
+switches and what was tried and dropped.
 
-The integration test passes (7:58 wall): `short-prose`, `smoke-test` and
-`trivia-capital-france` are token-for-token the 16-device port's (32 / 32 / 18 tokens,
-`...The capital of France is **Paris**.`), and `long-needle-2048-0` recalls `5591-C67` with
-the same 32 tokens up to the sentence after the code, then continues `...The maintenance log
-for sector 159 ...`, one of the continuations the 16-device port's own validated runs produced.
+The integration test passes: `short-prose`, `smoke-test` and `trivia-capital-france` are
+token-for-token the 16-device port's (32 / 32 / 18 tokens, `...The capital of France is **Paris**.`),
+and `long-needle-2048-0` recalls `5591-C67` with the same 32 tokens up to the sentence after the code,
+then continues `...The maintenance log for sector 159 ...`, one of the continuations the 16-device
+port's own validated runs produced.
 
 During serving the 32 workers hold `/dev/neuron0` .. `/dev/neuron7` only.
 

@@ -31,6 +31,9 @@ from .r1_decode import r1_decode
 #: merged launches (merge_launch.py): this launch's b1 share dict, and the previous part's to inherit
 LAST_SHARE = [None]
 INHERIT = [None]
+#: merged launches: the next part's first member, `(attention weights, pre_next tuple)` (set by the
+#: merged wrapper): this part's last member prefetches its weights and leaves it its stream in SBUF
+NEXT_FIRST = [None]
 _HANDOFF = ("attn_next", "next_b1", "pre_next", "S", "xin", "S_src", "gate", "pre", "pref")
 
 
@@ -102,6 +105,11 @@ def layers_decode_L24_L31_tp32(
                    "next_b1": {id(_loc[f"L{a}_wq_a_s"]) for a, _ in _b1_pairs},
                    "pre_next": {id(_loc[f"L{a}_wq_a_s"]): tuple(_loc[f"L{b}_{k}"] for k in (
                        "attn_norm_w", "hca_fn_t", "hca_base", "hca_scale")) for a, b in _b1_pairs}}
+    if NEXT_FIRST[0] is not None:
+        _naw, _npre = NEXT_FIRST[0]
+        share["b1"]["attn_next"][id(L31_wq_a_s)] = tuple(_naw)
+        share["b1"]["next_b1"].add(id(L31_wq_a_s))
+        share["b1"]["pre_next"][id(L31_wq_a_s)] = tuple(_npre)
     LAST_SHARE[0] = share
     if INHERIT[0] is not None:
         # (merged launch: the previous part's launch-level SBUF tiles and tables)

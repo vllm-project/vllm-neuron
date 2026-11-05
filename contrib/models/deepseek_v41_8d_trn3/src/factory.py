@@ -104,6 +104,17 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
             )
 
         if neuron_config is not None and getattr(
+            neuron_config, "enable_structured_outputs", False
+        ):
+            raise ValueError(
+                "enable_structured_outputs is not supported for DeepSeek-V4.1-Flash: "
+                "a grammar truncates the DSpark drafts, and the fused decode launches "
+                "run full 6-row spans only (a step with fewer rows does not compile). "
+                "The plugin also rejects structured outputs under async scheduling, "
+                "this port's default. Serve without structured outputs."
+            )
+
+        if neuron_config is not None and getattr(
             neuron_config, "mm_encoder_only", False
         ):
             raise ValueError(

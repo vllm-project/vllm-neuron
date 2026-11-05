@@ -118,8 +118,20 @@ def head_greedy_body(stream, pre_mix, norm_w, head_w, vocab_start, groups_world,
     `vocab_start [1, 1]` int32 this rank's first column."""
     vocab_size, _kver = flags
     T, hc, dim = stream.shape
-    part = head_w.shape[0]
-    assert head_w.shape[1] == dim and part % PT == 0 and T <= PT, (T, part, dim)
+    if len(head_w.shape) == 3:
+        # (`layout.py`: the head rows K-major, `[dim // 128, 128, part]` = head_w.T: the GEMM stages
+        # its weight tiles with plain DMAs instead of DMA transposes)
+        part = head_w.shape[2]
+        assert head_w.shape[0] * head_w.shape[1] == dim and head_w.shape[1] == PT, (head_w.shape, dim)
+        head_w = head_w.reshape((dim, part))
+        kmajor = True
+    else:
+        part = head_w.shape[0]
+        assert head_w.shape[1] == dim, (head_w.shape, dim)
+        kmajor = False
+    assert part % PT == 0 and T <= PT, (T, part, dim)
+    from . import mk_compress as _mc
+    _mc.HEAD_CT_ROWS[0] = T
     world = len(groups_world[0])
     W8 = max(world, 8)
     Tp = pad_to(T, PT)
@@ -146,7 +158,7 @@ def head_greedy_body(stream, pre_mix, norm_w, head_w, vocab_start, groups_world,
         ch = 1024 if dim % 1024 == 0 else dim
         _collapse_norm_spread(st, pre_mix, norm_w, hc, dim, T, Tp, xhn_c, ch)
         lo, hi = _half(part, pid)
-        bf16_gemm_rows(xhn_c, head_w, lg, Tp, dim, part, lo, hi)
+        bf16_gemm_rows(xhn_c, head_w, lg, Tp, dim, part, lo, hi, kmajor=kmajor)
     elif HEAD_BOTH_CORES and Tp == PT:
         xhn_c = nl.ndarray((Tp, dim), dtype=nl.bfloat16, buffer=nl.private_hbm)
         ch = 1024 if dim % 1024 == 0 else dim
@@ -182,7 +194,7 @@ def head_greedy_body(stream, pre_mix, norm_w, head_w, vocab_start, groups_world,
             # (rows past T zero: the pad rows the GEMM reads)
             nisa.dma_copy(dst=xhn_c[r0 : r0 + PT, :], src=y16)
         lo, hi = _half(part, pid)
-        bf16_gemm_rows(xhn_c, head_w, lg, Tp, dim, part, lo, hi)
+        bf16_gemm_rows(xhn_c, head_w, lg, Tp, dim, part, lo, hi, kmajor=kmajor)
     # collapse with the last pre_mix (fp32 sum, bf16 out); the pad rows zero
     elif pid == 0:
         for r0, nr in rows:
@@ -211,7 +223,7 @@ def head_greedy_body(stream, pre_mix, norm_w, head_w, vocab_start, groups_world,
             nisa.dma_copy(dst=xhn[T:Tp, :], src=padh[0 : Tp - T, :])
         nisa.core_barrier(data=xhn, cores=(0, 1))
         lo, hi = _half(part, pid)
-        bf16_gemm_rows(xhn, head_w, lg, Tp, dim, part, lo, hi)
+        bf16_gemm_rows(xhn, head_w, lg, Tp, dim, part, lo, hi, kmajor=kmajor)
     if HEAD_ARGMAX_SPLIT:
         return _argmax_split(lg, vocab_start, vocab_size, T, part, pid, rows, world, rg_world,
                              g2_src, g2_dst, ids)

@@ -848,6 +848,8 @@ def require_dspark_speculation(vllm_config) -> None:
             "proposed synchronously; see "
             "deepseek_v41.require_dspark_speculation"
         )
+    if scheduler is not None:
+        _match_scheduler_cls(scheduler)
 
     # One RPC a step (vllm_neuron's `NeuronModelRunner._one_rpc_step`): the engine's
     # `sample_tokens` and `take_draft_token_ids` RPCs to the 64 workers cost ~1 ms each
@@ -866,6 +868,27 @@ def require_dspark_speculation(vllm_config) -> None:
         "deepseek_v41.require_dspark_speculation",
         getattr(spec, "method", METHOD), num_speculative_tokens,
     )
+
+
+#: The platform's two scheduler classes, by `async_scheduling`.
+_NEURON_SCHEDULERS = {
+    True: "vllm_neuron.vllm.core.scheduler.NeuronAsyncScheduler",
+    False: "vllm_neuron.vllm.core.scheduler.NeuronScheduler",
+}
+
+
+def _match_scheduler_cls(scheduler) -> None:
+    """Keep `scheduler_cls` in step with `async_scheduling`. `NeuronPlatform.check_and_update_config`
+    picks the class from the flag before `require_dspark_speculation` may change the flag; an async
+    engine with `NeuronScheduler` (or the reverse) would skip `NeuronAsyncScheduler`'s placeholder
+    bookkeeping. Only the platform's own two classes are swapped: a caller's class is left alone."""
+    cls = getattr(scheduler, "scheduler_cls", None)
+    name = cls if isinstance(cls, str) or cls is None else f"{cls.__module__}.{cls.__qualname__}"
+    want = _NEURON_SCHEDULERS[bool(getattr(scheduler, "async_scheduling", False))]
+    if name in _NEURON_SCHEDULERS.values() and name != want:
+        scheduler.scheduler_cls = want
+        logger.info("deepseek_v41: scheduler_cls %s -> %s (async_scheduling=%s)", name, want,
+                    bool(scheduler.async_scheduling))
 
 
 def declare_prefill_requirements() -> None:

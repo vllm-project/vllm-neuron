@@ -234,10 +234,57 @@ def pool_groups(pool_kv, pool_score, mslots_hbm, tiles, ratio, hd, out_hbm):
         nisa.dma_copy(dst=out_hbm[g0 : g0 + ng, 0:hd], src=o16[0:ng, :])
 
 
-def bf16_gemm_rows(x_hbm, w_hbm, out_hbm, m, k, n, lo, hi):
+#: K-major weights and at most CT_W rows: the head GEMM in PE column-tiling mode -- the rows' x^T a
+#: [128, CT_W] stationary in each of the 128 // CT_W column tiles, one output tile's moving weights each
+#: (the tiles' matmuls run side by side; the full-array stationary held 128 columns of which T were rows)
+HEAD_CT = True
+#: the widest column tile used (the rows' count rounded up to 32 or 64: 4 or 2 tiles side by side)
+CT_W_MAX = 64
+#: the valid rows of the head GEMM's input (set by the caller; None: not known)
+HEAD_CT_ROWS = [None]
+
+
+def _gemm_ct(x_hbm, w_hbm, out_hbm, T, k, lo, hi, nt=512):
+    """`out[0:T, lo:hi] = x[0:T, 0:k] @ w_hbm[0:k, lo:hi]` (`w_hbm` K-major `[k, n]`), bf16 operands,
+    fp32 PSUM accumulation in contraction order, bf16 out (`_gemm`'s arithmetic), T <= CT_W_MAX."""
+    ktiles = k // PT
+    n = hi - lo
+    CT_W = 32 if T <= 32 else 64
+    nct = PT // CT_W
+    xt = nl.ndarray((PT, ktiles, PT), dtype=nl.bfloat16, buffer=nl.sbuf)
+    for kb in range(ktiles):
+        nisa.dma_transpose(dst=xt[0:PT, kb, 0:PT], src=x_hbm[0:PT, kb * PT : (kb + 1) * PT])
+    tiles = [(o, min(nt, n - o)) for o in range(0, n, nt)]
+    engs = (nisa.engine.sync, nisa.engine.scalar)
+    for g0 in range(0, len(tiles), nct):
+        grp = tiles[g0 : g0 + nct]
+        c0 = grp[0][0]
+        gw = grp[-1][0] + grp[-1][1] - c0
+        acc = nl.ndarray((PT, nt), dtype=nl.float32, buffer=nl.psum)
+        for kb in range(ktiles):
+            wt = nl.ndarray((PT, nct * nt), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=wt[0:PT, 0:gw], src=w_hbm[kb * PT : (kb + 1) * PT, lo + c0 : lo + c0 + gw],
+                          dge_mode=nisa.dge_mode.hwdge, engine=engs[kb % 2])
+            for j, (o, w) in enumerate(grp):
+                nisa.nc_matmul(dst=acc[j * CT_W : (j + 1) * CT_W, 0:w], stationary=xt[0:PT, kb, 0:CT_W],
+                               moving=wt[0:PT, o - c0 : o - c0 + w], tile_position=(0, j * CT_W),
+                               tile_size=(PT, CT_W), accumulate=(kb > 0))
+        o16 = nl.ndarray((PT, nt), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=o16[0 : len(grp) * CT_W, :], src=acc[0 : len(grp) * CT_W, :])
+        for j, (o, w) in enumerate(grp):
+            nisa.dma_copy(dst=out_hbm[0:T, lo + o : lo + o + w], src=o16[j * CT_W : j * CT_W + T, 0:w])
+
+
+def bf16_gemm_rows(x_hbm, w_hbm, out_hbm, m, k, n, lo, hi, kmajor=False):
     """`out[:, lo:hi] = x[m, k] @ w[lo:hi, :].T`, bf16 operands (no quantization), bf16 out;
-    `m` a multiple of 128 (`x_hbm` is bf16 HBM of that height)."""
-    _gemm(x_hbm, w_hbm[lo:hi, 0:k], out_hbm[0:m, lo:hi], m, k, hi - lo)
+    `m` a multiple of 128 (`x_hbm` is bf16 HBM of that height). `kmajor`: `w_hbm` is `w.T`
+    (`[k, n]`), its tiles staged with plain DMAs."""
+    if kmajor and HEAD_CT and HEAD_CT_ROWS[0] is not None and HEAD_CT_ROWS[0] <= CT_W_MAX:
+        _gemm_ct(x_hbm, w_hbm, out_hbm, HEAD_CT_ROWS[0], k, lo, hi)
+    elif kmajor:
+        _gemm(x_hbm, w_hbm[0:k, lo:hi], out_hbm[0:m, lo:hi], m, k, hi - lo, w_kmajor=True)
+    else:
+        _gemm(x_hbm, w_hbm[lo:hi, 0:k], out_hbm[0:m, lo:hi], m, k, hi - lo)
 
 
 # --------------------------------------------------------------------------- indexer

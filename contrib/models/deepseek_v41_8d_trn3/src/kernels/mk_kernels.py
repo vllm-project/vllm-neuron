@@ -396,6 +396,11 @@ def _tree_hash(root: str) -> int:
     return int.from_bytes(h.digest()[:4], "little") & 0x7FFFFFFF
 
 
+def fused_attr(name: str, attr: str, default=None):
+    """A module-level attribute of the optimized launch package `tp32/fused/<name>/` (its `__init__.py`)."""
+    return getattr(importlib.import_module(f".tp32.fused.{name}", __package__), attr, default)
+
+
 @functools.lru_cache(maxsize=None)
 def optimized_fused(name: str, kernels: tuple, plan: tuple, nparams: int, returns: tuple):
     """`(kernel, None)`: the optimized launch `tp32/fused/<name>/` (`@nki.jit`) for this plan

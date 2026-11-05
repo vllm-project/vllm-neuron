@@ -19,7 +19,7 @@ reported numbers come from two runs -- see "Reproducing the reported numbers".
 
 ## Reproducing the reported numbers
 
-The model README's performance table (measured 2026-11-03 on 8 devices of a trn3.48xlarge,
+The model README's performance table (measured 2026-11-05 on 8 devices of a trn3.48xlarge,
 devices 0-7, 32 ranks, with the DLAMI venv `aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0`
 and the checkpoint at `/mnt/nvme/hf`) comes from these two runs, one after the other, each with
 devices 0-7 to itself. The reports (`bench_report.json`, `bench_report_ms10.json`) and the

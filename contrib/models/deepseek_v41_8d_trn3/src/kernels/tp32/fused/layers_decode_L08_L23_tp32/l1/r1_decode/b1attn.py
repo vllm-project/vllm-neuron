@@ -161,7 +161,7 @@ def stage_rows(rows, nr, k, nc):
     nisa.tensor_copy(dst=xT[:, :, 0:nr, :], src=tp.ap(pattern=[[nkc * 4 * nc, PT], [4 * nc, nkc], [1, nr], [nc, 4]]))
     xq = nl.ndarray((PT, nkc * nc), dtype=FP8_X4, buffer=nl.sbuf)
     xs = nl.ndarray((PT, nkc * nc), dtype=nl.uint8, buffer=nl.sbuf)
-    nisa.quantize_mx(dst=xq, src=xT.reshape((PT, nkc * nc * 4)), dst_scale=xs)
+    ANCH["stage"] = nisa.quantize_mx(dst=xq, src=xT.reshape((PT, nkc * nc * 4)), dst_scale=xs)
     return xq, xs
 
 
@@ -494,8 +494,13 @@ def attn_weights(pid, wq_a, wq_a_s, wq_b, wq_b_s, wkv, wkv_s, wo_a, wo_a_s, wo_b
 
 #: DMA priority (0 highest .. 3) of the next member's attention-weight prefetch
 PREFETCH_PRIO = None
-#: its DMA queue (the ACT queue: the sync queue carries the block-start loads / the all-reduce stores)
-PREFETCH_ENG = nisa.engine.scalar
+#: its DMA queue (the ACT queue: the sync queue carries the block-start loads / the all-reduce stores).
+#: iter-2: the sync queue -- `b1.PREFETCH_AT = "ar1done"` orders it after the attention all-reduce's result
+#: load only in the program; on the ACT queue the ACT engine issued it as soon as it reached it, so the 6.5 MB
+#: (core 0) / 2.6 MB (core 1) ran during the attention's tail and the AR-8 (the cc_src store waited ~3 us
+#: behind it on the shared DMA rings). Behind the result load on the sync queue it runs after the AR-8,
+#: while the routing runs (the queues idle until the experts' loads)
+PREFETCH_ENG = nisa.engine.sync
 #: the weights prefetched (the first GEMM's: q_a / kv; the others loaded at the block's start, the
 #: DMA queues idle then, needed tens of us later) -- the prefetch window and the SBUF next to the
 #: MoE's buffers hold less
@@ -963,6 +968,10 @@ def attn_side(pid, xn, wq_a, wq_a_s, q_norm_w, wq_b, wq_b_s, wkv, wkv_s, kv_norm
     evac(z16, z_p)
     dbg("z16", z16, RC, o_lora, pid)
     zq, zs = stage_rows(z16, RC, o_lora, RC)
+    # (the hc_in tail's remaining steps -- `Ticker.rest` -- pinned behind this staging: else the scheduler
+    # hoisted ~3-5 Sinkhorn iterations ahead of it on the coefficient core's vector engine, delaying the
+    # z exchange both cores wait for)
+    ANCH["zq"] = ANCH.get("stage")
     # exchange the staged z rows: zall[p, kc, t] for the 6 rows
     nzc = o_lora // KC
     zb = nl.ndarray((PT, 2 * nzc * RC), dtype=nl.int32, buffer=nl.sbuf)

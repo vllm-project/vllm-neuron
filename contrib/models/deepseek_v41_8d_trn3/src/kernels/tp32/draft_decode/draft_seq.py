@@ -82,6 +82,7 @@ from .mk_common import (
     tiles_of,
     transpose_pe,
 )
+from . import mk_compress as _mc
 from .mk_compress import bf16_gemm_rows
 
 CORES = 2
@@ -287,7 +288,16 @@ def draft_body(
     wo_a4, wo_b4 = wo_a.view(X.FP8_X4), wo_b.view(X.FP8_X4)
     sh_w1_4, sh_w3_4, sh_w2_4 = sh_w1.view(X.FP8_X4), sh_w3.view(X.FP8_X4), sh_w2.view(X.FP8_X4)
     w1_4, w3_4, w2_4 = w1.view(X.FP4_X4), w3.view(X.FP4_X4), w2.view(X.FP4_X4)
-    part = head_w.shape[0]
+    if len(head_w.shape) == 3:
+        # (the head rows K-major, `[dim // 128, 128, part]` = head_w.T, `mk_model.head_kmajor`: the head GEMM
+        # in the PE's column-tiling mode, its weight tiles staged with plain DMAs)
+        part = head_w.shape[2]
+        assert head_w.shape[0] * head_w.shape[1] == dim and head_w.shape[1] == PT, (head_w.shape, dim)
+        head_w = head_w.reshape((dim, part))
+        head_kmajor = True
+    else:
+        part = head_w.shape[0]
+        head_kmajor = False
     mrank = mk_embed_w.shape[1]
     world = len(groups_world[0])
     # main_proj column-sharded over the world (layout.prepare: each rank its dim / world output
@@ -992,7 +1002,8 @@ def draft_body(
         nisa.dma_copy(dst=xhn[K:Kp, :], src=padh[0 : Kp - K, :])
     nisa.core_barrier(data=xhn, cores=(0, 1))
     lo, hi = _half(part, pid)
-    bf16_gemm_rows(xhn, head_w, lg, Kp, dim, part, lo, hi)
+    _mc.HEAD_CT_ROWS[0] = K
+    bf16_gemm_rows(xhn, head_w, lg, Kp, dim, part, lo, hi, kmajor=head_kmajor)
     if HEAD_SPLIT:
         # this core's half (its own GEMM's columns): fp32 logits + the pad bias, on chip
         l16 = nl.ndarray((PT, hv), dtype=nl.bfloat16, buffer=nl.sbuf)

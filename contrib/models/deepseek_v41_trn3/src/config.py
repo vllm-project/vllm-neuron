@@ -248,8 +248,11 @@ ASYNC_ENV = "DEEPSEEK_V41_ASYNC"
 def async_decode() -> bool:
     """Whether the engine runs with async scheduling (`ASYNC_ENV`, and a plugin runner that
     replays a device-drafting proposer's drafts across batch-composition changes: without
-    that a step would verify the scheduler's -1 placeholders)."""
-    return os.environ.get(ASYNC_ENV, "1") not in ("", "0") and _runner_has("device_draft_futures")
+    that a step would verify the scheduler's -1 placeholders). The flat scheme only: an async
+    decode step needs the device step prologue, which only the flat scheme's fused decode
+    launches run (`mk_model.fuses_embed`), so the pipeline scheme decodes synchronously."""
+    return (SCHEME == "tp64" and os.environ.get(ASYNC_ENV, "1") not in ("", "0")
+            and _runner_has("device_draft_futures"))
 
 
 def _runner_has(capability: str) -> bool:
