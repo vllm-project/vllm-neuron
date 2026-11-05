@@ -9,6 +9,9 @@ These scripts run one prefill node and one decode node, both trn2.48xlarge at TP
 | `pd_proxy.sh` | the proxy matching `CONNECTOR`. Mooncake: `mooncake_connector_proxy.py`, vendored unmodified from vLLM v0.29.0, which sends to prefill and decode concurrently. NIXL: vllm-neuron's toy proxy |
 | `pd_bench.sh` | smoke and needle checks, then the 85k / 92% shared-prefix case at the given concurrencies. Reports the prefill and decode hit rates and the MTP acceptance |
 | `pd_acc.sh` | `../needle.py` (12 prompts, 16k-85k) and `../sparse_decode_eval.py` (19 greedy continuations) through the proxy |
+| `pd_bench_split.sh` | Qingzhong's `../bench_pd_split.sh` flags through the proxy: P-only (output 1, 10×C requests) and D replays; `P_ONLY=1` runs only P |
+| `pd_bench_final.sh` | the Trn2 vs H100 set: `pd_bench_split.sh` P at C = 1 / 4 / 8 / 12, then `pd_bench.sh` at C = 8 with 1024 output tokens |
+| `gpu/` | the H100 1P1D reference (vLLM 0.29.0): `Dockerfile` and `gpu_serve.sh` |
 | `needle_check.py` | the single needle request of `pd_bench.sh` |
 
 Results go to `$WORK/results/pd/<label>/` and logs to `$WORK/logs/pd_<label>_*.log` (`WORK` defaults to `/mnt/nvme`). `VENV` is the vLLM / Neuron venv, default `$WORK/venv/sdk233`.
