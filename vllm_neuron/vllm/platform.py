@@ -57,6 +57,12 @@ SO_DISABLED_MESSAGE = (
 # successful patch, so ongoing overhead is a single boolean check per import.
 _dcp_config_patched = False
 
+# Tracks whether the "neuron" weight-transfer backend has been registered in
+# vLLM's lazy factories. Registration is idempotent per process: the factories
+# raise on a duplicate name, and ``pre_register_and_update`` can run more than
+# once (frontend + workers).
+_neuron_weight_transfer_registered = False
+
 
 def _patch_dcp_config_validation():
     """Patch ModelConfig.verify_with_parallel_config to skip DCP checks on prefill.
@@ -276,6 +282,11 @@ class NeuronPlatform(Platform):
         # the Neuron policy before ModelConfig validation constructs the config.
         patch_vllm_config_for_neuron()
 
+        # Register the "neuron" weight-transfer backend so an RL trainer can push
+        # weights into a serving rollout in place (RL weight-sync API). This is
+        # lazy and module-path based; no upstream vLLM patch is required.
+        cls._register_neuron_weight_transfer_backend()
+
         if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
             from vllm.model_executor.models.registry import ModelRegistry
 
@@ -290,6 +301,47 @@ class NeuronPlatform(Platform):
                 "SyntheticStackedNeuronModel",
                 "vllm_neuron.model.synthetic:SyntheticStackedNeuronModel",
             )
+
+    @classmethod
+    def _register_neuron_weight_transfer_backend(cls) -> None:
+        """Register the ``"neuron"`` weight-transfer backend in vLLM's factories.
+
+        vLLM's weight-transfer factories are lazy and module-path based (see
+        ``vllm/distributed/weight_transfer/factory.py``), so the backend is
+        registered from vLLM Neuron's own package without patching upstream. The
+        engine modules are imported only when an RL trainer selects
+        ``weight_transfer_config.backend = "neuron"``.
+        """
+        global _neuron_weight_transfer_registered
+        if _neuron_weight_transfer_registered:
+            return
+
+        try:
+            from vllm.distributed.weight_transfer.factory import (
+                WeightTransferEngineFactory,
+                WeightTransferTrainerFactory,
+            )
+        except ImportError:
+            # The weight-transfer framework arrived in a specific vLLM version.
+            # Without it the RL weight-sync API is unavailable and there is
+            # nothing to register against.
+            logger.warning(
+                "vLLM weight-transfer framework is unavailable; the 'neuron' "
+                "weight-transfer backend was not registered."
+            )
+            return
+
+        WeightTransferEngineFactory.register_engine(
+            "neuron",
+            "vllm_neuron.vllm.weight_transfer.neuron_engine",
+            "NeuronWeightTransferEngine",
+        )
+        WeightTransferTrainerFactory.register_engine(
+            "neuron",
+            "vllm_neuron.vllm.weight_transfer.neuron_trainer",
+            "NeuronTrainerWeightTransferEngine",
+        )
+        _neuron_weight_transfer_registered = True
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:

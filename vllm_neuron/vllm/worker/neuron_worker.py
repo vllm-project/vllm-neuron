@@ -536,6 +536,12 @@ class NeuronWorker(WorkerBase):
         self.model_runner = None
         self.device = None
 
+        # Weight-transfer engine (RL weight sync). Created in load_model() when
+        # weight_transfer_config is set; drives in-place weight updates into the
+        # resident model. _weight_update_active tracks the start/finish session.
+        self.weight_transfer_engine = None
+        self._weight_update_active = False
+
         # Register models with ModelRegistry
         # Put it in the worker as vLLM's model registry overwrites vllm_neuron model registry
         # if we put it too early in the platform.py.
@@ -1072,6 +1078,113 @@ class NeuronWorker(WorkerBase):
             self.model_runner.load_model()
             self.model_runner.init_tensor_capture()
             self.model_runner.init_tensor_replacement()
+
+        # Weight-transfer engine: created after the model is resident so the
+        # engine can write into the exact parameter tensors the compiled graph
+        # reads. Mirrors the upstream GPU worker's wiring in gpu_worker.py.
+        if self.vllm_config.weight_transfer_config is not None:
+            from vllm.distributed.weight_transfer.factory import (
+                WeightTransferEngineFactory,
+            )
+
+            self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
+                self.vllm_config.weight_transfer_config,
+                self.vllm_config,
+                self.device,
+                self._get_model_from_runner(),
+            )
+
+    def _get_model_from_runner(self):
+        """Return the resident model, whichever runner backend is active.
+
+        ``NeuronModelRunner`` exposes ``get_model()``; ``NeuronModelRunnerV2``
+        publishes the model as ``self.model`` directly.
+        """
+        get_model = getattr(self.model_runner, "get_model", None)
+        if callable(get_model):
+            return get_model()
+        return self.model_runner.model
+
+    # ----------------------------------------------------------------------
+    # Weight transfer (RL weight sync) — mirrors the upstream GPU worker.
+    # ----------------------------------------------------------------------
+
+    def _check_weight_transfer_engine(self) -> None:
+        if self.weight_transfer_engine is None:
+            raise RuntimeError(
+                "Weight transfer not configured. "
+                "Please set weight_transfer_config to enable weight transfer."
+            )
+
+    def init_weight_transfer_engine(self, init_info: dict) -> None:
+        """Initialize the weight-transfer mechanism.
+
+        For the Neuron backend this opens the trainer<->worker model-update
+        group. The trainer is rank 0, workers 1..N.
+
+        Args:
+            init_info: Backend-specific initialization info.
+        """
+        self._check_weight_transfer_engine()
+        assert self.weight_transfer_engine is not None
+        typed_init_info = self.weight_transfer_engine.parse_init_info(init_info)
+        self.weight_transfer_engine.init_transfer_engine(typed_init_info)
+
+    def start_weight_update(self) -> None:
+        """Start a new weight update session."""
+        self._check_weight_transfer_engine()
+        assert self.weight_transfer_engine is not None
+        if self._weight_update_active:
+            raise RuntimeError(
+                "start_weight_update called while a weight update is already "
+                "active. Call finish_weight_update first."
+            )
+        self.weight_transfer_engine.start_weight_update()
+        self._weight_update_active = True
+
+    def update_weights(self, update_info: dict | list[dict]) -> None:
+        """Receive one weight update chunk from the trainer.
+
+        ``start_weight_update`` must be called before ``update_weights`` and
+        ``finish_weight_update`` after all chunks have been sent.
+
+        Args:
+            update_info: Backend-specific update info, or a list indexed by
+                global worker rank across data-parallel replicas.
+        """
+        self._check_weight_transfer_engine()
+        assert self.weight_transfer_engine is not None
+
+        if not self._weight_update_active:
+            raise RuntimeError(
+                "start_weight_update must be called before update_weights."
+            )
+
+        from vllm.config import set_current_vllm_config
+
+        with set_current_vllm_config(self.vllm_config):
+            if isinstance(update_info, list):
+                parallel_config = self.vllm_config.parallel_config
+                local_update_info = update_info[
+                    parallel_config.data_parallel_rank * parallel_config.world_size
+                    + self.rank
+                ]
+            else:
+                local_update_info = update_info
+            self.weight_transfer_engine.update_weights(local_update_info)
+
+    def finish_weight_update(self) -> None:
+        """Finish the current weight update session."""
+        self._check_weight_transfer_engine()
+        assert self.weight_transfer_engine is not None
+
+        if not self._weight_update_active:
+            raise RuntimeError(
+                "finish_weight_update called without a matching start_weight_update."
+            )
+
+        self.weight_transfer_engine.finish_weight_update()
+        self._weight_update_active = False
 
     def _configure_torchinductor_cache_dir(self) -> None:
         """Isolate this worker's TorchInductor cache by configuration and rank.
@@ -2870,6 +2983,10 @@ class NeuronWorker(WorkerBase):
         """Clean up resources held by the worker."""
         if self._profiler is not None:
             self._profiler.shutdown()
+
+        if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
+            weight_transfer_engine.shutdown()
+            self.weight_transfer_engine = None
 
         # Disable tensor capture to prevent writes during teardown
         if self.model_runner is not None:
