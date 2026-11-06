@@ -78,29 +78,24 @@ class Qwen3_5Config:
         field_names = {f.name for f in cls.__dataclass_fields__.values()}
         filtered_dict = {k: v for k, v in config_dict.items() if k in field_names}
 
-        # Pull rope_theta / partial_rotary_factor out of rope_parameters (or the
-        # legacy top-level rope_scaling dict). rope_parameters wins if both the
-        # top-level key and the dict carry a value.
+        # rope_parameters is authoritative for Qwen3.5 RoPE geometry. The
+        # top-level ``partial_rotary_factor`` is a BC default injected by
+        # transformers (0.25), so it must not mask a value carried in
+        # rope_parameters.
         rope_params = filtered_dict.get("rope_parameters") or {}
         if isinstance(rope_params, str):
             rope_params = {}
-        if filtered_dict.get("rope_theta") is None and "rope_theta" in rope_params:
-            filtered_dict["rope_theta"] = rope_params["rope_theta"]
-        if (
-            filtered_dict.get("partial_rotary_factor") is None
-            and "partial_rotary_factor" in rope_params
-        ):
-            filtered_dict["partial_rotary_factor"] = rope_params[
-                "partial_rotary_factor"
-            ]
+        for key in ("rope_theta", "partial_rotary_factor"):
+            if key in rope_params:
+                filtered_dict[key] = rope_params[key]
+
+        # Legacy fallback: top-level rope_scaling (Qwen2/Qwen3-era) for any key
+        # rope_parameters does not carry.
         if "rope_scaling" in filtered_dict and isinstance(
             filtered_dict["rope_scaling"], dict
         ):
             for key in ("rope_theta", "partial_rotary_factor", "rope_type"):
-                if (
-                    filtered_dict.get(key) is None
-                    and key in filtered_dict["rope_scaling"]
-                ):
+                if key not in rope_params and key in filtered_dict["rope_scaling"]:
                     filtered_dict[key] = filtered_dict["rope_scaling"][key]
 
         if "torch_dtype" in filtered_dict and isinstance(

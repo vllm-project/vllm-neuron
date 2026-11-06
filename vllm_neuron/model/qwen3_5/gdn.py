@@ -187,7 +187,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
     def _forward_prefill(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Stateless prefill pass (chunked delta rule)."""
+        """Stateless prefill pass (chunked delta rule).
+
+        ``hidden_states`` is the vLLM-neuron flattened token tensor
+        ``[tokens, hidden]``. Phase 1 handles a single sequence, so it is viewed
+        as ``[1, tokens, hidden]`` and the output is squeezed back to 2D.
+        """
+        tokens, _ = hidden_states.shape
+        hidden_states = hidden_states.unsqueeze(0)  # [1, tokens, hidden]
         batch, seq, _ = hidden_states.shape
 
         mixed_qkv, z, b, a = self._project(hidden_states)
@@ -229,7 +236,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(batch, seq, self.value_dim)
         output = F.linear(core_attn_out, self.out_proj_weight)
-        return output
+        return output.squeeze(0)  # [tokens, hidden]
 
     def forward_decode(
         self,
@@ -239,12 +246,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     ):
         """Single-step decode with a cached recurrent state.
 
-        ``conv_state`` is ``[B, conv_dim, kernel_size - 1]``; ``ssm_state`` is
-        ``[B, H, k_head_dim, v_head_dim]``. Returns ``(output, conv_state,
-        ssm_state)`` with the states updated in place / returned.
+        ``hidden_states`` is the vLLM-neuron flattened token tensor
+        ``[tokens=1, hidden]``. ``conv_state`` is ``[B, conv_dim,
+        kernel_size - 1]``; ``ssm_state`` is ``[B, H, k_head_dim, v_head_dim]``.
+        Returns ``(output, conv_state, ssm_state)`` with ``output`` back in 2D.
         """
+        tokens, _ = hidden_states.shape
+        assert tokens == 1, "forward_decode expects a single token per sequence"
+        hidden_states = hidden_states.unsqueeze(0)  # [1, 1, hidden]
         batch, seq, _ = hidden_states.shape
-        assert seq == 1, "forward_decode expects a single token per sequence"
 
         mixed_qkv, z, b, a = self._project(hidden_states)
         mixed_qkv = mixed_qkv.transpose(1, 2)
@@ -281,4 +291,4 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(batch, seq, self.value_dim)
         output = F.linear(core_attn_out, self.out_proj_weight)
-        return output, conv_state, ssm_state
+        return output.squeeze(0), conv_state, ssm_state
