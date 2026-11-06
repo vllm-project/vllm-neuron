@@ -1019,6 +1019,44 @@ contexts (acceptance 60% of drafts either way); it pays at long context (see
 "The same split with an FP8 KV cache" above). Design, correctness checks and the per-step overhead:
 [docs/MTP_DESIGN.md](docs/MTP_DESIGN.md).
 
+#### Draft prefill under sequence parallelism (fixed)
+
+Before this fix, the draft's KV for the whole prompt was wrong:
+- At prefill each rank holds a different SP token shard. `_mtp_step` ran `eh_proj` on those shards.
+- `eh_proj` is a `ColumnParallelLinear` with a gathered output, so column block r of row i came
+  from token i of rank r's shard.
+- Every rank ended up with the same spliced rows, and the MTP layer wrote its KV for every prompt
+  position from them.
+- Decode steps (no SP) were correct. So each draft step attended to a wrong prompt and to correct
+  generated tokens only.
+
+The draft now runs the embedding, `enorm` / `hnorm` and `eh_proj` on every token, and keeps its
+token shard only after `eh_proj`. Decode is unchanged.
+
+How the draft KV was checked:
+- The draft layer's KV cache rows (KV head 0) were read back after prefill.
+- They were compared with a CPU reference of the MTP layer (vLLM `hy_v3_mtp` semantics) on the
+  same target hidden states.
+
+| draft KV of a 2048-token prompt | before | after |
+|---|---|---|
+| K cos | 0.80 | 0.9999 |
+| V cos | 0.37 | 0.9997 |
+
+Acceptance on one trn2.48xlarge.
+- Config: FP8 KV, MTP k=3, sparse decode 0.125 + sparse prefill 0.25, `HY3_DECODE_MOE_FUSED=1`.
+- Workload: the `bench_data/prefix` c8 prompts cut to the last N tokens, greedy raw-prompt
+  continuation of 256 tokens, 16 requests, C = 8.
+
+| prompt tokens | tokens/step before | tokens/step after | per-position acceptance after |
+|---|---|---|---|
+| 2048 | 2.38 | **3.14** | 0.95 / 0.71 / 0.48 |
+| 32768 | 2.64 | **3.14** | 0.97 / 0.72 / 0.45 |
+| 84000 | 2.49 | **2.94** | 0.94 / 0.64 / 0.35 |
+
+H100 1P1D (vLLM 0.29.0, FP8 KV, MTP k=3) gives 3.12-3.15 tokens/step (0.98 / 0.73 / 0.41) on the
+same 85k prompts. The MATH-500 acceptance above was measured before this fix.
+
 ### Comparison with the previous implementation (vllm-neuron 0.24, neuronx-cc 2.27)
 
 The same model code previously ran on vllm-neuron 0.24. Same benchmark, same
