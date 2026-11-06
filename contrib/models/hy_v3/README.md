@@ -547,7 +547,7 @@ commands above are unchanged.
 0.25, decode `HY3_DECODE_MOE_FUSED=1 HY3_DECODE_HITS=0`.
 
 **Shared between the two.** The same proxy file. The same benchmark: `scripts/pd/pd_bench_final.sh`
-(P-only at C = 1 / 4 / 8 / 12, then the end-to-end 1024-output case at C = 8). The same prompt files
+(P-only at C = 1 / 4 / 8 / 12, the end-to-end 1024-output case at C = 8, then the D-only replay at C = 8). The same prompt files
 (md5-checked on every host; `in85000_p78336_c12` was generated with `gen_prefix_prompts.py`, which
 regenerates c8 byte-identically). The same `vllm bench serve` (vLLM 0.29.0).
 
@@ -563,6 +563,22 @@ regenerates c8 byte-identically). The same `vllm bench serve` (vLLM 0.29.0).
 
 All runs completed 80/80 (or 10×C) requests, with prefill and decode prefix hits of 92.0-92.2%.
 Results are in `results/pd_prefill/`.
+
+**D-only, the customer GPU table** (`scripts/pd/pd_bench_dcust.sh`, the third part of
+`pd_bench_final.sh`). All 80 prompts of the c8 file are sent once with output 1, so both nodes cache
+them. They are then replayed with the same `cache_salt`, so almost nothing is prefilled or
+transferred. 1200 output tokens, `--ignore-eos`, C = 8, 2 warm-ups, temperature 0.9, seed 0, mean
+and P99. TPOT is the number to read here. TTFT is only the fixed path overhead, not prefill.
+
+| D-only, 1200 out, C = 8 | TTFT mean / P99 | TPOT mean / P99 | prefix hits P / D |
+|---|---|---|---|
+| customer GPU reference | 388 ms / - | 15.25 ms / - | - |
+| H100 1P1D (the setup above) | 477 ms / 1.64 s | 17.09 / 17.17 ms | 100% / 99.5% |
+| Trn2 1P1D | not measured yet with these defaults | | |
+
+On Trn2 the 80 prompts (about 611k tokens) do not all fit in the prefill node KV (514k at
+`P_KV_CAP` 0.45), so part of the replay is prefilled again and TTFT reads higher than on H100. TPOT
+is not affected. The H100 run is in `results/pd_prefill/h100/dcust/`.
 
 ## Compatibility Matrix
 
@@ -1131,7 +1147,7 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 | `scripts/bench_fixed.sh` | `vllm bench serve` matrix over the fixed real-text prompts in `bench_data/prompts` (same requests every run) |
 | `scripts/gen_bench_prompts.py` | generates `bench_data/prompts`: sglang-style ShareGPT text cut / repeated to an exact token count |
 | `scripts/bench_prefix_fixed.sh` | prefix-cache benchmark over `bench_data/prefix` (85k input, 92% shared prefix): warm-up request, one `cache_salt` per run, hit rate from `/metrics` |
-| `scripts/pd/pd_bench_final.sh`, `pd_bench_split.sh` | the comparison set: P-only (output 1) at C = 1 / 4 / 8 / 12, then the end-to-end 1024-output case at C = 8 ("Trn2 vs H100") |
+| `scripts/pd/pd_bench_final.sh`, `pd_bench_split.sh`, `pd_bench_dcust.sh` | the comparison set: P-only (output 1) at C = 1 / 4 / 8 / 12, the end-to-end 1024-output case at C = 8, then the customer D-only replay (1200 output) at C = 8 ("Trn2 vs H100") |
 | `scripts/pd/gpu/` | the H100 1P1D reference: Dockerfile (vLLM 0.29.0 + EFA + GDRCopy + Mooncake) and `gpu_serve.sh` |
 | `scripts/pd/` | 1P1D (Mooncake / NIXL) runs on two trn2.48xlarge: servers, proxy, the 85k / 92% bench and the accuracy checks through the proxy ([scripts/pd/README.md](scripts/pd/README.md), "PD test method and results") |
 | `src/kernels/moe_tkg_fused.py` | EXPERIMENTAL fused decode MoE block (`HY3_DECODE_MOE_FUSED=1`): norm + router + routed + shared shard, W8A8 + FP8 double-row; 8-request PD TPOT 26.5 -> 19.9 ms ("Fused decode MoE") |

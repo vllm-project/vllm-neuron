@@ -10,7 +10,8 @@ These scripts run one prefill node and one decode node, both trn2.48xlarge at TP
 | `pd_bench.sh` | smoke and needle checks, then the 85k / 92% shared-prefix case at the given concurrencies. Reports the prefill and decode hit rates and the MTP acceptance |
 | `pd_acc.sh` | `../needle.py` (12 prompts, 16k-85k) and `../sparse_decode_eval.py` (19 greedy continuations) through the proxy |
 | `pd_bench_split.sh` | Qingzhong's `../bench_pd_split.sh` flags through the proxy: P-only (output 1, 10×C requests) and D replays; `P_ONLY=1` runs only P |
-| `pd_bench_final.sh` | the Trn2 vs H100 set: `pd_bench_split.sh` P at C = 1 / 4 / 8 / 12, then `pd_bench.sh` at C = 8 with 1024 output tokens |
+| `pd_bench_final.sh` | the Trn2 vs H100 set: `pd_bench_split.sh` P at C = 1 / 4 / 8 / 12, then `pd_bench.sh` at C = 8 with 1024 output tokens, then `pd_bench_dcust.sh` at C = 8 |
+| `pd_bench_dcust.sh` | the customer GPU "D-only" table: warm all 80 prompts of the c8 file with output 1, then replay them with the same `cache_salt` (~100% hit on both nodes, nothing to transfer), 1200 output tokens, mean / P99; `PROMPTS_DIR` overrides the prompt directory |
 | `gpu/` | the H100 1P1D reference (vLLM 0.29.0): `Dockerfile` and `gpu_serve.sh` |
 | `needle_check.py` | the single needle request of `pd_bench.sh` |
 
