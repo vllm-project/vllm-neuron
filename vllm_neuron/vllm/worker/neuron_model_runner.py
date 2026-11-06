@@ -8599,18 +8599,31 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self,
         req_ids: list[str],
         num_draft_tokens: list[int],
+        input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        if self._missing_async_spec_transition_cache_req_ids(req_ids, num_draft_tokens):
+        new_ids = getattr(self, "_transition_new_req_ids", set()) or set()
+        missing = self._missing_async_spec_transition_cache_req_ids(req_ids, num_draft_tokens)
+        if any(req_id not in new_ids for req_id in missing) or (missing and input_ids is None):
             return None
 
         full_pieces: list[torch.Tensor] = []
         drafts_pieces: list[torch.Tensor] = []
+        cached = [self._async_spec_transition_full_draft_cache[r] for r in req_ids if r not in missing]
+        device = cached[0].device if cached else input_ids.device
+        pad_id = getattr(self.vllm_config.model_config.hf_config, "pad_token_id", None) or 0
 
+        offset = 0
         for req_id, n_draft in zip(req_ids, num_draft_tokens):
-            full_row = self._async_spec_transition_full_draft_cache[req_id]
+            if req_id in missing:
+                first = input_ids[offset : offset + 1].to(device=device, dtype=torch.int32)
+                pads = torch.full((n_draft,), pad_id, dtype=torch.int32, device=device)
+                full_row = torch.cat([first, pads])
+            else:
+                full_row = self._async_spec_transition_full_draft_cache[req_id]
             full_pieces.append(full_row[: 1 + n_draft])
             if n_draft:
                 drafts_pieces.append(full_row[1 : 1 + n_draft])
+            offset += 1 + n_draft
 
         if not full_pieces:
             return None
@@ -8637,6 +8650,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         decode for this one step and let the next proposer output refill
         the cache.
         """
+        self._transition_new_req_ids = set()
         if not (
             self._uses_async_spec_transition_cache()
             and getattr(self, "_batch_composition_changed", False)
@@ -8653,6 +8667,22 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             req_ids, num_draft_tokens
         )
         if not missing_req_ids:
+            return
+        # A request that is new this step (a PD decode node admits it with its KV loaded and
+        # no local prefill) has no cached row, but its CPU-built first token is fresh
+        # (add_request writes its history). Fill its row from that token and pad drafts
+        # instead of stripping spec decode: the stripped step's CPU-built inputs read the
+        # running requests' tokens at the scheduler's optimistic offsets, which are stale.
+        new_req_ids = {
+            r.req_id for r in getattr(scheduler_output, "scheduled_new_reqs", []) or []
+        }
+        if all(req_id in new_req_ids for req_id in missing_req_ids):
+            self._transition_new_req_ids = set(missing_req_ids)
+            logger.debug(
+                "Async spec batch change: new req_ids=%s take their first token from the "
+                "CPU-built inputs and pad drafts.",
+                missing_req_ids,
+            )
             return
 
         logger.warning(
@@ -8691,7 +8721,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         num_reqs = self.input_batch.num_reqs
         req_ids = list(self.input_batch.req_ids)[:num_reqs]
         num_draft_tokens = spec_decode_metadata.num_draft_tokens[:num_reqs]
-        pieces = self._get_cached_transition_draft_pieces(req_ids, num_draft_tokens)
+        pieces = self._get_cached_transition_draft_pieces(
+            req_ids, num_draft_tokens, input_ids
+        )
         if pieces is None:
             # _drop_transition_spec_decode_if_cache_incomplete should already
             # have stripped spec decode before spec metadata was built. If we

@@ -1057,6 +1057,56 @@ Acceptance on one trn2.48xlarge.
 H100 1P1D (vLLM 0.29.0, FP8 KV, MTP k=3) gives 3.12-3.15 tokens/step (0.98 / 0.73 / 0.41) on the
 same 85k prompts. The MATH-500 acceptance above was measured before this fix.
 
+#### Decode node: async spec decode when a request joins (fixed)
+
+On a PD decode node (`kv_consumer`), a new request joins the running batch with its KV loaded
+and no local prefill, so it has no row in the runner's async spec transition cache.
+`_drop_transition_spec_decode_if_cache_incomplete` then stripped spec decode for the whole step.
+
+That step's CPU-built `input_ids` read the running requests' tokens at the scheduler's optimistic
+`num_computed_tokens`, which are `-1` / `0` placeholders:
+- the target decoded those at the running requests' positions, and their outputs derailed;
+- without async scheduling, the same `-1` ids fail validation (`Token IDs out of range`) instead.
+
+Every join hit this: 11008 "Missing async spec transition drafts" warnings in one c=8 run. So at
+C >= 2 the PD output differed from C = 1 within a few tokens. MTP acceptance fell to the level of
+fresh text, because the derailed continuation no longer copied the prompt.
+
+The fix (`neuron_model_runner.py`) keeps spec decode when only new requests miss the cache:
+- running requests replay their cached `[bonus, drafts]` rows, and positions are corrected on
+  device as in any spec step;
+- a new request takes its CPU-built first token (written fresh by `add_request`), followed by
+  pad drafts that the first verify rejects.
+
+1P1D check: greedy continuation of the `bench_data/prefix` prompts cut to the last 2048 tokens, 16
+requests, 256 tokens each.
+
+| C | tokens/step before | tokens/step after | greedy text vs C = 1 after |
+|---|---|---|---|
+| 1 | 3.10 | 3.09 | - |
+| 2 | 2.32 | 3.11 | identical (all chars) |
+| 8 | 2.34 | 3.08 | identical (all chars) |
+
+**1P1D `scripts/pd/pd_bench_final.sh` with both fixes.**
+- Setup: two trn2.48xlarge, the `scripts/pd` defaults; C = 8 unless noted.
+- "Before" is the same setup without either fix.
+- The H100 1P1D reference is vLLM 0.29.0 with FP8 KV + MTP k=3.
+
+| | before | both fixes | H100 FP8 + MTP |
+|---|---|---|---|
+| P-only TTFT P50, C = 1 / 4 / 8 / 12 (s) | 1.13 / 2.95 / 5.78 / 8.71 | 1.13 / 2.96 / 5.79 / 8.74 | 0.84 / 2.10 / 3.94 / 5.90 |
+| end-to-end TPOT median / P99 (ms) | 19.6 / 24.0 | **15.45 / 22.6** | 7.6 / 11.4 |
+| end-to-end MTP tokens/step | 2.23 | **2.71** | 2.98 |
+| end-to-end output tok/s | 353 | **416** | 795 |
+| D-only TPOT mean / P99 (ms) | 19.86 / 23.73 | 19.71 / 25.19 | 11.02 / 13.31 |
+| D-only MTP tokens/step | 2.20 | 2.22 | 2.23 |
+
+Notes on the table:
+- The end-to-end case continues raw prompts (`/v1/completions`), so it shows the gain.
+- The D-only replay samples chat answers at temperature 0.9, where Trn2 and H100 accept the same
+  2.2 tokens per step. Its TPOT is bound by the decode step time (about 44 ms at C = 8), not by
+  MTP.
+
 ### Comparison with the previous implementation (vllm-neuron 0.24, neuronx-cc 2.27)
 
 The same model code previously ran on vllm-neuron 0.24. Same benchmark, same
