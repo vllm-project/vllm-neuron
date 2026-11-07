@@ -8,6 +8,7 @@ bucket-aware admission control.
 """
 
 import logging
+import os
 from collections import deque
 from enum import Enum, auto
 from typing import TYPE_CHECKING
@@ -327,6 +328,18 @@ class NeuronScheduler(Scheduler):
         self._max_kv_concurrent = (
             max_concurrent if max_concurrent > 0 else self.max_num_seqs
         )
+        # VLLM_NEURON_MAX_KV_CONCURRENT overrides the worst-case cap above, which assumes every
+        # request fills max_model_len with no prefix-cache sharing. Block allocation still
+        # bounds what actually runs.
+        _override = os.environ.get("VLLM_NEURON_MAX_KV_CONCURRENT")
+        if _override:
+            logger.warning(
+                "VLLM_NEURON_MAX_KV_CONCURRENT=%s overrides the worst-case KV concurrency cap %d.",
+                _override,
+                self._max_kv_concurrent,
+            )
+            self._max_kv_concurrent = int(_override)
+            max_concurrent = self._max_kv_concurrent
 
         if 0 < max_concurrent < self.max_num_seqs:
             logger.warning(
