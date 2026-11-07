@@ -1,26 +1,28 @@
 #!/bin/bash
-# pd_bench.sh <out_dir> [concurrencies="1 4 8"] [output_len=256]: the 85k / 92% shared-prefix
+# pd_bench.sh <out_dir> [concurrencies="1 4 8"] [output_len=1200]: the 85k / 92% shared-prefix
 # customer case through the PD proxy, same prompts and procedure as
 # ../bench_prefix_fixed.sh (bench_data/prefix/in85000_p78336: 78336 of 85000 tokens shared; one
 # warm-up request per cell, then 10 x C requests; a new cache_salt per run), plus a needle check
 # first. The proxy has no /metrics, so the prefix-cache counters are read on both servers:
 # the prefill hit rate (P) is the customer's 92%; the decode side's own hits (D) are tokens it
 # did not have to pull over NIXL.
+# Requests go to /v1/chat/completions with the server-side chat template, temperature 0.9 and
+# seed 0, as in pd_bench_split.sh and pd_bench_dcust.sh.
 # Works with either proxy of pd_proxy.sh (NIXL toy proxy or Mooncake).
 # Env: CODE (vllm-neuron checkout, default: the one holding this script), MODEL (tokenizer), PROXY (http://127.0.0.1:8000),
 #      P_URL (http://P_HOST:8100), D_URL (http://D_HOST:8200), SALT, MTP (1: also record the
-#      decode side's spec-decode acceptance counters).
+#      decode side's spec-decode acceptance counters), PROMPTS_DIR (default bench_data/prefix).
 set -uo pipefail
 OUT=${1:?usage: pd_bench.sh <out_dir> [concurrencies] [output_len]}
 CONCS=${2:-1 4 8}
-OUTPUT_LEN=${3:-256}
+OUTPUT_LEN=${3:-1200}
 CODE=${CODE:-$(cd "$(dirname "$0")/../../../../.." && pwd)}
 MODEL=${MODEL:-tencent/Hy3-FP8}
 PROXY=${PROXY:-http://127.0.0.1:8000}
 P_URL=${P_URL:-http://${P_HOST:-127.0.0.1}:8100}
 D_URL=${D_URL:-http://${D_HOST:-127.0.0.1}:8200}
 SALT=${SALT:-pd-$(date +%s)}
-PROMPTS=$CODE/contrib/models/hy_v3/bench_data/prefix
+PROMPTS=${PROMPTS_DIR:-$CODE/contrib/models/hy_v3/bench_data/prefix}
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$OUT"
 TMP=$(mktemp -d); trap 'rm -rf $TMP' EXIT
@@ -62,18 +64,21 @@ with gzip.open(src, "rt") as f:
     rows = [json.loads(line) for line in f]
 prefix = rows[0]["prefix"]
 with open(warm, "w") as f:
-    json.dump({"model": "hy3", "prompt": prefix + rows[1]["suffix"], "max_tokens": 1, "cache_salt": salt}, f)
+    json.dump({"model": "hy3", "messages": [{"role": "user", "content": prefix + rows[1]["suffix"]}],
+               "max_tokens": 1, "cache_salt": salt}, f)
 with open(out, "w") as f:
     for r in rows[2:]:
         f.write(json.dumps({"prompt": prefix + r["suffix"]}, ensure_ascii=False) + "\n")
 EOF
   N=$(wc -l < "$TMP/$tag.jsonl")
   echo "=== $tag (warm-up + $N requests, cache_salt=$SALT)"
-  curl -sf "$PROXY/v1/completions" -H "Content-Type: application/json" -d @"$TMP/warmup.json" >/dev/null \
+  curl -sf "$PROXY/v1/chat/completions" -H "Content-Type: application/json" -d @"$TMP/warmup.json" >/dev/null \
     || { echo "warm-up failed"; exit 1; }
   snap a
-  vllm bench serve --backend openai --base-url "$PROXY" --model hy3 --tokenizer "$MODEL" \
+  vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url "$PROXY" \
+    --model "$MODEL" --served-model-name hy3 --tokenizer "$MODEL" --trust-remote-code \
     --dataset-name custom --dataset-path "$TMP/$tag.jsonl" --skip-chat-template --disable-shuffle \
+    --temperature 0.9 --seed 0 \
     --custom-output-len "$OUTPUT_LEN" --ignore-eos --num-prompts "$N" --max-concurrency "$C" \
     --ready-check-timeout-sec 0 --extra-body "{\"cache_salt\": \"$SALT\"}" \
     --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,99 \

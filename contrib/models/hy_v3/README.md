@@ -1107,6 +1107,73 @@ Notes on the table:
   2.2 tokens per step. Its TPOT is bound by the decode step time (about 44 ms at C = 8), not by
   MTP.
 
+#### Decode at C = 10 / 12, and the benchmark set
+
+**Benchmark.** All three parts of `scripts/pd/pd_bench_final.sh` now use the same 85k / 92% prompts:
+- `pd_bench_split.sh` (P-only) and `pd_bench_dcust.sh` (D-only) already used
+  `/v1/chat/completions` with the server-side chat template and temperature 0.9;
+- `pd_bench.sh` (end to end) now does too, with 1200 output tokens instead of a raw
+  `/v1/completions` prompt with 1024.
+
+A raw completion of these repeated-text prompts copies the prompt, which inflated MTP acceptance
+(2.71 tokens/step) above what chat traffic gets (2.2).
+
+**Admission.** The Neuron scheduler admits `floor(KV tokens / max_model_len)` requests, which
+ignores prefix sharing. It held back prefills on the prefill node (`Prefill deferred`) and would
+cap a 0.35 decode pool at 4 requests. `VLLM_NEURON_MAX_KV_CONCURRENT` overrides that cap. Block
+allocation still bounds what runs: 16 requests sharing the 78k prefix use about 210k tokens.
+`pd_serve.sh` now sets it, together with these batch sizes:
+- prefill: `max_num_seqs` 16, buckets 1 / 4 / 8 / 16;
+- decode: 16, buckets 1 / 4 / 8 / 10 / 12 / 16.
+
+Neither node logged `Prefill deferred` with these settings. P-only TTFT is unchanged
+(5.77 s at C = 8): prefill runs one request per 8192-token step, so a burst of C requests waits
+for C prefills, and the P-only TTFT measures that queue. The end-to-end median TTFT (1.78 s) is
+lower because its requests arrive as others finish.
+
+**Decode step at C = 12.** A device profile of rank 0 gives 48.2 ms per step: the target is
+43.6 ms and the MTP draft 4.6 ms. Within the target:
+
+| part | ms |
+|---|---|
+| attention | 24.3 |
+| fused MoE | 15.3 |
+| other instructions | 9.5 |
+| collectives | 5.0 |
+
+The attention splits into the NKI `attention_tkg` kernel (13.8 ms) and the sparse-decode torch
+ops (selection, gather and summary update, 8.2 ms).
+
+**Settings.** The measured defaults are in `pd_serve.sh` for FP8 decode:
+- `HY3_SPARSE_SELECT_EVERY=8`;
+- `HY3_MOE_STATIC_DGE=1`;
+- `KV_CAP` 0.35, which leaves HBM for the batch-16 NEFFs and the static DGE descriptors.
+
+Set `HY3_SPARSE_DECODE=0.0625` on the decode node only; the prefill node keeps 0.125.
+
+D-only (1200 output tokens, temperature 0.9), MTP k=3:
+
+| | C = 8 | C = 10 | C = 12 | C = 16 |
+|---|---|---|---|---|
+| sparse 0.125, select every 4, buckets 1 / 4 / 8 / 12 | 19.57 ms | 22.29 ms | 22.96 ms | |
+| + select every 8, static DGE, KV_CAP 0.35, buckets + 10 | 19.34 ms | 20.96 ms | 21.79 ms | |
+| **+ sparse decode 0.0625, bucket 16** | | **19.58 ms** | 20.34 ms | 22.32 ms |
+| output tok/s (last row) | | 446 | 502 | 595 |
+
+MTP accepts 2.19-2.22 tokens per step in every row. MTP k=2 lowered the step (46.3 instead of
+51.5 ms at C = 12) but also the tokens per step (2.05), so k=3 stays.
+
+**Accuracy.** Sparse decode runs only at batch >= `HY3_SPARSE_MIN_BATCH` (4), so the single-request
+checks of `pd_acc.sh` need `HY3_SPARSE_MIN_BATCH=1` on the decode node to test it. With the last
+row's settings:
+- needle 12/12;
+- 16/19 continuations identical to dense, the same as with 0.125.
+
+**End to end at C = 8** (chat, 1200 output tokens, temperature 0.9):
+- TTFT median 1.78 s;
+- TPOT 19.38 ms, against 19.34 ms for D-only at the same settings;
+- 2.17 tokens/step.
+
 ### Comparison with the previous implementation (vllm-neuron 0.24, neuronx-cc 2.27)
 
 The same model code previously ran on vllm-neuron 0.24. Same benchmark, same

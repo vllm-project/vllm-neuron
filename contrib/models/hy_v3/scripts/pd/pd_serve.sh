@@ -70,9 +70,12 @@ if fi_info -p efa >/dev/null 2>&1; then export NEURON_SKIP_EFA_AFFINITY=0; else 
 
 # Per role: the prefill side keeps the shared prefix and the running prompts; the decode side
 # keeps every running request at max_model_len (the scheduler admits by worst case).
-if [ "$KV_DTYPE" = fp8 ]; then d_seqs=8 d_buckets='[1, 4, 8]' d_ctx='[32768]' d_cap=0.60
+if [ "$KV_DTYPE" = fp8 ]; then d_seqs=16 d_buckets='[1, 4, 8, 10, 12, 16]' d_ctx='[32768]' d_cap=0.35
 else d_seqs=4 d_buckets='[1, 4]' d_ctx='[8192, 32768, 65536]' d_cap=0.65; fi
-[ -n "${MTP_K:-}" ] && d_cap=0.61
+[ -n "${MTP_K:-}" ] && [ "$KV_DTYPE" != fp8 ] && d_cap=0.61
+# FP8 decode: KV_CAP 0.35 holds 400k tokens. With the 78k shared prefix, 16 requests use about 210k,
+# but the scheduler's worst-case cap (KV tokens / max_model_len) would admit 4. It is overridden below
+# (VLLM_NEURON_MAX_KV_CONCURRENT); block allocation still bounds what runs.
 # HY3_SPARSE_DECODE / HY3_SPARSE_PREFILL (set the summaries' owner, HY3_SPARSE_DECODE, on BOTH nodes:
 # prefill writes the K summaries, the connector moves them; HY3_SPARSE_PREFILL only acts on the prefill node):
 # as serve_85k.sh, only the max_model_len decode bucket (the summaries do not fit next to the
@@ -91,11 +94,16 @@ case "$ROLE" in
     # at C=8) need the HBM that a smaller KV pool leaves: P_KV_CAP 0.45 holds 514k tokens, the
     # running prefills and the prefix cache. (8192 with KV_CAP 0.65 fails to allocate.)
     pb=${P_PREFILL_BUCKETS:-'[512, 1024, 2048, 4096, 8192]'}
-    seqs=${SEQS:-4} buckets=${SEQ_BUCKETS:-'[1, 4]'} ctx=${CTX_BUCKETS:-} cap=${P_KV_CAP:-0.45} ;;
+    seqs=${SEQS:-16} buckets=${SEQ_BUCKETS:-'[1, 4, 8, 16]'} ctx=${CTX_BUCKETS:-} cap=${P_KV_CAP:-0.45}
+    export VLLM_NEURON_MAX_KV_CONCURRENT=${VLLM_NEURON_MAX_KV_CONCURRENT:-16} ;;
   decode)
     kv_role=kv_consumer port=8200 nixl_port=5557
     export VLLM_NEURON_SKIP_PREFILL_WARMUP=1
-    seqs=${SEQS:-$d_seqs} buckets=${SEQ_BUCKETS:-$d_buckets} ctx=${CTX_BUCKETS:-$d_ctx} cap=${KV_CAP:-$d_cap} ;;
+    seqs=${SEQS:-$d_seqs} buckets=${SEQ_BUCKETS:-$d_buckets} ctx=${CTX_BUCKETS:-$d_ctx} cap=${KV_CAP:-$d_cap}
+    if [ "$KV_DTYPE" = fp8 ]; then
+      export VLLM_NEURON_MAX_KV_CONCURRENT=${VLLM_NEURON_MAX_KV_CONCURRENT:-$((seqs + 4))}
+      export HY3_SPARSE_SELECT_EVERY=${HY3_SPARSE_SELECT_EVERY:-8} HY3_MOE_STATIC_DGE=${HY3_MOE_STATIC_DGE:-1}
+    fi ;;
   decode-bench)
     kv_role=kv_consumer port=8200 nixl_port=5557
     export VLLM_NEURON_SKIP_PREFILL_WARMUP=1
