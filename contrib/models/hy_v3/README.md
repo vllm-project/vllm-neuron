@@ -499,6 +499,54 @@ batch-8 NEFF) shows where the step went:
 
 The selection in the kernel gives the same tokens as `hy3_route`.
 
+## KV data parallelism on decode (`HY3_DECODE_KVDP=8`, experimental, off)
+
+At TP=64 the 8 KV heads are replicated 8 ways. Each rank reads its KV head's whole history for
+every request, so every KV byte is read 8 times.
+
+nkilib's `attention_block_tkg` has a KV-data-parallel mode (`KVDP`):
+- Each of the 8 ranks that share a KV head attends for B / 8 of the requests.
+- An in-kernel all-to-all brings it those requests' 8 query heads, and gives every rank back its own head for all B requests.
+- The O-projection and everything after it stay TP=64.
+
+vllm-neuron's `NF.attention_decode` does not expose this (`attention_dp > 1` takes its torch
+path), so `src/kvdp_attention.py` calls the kernel directly.
+
+**Keeping the caches complete.**
+- vLLM can move a request to another batch row, and so to another KVDP rank, between steps. Every rank must therefore hold every request's KV.
+- The kernel runs with `update_cache=False` and returns its requests' new FP8 K / V. One TP all-gather collects the group's rows.
+- `kvdp_kv_write` then writes all B rows. It is a small NKI kernel around nkilib's `_update_block_cache`, the attention kernel's own vectorized scatter.
+- Writing those rows with torch `index_put_` instead cost 55.8 ms per step (0.8 ms per layer for 32 rows), plus about 36 ms of transposes.
+
+**Sparse decode on top.**
+- A rank now attends with all 8 query heads of its KV head, so the selection has to serve the whole GQA group.
+- Every rank scores every request's groups with its own head, as before. One TP all-gather of the [B, groups] scores gives the group's maximum over its 8 heads.
+- Each rank then picks blocks for its own requests (`sparse_select_blocks_kvdp`). This runs only on the selecting layers (`HY3_SPARSE_SELECT_EVERY`).
+
+**Constraints.**
+- KVDP applies to batch buckets that are a multiple of 8, with FP8 KV and without DCP. Other buckets take the default path, so C = 12 pads to the 16 bucket.
+- Dense decode needs `max_model_len` 90112 rather than 87040. With 87040 (2720 blocks) the kernel shrinks its block length to 4; with 90112 it stays at 32.
+
+**Single node, D-only TPOT mean** (`pd_bench_dcust.sh` against one server, MTP k=3, FP8 KV):
+
+| decode attention | C = 8 | C = 12 |
+|---|---|---|
+| dense, max_model_len 87040 | 41.24 ms | 54.72 ms |
+| dense, max_model_len 90112 | 34.15 ms | 51.44 ms |
+| dense + KVDP | 26.13 ms | 34.08 ms (bucket 16) |
+| sparse 0.0625, no KVDP | **21.62 ms** | **26.54 ms** (bucket 12) |
+| sparse 0.0625 + KVDP | 22.48 ms | 28.20 ms (bucket 16) |
+| sparse 0.125 + KVDP | 23.18 ms | 29.18 ms (bucket 16) |
+
+- KVDP cuts dense decode TPOT by 23-34%.
+- On top of sparse decode it does not pay at these batch sizes. Its per-layer fixed cost (two in-kernel all-to-alls, the all-gather and the write) is about what the remaining 1/16 of the reads costs.
+- It stays off. It is the option for configurations that need dense decode attention.
+
+**Accuracy.**
+- With 8 background requests decoding (`scripts/needle_load.py`), the needles decode in KVDP buckets. The needle test passed 12/12 with sparse 0.0625 + KVDP and with sparse 0.125 + KVDP.
+- Plain `scripts/needle.py` sends one request at a time, which never takes the KVDP path.
+- On the 4-layer model, greedy continuations of 24 requests with varying output lengths matched the default path in 23/24. The one difference came at a near-tie late in a request that also diverged between two default-path runs.
+
 ## Prefill: the MoE blockwise mapping on the NKI path (`HY3_MOE_MAP_PAD`, on)
 
 `NF.build_blockwise_mapping` maps each routed token to a 256-token block of its expert for the prefill
@@ -533,6 +581,48 @@ The 8192-token steps need the HBM that a smaller KV pool leaves. With KV_CAP 0.6
 allocate. The prefill role of `pd_serve.sh` therefore takes `P_KV_CAP` (default 0.45, 514k tokens)
 and `P_PREFILL_BUCKETS` (default 512..8192), and ignores `KV_CAP`, which applies to decode. The PD
 commands above are unchanged.
+
+### Two prefill instances on the prefill node (`P_INSTANCES=2`)
+
+Prefill on Neuron runs one request at a time. One TP=64 prefill instance reaches 1.37 req/s on the
+85k / 92% case, so a burst of C requests waits about C / 1.37 s for the last one. A TP=32 / EP=32
+instance on half the node (`pd_serve.sh` `P_HALF=0` / `1`: logical NeuronCores 0-31 / 32-63) runs at
+1.02 req/s. Two of them run side by side without slowing each other down (1.02 req/s each), so the
+node prefills 2.0 req/s.
+
+- The decode node stays one TP=64 instance.
+- The Mooncake proxy round-robins requests over the two prefill instances (`pd_proxy.sh`
+  `P_INSTANCES=2`).
+- vLLM's `MooncakeConnector` maps the TP=32 prefill ranks onto the TP=64 decode ranks.
+
+```bash
+# prefill node (decode node unchanged)
+bash contrib/models/hy_v3/scripts/pd/run_pd.sh p2 prefill-node $COMMON D_HOST=<decode IP> \
+  P_INSTANCES=2 BENCH=pd_bench_final VLLM_CACHE_ROOT=/path/cache/prefill_tp32
+```
+
+**Results**, 1P1D with the `pd_serve.sh` decode defaults and `HY3_SPARSE_DECODE=0.0625` on the decode node:
+
+| | 1 x TP=64 prefill | 2 x TP=32 prefill |
+|---|---|---|
+| P-only TTFT P50 / P99, C = 1 (s) | 1.11 / 1.16 | 1.46 / 1.51 |
+| P-only TTFT P50 / P99, C = 4 (s) | 2.91 / 3.51 | 2.48 / 3.40 |
+| P-only TTFT P50 / P99, C = 8 (s) | 5.77 / 6.42 | **3.87 / 6.08** |
+| P-only TTFT P50 / P99, C = 12 (s) | 8.68 / 9.43 | **5.86 / 7.81** |
+| prefill req/s | 1.37 | **2.00** |
+| end to end, C = 8: TTFT median / P99 (s) | 1.78 / 5.96 | 2.18 / 5.14 |
+| end to end, C = 8: TPOT median (ms) | 19.33 (decode sparse 0.125) | 18.39 |
+| D-only TPOT mean, C = 8 (ms) | 19.34 (decode sparse 0.125) | 18.26 |
+
+- **Gain:** a burst prefills about 1.5x faster, so C = 12 P-only goes from 8.7 to 5.9 s.
+- **Cost:** one request alone takes 1.46 instead of 1.11 s. That is the TP=32 prefill plus the transfer from 32 to 64 ranks.
+- **Checks:** the KV transfer had no errors, the needle passed, and MTP acceptance was unchanged (2.18-2.21).
+- **Warm-up:** each instance needs its own warm-up. An instance without the shared prefix cold-prefills 85k tokens for its first request. `pd_bench.sh` therefore sends one warm-up per instance (`P_INSTANCES`). With a single warm-up, the first pass had a P99 TTFT of 12.1 s.
+
+**Proxy keep-alive fix** (`mooncake_connector_proxy.py`).
+- **Symptom:** a run hung on its last request. The prefill POST had failed with `httpx.ReadError`, and the decode node logged `Timeout waiting for P side ready` but kept the request deferred.
+- **Cause:** httpx's default `keepalive_expiry` (5 s) equals uvicorn's keep-alive timeout, so the proxy now and then reused a connection the server had just closed.
+- **Fix:** the proxy's clients now expire idle connections after 2 s, and the prefill POST is retried once on a connection-level error.
 
 ### Trn2 vs H100, 1P1D, the same benchmark
 
@@ -1308,12 +1398,14 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 | `src/kernels/moe_tkg_fused.py` | EXPERIMENTAL fused decode MoE block (`HY3_DECODE_MOE_FUSED=1`): norm + router + routed + shared shard, W8A8 + FP8 double-row; 8-request PD TPOT 26.5 -> 19.9 ms ("Fused decode MoE") |
 | `scripts/bench_pd_split.sh` | prefill-only (output 1) and decode-only (replay twice) split over `bench_data/prefix`, with per-cell `cache_salt`, hit rates and MTP acceptance |
 | `src/kernels/moe_cte_fp8w.py`, `bwmm_shard_on_I_fp8w.py` | prefill routed experts: nkilib's `shard_on_i_hybrid` with the FP8 weight tiles fed to the matmul (no BF16 copy; identical output, routed experts -33% per prefill chunk; `HY3_MOE_CTE_FP8W=0` for the nkilib kernel; [docs/PROFILE_85K.md](docs/PROFILE_85K.md)) |
+| `src/kvdp_attention.py` | `HY3_DECODE_KVDP`: `attention_block_tkg` with KV data parallelism, and `kvdp_kv_write` (all B rows of a step into the caches, NKI) ("KV data parallelism on decode") |
 | `scripts/tensore_mm_bench.py` | one-core TensorE cost of the decode MoE matmul shapes, BF16 x FP8 vs FP8 x FP8 (W8A8, with and without `double_row`): W8A8 is not faster there (`results/w8a8_decode/`, docs/PROFILE_85K.md) |
 | `scripts/profile_attn_breakdown.py` | attention-module time of a profiled decode step by model.py function (sparse-decode profile, [docs/SPARSE_DECODE.md](docs/SPARSE_DECODE.md)) |
 | `scripts/sparse_select_bench.py` | single-core timing of the sparse-decode block selection variants ([docs/SPARSE_DECODE.md](docs/SPARSE_DECODE.md)) |
 | `scripts/serve_85k.sh` | 85k-context config without DCP (max_model_len 86016, 4 requests at once), for MTP on `bench_data/prefix` |
 | `scripts/gen_prefix_prompts.py` | generates `bench_data/prefix`: real-text shared prefix + distinct suffixes, exact token counts |
 | `scripts/needle.py` | passkey retrieval at 16k-85k (`gen` writes `bench_data/needle.jsonl.gz`, `run` checks a server) |
+| `scripts/needle_load.py` | the needle test with background requests decoding, so the needles decode in batch buckets of 8+ (the `HY3_DECODE_KVDP` path) |
 | `scripts/bench_sharegpt.sh` | `vllm bench serve` on ShareGPT (vLLM keeps prompts <= 1024 tokens only) |
 | `scripts/bench_prefix_cache.sh` | prefix-cache benchmark: shared-prefix share sweep, hit rate read from the server's `/metrics` |
 | `scripts/summarize_bench.py` | markdown table from benchmark JSONs, optionally against a baseline directory |
