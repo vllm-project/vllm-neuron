@@ -4,9 +4,9 @@ These scripts run one prefill node and one decode node, both trn2.48xlarge at TP
 
 | script | what |
 |---|---|
-| `run_pd.sh <label> <mode> [KEY=VAL ...]` | one run: starts this node's server (and the proxy plus the bench on the prefill node), waits for health, stops everything on exit. Modes: `decode-node` (start first; stays up), `prefill-node` (needs `D_HOST`), `split` (both roles on one node, TP=32 each), `decode-bench` |
-| `pd_serve.sh <prefill\|decode\|decode-bench>` | one role on top of `../serve.sh`: KV transfer config, per-role buckets / KV_CAP, sparse attention, DCP, attention DP |
-| `pd_proxy.sh` | the proxy matching `CONNECTOR`. Mooncake: `mooncake_connector_proxy.py`, vendored unmodified from vLLM v0.29.0, which sends to prefill and decode concurrently. NIXL: vllm-neuron's toy proxy |
+| `run_pd.sh <label> <mode> [KEY=VAL ...]` | one run: starts this node's server (and the proxy plus the bench on the prefill node), waits for health, stops everything on exit. Modes: `decode-node` (start first; stays up), `prefill-node` (needs `D_HOST`; `P_INSTANCES=2`: two TP=32 prefill instances), `split` (both roles on one node, TP=32 each), `decode-bench` |
+| `pd_serve.sh <prefill\|decode\|decode-bench>` | one role on top of `../serve.sh`: KV transfer config, per-role buckets / KV_CAP, sparse attention, DCP, attention DP, `P_HALF=0/1` (a TP=32 prefill instance on half the node) |
+| `pd_proxy.sh` | the proxy matching `CONNECTOR`. Mooncake: `mooncake_connector_proxy.py`, vendored from vLLM v0.29.0 (sends to prefill and decode concurrently), with a 2 s keep-alive expiry and one retry of the prefill POST on a connection error; `P_INSTANCES=2` puts two half-node prefill instances behind it. NIXL: vllm-neuron's toy proxy |
 | `pd_bench.sh` | smoke and needle checks, then the 85k / 92% shared-prefix case at the given concurrencies. Reports the prefill and decode hit rates and the MTP acceptance |
 | `pd_acc.sh` | `../needle.py` (12 prompts, 16k-85k) and `../sparse_decode_eval.py` (19 greedy continuations) through the proxy |
 | `pd_bench_split.sh` | Qingzhong's `../bench_pd_split.sh` flags through the proxy: P-only (output 1, 10×C requests) and D replays; `P_ONLY=1` runs only P |
