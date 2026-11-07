@@ -161,9 +161,24 @@ def _compute_local_max(tensor: Tensor, dim: int) -> tuple[Tensor, Tensor]:
         if is_3d:
             value = value.unsqueeze(0)
             index = index.unsqueeze(0)
+        # The kernel's choice among exactly equal maxima depends on its stage layout,
+        # i.e. on the row count, so a 1-row decode step and a multi-row speculative
+        # verify step could pick different tokens for the same logits. Return the
+        # lowest index of the maximum, as torch.argmax does.
+        index = _lowest_index_of(tensor, value, dim)
         return value, index
     else:
         return torch.max(tensor, dim=dim, keepdim=True)
+
+
+def _lowest_index_of(tensor: Tensor, value: Tensor, dim: int) -> Tensor:
+    """Lowest index along ``dim`` where ``tensor`` equals ``value`` (keepdim, int64)."""
+    n = tensor.shape[dim]
+    shape = [1] * tensor.dim()
+    shape[dim] = n
+    idx = torch.arange(n, device=tensor.device, dtype=torch.int32).view(shape)
+    cand = torch.where(tensor == value.to(tensor.dtype), idx, torch.full_like(idx, n))
+    return torch.amin(cand, dim=dim, keepdim=True).to(torch.int64)
 
 
 def _can_use_nki_max(tensor: Tensor, dim: int) -> bool:
