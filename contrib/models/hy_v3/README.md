@@ -1019,6 +1019,161 @@ contexts (acceptance 60% of drafts either way); it pays at long context (see
 "The same split with an FP8 KV cache" above). Design, correctness checks and the per-step overhead:
 [docs/MTP_DESIGN.md](docs/MTP_DESIGN.md).
 
+#### Draft prefill under sequence parallelism (fixed)
+
+Before this fix, the draft's KV for the whole prompt was wrong:
+- At prefill each rank holds a different SP token shard. `_mtp_step` ran `eh_proj` on those shards.
+- `eh_proj` is a `ColumnParallelLinear` with a gathered output, so column block r of row i came
+  from token i of rank r's shard.
+- Every rank ended up with the same spliced rows, and the MTP layer wrote its KV for every prompt
+  position from them.
+- Decode steps (no SP) were correct. So each draft step attended to a wrong prompt and to correct
+  generated tokens only.
+
+The draft now runs the embedding, `enorm` / `hnorm` and `eh_proj` on every token, and keeps its
+token shard only after `eh_proj`. Decode is unchanged.
+
+How the draft KV was checked:
+- The draft layer's KV cache rows (KV head 0) were read back after prefill.
+- They were compared with a CPU reference of the MTP layer (vLLM `hy_v3_mtp` semantics) on the
+  same target hidden states.
+
+| draft KV of a 2048-token prompt | before | after |
+|---|---|---|
+| K cos | 0.80 | 0.9999 |
+| V cos | 0.37 | 0.9997 |
+
+Acceptance on one trn2.48xlarge.
+- Config: FP8 KV, MTP k=3, sparse decode 0.125 + sparse prefill 0.25, `HY3_DECODE_MOE_FUSED=1`.
+- Workload: the `bench_data/prefix` c8 prompts cut to the last N tokens, greedy raw-prompt
+  continuation of 256 tokens, 16 requests, C = 8.
+
+| prompt tokens | tokens/step before | tokens/step after | per-position acceptance after |
+|---|---|---|---|
+| 2048 | 2.38 | **3.14** | 0.95 / 0.71 / 0.48 |
+| 32768 | 2.64 | **3.14** | 0.97 / 0.72 / 0.45 |
+| 84000 | 2.49 | **2.94** | 0.94 / 0.64 / 0.35 |
+
+H100 1P1D (vLLM 0.29.0, FP8 KV, MTP k=3) gives 3.12-3.15 tokens/step (0.98 / 0.73 / 0.41) on the
+same 85k prompts. The MATH-500 acceptance above was measured before this fix.
+
+#### Decode node: async spec decode when a request joins (fixed)
+
+On a PD decode node (`kv_consumer`), a new request joins the running batch with its KV loaded
+and no local prefill, so it has no row in the runner's async spec transition cache.
+`_drop_transition_spec_decode_if_cache_incomplete` then stripped spec decode for the whole step.
+
+That step's CPU-built `input_ids` read the running requests' tokens at the scheduler's optimistic
+`num_computed_tokens`, which are `-1` / `0` placeholders:
+- the target decoded those at the running requests' positions, and their outputs derailed;
+- without async scheduling, the same `-1` ids fail validation (`Token IDs out of range`) instead.
+
+Every join hit this: 11008 "Missing async spec transition drafts" warnings in one c=8 run. So at
+C >= 2 the PD output differed from C = 1 within a few tokens. MTP acceptance fell to the level of
+fresh text, because the derailed continuation no longer copied the prompt.
+
+The fix (`neuron_model_runner.py`) keeps spec decode when only new requests miss the cache:
+- running requests replay their cached `[bonus, drafts]` rows, and positions are corrected on
+  device as in any spec step;
+- a new request takes its CPU-built first token (written fresh by `add_request`), followed by
+  pad drafts that the first verify rejects.
+
+1P1D check: greedy continuation of the `bench_data/prefix` prompts cut to the last 2048 tokens, 16
+requests, 256 tokens each.
+
+| C | tokens/step before | tokens/step after | greedy text vs C = 1 after |
+|---|---|---|---|
+| 1 | 3.10 | 3.09 | - |
+| 2 | 2.32 | 3.11 | identical (all chars) |
+| 8 | 2.34 | 3.08 | identical (all chars) |
+
+**1P1D `scripts/pd/pd_bench_final.sh` with both fixes.**
+- Setup: two trn2.48xlarge, the `scripts/pd` defaults; C = 8 unless noted.
+- "Before" is the same setup without either fix.
+- The H100 1P1D reference is vLLM 0.29.0 with FP8 KV + MTP k=3.
+
+| | before | both fixes | H100 FP8 + MTP |
+|---|---|---|---|
+| P-only TTFT P50, C = 1 / 4 / 8 / 12 (s) | 1.13 / 2.95 / 5.78 / 8.71 | 1.13 / 2.96 / 5.79 / 8.74 | 0.84 / 2.10 / 3.94 / 5.90 |
+| end-to-end TPOT median / P99 (ms) | 19.6 / 24.0 | **15.45 / 22.6** | 7.6 / 11.4 |
+| end-to-end MTP tokens/step | 2.23 | **2.71** | 2.98 |
+| end-to-end output tok/s | 353 | **416** | 795 |
+| D-only TPOT mean / P99 (ms) | 19.86 / 23.73 | 19.71 / 25.19 | 11.02 / 13.31 |
+| D-only MTP tokens/step | 2.20 | 2.22 | 2.23 |
+
+Notes on the table:
+- The end-to-end case continues raw prompts (`/v1/completions`), so it shows the gain.
+- The D-only replay samples chat answers at temperature 0.9, where Trn2 and H100 accept the same
+  2.2 tokens per step. Its TPOT is bound by the decode step time (about 44 ms at C = 8), not by
+  MTP.
+
+#### Decode at C = 10 / 12, and the benchmark set
+
+**Benchmark.** All three parts of `scripts/pd/pd_bench_final.sh` now use the same 85k / 92% prompts:
+- `pd_bench_split.sh` (P-only) and `pd_bench_dcust.sh` (D-only) already used
+  `/v1/chat/completions` with the server-side chat template and temperature 0.9;
+- `pd_bench.sh` (end to end) now does too, with 1200 output tokens instead of a raw
+  `/v1/completions` prompt with 1024.
+
+A raw completion of these repeated-text prompts copies the prompt, which inflated MTP acceptance
+(2.71 tokens/step) above what chat traffic gets (2.2).
+
+**Admission.** The Neuron scheduler admits `floor(KV tokens / max_model_len)` requests, which
+ignores prefix sharing. It held back prefills on the prefill node (`Prefill deferred`) and would
+cap a 0.35 decode pool at 4 requests. `VLLM_NEURON_MAX_KV_CONCURRENT` overrides that cap. Block
+allocation still bounds what runs: 16 requests sharing the 78k prefix use about 210k tokens.
+`pd_serve.sh` now sets it, together with these batch sizes:
+- prefill: `max_num_seqs` 16, buckets 1 / 4 / 8 / 16;
+- decode: 16, buckets 1 / 4 / 8 / 10 / 12 / 16.
+
+Neither node logged `Prefill deferred` with these settings. P-only TTFT is unchanged
+(5.77 s at C = 8): prefill runs one request per 8192-token step, so a burst of C requests waits
+for C prefills, and the P-only TTFT measures that queue. The end-to-end median TTFT (1.78 s) is
+lower because its requests arrive as others finish.
+
+**Decode step at C = 12.** A device profile of rank 0 gives 48.2 ms per step: the target is
+43.6 ms and the MTP draft 4.6 ms. Within the target:
+
+| part | ms |
+|---|---|
+| attention | 24.3 |
+| fused MoE | 15.3 |
+| other instructions | 9.5 |
+| collectives | 5.0 |
+
+The attention splits into the NKI `attention_tkg` kernel (13.8 ms) and the sparse-decode torch
+ops (selection, gather and summary update, 8.2 ms).
+
+**Settings.** The measured defaults are in `pd_serve.sh` for FP8 decode:
+- `HY3_SPARSE_SELECT_EVERY=8`;
+- `HY3_MOE_STATIC_DGE=1`;
+- `KV_CAP` 0.35, which leaves HBM for the batch-16 NEFFs and the static DGE descriptors.
+
+Set `HY3_SPARSE_DECODE=0.0625` on the decode node only; the prefill node keeps 0.125.
+
+D-only (1200 output tokens, temperature 0.9), MTP k=3:
+
+| | C = 8 | C = 10 | C = 12 | C = 16 |
+|---|---|---|---|---|
+| sparse 0.125, select every 4, buckets 1 / 4 / 8 / 12 | 19.57 ms | 22.29 ms | 22.96 ms | |
+| + select every 8, static DGE, KV_CAP 0.35, buckets + 10 | 19.34 ms | 20.96 ms | 21.79 ms | |
+| **+ sparse decode 0.0625, bucket 16** | | **19.58 ms** | 20.34 ms | 22.32 ms |
+| output tok/s (last row) | | 446 | 502 | 595 |
+
+MTP accepts 2.19-2.22 tokens per step in every row. MTP k=2 lowered the step (46.3 instead of
+51.5 ms at C = 12) but also the tokens per step (2.05), so k=3 stays.
+
+**Accuracy.** Sparse decode runs only at batch >= `HY3_SPARSE_MIN_BATCH` (4), so the single-request
+checks of `pd_acc.sh` need `HY3_SPARSE_MIN_BATCH=1` on the decode node to test it. With the last
+row's settings:
+- needle 12/12;
+- 16/19 continuations identical to dense, the same as with 0.125.
+
+**End to end at C = 8** (chat, 1200 output tokens, temperature 0.9):
+- TTFT median 1.78 s;
+- TPOT 19.38 ms, against 19.34 ms for D-only at the same settings;
+- 2.17 tokens/step.
+
 ### Comparison with the previous implementation (vllm-neuron 0.24, neuronx-cc 2.27)
 
 The same model code previously ran on vllm-neuron 0.24. Same benchmark, same

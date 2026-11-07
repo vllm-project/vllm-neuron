@@ -318,17 +318,20 @@ class HYV3MTPForCausalLM(nn.Module):
         """One MTP layer pass; returns the final-normed hidden states (full rows)."""
         # >>> PARALLELISM: prefill runs the layer on SP token shards <<<
         sp = is_prefill and self.world_size > 1
-        embeds = self.embed_tokens(input_ids, scatter_tokens=sp, rank=rank)
-        local_positions = shard_select(positions, 0, self.tp_group) if sp else positions
-        if sp:
-            prev_hidden = shard_select(prev_hidden, 0, self.tp_group)
+        # eh_proj is column-parallel with a gathered output, so every rank must feed it the same
+        # rows. Under SP prefill each rank holds a different token shard, and gathering the
+        # column blocks would splice different tokens into one row. Run the input projection on
+        # every token, then keep this rank's token shard for the decoder layer.
+        embeds = self.embed_tokens(input_ids, scatter_tokens=False, rank=rank)
         # <-- MODEL-SPECIFIC: position 0 has no previous token to predict from.
-        embeds = embeds * (local_positions != 0).unsqueeze(-1).to(embeds.dtype)
+        embeds = embeds * (positions != 0).unsqueeze(-1).to(embeds.dtype)
         h = self.eh_proj(
             torch.cat(
                 [self.enorm(embeds), self.hnorm(prev_hidden.to(embeds.dtype))], dim=-1
             )
         )
+        if sp:
+            h = shard_select(h, 0, self.tp_group)
         position_embeddings = self.rotary_emb(positions, device=h.device, dtype=h.dtype)
         h = self.layers[0](
             h,
