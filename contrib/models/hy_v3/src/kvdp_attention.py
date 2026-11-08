@@ -79,6 +79,7 @@ def kvdp_attention_block_tkg(
     KVDP=1,
     KVDP_groups=None,
     KVDP_rank=None,
+    pos_ids=None,
 ):
     """attention_block_tkg with KVDP: the Hy3 decode configuration, no cache update.
 
@@ -130,4 +131,5 @@ def kvdp_attention_block_tkg(
         KVDP_replica_group=ncc.ReplicaGroup([list(g) for g in KVDP_groups]),
         KVDP_collective_mode=KVDPCollectiveMode.ALL_TO_ALL,
         KVDP_rank=KVDP_rank,
+        pos_ids=pos_ids,
     )
