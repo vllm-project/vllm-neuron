@@ -82,6 +82,7 @@ from vllm_neuron.vllm.spec_decode.decorator import async_speculative_decoding
 
 from . import kv_scales
 from .fp8_kv_layout import packed_decode_viable, swizzle_packed_k, unswizzle_packed_k
+from .kvdp_attention import kvdp_attention_block_tkg, kvdp_kv_write
 from .config import HYV3Config
 from .kernels.moe_cte_fp8w import moe_cte_fp8w
 from .kernels.moe_tkg_hits import moe_tkg_hits
@@ -133,6 +134,40 @@ _SHARED_DECODE_SHARDS = 8
 # The decode attention mask is identical for every layer; it is built once per
 # step and cached in attn_metadata under this key.
 _DECODE_MASK_CACHE_KEY = "_hy_v3_decode_mask"
+# EXPERIMENTAL, off (kvdp_attention.py, README "KV data parallelism on decode"): decode attention
+# with KV data parallelism over the ranks that share a KV head (HY3_DECODE_KVDP=8 at TP=64): each
+# attends for B / 8 of the requests. With sparse decode the blocks are chosen per GQA group
+# (sparse_select_blocks_kvdp). Batch buckets that are not a multiple of it and DCP keep the
+# default path.
+_DECODE_KVDP = int(os.environ.get("HY3_DECODE_KVDP", "1") or 1)
+_KVDP_MASK_CACHE_KEY = "_hy_v3_kvdp_mask"
+_DECODE_POSID = os.environ.get("HY3_DECODE_POSID", "0") == "1"
+_KVDP_ACTIVE_MASK_KEY = "_hy_v3_kvdp_active_mask"
+# EXPERIMENTAL: segmented prefill (no DCP, no sparse prefill) reads the packed FP8 KV cache directly
+# instead of a per-layer BF16 copy of the request's blocks. Same values (the copy is exact).
+_PREFILL_FP8_DIRECT = os.environ.get("HY3_PREFILL_FP8_DIRECT", "0") == "1"
+
+
+# HY3_DECODE_KVDP_PAD=1 (dense decode): a batch that 8 does not divide but 4 does (4, 12) runs
+# KVDP=8 on a batch padded to a multiple of 8 inside the attention (patch_kvdp_pad.py).
+_DECODE_KVDP_PAD = os.environ.get("HY3_DECODE_KVDP_PAD", "0") == "1"
+
+
+def _kvdp_plan(batch: int, sparse: bool) -> tuple[int, int]:
+    """(KVDP degree, attention batch) of a decode batch bucket."""
+    if _DECODE_KVDP_PAD and not sparse and _DECODE_KVDP >= 8 and batch % 8 and batch % 4 == 0:
+        return 8, -(-batch // 8) * 8
+    d = _kvdp_degree(batch)
+    return d, batch
+
+
+def _kvdp_degree(batch: int) -> int:
+    """The KVDP degree of a batch bucket: the largest of 8 / 4 that HY3_DECODE_KVDP allows and that
+    divides the batch (the kernel's all-to-all needs >= 4 ranks at LNC=2), else 1."""
+    for d in (8, 4):
+        if d <= _DECODE_KVDP and batch % d == 0:
+            return d
+    return 1
 
 
 def _validate_dcp_decode_sequence_length(dcp_size: int, sequence_length: int) -> None:
@@ -549,6 +584,49 @@ def sparse_select_blocks(q, k_sum, block_table, n_hist, block_size, group, n_sel
     return compact.to(block_table.dtype), prior
 
 
+def sparse_select_blocks_kvdp(
+    q, k_sum, block_table, n_hist, block_size, group, n_sel, sink, recent, tp_group, own, mine
+):
+    """``sparse_select_blocks`` for KVDP: the kept blocks of this rank's requests (``own``).
+
+    Every rank scores all B requests with its query head; one TP all-gather of the scores and the
+    max over this KV head's ranks (``mine``) gives the group score. Returns the table
+    [B / KVDP, n_sel] and the history tokens it holds [B / KVDP].
+    """
+    nh, B, S, D = q.shape
+    kvh = k_sum.shape[2]
+    t = block_table.to(torch.long)
+    nb = t.shape[1]
+    ns, L, k_g = nb // group, block_size * group, n_sel // group
+    t3 = t.view(B, ns, group)
+    summ = k_sum[torch.clamp(t3[:, :, 0], min=0)].to(torch.float32)  # [B, ns, 2, kvh, D]
+    qg = q.view(kvh, nh // kvh, B, S, D).permute(2, 0, 1, 3, 4).reshape(B, kvh, -1, D)
+    bound = torch.einsum("bhqd,bnhd->bnhq", torch.clamp(qg, min=0), summ[:, :, 1]) + torch.einsum(
+        "bhqd,bnhd->bnhq", torch.clamp(qg, max=0), summ[:, :, 0])
+    score = bound.amax(dim=(2, 3))  # [B, ns], this rank's head
+    # >>> PARALLELISM: the KV head's score is the max over its KVDP query heads <<<
+    every = tp_group.all_gather(score.reshape(1, B * ns), dim=0)  # [world, B * ns]
+    score = every.index_select(0, mine).amax(dim=0).view(B, ns)
+    score = score.index_select(0, own)
+    t3 = t3.index_select(0, own)
+    Ba = own.shape[0]
+    n = n_hist.to(torch.long).view(B, 1).index_select(0, own)
+    nsv = torch.div(n + L - 1, L, rounding_mode="floor")
+    idx = torch.arange(ns, device=q.device).view(1, ns)
+    big = torch.finfo(torch.float32).max
+    cand = idx < nsv - 1
+    forced = (idx < sink) | (idx >= nsv - recent)
+    score = torch.where(cand, torch.where(forced, big, score), -big)
+    top = torch.topk(score, k_g - 2, dim=1).indices
+    last = torch.clamp(torch.cat([nsv - 1, nsv], dim=1), min=0, max=ns - 1)
+    dense = nsv <= k_g - 1
+    pick = torch.where(dense, torch.arange(k_g, device=q.device).view(1, k_g), torch.cat([top, last], dim=1))
+    compact = t3[torch.arange(Ba, device=q.device).view(Ba, 1), pick].reshape(Ba, n_sel)
+    fill = n - L * (nsv - 1)
+    prior = torch.where(dense, n, L * (k_g - 2) + fill).view(Ba)
+    return compact.to(block_table.dtype), prior
+
+
 def sparse_prefill_blocks(q, k_sum, block_row, prior, valid, block_size, group, n_sel, sink, recent):
     """EXPERIMENTAL (HY3_SPARSE_PREFILL): the blocks a segmented prefill chunk reads.
 
@@ -910,6 +988,7 @@ class HYV3Attention(nn.Module):
 
         # Step 4: Attention
         kv_segment_size = meta.get("kv_segment_size")
+        fp8_direct = False
         if self.dcp_size > 1 or kv_segment_size:
             # Segmented prefill over the cache, which now holds this step's tokens.
             k_attn, v_attn = self.k_cache, self.v_cache
@@ -935,9 +1014,11 @@ class HYV3Attention(nn.Module):
                             _SPARSE_GROUP, n_sel, _SPARSE_SINK, _SPARSE_RECENT,
                         )
                         block_table = blocks.view(1, -1).to(block_table.dtype)
-                k_attn, v_attn, block_table = _request_blocks_bf16(
-                    self.k_cache, self.v_cache, block_table, self.fp8_packed, self.dtype
-                )
+                fp8_direct = _PREFILL_FP8_DIRECT and self.dcp_size == 1 and block_table is meta["block_table_tensor"]
+                if not fp8_direct:
+                    k_attn, v_attn, block_table = _request_blocks_bf16(
+                        self.k_cache, self.v_cache, block_table, self.fp8_packed, self.dtype
+                    )
                 q = self._fp8_prefill_q(q)
             if self.dcp_size > 1:
                 # Full Q against this rank's local KV shard, LSE-combined across
@@ -974,6 +1055,7 @@ class HYV3Attention(nn.Module):
                     scale=self.scaling,
                     tp_q=True,
                     tp_out=True,
+                    **({"fp8_packed": self.fp8_packed} if kv_fp8 and fp8_direct else {}),
                 )
             if kv_fp8:
                 attn_output = self._fp8_prefill_out(attn_output)
@@ -1005,7 +1087,7 @@ class HYV3Attention(nn.Module):
             attn_output = self.tp_group.reduce_scatter(attn_output, dim=0)
         return attn_output.contiguous()
 
-    def _sparse_decode_blocks(self, X, positions, slot_mapping, block_table, block_size, n_sel):
+    def _sparse_decode_blocks(self, X, positions, slot_mapping, block_table, block_size, n_sel, kvdp_idx=None):
         """EXPERIMENTAL (HY3_SPARSE_DECODE): fold the step's K into the summaries
         and, when ``n_sel`` is set, select the ``n_sel`` blocks each request
         attends to.
@@ -1042,15 +1124,163 @@ class HYV3Attention(nn.Module):
         if n_sel:
             # Before this step's K is folded in: the group the step writes is
             # always kept.
-            out = sparse_select_blocks(
-                q.view(nh, B, S, D), self.k_sum, block_table, positions.view(B, S)[:, 0],
-                block_size, _SPARSE_GROUP, n_sel, _SPARSE_SINK, _SPARSE_RECENT,
-            )
+            if kvdp_idx is not None:
+                out = sparse_select_blocks_kvdp(
+                    q.view(nh, B, S, D), self.k_sum, block_table, positions.view(B, S)[:, 0],
+                    block_size, _SPARSE_GROUP, n_sel, _SPARSE_SINK, _SPARSE_RECENT,
+                    self.tp_group, kvdp_idx[0], kvdp_idx[1],
+                )
+            else:
+                out = sparse_select_blocks(
+                    q.view(nh, B, S, D), self.k_sum, block_table, positions.view(B, S)[:, 0],
+                    block_size, _SPARSE_GROUP, n_sel, _SPARSE_SINK, _SPARSE_RECENT,
+                )
         update_k_summary_decode(
             self.k_sum, k.view(kvh, B, S, D).permute(1, 2, 0, 3), positions, slot_mapping,
             block_table, block_size, _SPARSE_GROUP,
         )
         return out
+
+    def _kvdp_indices(self, B, device, kvdp):
+        """(own, mine, kvdp): this rank's batch rows and its KVDP group's TP ranks, as runtime
+        tensors, and the degree. The groups are consecutive ranks: at KVDP=4 the 8 ranks of a KV
+        head form two groups that each serve all B requests."""
+        Ba = B // kvdp
+        rank = self.tp_group.rank_in_group_tensor.reshape(-1)[0:1].to(torch.int64)
+        r = rank % kvdp
+        g = torch.div(rank, kvdp, rounding_mode="floor")
+        own = r * Ba + torch.arange(Ba, dtype=torch.int64, device=device)
+        mine = g * kvdp + torch.arange(kvdp, dtype=torch.int64, device=device)
+        return own, mine, kvdp
+
+    def _forward_decode_kvdp(
+        self, X, cos_kernel, sin_kernel, block_table, positions, slot_mapping, block_size,
+        S_ctx, ln_w, attn_metadata, kvdp_idx, sparse=None,
+    ):
+        """EXPERIMENTAL (HY3_DECODE_KVDP): decode attention in which each of the KVDP ranks that
+        share this KV head attends for B / KVDP of the requests (kvdp_attention.py); sparse:
+        the [table, positions, mask] of a sparse selection. Returns the all-reduced output, or
+        None when the packed kernel cannot take this bucket."""
+        from vllm_neuron.functional.attention.attention_decode_mask import (
+            maybe_transpose_mask_for_qk_swap,
+        )
+        from vllm_neuron.utils.hardware_config import get_logical_nc_config
+
+        kvdp = kvdp_idx[2]
+        B0, S, _ = X.shape
+        Bp = kvdp_idx[0].shape[0] * kvdp
+        if Bp != B0:
+            # >>> KVDP_PAD: Bp - B0 padding rows for the attention only (see _kvdp_plan) <<<
+            assert sparse is None, "KVDP padding is for dense decode"
+            pad = Bp - B0
+            X = torch.cat([X, X.new_zeros(pad, S, X.shape[2])], dim=0)
+            cos_kernel = torch.cat([cos_kernel, cos_kernel[:, :1].expand(-1, pad, -1)], dim=1)
+            sin_kernel = torch.cat([sin_kernel, sin_kernel[:, :1].expand(-1, pad, -1)], dim=1)
+            block_table = torch.cat([block_table, block_table.new_full((pad, block_table.shape[1]), -1)], dim=0)
+            positions = torch.cat([positions.view(B0, S), positions.new_zeros(pad, S)], dim=0).view(-1)
+            slot_mapping = torch.cat([slot_mapping.view(B0, S), slot_mapping.new_full((pad, S), -1)], dim=0).view(-1)
+        B = Bp
+        Ba = B // kvdp
+        nh, D = self.num_attention_heads_per_rank, self.head_dim
+        packed = self.fp8_packed and packed_decode_viable(
+            block_len=block_size, bs=Ba, q_head=nh * kvdp, s_active=S, s_prior=S_ctx
+        )
+        if self.fp8_packed and not packed:
+            return None
+        # >>> PARALLELISM: this rank's slot in its KV head's group, as runtime tensors (SPMD) <<<
+        own, mine, _ = kvdp_idx
+        r = own[0:1] // Ba
+        if sparse is not None:
+            table, pos_own, mask = sparse  # mask: None until built for this selection
+        else:
+            table = block_table.index_select(0, own)
+            mask = attn_metadata.get((_KVDP_MASK_CACHE_KEY, kvdp, Ba, S, S_ctx))
+        kpos = None
+        if _DECODE_POSID and sparse is None:
+            # >>> POSID: prior mask generated in-kernel; only the active [S, Ba, H, S] triu is passed <<<
+            kpos = positions.view(B, S).index_select(0, own).to(torch.float32).contiguous()
+            mask = attn_metadata.get((_KVDP_ACTIVE_MASK_KEY, Ba, S))
+            if mask is None:
+                tri = torch.triu(torch.ones(S, S, dtype=torch.float32, device=X.device))
+                mask = tri[:, None, None, :].expand(S, Ba, nh * kvdp, S).contiguous()
+                attn_metadata[(_KVDP_ACTIVE_MASK_KEY, Ba, S)] = mask
+        if mask is None:
+            if sparse is None:
+                pos_own = positions.view(B, S).index_select(0, own)
+            mask = NF.gen_attention_decode_mask(
+                pos_ids=pos_own.reshape(1, Ba * S).to(torch.float32),
+                bs=Ba,
+                q_head=nh * kvdp,
+                s_active=S,
+                s_prior=S_ctx,
+                start_pos=None,
+                block_len=block_size,
+            )
+            mask = maybe_transpose_mask_for_qk_swap(
+                mask, d_head=D, is_fp8_kv=True, fp8_packed=packed
+            )
+            if sparse is not None:
+                sparse[2] = mask  # reused by the layers that reuse this selection
+            else:
+                attn_metadata[(_KVDP_MASK_CACHE_KEY, kvdp, Ba, S, S_ctx)] = mask
+        o_weight_scale, o_input_scale = self.o_weight_scale, self.o_input_scale
+        if self.v_scale_float != 1.0:
+            o_input_scale = o_input_scale * self.v_scale_float
+            o_weight_scale = o_weight_scale / self.v_scale_float
+        world = self.world_size
+        groups = tuple(tuple(range(i * kvdp, (i + 1) * kvdp)) for i in range(world // kvdp))
+        output, k_new, v_new = wrap_nki(kvdp_attention_block_tkg)[get_logical_nc_config()](
+            X,
+            X_hidden_dim_actual=self.hidden_size,
+            rmsnorm_X_enabled=True,
+            rmsnorm_X_eps=self.rms_norm_eps,
+            rmsnorm_X_gamma=ln_w.view(1, -1),
+            W_qkv=self.qkv_proj_weight,
+            quantization_type_qkv=QuantizationType.STATIC,
+            weight_dequant_scale_qkv=self.qkv_weight_scale,
+            input_dequant_scale_qkv=self.qkv_input_scale,
+            rmsnorm_QK_pre_rope_eps=self.q_norm.variance_epsilon,
+            rmsnorm_QK_pre_rope_W_Q=self.q_norm.weight.view(1, -1),
+            rmsnorm_QK_pre_rope_W_K=self.k_norm.weight.view(1, -1),
+            cos=cos_kernel,
+            sin=sin_kernel,
+            active_blocks_table=table,
+            K_cache=self.k_cache,
+            V_cache=self.v_cache,
+            attention_mask=mask,
+            softmax_scale=self.scaling / self.k_scale_float,
+            k_scale=_scale_column(self.k_scale_float, X.device),
+            v_scale=_scale_column(self.v_scale_float, X.device),
+            fp8_packed=packed,
+            W_out=self.o_proj_weight,
+            quantization_type_out=QuantizationType.STATIC,
+            weight_dequant_scale_out=o_weight_scale,
+            input_dequant_scale_out=o_input_scale,
+            KVDP=kvdp,
+            KVDP_groups=groups,
+            KVDP_rank=r.to(torch.uint32),
+            pos_ids=kpos,
+        )
+        # >>> PARALLELISM: every rank writes every request's new K / V (a request can move to
+        # another rank of the group between steps). The kernel returns its B / KVDP requests'
+        # FP8 K [D, Ba, S] / V [Ba, 1, S, D]; one TP all-gather of their bytes (as bf16 pairs,
+        # flat: no transposes) collects them, keep this group's KVDP rows. <<<
+        n = D * Ba * S
+        both = torch.cat([k_new.reshape(-1), v_new.reshape(-1)]).view(torch.bfloat16)
+        gathered = self.tp_group.all_gather(both, dim=0).view(world, n)
+        sel = gathered.index_select(0, mine).view(self.k_cache.dtype).view(kvdp, 2, n)
+        k_groups = sel[:, 0].reshape(kvdp, D, Ba * S).contiguous()
+        v_all = sel[:, 1].reshape(B * S, D).contiguous()
+        wrap_nki(kvdp_kv_write)[get_logical_nc_config()](
+            self.k_cache, self.v_cache, k_groups, v_all,
+            slot_mapping.view(B, S).to(torch.uint32), fp8_packed=self.fp8_packed,
+        )
+        if Bp != B0:
+            output = output.reshape(Bp * S, -1)[: B0 * S]
+        # >>> PARALLELISM: TP all-reduce of the O projection <<<
+        if self.world_size > 1:
+            output = self.tp_group.all_reduce(output)
+        return output
 
     def forward_decode(
         self,
@@ -1110,6 +1340,13 @@ class HYV3Attention(nn.Module):
 
         attention_mask = None
         n_sel = 0
+        kvdp_deg, kvdp_B = (
+            _kvdp_plan(B, _SPARSE_DECODE > 0 and self.k_sum is not None)
+            if self.dcp_size == 1 and _is_fp8_kv(self.k_cache)
+            else (1, B)
+        )
+        kvdp_on = kvdp_deg > 1
+        kvdp_idx = self._kvdp_indices(kvdp_B, X.device, kvdp_deg) if kvdp_on else None
         if self.k_sum is not None:
             nb = block_table.shape[1]
             n_sel = sparse_budget_blocks(
@@ -1122,8 +1359,27 @@ class HYV3Attention(nn.Module):
             if n_sel and self.layer_idx % _SPARSE_SELECT_EVERY:
                 reuse = attn_metadata.get(_SPARSE_SEL_CACHE_KEY)
             selected = self._sparse_decode_blocks(
-                X, positions, slot_mapping, block_table, block_size, 0 if reuse is not None else n_sel
+                X, positions, slot_mapping, block_table, block_size,
+                0 if reuse is not None else n_sel, kvdp_idx if n_sel else None,
             )
+        if n_sel and kvdp_on:
+            S_ctx = n_sel * block_size
+            if reuse is not None:
+                got = reuse  # [table, positions, mask] of the last selecting layer
+            else:
+                table_own, prior = selected
+                Ba = B // kvdp_deg
+                prior_pos = prior.view(Ba, 1) + torch.arange(S_decode, device=X.device).view(1, -1)
+                got = [table_own, prior_pos, None]
+                if _SPARSE_SELECT_EVERY > 1:
+                    attn_metadata[_SPARSE_SEL_CACHE_KEY] = got
+            out = self._forward_decode_kvdp(
+                X, cos_kernel, sin_kernel, block_table, positions, slot_mapping, block_size,
+                S_ctx, ln_w, attn_metadata, kvdp_idx, sparse=got,
+            )
+            if out is not None:
+                return out.view(tokens, hidden)
+            raise RuntimeError("KVDP sparse decode: the packed kernel cannot take this bucket")
         if n_sel:
             S_ctx = n_sel * block_size
             if reuse is not None:
@@ -1143,6 +1399,14 @@ class HYV3Attention(nn.Module):
                 )
                 if _SPARSE_SELECT_EVERY > 1:
                     attn_metadata[_SPARSE_SEL_CACHE_KEY] = (block_table, attention_mask)
+
+        if kvdp_on and not n_sel:
+            out = self._forward_decode_kvdp(
+                X, cos_kernel, sin_kernel, block_table, positions, slot_mapping, block_size,
+                S_ctx, ln_w, attn_metadata, kvdp_idx,
+            )
+            if out is not None:
+                return out.view(tokens, hidden)
 
         # The decode mask is identical for every layer: build it once per step.
         if attention_mask is None:

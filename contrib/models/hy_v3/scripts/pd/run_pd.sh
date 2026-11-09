@@ -16,6 +16,7 @@
 # Results: $WORK/results/pd/<label>/, logs $WORK/logs/pd_<label>_*.log (WORK default /mnt/nvme)
 # Env: everything pd_serve.sh takes (CODE, PKG = a dir holding a hy_v3_neuron link to $CODE's model, MODEL, KV_DTYPE, MTP_K, HY3_KV_SCALE_PROFILE, ...),
 #      P_HOST / D_HOST (2-node), CONCS (default "1 4 8"), UP_TIMEOUT (s, default 43200),
+#      P_INSTANCES (prefill-node, Mooncake: 1, or 2 half-node TP=32 prefill instances behind the proxy),
 #      OUT_LEN (output tokens, default 256), BENCH (pd_bench = end-to-end 85k/92% | pd_acc = needle + sparse_decode_eval), VENV (default $WORK/venv/sdk233).
 set -u
 LABEL=${1:?usage: run_pd.sh <label> <split|prefill-node|decode-node|decode-bench> [KEY=VAL ...]}
@@ -70,8 +71,16 @@ case "$MODE" in
   prefill-node)
     : "${D_HOST:?set D_HOST to the decode node}"
     drop_caches
-    start prefill bash "$HERE/pd_serve.sh" prefill
-    wait_up http://127.0.0.1:8100/health prefill
+    if [ "${P_INSTANCES:-1}" = 2 ]; then
+      # Two half-node (TP=32) prefill instances; the second starts once the first has compiled.
+      P_HALF=0 start prefill bash "$HERE/pd_serve.sh" prefill
+      wait_up http://127.0.0.1:8100/health prefill
+      P_HALF=1 start prefill1 bash "$HERE/pd_serve.sh" prefill
+      wait_up http://127.0.0.1:8101/health prefill1
+    else
+      start prefill bash "$HERE/pd_serve.sh" prefill
+      wait_up http://127.0.0.1:8100/health prefill
+    fi
     until curl -sf "http://$D_HOST:8200/health" >/dev/null; do sleep 30; done   # the decode node's server
     echo "$(date +%T) $LABEL: decode on $D_HOST up"
     D_HOST=$D_HOST start proxy bash "$HERE/pd_proxy.sh"

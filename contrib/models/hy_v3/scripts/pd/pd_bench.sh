@@ -11,7 +11,9 @@
 # Works with either proxy of pd_proxy.sh (NIXL toy proxy or Mooncake).
 # Env: CODE (vllm-neuron checkout, default: the one holding this script), MODEL (tokenizer), PROXY (http://127.0.0.1:8000),
 #      P_URL (http://P_HOST:8100), D_URL (http://D_HOST:8200), SALT, MTP (1: also record the
-#      decode side's spec-decode acceptance counters), PROMPTS_DIR (default bench_data/prefix).
+#      decode side's spec-decode acceptance counters), PROMPTS_DIR (default bench_data/prefix),
+#      P_INSTANCES (prefill instances behind the proxy, default 1: one warm-up request each; the
+#      prefill hit rate is then read on P_URL's instance only).
 set -uo pipefail
 OUT=${1:?usage: pd_bench.sh <out_dir> [concurrencies] [output_len]}
 CONCS=${2:-1 4 8}
@@ -72,8 +74,12 @@ with open(out, "w") as f:
 EOF
   N=$(wc -l < "$TMP/$tag.jsonl")
   echo "=== $tag (warm-up + $N requests, cache_salt=$SALT)"
-  curl -sf "$PROXY/v1/chat/completions" -H "Content-Type: application/json" -d @"$TMP/warmup.json" >/dev/null \
-    || { echo "warm-up failed"; exit 1; }
+  # One warm-up per prefill instance (P_INSTANCES): the proxy round-robins, and an instance without
+  # the shared prefix cold-prefills 85k tokens for its first request (P99 TTFT 12 s instead of 5).
+  for i in $(seq "${P_INSTANCES:-1}"); do
+    curl -sf "$PROXY/v1/chat/completions" -H "Content-Type: application/json" -d @"$TMP/warmup.json" >/dev/null \
+      || { echo "warm-up failed"; exit 1; }
+  done
   snap a
   vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url "$PROXY" \
     --model "$MODEL" --served-model-name hy3 --tokenizer "$MODEL" --trust-remote-code \

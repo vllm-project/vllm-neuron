@@ -30,6 +30,10 @@
 #               ([512 .. 8192]); PREFILL_BUCKETS overrides the buckets on either role
 #   SPLIT       1: single-node split, prefill on NeuronCores 0-31 and decode on 32-63 (TP=32,
 #               EP=32 each), side-channel ports 5557 / 5558. Default: one role per node, TP=64.
+#   P_HALF      prefill only, 0 | 1: this prefill instance takes half the node (logical NeuronCores
+#               0-31 or 32-63, TP=32 / EP=32), API port 8100 + P_HALF, NIXL side channel
+#               5557 + 2 * P_HALF, Mooncake bootstrap 8998 + P_HALF. Two such instances on one
+#               node prefill twice as many requests at once (run_pd.sh P_INSTANCES=2).
 #   PORT, NIXL_PORT   override the role's API / NIXL side-channel port
 #   D_DP        decode only: attention DP with D_DP replicas of TP=64/D_DP each (vLLM
 #               --data-parallel-size), experts over all 64 ranks (EP=64). SEQS / SEQ_BUCKETS
@@ -113,11 +117,20 @@ case "$ROLE" in
 esac
 
 extra=""
+# vllm-neuron 0.29 reads NEURON_VISIBLE_DEVICES as logical NeuronCores (64 on a trn2.48xlarge at
+# LNC=2) and needs one per local rank: a TP=32 half is 0-31 or 32-63.
 if [ "${SPLIT:-0}" = 1 ]; then
-  # One trn2.48xlarge: 16 devices x 4 logical cores (LNC=2). Prefill gets devices 0-7.
-  if [ "$ROLE" = prefill ]; then export NEURON_VISIBLE_DEVICES=0-7; nixl_port=5557
-  else export NEURON_VISIBLE_DEVICES=8-15; nixl_port=5558; fi
+  if [ "$ROLE" = prefill ]; then export NEURON_VISIBLE_DEVICES=0-31; nixl_port=5557
+  else export NEURON_VISIBLE_DEVICES=32-63; nixl_port=5558; fi
   extra="--tensor-parallel-size 32"   # argparse: the last occurrence wins over serve.sh's 64
+  export EP=${EP:-32}
+elif [ -n "${P_HALF:-}" ]; then
+  [ "$ROLE" = prefill ] || { echo "P_HALF is for the prefill role" >&2; exit 1; }
+  case "$P_HALF" in 0|1) ;; *) echo "P_HALF must be 0 or 1" >&2; exit 1 ;; esac
+  export NEURON_VISIBLE_DEVICES=$((32 * P_HALF))-$((32 * P_HALF + 31))
+  port=$((8100 + P_HALF)) nixl_port=$((5557 + 2 * P_HALF))
+  export MC_BOOTSTRAP_PORT=${MC_BOOTSTRAP_PORT:-$((8998 + P_HALF))}
+  extra="--tensor-parallel-size 32"
   export EP=${EP:-32}
 fi
 export VLLM_NIXL_SIDE_CHANNEL_PORT=${NIXL_PORT:-$nixl_port}
@@ -153,7 +166,7 @@ else
   kvt="{\"kv_connector\":\"$CONNECTOR\",\"kv_role\":\"$kv_role\",\"kv_buffer_device\":\"cuda\",\"kv_connector_extra_config\":{\"backends\":[\"$BACKEND\"]}}"
 fi
 
-echo "$(date +%T) pd_serve $ROLE: port ${PORT:-$port}, nixl ${VLLM_NIXL_SIDE_CHANNEL_PORT}, kv $KV_DTYPE, mtp ${MTP_K:-off}, seqs $seqs $buckets, ctx ${ctx:-none}, KV_CAP $cap, efa_skip $NEURON_SKIP_EFA_AFFINITY, split ${SPLIT:-0}, dcp ${DCP:-1}"
+echo "$(date +%T) pd_serve $ROLE: port ${PORT:-$port}, nixl ${VLLM_NIXL_SIDE_CHANNEL_PORT}, kv $KV_DTYPE, mtp ${MTP_K:-off}, seqs $seqs $buckets, ctx ${ctx:-none}, KV_CAP $cap, efa_skip $NEURON_SKIP_EFA_AFFINITY, split ${SPLIT:-0}, p_half ${P_HALF:-none}, dcp ${DCP:-1}"
 echo "kv-transfer-config: $kvt"
 [ -n "${MTP_K:-}" ] && export HY3_DECODE_HITS_MAX_T=${HY3_DECODE_HITS_MAX_T:-$((4 * (MTP_K + 1)))}
 set -f  # the JSON's [ ] must not glob when EXTRA_ARGS is word-split

@@ -86,6 +86,9 @@ async def lifespan(app: FastAPI):
                     limits=httpx.Limits(
                         max_connections=None,
                         max_keepalive_connections=None,
+                        # Below the servers' 5 s keep-alive timeout: a pooled connection the
+                        # server has just closed fails the next request with ReadError.
+                        keepalive_expiry=2.0,
                     ),
                 ),
                 "url": url,
@@ -106,6 +109,9 @@ async def lifespan(app: FastAPI):
                     limits=httpx.Limits(
                         max_connections=None,
                         max_keepalive_connections=None,
+                        # Below the servers' 5 s keep-alive timeout: a pooled connection the
+                        # server has just closed fails the next request with ReadError.
+                        keepalive_expiry=2.0,
                     ),
                 ),
             }
@@ -272,9 +278,18 @@ async def send_request_to_service(
         "X-data-parallel-rank": str(dp_rank),
     }
 
-    response = await client_info["client"].post(
-        endpoint, json=req_data, headers=headers
-    )
+    # One retry on a connection-level failure (a stale pooled connection); otherwise the decode
+    # side waits for this request's KV forever.
+    for attempt in range(2):
+        try:
+            response = await client_info["client"].post(
+                endpoint, json=req_data, headers=headers
+            )
+            break
+        except (httpx.ReadError, httpx.RemoteProtocolError) as e:
+            if attempt:
+                raise
+            print(f"prefill request {request_id}: {type(e).__name__}, retrying", flush=True)
     response.raise_for_status()
 
     # CRITICAL: Release connection back to pool
