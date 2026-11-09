@@ -752,7 +752,29 @@ bash scripts/pd/gpu/agentx.sh results/agentx/c16 16     # restart the server bef
 Notes:
 - **Acceptance length.** It is the real MTP acceptance. InferenceX's published points use a synthetic golden acceptance length instead.
 - **Input token throughput.** AgentX reports it including cached tokens, so it is not a cold-prefill rate.
-- **Coming next.** The H100 single-node and 1P1D runs, and Trn2, are follow-ups. Trn2 needs `max_model_len` 262144 first; the current decode configuration is 87040.
+- **Coming next.** Trn2 needs `max_model_len` 262144 first; the current decode configuration is 87040.
+
+**H100** (p5.48xlarge, 8x H100 80 GB per node, the `scripts/pd/gpu/Dockerfile` image, FP8 KV, MTP k=3). Results are in `results/agentx_gpu/h100_*`.
+
+| | 1 node, C = 16 | 1 node, C = 8, KV offload | 1 node, C = 16, KV offload | 1P1D, C = 16 | 1P1D, C = 16, KV offload |
+|---|---|---|---|---|---|
+| requests in 3600 s | 786 | 1,213 | 2,002 | 1,760 | 2,286 |
+| TTFT P50 / P90 / P99 | 2.31 / 52.9 / 75.4 s | 0.55 / 1.46 / 5.16 s | 0.75 / 3.26 / 11.9 s | 2.21 / 37.0 / 80.6 s | 1.17 / 5.55 / 17.7 s |
+| inter-token latency P50 / P99 | 37.7 / 281 ms | 12.5 / 37.8 ms | 20.0 / 63.4 ms | 13.2 / 18.7 ms | 14.4 / 21.8 ms |
+| output tok/s per user, P50 | 27 | 80 | 50 | 76 | 69 |
+| output tok/s (per GPU) | 175 (22) | 306 (38) | 474 (59) | 431 (27) | 547 (34) |
+| preemptions | 3 | 0 | 40 | 77 | 0 |
+
+All five runs report `submission_valid` true with 0% request errors.
+
+Notes:
+- **Without offload, the KV working set does not fit.** About 36 GB of each 80 GB H100 holds weights. The prefix cache thrashes and finished prefixes are prefilled again, so TTFT P90 reaches 37-53 s.
+- **KV offload to host DRAM fixes it.**
+  - Single node: `OFFLOAD_BYTES=1200000000000 bash scripts/pd/gpu/gpu_single_serve.sh` (vLLM `SimpleCPUOffloadConnector`, write-through).
+  - 1P1D: `OFFLOAD_BYTES=1200000000000 MAX_LEN=262144 EXTRA='--kv-cache-dtype fp8 --speculative-config ...' bash scripts/pd/gpu/gpu_serve.sh prefill|decode`. This is a `MultiConnector` of Mooncake and CPU offload on both nodes.
+  - With vLLM 0.29.0 the 1P1D form needs the patched `scripts/pd/gpu/vllm029_multi_connector.py`, which `gpu_serve.sh` mounts. The stock file asserts on the first stats record (`MooncakeConnector is not contained in the list of registered connectors with Prometheus metrics support`), which kills the prefill engine's output handler, so every request then fails.
+- **The proxy has to send SSE.** `mooncake_connector_proxy.py` used to return streamed responses as `application/json`. aiperf parses by content type and read no tokens: the first 1P1D AgentX run had 100% request errors. It now returns `text/event-stream` for streamed requests.
+- **1P1D gives the smoothest decode**: inter-token latency P99 18.7-21.8 ms, because prefills no longer interrupt decode. Its per-GPU throughput counts both nodes.
 
 ## Compatibility Matrix
 

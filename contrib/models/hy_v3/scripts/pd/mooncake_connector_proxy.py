@@ -360,7 +360,10 @@ async def _handle_completions(api: str, request: Request):
             ):
                 yield chunk
 
-        return StreamingResponse(generate_stream(), media_type="application/json")
+        # Server-sent events when the client streams: OpenAI clients that parse by content type
+        # (aiperf, used by InferenceX AgentX) read no tokens from an application/json stream.
+        media_type = "text/event-stream" if req_data.get("stream") else "application/json"
+        return StreamingResponse(generate_stream(), media_type=media_type)
 
     except Exception as e:
         import sys
