@@ -106,7 +106,7 @@ case "$ROLE" in
     seqs=${SEQS:-$d_seqs} buckets=${SEQ_BUCKETS:-$d_buckets} ctx=${CTX_BUCKETS:-$d_ctx} cap=${KV_CAP:-$d_cap}
     if [ "$KV_DTYPE" = fp8 ]; then
       export VLLM_NEURON_MAX_KV_CONCURRENT=${VLLM_NEURON_MAX_KV_CONCURRENT:-$((seqs + 4))}
-      export HY3_SPARSE_SELECT_EVERY=${HY3_SPARSE_SELECT_EVERY:-8} HY3_MOE_STATIC_DGE=${HY3_MOE_STATIC_DGE:-1}
+      export HY3_SPARSE_SELECT_EVERY=${HY3_SPARSE_SELECT_EVERY:-8}
     fi ;;
   decode-bench)
     kv_role=kv_consumer port=8200 nixl_port=5557
