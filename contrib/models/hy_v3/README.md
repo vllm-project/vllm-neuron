@@ -432,6 +432,14 @@ latency to 0.152 ms, but the descriptors live in HBM: about 1.1 GB more "DMA rin
 with decode buckets [1, 4, 8]. At `KV_CAP` 0.61 the decode server then fails its first full step
 with `Failed to allocate ... dma rings io`. It stays off.
 
+In serving it is also much slower. Measured on a cold compile in 1P1D at C = 4 (85k, 92% prefix hit), end-to-end TPOT P50:
+- `HY3_MOE_STATIC_DGE=1`: 42.6 ms;
+- unset: 18.3 ms.
+
+The 2.3x comes from the fused decode MoE kernel. It was hidden for a while because NKI's intermediate-kernel cache (`/var/tmp/nki-intermediate-cache`) is keyed by the kernel source path and arguments, not by the environment. A checkout that had once compiled `moe_tkg_fused` without the flag kept loading that kernel with the flag set. Only a fresh path showed the slow kernel.
+
+When changing a kernel-level environment switch, use a fresh checkout path or clear that cache.
+
 ### PD test method and results
 
 **Setup.**
@@ -1272,8 +1280,9 @@ ops (selection, gather and summary update, 8.2 ms).
 
 **Settings.** The measured defaults are in `pd_serve.sh` for FP8 decode:
 - `HY3_SPARSE_SELECT_EVERY=8`;
-- `HY3_MOE_STATIC_DGE=1`;
-- `KV_CAP` 0.35, which leaves HBM for the batch-16 NEFFs and the static DGE descriptors.
+- `KV_CAP` 0.35, which leaves HBM for the batch-16 NEFFs.
+
+The defaults used to include `HY3_MOE_STATIC_DGE=1`. It is now off, because on a cold compile it makes the fused MoE 2.3x slower (see the fused decode MoE section). The numbers below came from a checkout whose cached kernel matches the unset case. At C = 4 the end-to-end TPOT was 18.4 ms there, and 18.3 ms on a cold compile without the flag.
 
 Set `HY3_SPARSE_DECODE=0.0625` on the decode node only; the prefill node keeps 0.125.
 

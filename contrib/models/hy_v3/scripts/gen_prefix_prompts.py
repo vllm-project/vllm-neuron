@@ -16,7 +16,8 @@ other. P should be a multiple of the prefix-cache block (block_size x DCP,
 
 Usage:
     python gen_prefix_prompts.py <tokenizer> <ShareGPT_V3_unfiltered_cleaned_split.json> \
-        <out_dir> <total_len> <prefix_len> "<concurrencies>" [requests_per_conc=10]
+        <out_dir> <total_len> <prefix_len> "<concurrencies>" [requests_per_conc=10] [seed_offset=0]
+seed_offset shifts every cell's seed (0 reproduces the committed files).
 Writes in{L}_p{P}_c{C}.jsonl.gz.
 """
 
@@ -96,10 +97,11 @@ def main():
     total, prefix_len = int(sys.argv[4]), int(sys.argv[5])
     concs = [int(x) for x in sys.argv[6].split()]
     per_conc = int(sys.argv[7]) if len(sys.argv) > 7 else 10
+    seed_offset = int(sys.argv[8]) if len(sys.argv) > 8 else 0
     convs = [d.get("conversations", d.get("conversation", [])) for d in data]
     convs = [c for c in convs if len(c) >= 2]
     for C in concs:
-        rng = random.Random(total * 1000 + prefix_len + C)
+        rng = random.Random(total * 1000 + prefix_len + C + seed_offset * 1_000_003)
         pool = convs[:]
         rng.shuffle(pool)
         # First half for prefixes, second half for suffixes: never the same text.
