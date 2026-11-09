@@ -714,6 +714,46 @@ On Trn2 the 80 prompts (about 611k tokens) do not all fit in the prefill node KV
 `P_KV_CAP` 0.45), so part of the replay is prefilled again and TTFT reads higher than on H100. TPOT
 is not affected. The H100 run is in `results/pd_prefill/h100/dcust/`.
 
+### AgentX (InferenceX agentic traces), GPU reference
+
+[AgentX](https://inferencex.semianalysis.com/agentx) is InferenceX's multi-turn benchmark.
+- It replays real coding-agent sessions (Claude Code traces with subagents). Every turn carries the whole session so far, so cross-request prefix reuse is the core of the load.
+- Requests are streamed on `/v1/chat/completions` with `ignore_eos`. `--cache-bust first_turn_prefix` keeps different sessions from sharing cache.
+- Each concurrency point is profiled for 3600 s, after a cache warm-up.
+
+`scripts/pd/gpu/agentx.sh` runs it with InferenceX's settings:
+- client `agentx-harness` 1.0.13, in its own venv on Python 3.11-3.13;
+- corpus `semianalysis_cc_traces_weka_062126_256k`. Hy3's `max_position_embeddings` is 262144, and the uncapped corpus has longer traces;
+- failed-request threshold 0.10;
+- one concurrency per server start;
+- `submission_valid` checked in the result.
+
+The server needs `max_model_len` 262144. `scripts/pd/gpu/gpu_single_serve.sh` starts the single-node GPU server: TP=8, FP8 KV, MTP k=3, the reference flags.
+
+```
+MAX_LEN=262144 IMAGE=vllm/vllm-openai:v0.29.0 bash scripts/pd/gpu/gpu_single_serve.sh
+bash scripts/pd/gpu/agentx.sh results/agentx/c16 16     # restart the server before the next C
+```
+
+**B200, single node** (1x p6-b200.48xlarge, 8x B200 183 GB, vLLM 0.29.0, FP8 KV, MTP k=3, no KV offload). Both points: `submission_valid` true, 0% request errors, 0 preemptions. Results are in `results/agentx_gpu/b200_single/`.
+
+| | C = 16 | C = 32 |
+|---|---|---|
+| requests in 3600 s | 2,664 | 4,028 |
+| input tokens P50 / P99 | 94k / 245k | 93k / 248k |
+| output tokens P50 / P99 | 327 / 9.3k | 337 / 7.4k |
+| theoretical prefix-cache hit | 96.3% | 96.6% |
+| TTFT P50 / P90 / P99 | 0.54 / 0.93 / 2.45 s | 0.64 / 1.27 / 6.55 s |
+| inter-token latency P50 / P90 / P99 | 9.0 / 14.6 / 25.7 ms | 16.0 / 29.9 / 54.8 ms |
+| output tok/s per user, P50 | 111 | 63 |
+| output tok/s (per GPU) | 688 (86) | 998 (125) |
+| MTP tokens per step | 2.30 | 2.27 |
+
+Notes:
+- **Acceptance length.** It is the real MTP acceptance. InferenceX's published points use a synthetic golden acceptance length instead.
+- **Input token throughput.** AgentX reports it including cached tokens, so it is not a cold-prefill rate.
+- **Coming next.** The H100 single-node and 1P1D runs, and Trn2, are follow-ups. Trn2 needs `max_model_len` 262144 first; the current decode configuration is 87040.
+
 ## Compatibility Matrix
 
 | Instance / Neuron SDK version | 2.33.0      | 2.32 and earlier |
@@ -1438,7 +1478,7 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 | `scripts/gen_bench_prompts.py` | generates `bench_data/prompts`: sglang-style ShareGPT text cut / repeated to an exact token count |
 | `scripts/bench_prefix_fixed.sh` | prefix-cache benchmark over `bench_data/prefix` (85k input, 92% shared prefix): warm-up request, one `cache_salt` per run, hit rate from `/metrics` |
 | `scripts/pd/pd_bench_final.sh`, `pd_bench_split.sh`, `pd_bench_dcust.sh` | the comparison set: P-only (output 1) at C = 1 / 4 / 8 / 12, the end-to-end 1024-output case at C = 8, then the customer D-only replay (1200 output) at C = 8 ("Trn2 vs H100") |
-| `scripts/pd/gpu/` | the H100 1P1D reference: Dockerfile (vLLM 0.29.0 + EFA + GDRCopy + Mooncake) and `gpu_serve.sh` |
+| `scripts/pd/gpu/` | the GPU references: Dockerfile (vLLM 0.29.0 + EFA + GDRCopy + Mooncake), `gpu_serve.sh` (H100 1P1D), `gpu_single_serve.sh` (single node, FP8 KV + MTP) and `agentx.sh` (InferenceX AgentX against a running server) |
 | `scripts/pd/` | 1P1D (Mooncake / NIXL) runs on two trn2.48xlarge: servers, proxy, the 85k / 92% bench and the accuracy checks through the proxy ([scripts/pd/README.md](scripts/pd/README.md), "PD test method and results") |
 | `src/kernels/moe_tkg_fused.py` | EXPERIMENTAL fused decode MoE block (`HY3_DECODE_MOE_FUSED=1`): norm + router + routed + shared shard, W8A8 + FP8 double-row; 8-request PD TPOT 26.5 -> 19.9 ms ("Fused decode MoE") |
 | `scripts/bench_pd_split.sh` | prefill-only (output 1) and decode-only (replay twice) split over `bench_data/prefix`, with per-cell `cache_salt`, hit rates and MTP acceptance |
