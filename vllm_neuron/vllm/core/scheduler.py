@@ -659,8 +659,12 @@ class NeuronScheduler(Scheduler):
     def _is_prefill_request(self, request: Request) -> bool:
         """Check if a request is in prefill phase.
 
-        A request is in prefill if it hasn't finished processing all prompt tokens.
-        This is independent of which queue (waiting/running) it's in.
+        A request is in prefill if it hasn't finished processing all prompt tokens,
+        or if it has tokens left to re-compute: a preempted request whose prompt came
+        back from the prefix cache (or a KV connector) re-computes the output tokens it
+        had generated, which is prefill work although the prompt is done. A decode step
+        leaves at most the last token uncomputed. This is independent of which queue
+        (waiting/running) it's in.
 
         Args:
             request: The request to check.
@@ -668,7 +672,10 @@ class NeuronScheduler(Scheduler):
         Returns:
             True if request is in prefill phase, False if in decode phase.
         """
-        return request.num_computed_tokens < request.num_prompt_tokens
+        return (
+            request.num_computed_tokens < request.num_prompt_tokens
+            or request.num_computed_tokens < request.num_tokens - 1
+        )
 
     def _kv_in_use(self) -> int:
         """Requests currently pinning KV blocks against the worst-case cap
@@ -978,7 +985,12 @@ class NeuronScheduler(Scheduler):
 
             # Use num_computed_tokens from SchedulerOutput (pre-increment value)
             num_computed = req_num_computed.get(req_id, request.num_computed_tokens)
-            is_prefill = num_computed < request.num_prompt_tokens
+            # Re-computed output tokens after a preemption are prefill work too (see
+            # _is_prefill_request): classified as decode they would run unpadded.
+            is_prefill = (
+                num_computed < request.num_prompt_tokens
+                or num_computed < request.num_tokens - 1
+            )
 
             # A last-token re-compute (the prompt is already available; only
             # the final token is re-computed for sampling) is decode-shaped
