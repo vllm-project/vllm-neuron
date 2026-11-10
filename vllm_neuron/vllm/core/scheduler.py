@@ -1159,9 +1159,11 @@ class NeuronScheduler(Scheduler):
         # nothing, the hidden decodes never run to free blocks, and every following step is
         # the same empty prefill step: a livelock. After such a step run decode-only steps
         # for a while, so the decodes make progress and free blocks.
+        decode_only_backoff = False
         if can_start_prefill and self._prefill_backoff_steps > 0 and self.running:
             self._prefill_backoff_steps -= 1
             can_start_prefill = False
+            decode_only_backoff = True
         running_holdback: list[Request] = []
         max_num_running_reqs_override: int | None = None
         if self.has_prefill_in_running:
@@ -1285,6 +1287,15 @@ class NeuronScheduler(Scheduler):
             for req in deferred:
                 self.skipped_waiting.add_request(req)
 
+        # A decode-only backoff step must not admit a prefill into the decode batch (Neuron runs
+        # prefill and decode in separate steps): hide every waiter until Step 5.
+        backoff_skipped: list[Request] = []
+        if decode_only_backoff:
+            while self.waiting:
+                self.holdback_queue.append(self.waiting.pop_request())
+            while self.skipped_waiting:
+                backoff_skipped.append(self.skipped_waiting.pop_request())
+
         # Step 4: Delegate to parent scheduler (sync or async)
         original_max_num_running_reqs = self.max_num_running_reqs
         if max_num_running_reqs_override is not None:
@@ -1326,6 +1337,8 @@ class NeuronScheduler(Scheduler):
             self.waiting.append(self.holdback_queue.popleft())
         # Restore the structured-output grammar waiters held back in Step 3.5.
         for req in skipped_holdback:
+            self.skipped_waiting.add_request(req)
+        for req in backoff_skipped:
             self.skipped_waiting.add_request(req)
 
         # Check if we can add JF tokens to requests (assuming we're in decode phase).
