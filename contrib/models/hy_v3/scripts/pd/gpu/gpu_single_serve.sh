@@ -4,8 +4,12 @@
 # connector is used), TP=8, FP8 KV, MTP k=3, the customer's reference flags, port 8000.
 # Container name hy3-single; logs: docker logs hy3-single.
 # Env: IMAGE (hy3-efa-029), MAX_LEN (262144 for AgentX; 87040 for the 85k benches),
-#      MODEL_DIR (/opt/dlami/nvme/models), EXTRA (more vllm serve flags).
+#      MODEL_DIR (/opt/dlami/nvme/models), EXTRA (more vllm serve flags),
+#      OFFLOAD_BYTES (host-DRAM KV offload with vLLM's SimpleCPUOffloadConnector, write-through;
+#      1200000000000 = 1.2 TB on p5; needed on H100 for AgentX, where the KV working set exceeds HBM).
 set -euo pipefail
+OFL=()
+[ -n "${OFFLOAD_BYTES:-}" ] && OFL=(--kv-transfer-config "{\"kv_connector\":\"SimpleCPUOffloadConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":$OFFLOAD_BYTES,\"lazy_offload\":false}}")
 docker rm -f hy3-single >/dev/null 2>&1 || true
 docker run -d --name hy3-single --gpus all --ipc=host --network host \
   -v ${MODEL_DIR:-/opt/dlami/nvme/models}:/models \
@@ -14,5 +18,5 @@ docker run -d --name hy3-single --gpus all --ipc=host --network host \
   --tensor-parallel-size 8 \
   --tool-call-parser hy_v3 --enable-auto-tool-choice --reasoning-parser hy_v3 \
   --max-model-len ${MAX_LEN:-262144} --port 8000 \
-  --kv-cache-dtype fp8 --speculative-config '{"method":"mtp","num_speculative_tokens":3}' ${EXTRA:-}
+  --kv-cache-dtype fp8 --speculative-config '{"method":"mtp","num_speculative_tokens":3}' "${OFL[@]}" ${EXTRA:-}
 echo "started hy3-single on port 8000"

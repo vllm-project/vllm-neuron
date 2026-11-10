@@ -752,7 +752,66 @@ bash scripts/pd/gpu/agentx.sh results/agentx/c16 16     # restart the server bef
 Notes:
 - **Acceptance length.** It is the real MTP acceptance. InferenceX's published points use a synthetic golden acceptance length instead.
 - **Input token throughput.** AgentX reports it including cached tokens, so it is not a cold-prefill rate.
-- **Coming next.** The H100 single-node and 1P1D runs, and Trn2, are follow-ups. Trn2 needs `max_model_len` 262144 first; the current decode configuration is 87040.
+- **Trn2.** See "AgentX on Trn2 (2P1D)" below.
+
+**H100** (p5.48xlarge, 8x H100 80 GB per node, the `scripts/pd/gpu/Dockerfile` image, FP8 KV, MTP k=3). Results are in `results/agentx_gpu/h100_*`.
+
+| | 1 node, C = 16 | 1 node, C = 8, KV offload | 1 node, C = 16, KV offload | 1P1D, C = 16 | 1P1D, C = 16, KV offload |
+|---|---|---|---|---|---|
+| requests in 3600 s | 786 | 1,213 | 2,002 | 1,760 | 2,286 |
+| TTFT P50 / P90 / P99 | 2.31 / 52.9 / 75.4 s | 0.55 / 1.46 / 5.16 s | 0.75 / 3.26 / 11.9 s | 2.21 / 37.0 / 80.6 s | 1.17 / 5.55 / 17.7 s |
+| inter-token latency P50 / P99 | 37.7 / 281 ms | 12.5 / 37.8 ms | 20.0 / 63.4 ms | 13.2 / 18.7 ms | 14.4 / 21.8 ms |
+| output tok/s per user, P50 | 27 | 80 | 50 | 76 | 69 |
+| output tok/s (per GPU) | 175 (22) | 306 (38) | 474 (59) | 431 (27) | 547 (34) |
+| preemptions | 3 | 0 | 40 | 77 | 0 |
+
+All five runs report `submission_valid` true with 0% request errors.
+
+Notes:
+- **Without offload, the KV working set does not fit.** About 36 GB of each 80 GB H100 holds weights. The prefix cache thrashes and finished prefixes are prefilled again, so TTFT P90 reaches 37-53 s.
+- **KV offload to host DRAM fixes it.**
+  - Single node: `OFFLOAD_BYTES=1200000000000 bash scripts/pd/gpu/gpu_single_serve.sh` (vLLM `SimpleCPUOffloadConnector`, write-through).
+  - 1P1D: `OFFLOAD_BYTES=1200000000000 MAX_LEN=262144 EXTRA='--kv-cache-dtype fp8 --speculative-config ...' bash scripts/pd/gpu/gpu_serve.sh prefill|decode`. This is a `MultiConnector` of Mooncake and CPU offload on both nodes.
+  - With vLLM 0.29.0 the 1P1D form needs the patched `scripts/pd/gpu/vllm029_multi_connector.py`, which `gpu_serve.sh` mounts. The stock file asserts on the first stats record (`MooncakeConnector is not contained in the list of registered connectors with Prometheus metrics support`), which kills the prefill engine's output handler, so every request then fails.
+- **The proxy has to send SSE.** `mooncake_connector_proxy.py` used to return streamed responses as `application/json`. aiperf parses by content type and read no tokens: the first 1P1D AgentX run had 100% request errors. It now returns `text/event-stream` for streamed requests.
+- **1P1D gives the smoothest decode**: inter-token latency P99 18.7-21.8 ms, because prefills no longer interrupt decode. Its per-GPU throughput counts both nodes.
+
+### AgentX on Trn2 (2P1D)
+
+`scripts/pd/agentx_trn2.sh` is a `run_pd.sh` BENCH plugin. It runs AgentX with the same settings as `gpu/agentx.sh`, through the Mooncake proxy.
+- **Session affinity.** Sessions carry `X-Session-ID` (`AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true`). With `P_INSTANCES=2` the proxy keeps each session on one prefill instance, so that instance's prefix cache holds the conversation. Requests without the header still go round robin.
+- **Metrics.** `/metrics` is scraped from both prefill instances and the decode.
+
+```
+# decode node (start first; stays up)
+bash scripts/pd/run_pd_best.sh agx decode-node MAX_LEN=262144 "CTX_BUCKETS=[98304]" \
+  "SEQ_BUCKETS=[1, 4, 8, 16]" SEQS=16 KV_CAP=0.55 VLLM_NEURON_MAX_KV_CONCURRENT=20 \
+  VLLM_NEURON_SKIP_PREFILL_WARMUP=0 "PREFILL_BUCKETS=[512]"
+# prefill node: two TP=32 instances + proxy, waits for the decode, then runs AgentX
+bash scripts/pd/run_pd_best.sh agx prefill-node D_HOST=<decode ip> MAX_LEN=262144 \
+  VLLM_NEURON_MAX_KV_CONCURRENT=16 BENCH=agentx_trn2 CONCS=4
+```
+
+The C = 4 run below used this command without the last two decode settings. By default the decode skips the prefill warm-up, and at C = 4 it never preempted.
+
+**Result, C = 4** (2x trn2.48xlarge; P = 2x TP=32, D = TP=64; FP8 KV, MTP k=3, sparse attention). The run reports `submission_valid` true with 0% request errors. Results are in `results/agentx_trn2/2p1d/c4/`.
+
+| | C = 4 |
+|---|---|
+| requests in 3600 s | 435 |
+| TTFT P50 / P90 / P99 | 1.69 / 21.1 / 72.4 s |
+| inter-token latency P50 / P90 / P99 | 21.4 / 24.5 / 28.4 ms |
+| output tok/s per user, P50 | 47 |
+| output tok/s | 124 |
+| MTP tokens per step | 2.41 |
+
+Notes:
+- **Decode KV capacity is the limit.**
+  - At TP=64 each of the 8 KV heads is replicated on 8 ranks, so the decode holds 628,832 KV tokens at `KV_CAP` 0.55. The AgentX working set at C = 8 is about 840k tokens.
+  - When the decode runs out of KV it preempts. The preempted request re-computes its prompt as a prefill on the decode node.
+- **The decode needs a warmed prefill bucket.** Set `VLLM_NEURON_SKIP_PREFILL_WARMUP=0` and `PREFILL_BUCKETS` equal to the decode's `max_num_batched_tokens` (512), which `pd_serve.sh` now lets you override. Otherwise that re-compute has no compiled graph.
+- **Fixed: unpadded prefills on the decode node.** The scheduler used to run every prefill on a PD decode node unpadded, so the re-compute had an uncompiled length and failed the `fail_on_recompile` stance. The first C = 8 run had 10.1% request errors from this and was invalid. Now only a decode-shaped step (at most 1 + `num_spec_tokens` tokens) runs unpadded. A real prefill, whether a preempted request's re-compute or a recompute after a failed KV load, is padded to a compiled bucket.
+- **C >= 8 needs more decode KV capacity.** Options are attention DP or DCP on the decode, or host-memory KV offload, which vllm-neuron does not have yet.
 
 ## Compatibility Matrix
 

@@ -9,6 +9,7 @@ import itertools
 import os
 import urllib
 import uuid
+import zlib
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -337,7 +338,15 @@ async def _handle_completions(api: str, request: Request):
         request_id = str(uuid.uuid4())
 
         # Get the next prefill client in round-robin fashion
-        prefill_client_info, prefill_dp_rank = get_next_client(request.app, "prefill")
+        # Session affinity: a multi-turn session (X-Session-ID, e.g. AgentX with
+        # AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true) always goes to the same prefill
+        # instance, so its prefix cache holds the conversation; otherwise round robin.
+        session = request.headers.get("x-session-id")
+        if session and len(request.app.state.prefill_clients) > 1:
+            pc = request.app.state.prefill_clients
+            prefill_client_info, prefill_dp_rank = pc[zlib.crc32(session.encode()) % len(pc)], 0
+        else:
+            prefill_client_info, prefill_dp_rank = get_next_client(request.app, "prefill")
 
         # Send request to prefill service
         asyncio.create_task(
@@ -360,7 +369,10 @@ async def _handle_completions(api: str, request: Request):
             ):
                 yield chunk
 
-        return StreamingResponse(generate_stream(), media_type="application/json")
+        # Server-sent events when the client streams: OpenAI clients that parse by content type
+        # (aiperf, used by InferenceX AgentX) read no tokens from an application/json stream.
+        media_type = "text/event-stream" if req_data.get("stream") else "application/json"
+        return StreamingResponse(generate_stream(), media_type=media_type)
 
     except Exception as e:
         import sys
