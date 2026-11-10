@@ -102,7 +102,7 @@ case "$ROLE" in
     export VLLM_NEURON_MAX_KV_CONCURRENT=${VLLM_NEURON_MAX_KV_CONCURRENT:-16} ;;
   decode)
     kv_role=kv_consumer port=8200 nixl_port=5557
-    export VLLM_NEURON_SKIP_PREFILL_WARMUP=1
+    export VLLM_NEURON_SKIP_PREFILL_WARMUP=${VLLM_NEURON_SKIP_PREFILL_WARMUP:-1}
     seqs=${SEQS:-$d_seqs} buckets=${SEQ_BUCKETS:-$d_buckets} ctx=${CTX_BUCKETS:-$d_ctx} cap=${KV_CAP:-$d_cap}
     if [ "$KV_DTYPE" = fp8 ]; then
       export VLLM_NEURON_MAX_KV_CONCURRENT=${VLLM_NEURON_MAX_KV_CONCURRENT:-$((seqs + 4))}
@@ -110,7 +110,7 @@ case "$ROLE" in
     fi ;;
   decode-bench)
     kv_role=kv_consumer port=8200 nixl_port=5557
-    export VLLM_NEURON_SKIP_PREFILL_WARMUP=1
+    export VLLM_NEURON_SKIP_PREFILL_WARMUP=${VLLM_NEURON_SKIP_PREFILL_WARMUP:-1}
     CONNECTOR=NeuronDecodeBenchConnector
     seqs=${SEQS:-$d_seqs} buckets=${SEQ_BUCKETS:-$d_buckets} ctx=${CTX_BUCKETS:-$d_ctx} cap=${KV_CAP:-$d_cap} ;;
   *) echo "role must be prefill, decode or decode-bench" >&2; exit 1 ;;

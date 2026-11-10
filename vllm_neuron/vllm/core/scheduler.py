@@ -906,11 +906,19 @@ class NeuronScheduler(Scheduler):
         if request is None:
             return False
         kv_transfer_params = request.kv_transfer_params
-        return (
+        if not (
             scheduler_output.kv_connector_metadata is not None
             and kv_transfer_params is not None
             and not kv_transfer_params.get("do_remote_decode", False)
-        )
+        ):
+            return False
+        # Only a decode-shaped step (the token after a remote KV load, plus its
+        # draft tokens) runs unpadded. A real prefill on the decode node -- a
+        # preempted request re-computing its prompt, or a recompute after a
+        # failed KV load -- is padded to a compiled prefill bucket; unpadded it
+        # has an uncompiled length and fails the fail_on_recompile stance.
+        num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+        return num_tokens <= 1 + self.num_spec_tokens
 
     def _apply_padding_and_log_stats(
         self,
