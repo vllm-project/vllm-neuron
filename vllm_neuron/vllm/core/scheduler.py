@@ -48,6 +48,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Decode-only steps after a prefill step that could not schedule (KV cache full).
+_PREFILL_BACKOFF_STEPS = 16
+
 
 def _kv_capacity_guidance() -> str:
     """Return capacity guidance for the active KV budget policy."""
@@ -192,6 +195,8 @@ class NeuronScheduler(Scheduler):
             and not kv_transfer_config.is_kv_consumer
         )
         self._pending_kv_send: set[str] = set()
+        # Decode-only steps left after a prefill step that scheduled nothing (see schedule()).
+        self._prefill_backoff_steps = 0
         # Keep the running decodes when every admissible waiter is a pure asynchronous KV pull.
         # Branch 3.2 hides all running decodes so a waiter can prefill, but a pure pull needs no
         # forward pass: the base scheduler parks it in WAITING_FOR_REMOTE_KVS with zero tokens.
@@ -1149,6 +1154,14 @@ class NeuronScheduler(Scheduler):
             and not self.has_prefill_in_running
             and self._kv_in_use() < self._max_kv_concurrent
         )
+        # A prefill step hides every running decode. When the waiting prefill cannot get its
+        # KV blocks (the cache is full of the running requests' KV), that step schedules
+        # nothing, the hidden decodes never run to free blocks, and every following step is
+        # the same empty prefill step: a livelock. After such a step run decode-only steps
+        # for a while, so the decodes make progress and free blocks.
+        if can_start_prefill and self._prefill_backoff_steps > 0 and self.running:
+            self._prefill_backoff_steps -= 1
+            can_start_prefill = False
         running_holdback: list[Request] = []
         max_num_running_reqs_override: int | None = None
         if self.has_prefill_in_running:
@@ -1292,6 +1305,20 @@ class NeuronScheduler(Scheduler):
             scheduler_output = self._call_base_schedule(throttle_prefills)
         finally:
             self.max_num_running_reqs = original_max_num_running_reqs
+        if (
+            running_holdback
+            and not self.has_prefill_in_running
+            and scheduler_output.total_num_scheduled_tokens == 0
+            and any(r.status == RequestStatus.WAITING for r in self.waiting)
+        ):
+            if self._prefill_backoff_steps == 0:
+                logger.info(
+                    "Prefill step scheduled nothing (no KV blocks for the waiting prefill); "
+                    "%d decode-only steps for the %d hidden decodes",
+                    _PREFILL_BACKOFF_STEPS,
+                    len(running_holdback),
+                )
+            self._prefill_backoff_steps = _PREFILL_BACKOFF_STEPS
 
         # Step 5: Restore holdbacks
         self.running = self.running + running_holdback
