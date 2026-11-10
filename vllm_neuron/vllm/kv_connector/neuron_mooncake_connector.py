@@ -218,6 +218,51 @@ class NeuronMooncakeConnectorWorker(MooncakeConnectorWorker):
         return src_ptrs, dst_ptrs, lengths, err_reqs, err_msg
 
 
+    # A failed pull: the base worker only logs it, so the decode-side request stays in
+    # WAITING_FOR_REMOTE_KVS forever (e.g. "Timeout waiting for P side ready" when the prefill
+    # queue outlasts VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT, or an EAGAIN from the transfer). Report
+    # it finished with its blocks as load errors instead, so kv_load_failure_policy applies
+    # (recompute: the decode re-computes the prompt; fail: the request errors out).
+
+    def _mark_pull_failed(self, req_id, pull_meta) -> None:
+        errs = self.__dict__.setdefault("_load_error_blocks", set())
+        for group in pull_meta.local_block_ids:
+            errs.update(int(b) for b in group if b)
+        pull_meta.pull_tasks_count -= 1
+        if pull_meta.pull_tasks_count <= 0:
+            self.finished_recving_reqs.add(pull_meta.d_req_id)
+        logger.warning(
+            "NeuronMooncakeConnector: KV pull for %s failed; %d blocks reported as load errors",
+            req_id, sum(len(g) for g in pull_meta.local_block_ids),
+        )
+
+    def process_pulling_result(self, response, pull_metas):
+        super().process_pulling_result(response, pull_metas)
+        seen = self.__dict__.setdefault("_pull_seen", {}).setdefault(id(pull_metas), set())
+        seen.update(response.ok_reqs or [])
+        for req_id in response.err_reqs or []:
+            if req_id in pull_metas and req_id not in seen:
+                seen.add(req_id)
+                self._mark_pull_failed(req_id, pull_metas[req_id])
+
+    async def receive_kv_from_single_worker(self, worker_addr, pull_metas):
+        try:
+            await super().receive_kv_from_single_worker(worker_addr, pull_metas)
+        finally:
+            # An ERROR response or an exception returns without a result for these requests.
+            seen = self.__dict__.setdefault("_pull_seen", {}).pop(id(pull_metas), set())
+            for req_id, pull_meta in pull_metas.items():
+                if req_id not in seen:
+                    self._mark_pull_failed(req_id, pull_meta)
+
+    def take_load_error_blocks(self) -> set[int]:
+        errs = self.__dict__.get("_load_error_blocks")
+        if not errs:
+            return set()
+        self._load_error_blocks = set()
+        return errs
+
+
 class NeuronMooncakeConnector(MooncakeConnector):
     def __init__(self, vllm_config, role, kv_cache_config):
         super().__init__(vllm_config, role, kv_cache_config)
@@ -226,6 +271,10 @@ class NeuronMooncakeConnector(MooncakeConnector):
             # beyond what _setup_remote_dcp adds).
             self.connector_worker.__class__ = NeuronMooncakeConnectorWorker
             self.connector_worker._setup_remote_dcp()
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        w = self.connector_worker
+        return w.take_load_error_blocks() if w is not None else set()
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         if not coalesce_enabled():
