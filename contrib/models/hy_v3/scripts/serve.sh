@@ -12,7 +12,10 @@
 #   MTP_K            MTP speculative tokens per step (default: off; needs a
 #                    vllm-neuron with MTP support)
 #   PORT             API port (default: 8000)
-#   EP               neuron_config.ep_degree (default: full EP=64)
+#   EP               neuron_config.ep_degree (default: full EP over TP)
+#   TP               tensor-parallel size (default 64, the whole trn2.48xlarge at LNC=2)
+#   CORES            logical NeuronCores to run on (NEURON_VISIBLE_DEVICES), e.g. 0-31 with TP=32
+#                    for half a node; one per rank
 #   KV_DTYPE         --kv-cache-dtype: auto (BF16, default) or fp8. FP8 takes its KV scales
 #                    from HY3_KV_SCALE_PROFILE (see calibrate_kv_scales.py; else 1.0) and uses
 #                    the packed K layout ("fp8_packed_kv"; FP8_PACKED=0 turns it off)
@@ -37,6 +40,9 @@ if [ "$KV_DTYPE" != auto ] && [ "${FP8_PACKED:-1}" = 1 ]; then
     PACKED_NC='"fp8_packed_kv": true,'
 fi
 export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=${KV_CAP:-0.45}
+TP=${TP:-64}
+[ "$TP" != 64 ] && EP=${EP:-$TP}
+[ -n "${CORES:-}" ] && export NEURON_VISIBLE_DEVICES=$CORES
 # Needed on instances without EFA devices.
 export NEURON_SKIP_EFA_AFFINITY=${NEURON_SKIP_EFA_AFFINITY:-1}
 SPEC_ARGS=()
@@ -45,7 +51,7 @@ if [ -n "${MTP_K:-}" ]; then
 fi
 exec vllm serve "${MODEL:-tencent/Hy3-FP8}" "${SPEC_ARGS[@]}" \
     --served-model-name hy3 \
-    --tensor-parallel-size 64 \
+    --tensor-parallel-size "$TP" \
     --enable-expert-parallel \
     --max-model-len "$1" \
     --max-num-seqs "$2" \
