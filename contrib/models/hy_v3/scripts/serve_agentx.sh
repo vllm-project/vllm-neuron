@@ -39,4 +39,6 @@ export NEURON_RT_CC_ALG_TYPES=${NEURON_RT_CC_ALG_TYPES:-^INTRA_RDH_ALG}
 SEQS=${SEQS:-16}
 export VLLM_NEURON_MAX_KV_CONCURRENT=${VLLM_NEURON_MAX_KV_CONCURRENT:-$((SEQS + 4))}
 export KV_CAP=${KV_CAP:-0.45} PREFILL_BUCKETS=${PREFILL_BUCKETS:-'[512, 1024, 2048, 4096, 8192]'}
-exec "$HERE/serve.sh" "${MAX_LEN:-262144}" "$SEQS" "${SEQ_BUCKETS:-[1, 4, 8, 16]}" "${CTX_BUCKETS:-[98304]}"
+# CTX_BUCKETS= (empty): only the implicit max_model_len decode bucket.
+ctx=${CTX_BUCKETS-[98304]}
+exec "$HERE/serve.sh" "${MAX_LEN:-262144}" "$SEQS" "${SEQ_BUCKETS:-[1, 4, 8, 16]}" ${ctx:+"$ctx"}
