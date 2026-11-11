@@ -85,6 +85,7 @@ Confirm your contribution follows this structure:
 **By submitting this PR, I confirm that:**
 
 - [ ] I have read and followed the [contributing guidelines](../../contrib/README.md).
+- [ ] Every commit includes a DCO `Signed-off-by` line (created with `git commit -s`).
 - [ ] This is a community contribution and may have limited testing compared to officially-supported models.
 - [ ] The code follows best practices and is documented.
 - [ ] All required components listed above are included.
