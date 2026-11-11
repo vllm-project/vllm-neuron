@@ -336,6 +336,7 @@ async def stream_service_response(
 # sessions (seen within PREFILL_SESSION_TTL s) and keeps it there, so its prefix cache and host
 # KV tier stay on one instance. PREFILL_ROUTING=hash restores the crc32 placement.
 _PREFILL_ROUTING = os.environ.get("PREFILL_ROUTING", "balanced")
+_PD_DISPATCH = os.environ.get("PD_DISPATCH", "serial")
 _PREFILL_SESSION_TTL = float(os.environ.get("PREFILL_SESSION_TTL", "600"))
 _session_route: dict[str, list] = {}
 
@@ -381,12 +382,19 @@ async def _handle_completions(api: str, request: Request):
         else:
             prefill_client_info, prefill_dp_rank = get_next_client(request.app, "prefill")
 
-        # Send request to prefill service
-        asyncio.create_task(
+        # Send request to prefill service. PD_DISPATCH=serial (default) waits for the prefill to
+        # finish before the decode gets the request. With PD_DISPATCH=concurrent (upstream) the
+        # decode admits the request and allocates its KV blocks right away, while the prefill
+        # may still be queued: when both sides are KV-bound, the decode blocks wait on prefills
+        # that wait on prefill KV, held by finished prefills the decode has no room to admit
+        # (AgentX C=16: a KV pull timed out after 1800 s).
+        prefill_task = asyncio.create_task(
             send_request_to_service(
                 prefill_client_info, prefill_dp_rank, api, req_data, request_id
             )
         )
+        if _PD_DISPATCH == "serial":
+            await prefill_task
 
         decode_client_info = get_next_client(request.app, "decode")
 
