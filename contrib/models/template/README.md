@@ -21,6 +21,15 @@ architecture is registered (see
 [contrib/README.md](../../README.md) — "How do I use a custom model
 with vLLM?"), you can serve and query it like any other vLLM model.
 
+If your model ships the optional `pyproject.toml` (Option 3 in
+[contrib/README.md](../../README.md)), install it first. The install registers
+the architecture in every vLLM process, so `vllm serve` and tensor parallelism
+work with no other setup:
+
+```bash
+pip install -e contrib/models/<your_model_name>
+```
+
 ### Serve with the OpenAI-compatible server
 
 ```bash
