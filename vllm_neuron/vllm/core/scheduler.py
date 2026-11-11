@@ -360,6 +360,15 @@ class NeuronScheduler(Scheduler):
             os.environ.get("VLLM_NEURON_CONSUMER_KV_RESERVE_TOKENS", "8192")
         )
         self._consumer_reserve_warned = False
+        if self._pure_kv_consumer and self.recompute_kv_load_failures:
+            # A failed KV load (e.g. "Timeout waiting for P side ready") would be re-computed
+            # locally, which a pure consumer has no compiled prefill graph for.
+            logger.warning(
+                "kv_load_failure_policy=recompute on a pure KV consumer: it cannot re-compute "
+                "(no prefill graph is compiled), so a failed KV load finishes the request with "
+                "an error instead."
+            )
+            self.recompute_kv_load_failures = False
         # VLLM_NEURON_MAX_KV_CONCURRENT overrides the worst-case cap above, which assumes every
         # request fills max_model_len with no prefix-cache sharing. Block allocation still
         # bounds what actually runs.
