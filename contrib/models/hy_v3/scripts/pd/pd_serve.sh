@@ -142,9 +142,10 @@ if [ "$ROLE" != prefill ] && [ "${D_DP:-1}" != 1 ]; then
   seqs=${SEQS:-4} buckets=${SEQ_BUCKETS:-'[1, 4]'}
 fi
 if [ "$ROLE" = prefill ]; then role_dcp=${P_DCP:-}; else role_dcp=${D_DCP:-}; fi
-[ "${D_DCP:-1}${P_DCP:-1}" != 11 ] && [ -n "${MTP_K:-}" ] && { echo "MTP does not run with DCP; unset MTP_K on both sides" >&2; exit 1; }
+# MTP + DCP: needs the span-aware DCP decode (VLLM_NEURON_DCP_SPEC_DECODE=1, local hy3-dcp-mtp-sparse changes).
+[ "${D_DCP:-1}${P_DCP:-1}" != 11 ] && [ -n "${MTP_K:-}" ] && [ "${VLLM_NEURON_DCP_SPEC_DECODE:-0}" != 1 ] && { echo "MTP does not run with DCP; unset MTP_K on both sides (or VLLM_NEURON_DCP_SPEC_DECODE=1)" >&2; exit 1; }
 if [ -n "$role_dcp" ] && [ "$role_dcp" != 1 ]; then
-  [ -n "${MTP_K:-}" ] && { echo "MTP does not run with DCP" >&2; exit 1; }
+  [ -n "${MTP_K:-}" ] && [ "${VLLM_NEURON_DCP_SPEC_DECODE:-0}" != 1 ] && { echo "MTP does not run with DCP" >&2; exit 1; }
   [ "$CONNECTOR" = NeuronMooncakeConnector ] && [ "$ROLE" = prefill ] && { echo "NeuronMooncakeConnector: prefill DCP must be 1" >&2; exit 1; }
   export DCP=$role_dcp
 fi
@@ -163,7 +164,7 @@ elif [ "$CONNECTOR" = NeuronMooncakeConnector ]; then
   # graph, so it cannot re-compute (the scheduler forces fail on a pure KV consumer anyway).
   export VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT=${VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT:-1800}
   # Prefill into a DCP decode: the prefill side maps its blocks onto the decode's DCP shards.
-  mc_dcp=""; [ "$ROLE" = prefill ] && [ "${D_DCP:-1}" != 1 ] && mc_dcp=",\"remote_dcp_size\":$D_DCP"
+  mc_dcp=""; [ "$ROLE" = prefill ] && [ "${D_DCP:-1}" != 1 ] && mc_dcp=",\"remote_dcp_size\":$D_DCP,\"remote_tp_size\":${D_TP:-64}"
   kvt="{\"kv_connector\":\"NeuronMooncakeConnector\",\"kv_connector_module_path\":\"$mc_mod\",\"kv_role\":\"$kv_role\",\"kv_load_failure_policy\":\"${KV_LOAD_FAILURE_POLICY:-fail}\",\"kv_connector_extra_config\":{\"mooncake_protocol\":\"efa\",\"num_workers\":${MC_WORKERS:-10}$mc_dcp}}"
 elif [ "$CONNECTOR" = NeuronNixlConnector ]; then
   kvt="{\"kv_connector\":\"NeuronNixlConnector\",\"kv_connector_module_path\":\"vllm_neuron.vllm.kv_connector.neuron_nixl_connector\",\"kv_role\":\"$kv_role\",\"kv_buffer_device\":\"cuda\",\"kv_connector_extra_config\":{\"backends\":[\"$BACKEND\"]}}"
