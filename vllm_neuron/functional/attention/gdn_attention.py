@@ -70,20 +70,24 @@ def gdn_causal_conv1d_update(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
     activation: str | None = None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Single-step causal depthwise conv1d for decode.
 
-    ``conv_state`` is ``[B, C, state_len]``; it is updated in place.
+    ``conv_state`` is ``[B, C, state_len]``. Returns ``(out, new_conv_state)``.
+    The state is returned functionally (not mutated in place) so the caller
+    writes it back to the paged cache via ``index_put_``. This mirrors the SSM
+    delta rule and avoids an in-place ``copy_`` that the Neuron pre-AOT mutation
+    passes mis-handle.
     """
     _, channels, length = x.shape
     state_len = conv_state.shape[-1]
     x_new = torch.cat([conv_state, x], dim=-1).to(weight.dtype)
-    conv_state.copy_(x_new[:, :, -state_len:])
+    new_conv_state = x_new[:, :, -state_len:].contiguous().to(conv_state.dtype)
     out = F.conv1d(x_new, weight.unsqueeze(1), bias, padding=0, groups=channels)
     out = out[:, :, -length:]
     if activation is not None:
         out = F.silu(out)
-    return out.to(x.dtype)
+    return out.to(x.dtype), new_conv_state
 
 
 def gdn_chunk_gated_delta_rule(

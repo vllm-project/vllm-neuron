@@ -27,7 +27,7 @@ from torch import nn
 from vllm.distributed.parallel_state import get_tp_group
 from transformers import PretrainedConfig
 
-from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
+from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, paged_slot_indices
 from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.nn.sampler import Sampler
@@ -187,14 +187,13 @@ class Qwen3_5Attention(nn.Module):
                 sharding_weight_loader(shard_dim=0, shard_size=out_dim, num_shards=1),
             )
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        positions: torch.LongTensor | None,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attn_metadata: object | None = None,
-    ) -> torch.Tensor:
-        """Stateless prefill (Phase 1). KV cache write + decode are follow-ups."""
+    def _project_qkvg(self, hidden_states: torch.Tensor):
+        """Project to q/gate/k/v and apply per-head QK-norm.
+
+        Returns ``(q, k, v, gate)`` with ``q`` ``[tokens, heads, head_dim]``,
+        ``k``/``v`` ``[tokens, kv_heads, head_dim]``, and ``gate``
+        ``[tokens, heads * head_dim]``.
+        """
         tokens, _ = hidden_states.shape
         hidden_states = hidden_states.to(self.dtype)
 
@@ -213,16 +212,78 @@ class Qwen3_5Attention(nn.Module):
 
         q = self.q_norm(q)
         k = self.k_norm(k)
+        return q, k, v, gate
 
+    def _write_kv_cache(self, k: torch.Tensor, v: torch.Tensor, attn_metadata):
+        """Write K/V into the bound paged cache (head-major, like Qwen3)."""
+        layer_name = f"layers.{self.layer_idx}.self_attn"
+        md = attn_metadata[layer_name]
+        slot_mapping = md["slot_mapping"]
+        block_size = md["block_size"]
+        tokens = slot_mapping.shape[0]
+        block_indices, position_indices = paged_slot_indices(
+            slot_mapping, block_size, self.k_cache.shape[0]
+        )
+        head_indices = torch.arange(
+            self.num_key_value_heads, dtype=torch.long, device=k.device
+        ).repeat_interleave(tokens)
+        k_flat = k.transpose(0, 1).reshape(-1, self.head_dim).to(self.k_cache.dtype)
+        v_flat = v.transpose(0, 1).reshape(-1, self.head_dim).to(self.v_cache.dtype)
+        self.k_cache.index_put_(
+            (
+                block_indices.repeat(self.num_key_value_heads),
+                head_indices,
+                position_indices.repeat(self.num_key_value_heads),
+            ),
+            k_flat,
+        )
+        self.v_cache.index_put_(
+            (
+                block_indices.repeat(self.num_key_value_heads),
+                head_indices,
+                position_indices.repeat(self.num_key_value_heads),
+            ),
+            v_flat,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.LongTensor | None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attn_metadata: object | None = None,
+    ) -> torch.Tensor:
+        """Dispatch to prefill or decode from the per-layer attention metadata."""
+        if attn_metadata is None:
+            return self._forward_prefill_stateless(hidden_states, position_embeddings)
+        layer_name = f"layers.{self.layer_idx}.self_attn"
+        md = attn_metadata[layer_name]
+        if md["max_query_len"] <= md["decode_token_threshold"]:
+            return self._forward_decode(
+                hidden_states, positions, position_embeddings, attn_metadata
+            )
+        return self._forward_prefill(
+            hidden_states, positions, position_embeddings, attn_metadata
+        )
+
+    def _forward_prefill(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.LongTensor | None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attn_metadata: object,
+    ) -> torch.Tensor:
+        """Stateless prefill attention; write K/V to the paged cache."""
+        tokens, _ = hidden_states.shape
+        q, k, v, gate = self._project_qkvg(hidden_states)
         cos, sin = position_embeddings
         q, k = _apply_partial_rotary(q, k, cos, sin)
+        self._write_kv_cache(k, v, attn_metadata)
 
-        # [1, heads, tokens, head_dim] for causal SDPA.
-        q = q.transpose(0, 1).unsqueeze(0)
+        # Stateless causal attention over the prefill tokens (all in hand).
+        q = q.transpose(0, 1).unsqueeze(0)  # [1, heads, tokens, head_dim]
         k = k.transpose(0, 1).unsqueeze(0)
         v = v.transpose(0, 1).unsqueeze(0)
-
-        # GQA: repeat K/V heads to match the Q head count.
         n_rep = self.num_attention_heads // self.num_key_value_heads
         if n_rep > 1:
             k = k.repeat_interleave(n_rep, dim=1)
@@ -233,9 +294,82 @@ class Qwen3_5Attention(nn.Module):
         )
         attn = attn.squeeze(0).transpose(0, 1)  # [tokens, heads, head_dim]
         attn = attn.reshape(tokens, self.num_attention_heads * self.head_dim)
-
         attn = attn * torch.sigmoid(gate)
+        return F.linear(attn, self.o_proj_weight)
 
+    def _forward_prefill_stateless(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        """Warmup/unit-test path: prefill attention without a bound KV cache."""
+        tokens, _ = hidden_states.shape
+        q, k, v, gate = self._project_qkvg(hidden_states)
+        cos, sin = position_embeddings
+        q, k = _apply_partial_rotary(q, k, cos, sin)
+
+        q = q.transpose(0, 1).unsqueeze(0)
+        k = k.transpose(0, 1).unsqueeze(0)
+        v = v.transpose(0, 1).unsqueeze(0)
+        n_rep = self.num_attention_heads // self.num_key_value_heads
+        if n_rep > 1:
+            k = k.repeat_interleave(n_rep, dim=1)
+            v = v.repeat_interleave(n_rep, dim=1)
+
+        attn = F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, scale=self.scaling
+        )
+        attn = attn.squeeze(0).transpose(0, 1)
+        attn = attn.reshape(tokens, self.num_attention_heads * self.head_dim)
+        attn = attn * torch.sigmoid(gate)
+        return F.linear(attn, self.o_proj_weight)
+
+    def _forward_decode(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.LongTensor | None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attn_metadata: object,
+    ) -> torch.Tensor:
+        """Decode attention: write new K/V, read full context, attend eagerly."""
+        batch = hidden_states.shape[0]  # one token per sequence
+        q, k, v, gate = self._project_qkvg(hidden_states)
+        cos, sin = position_embeddings
+        q, k = _apply_partial_rotary(q, k, cos, sin)
+        self._write_kv_cache(k, v, attn_metadata)
+
+        layer_name = f"layers.{self.layer_idx}.self_attn"
+        md = attn_metadata[layer_name]
+        block_size = md["block_size"]
+        block_table = md["block_table_tensor"]  # [batch, max_blocks]
+
+        max_blocks = block_table.shape[1]
+        bt = block_table.clamp(min=0)  # -1 sentinel -> block 0, masked below
+        k_ctx = self.k_cache[bt].permute(0, 2, 1, 3, 4).reshape(
+            batch, self.num_key_value_heads, max_blocks * block_size, self.head_dim
+        )
+        v_ctx = self.v_cache[bt].permute(0, 2, 1, 3, 4).reshape(
+            batch, self.num_key_value_heads, max_blocks * block_size, self.head_dim
+        )
+
+        seq_len = positions.reshape(batch).to(torch.int64) + 1  # context after write
+        length = max_blocks * block_size
+        pos_idx = torch.arange(length, device=hidden_states.device)
+        mask = pos_idx[None, None, None, :] < seq_len[:, None, None, None]
+
+        q = q.unsqueeze(2)  # [batch, heads, 1, head_dim]
+        n_rep = self.num_attention_heads // self.num_key_value_heads
+        if n_rep > 1:
+            k_ctx = k_ctx.repeat_interleave(n_rep, dim=1)
+            v_ctx = v_ctx.repeat_interleave(n_rep, dim=1)
+
+        attn = F.scaled_dot_product_attention(
+            q, k_ctx, v_ctx, attn_mask=mask, scale=self.scaling
+        )
+        attn = attn.squeeze(2).reshape(
+            batch, self.num_attention_heads * self.head_dim
+        )
+        attn = attn * torch.sigmoid(gate)
         return F.linear(attn, self.o_proj_weight)
 
 
@@ -316,6 +450,7 @@ class Qwen3_5DecoderLayer(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attn_metadata: object | None = None,
         is_prefill: bool = True,
+        prefill_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -324,7 +459,9 @@ class Qwen3_5DecoderLayer(nn.Module):
                 hidden_states, positions, position_embeddings, attn_metadata
             )
         else:
-            hidden_states = self.linear_attn(hidden_states, is_prefill=is_prefill)
+            hidden_states = self.linear_attn(
+                hidden_states, is_prefill=is_prefill, prefill_mask=prefill_mask
+            )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -395,6 +532,9 @@ class Qwen3_5Model(nn.Module):
         is_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         is_prefill, _ = _is_prefill(attn_metadata, self.config.layer_types)
+        # Real-token mask for the linear-attention layers. Padding tokens carry
+        # input id ``PAD_TOKEN`` (0); the recurrent state must ignore them.
+        prefill_mask = (input_ids != 0) if is_prefill else None
 
         hidden_states = self.embed_tokens(input_ids, scatter_tokens=False, rank=rank)
         if inputs_embeds is not None:
@@ -414,6 +554,7 @@ class Qwen3_5Model(nn.Module):
                 position_embeddings=position_embeddings,
                 attn_metadata=attn_metadata,
                 is_prefill=is_prefill,
+                prefill_mask=prefill_mask,
             )
 
         return self.norm(hidden_states)
@@ -559,6 +700,44 @@ class Qwen3_5ForCausalLM(nn.Module):
             # Phase 1 attention does not read/write these yet; store for later.
             layer.self_attn.k_cache = kv_caches[layer_name][0]
             layer.self_attn.v_cache = kv_caches[layer_name][1]
+
+    # ── Linear-attention recurrent-state cache ───────────────────────────
+
+    def get_linear_cache_spec(self) -> list[dict]:
+        """Per-sequence recurrent-state shapes the runner must allocate.
+
+        One entry per linear-attention layer: ``conv_state``
+        ``[conv_dim, kernel_size - 1]`` and ``ssm_state``
+        ``[num_v_heads, k_head_dim, v_head_dim]``. The runner prepends the
+        ``max_num_reqs`` batch dimension.
+        """
+        specs = []
+        for i, layer in enumerate(self.model.layers):
+            if layer.layer_type != "linear_attention":
+                continue
+            gdn = layer.linear_attn
+            specs.append(
+                {
+                    "layer_name": f"layers.{i}.linear_attn",
+                    "conv_shape": (gdn.conv_dim, gdn.conv_kernel_size - 1),
+                    "conv_dtype": gdn.dtype,
+                    "ssm_shape": (gdn.num_v_heads, gdn.head_k_dim, gdn.head_v_dim),
+                    "ssm_dtype": torch.float32,
+                }
+            )
+        return specs
+
+    def bind_linear_cache(
+        self, linear_caches: dict[str, tuple[torch.Tensor, torch.Tensor]]
+    ):
+        """Bind per-layer ``(conv_state, ssm_state)`` recurrent-state caches."""
+        for i, layer in enumerate(self.model.layers):
+            if layer.layer_type != "linear_attention":
+                continue
+            layer_name = f"layers.{i}.linear_attn"
+            conv_state, ssm_state = linear_caches[layer_name]
+            layer.linear_attn.conv_state_cache = conv_state
+            layer.linear_attn.ssm_state_cache = ssm_state
 
     # ── Weight loading ────────────────────────────────────────────────────
 
