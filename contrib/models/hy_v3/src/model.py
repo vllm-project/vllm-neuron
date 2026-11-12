@@ -171,9 +171,10 @@ def _kvdp_degree(batch: int) -> int:
 
 
 def _validate_dcp_decode_sequence_length(dcp_size: int, sequence_length: int) -> None:
-    if dcp_size > 1 and sequence_length != 1:
+    # The NKI CP decode kernel takes up to 8 new tokens per request (MTP verify: 1 + k).
+    if dcp_size > 1 and not 1 <= sequence_length <= 8:
         raise ValueError(
-            "Hy3 DCP decode supports exactly one token per request; "
+            "Hy3 DCP decode supports 1 to 8 tokens per request; "
             f"got {sequence_length}."
         )
 
@@ -221,6 +222,10 @@ _SPARSE_SEL_CACHE_KEY = "_hy_v3_sparse_selection"
 # chunk's queries. The kept prior blocks and the chunk's own blocks make the
 # BF16 copy the segmented kernel reads.
 _SPARSE_PREFILL = float(os.environ.get("HY3_SPARSE_PREFILL", "0") or 0)
+# HY3_SPARSE_EXPORT_DCP=<decode DCP> on a prefill node: export the K summaries in that DCP
+# decode's layout (sparse decode under DCP in a P/D split).
+_SPARSE_EXPORT_DCP = int(os.environ.get("HY3_SPARSE_EXPORT_DCP", "1") or 1)
+# Under DCP the K summaries are per block (one row per 32-token block, in the block's own row).
 # EXPERIMENTAL: the whole decode MoE block (post-attention RMSNorm, router, routed experts,
 # shared-expert decode shard) as one NKI kernel with static-FP8 activations and FP8
 # double-row matmuls (kernels/moe_tkg_fused.py). README, "Fused decode MoE".
@@ -259,7 +264,7 @@ def bind_attention_kv(
     attn.k_cache = k_cache
     attn.v_cache = v_cache
     attn.fp8_packed = packed
-    if sparse and (_SPARSE_DECODE > 0 or _SPARSE_PREFILL > 0) and attn.dcp_size == 1:
+    if sparse and (_SPARSE_DECODE > 0 or _SPARSE_PREFILL > 0) and (attn.dcp_size == 1 or _SPARSE_DECODE > 0):
         # [blocks, (min, max), kvh, D]: a group's summary lives at the row of
         # its first block. Empty: min > max.
         shape = (v_cache.shape[0], v_cache.shape[1], v_cache.shape[-1])
@@ -267,7 +272,13 @@ def bind_attention_kv(
             torch.full(shape, _SUMMARY_EMPTY, dtype=torch.bfloat16, device=v_cache.device),
             torch.full(shape, -_SUMMARY_EMPTY, dtype=torch.bfloat16, device=v_cache.device),
         ], dim=1)
-        CONNECTOR_EXTRA_KV_TENSORS[name] = attn.k_sum
+        # Per-block summaries (one row per block, in the block's own row) under DCP and on a
+        # prefill node feeding a DCP decode: the connector's DCP block map moves each row with its
+        # block, the DCP rank groups its local blocks, and the prefill node's own sparse prefill
+        # reduces each group's rows to the group summary (sparse_prefill_blocks per_block).
+        attn.k_sum_per_block = attn.dcp_size > 1 or _SPARSE_EXPORT_DCP > 1
+        if os.environ.get("HY3_SPARSE_EXPORT_KSUM", "1") != "0":  # local: 0 = sparse prefill into a non-sparse decode
+            CONNECTOR_EXTRA_KV_TENSORS[name] = attn.k_sum
 
 
 def _quantize_kv(x: torch.Tensor, q, dtype: torch.dtype) -> torch.Tensor:
@@ -415,6 +426,57 @@ def update_k_summary_prefill(k_sum, k, slot_mapping, block_row, block_size, grou
     k_sum.index_put_((key,), torch.stack([gmin, gmax], dim=1).to(k_sum.dtype))
 
 
+def update_k_summary_prefill_dcp_blocks(k_sum, k, p0, valid, block_row, block_size, W, rank):
+    """Fold one DCP prefill chunk's K into this DCP rank's per-block K min / max.
+
+    Every DCP rank has the whole chunk's K. Sequence block j belongs to rank j % W as its local
+    block j // W (interleave = block size); this rank writes the summaries of its blocks, merged
+    with the stored one for the block the chunk starts inside of. k: [kvh, T, D], p0: the
+    chunk's first position, valid: [T], block_row: [nb] this rank's local table.
+    Same reduction as update_k_summary_prefill with group 1, by sequence position.
+    """
+    kvh, T, D = k.shape
+    nb = block_row.shape[0]
+    dev = k.device
+    p0 = p0.to(torch.long).reshape(-1)[0]
+    r = p0 % block_size
+    G = T // block_size + 1
+    src = torch.arange(G * block_size, device=dev) - r
+    ok = (src >= 0) & (src < T)
+    src = torch.clamp(src, min=0, max=T - 1)
+    kk = k.permute(1, 0, 2).to(torch.float32)[src]  # [G * B, kvh, D]
+    v = (ok & valid[src]).view(-1, 1, 1)
+    gmin = torch.where(v, kk, _SUMMARY_EMPTY).view(G, block_size, kvh, D).amin(1)
+    gmax = torch.where(v, kk, -_SUMMARY_EMPTY).view(G, block_size, kvh, D).amax(1)
+    gvalid = v.view(G, block_size).any(dim=1)
+    gi = torch.arange(G, device=dev)
+    j = p0 // block_size + gi  # sequence block
+    R = rank.to(torch.long).reshape(-1)[0]
+    mine = (j % W) == R
+    key = block_row.to(torch.long)[torch.clamp(j // W, max=nb - 1)].clamp(min=0)
+    key = torch.where(gvalid & mine, key, 0)  # other ranks' blocks / padding: the null block
+    cont = ((gi == 0) & (r != 0)).view(G, 1, 1)
+    old = k_sum[key].to(torch.float32)
+    gmin = torch.where(cont, torch.minimum(old[:, 0], gmin), gmin)
+    gmax = torch.where(cont, torch.maximum(old[:, 1], gmax), gmax)
+    k_sum.index_put_((key,), torch.stack([gmin, gmax], dim=1).to(k_sum.dtype))
+
+
+def dcp_local_positions(positions, block_size, W, rank):
+    """(local position, owned) of sequence positions on DCP rank ``rank`` (interleave = block).
+
+    The local position of a token another rank owns is this rank's insertion point: the
+    number of its tokens before it, so a span's first owned token keeps its group."""
+    pos = positions.to(torch.long)
+    vb = block_size * W
+    full = torch.div(pos, vb, rounding_mode="floor")
+    rem = pos - full * vb
+    R = rank.to(torch.long).reshape(-1)[0]
+    off = rem - R * block_size
+    owned = (off >= 0) & (off < block_size)
+    return full * block_size + torch.clamp(off, min=0, max=block_size), owned
+
+
 def update_k_summary_decode(k_sum, k, positions, slot_mapping, block_table, block_size, group):
     """Fold one decode step's K into the per-group K min / max.
 
@@ -514,7 +576,7 @@ def prepare_sparse_decode(layer, device, from_weights: bool = True) -> None:
     ``from_weights=False`` (CPU compile) allocates placeholders.
     """
     attn = layer.self_attn
-    if (_SPARSE_DECODE <= 0 and _SPARSE_PREFILL <= 0) or attn.dcp_size > 1:
+    if (_SPARSE_DECODE <= 0 and _SPARSE_PREFILL <= 0) or (attn.dcp_size > 1 and _SPARSE_DECODE <= 0):
         return
     nh, kvh = attn.num_attention_heads_per_rank, attn.num_key_value_heads_per_rank
     D, H = attn.head_dim, attn.hidden_size
@@ -537,7 +599,8 @@ def prepare_sparse_decode(layer, device, from_weights: bool = True) -> None:
     attn.sparse_ln_w = param(ln, torch.float32)
 
 
-def sparse_select_blocks(q, k_sum, block_table, n_hist, block_size, group, n_sel, sink, recent):
+def sparse_select_blocks(q, k_sum, block_table, n_hist, block_size, group, n_sel, sink, recent,
+                         per_block=False):
     """The ``n_sel`` blocks a decode step attends to, and the history tokens they hold.
 
     q: [nh, B, S, D] fp32 (QK-norm + RoPE), k_sum: [blocks, 2, kvh, D],
@@ -558,13 +621,17 @@ def sparse_select_blocks(q, k_sum, block_table, n_hist, block_size, group, n_sel
     nb = t.shape[1]
     ns, L, k_g = nb // group, block_size * group, n_sel // group
     t3 = t.view(B, ns, group)
-    summ = k_sum[torch.clamp(t3[:, :, 0], min=0)].to(torch.float32)  # [B, ns, 2, kvh, D]
+    # per_block (DCP): one summary per block; a group scores the max of its blocks' bounds.
+    rows = t if per_block else t3[:, :, 0]
+    summ = k_sum[torch.clamp(rows, min=0)].to(torch.float32)  # [B, nb or ns, 2, kvh, D]
     qg = q.view(kvh, nh // kvh, B, S, D).permute(2, 0, 1, 3, 4).reshape(B, kvh, -1, D)
     # Both terms are <= 0 for a group without a summary (min = +3e38,
     # max = -3e38): it scores very low (or -inf), never NaN.
     bound = torch.einsum("bhqd,bnhd->bnhq", torch.clamp(qg, min=0), summ[:, :, 1]) + torch.einsum(
         "bhqd,bnhd->bnhq", torch.clamp(qg, max=0), summ[:, :, 0])
-    score = bound.amax(dim=(2, 3))  # [B, ns]
+    score = bound.amax(dim=(2, 3))  # [B, ns] (or [B, nb])
+    if per_block:
+        score = score.view(B, ns, group).amax(dim=2)
     n = n_hist.to(torch.long).view(B, 1)
     nsv = torch.div(n + L - 1, L, rounding_mode="floor")
     idx = torch.arange(ns, device=q.device).view(1, ns)
@@ -627,7 +694,8 @@ def sparse_select_blocks_kvdp(
     return compact.to(block_table.dtype), prior
 
 
-def sparse_prefill_blocks(q, k_sum, block_row, prior, valid, block_size, group, n_sel, sink, recent):
+def sparse_prefill_blocks(q, k_sum, block_row, prior, valid, block_size, group, n_sel, sink, recent,
+                          per_block=False):
     """EXPERIMENTAL (HY3_SPARSE_PREFILL): the blocks a segmented prefill chunk reads.
 
     q: [nh, T, D] (QK-norm + RoPE), k_sum: [blocks, 2, kvh, D], block_row: [nb]
@@ -647,7 +715,13 @@ def sparse_prefill_blocks(q, k_sum, block_row, prior, valid, block_size, group, 
     t = block_row.to(torch.long)
     nb = t.shape[0]
     ns, L, k_g = nb // group, block_size * group, n_sel // group
-    summ = k_sum[torch.clamp(t.view(ns, group)[:, 0], min=0)].to(torch.float32)  # [ns, 2, kvh, D]
+    if per_block:
+        # One summary per block: the group's is the min / max over its blocks' (exactly the
+        # group summary of the grouped layout), so the selection is unchanged.
+        rows = k_sum[torch.clamp(t, min=0)].to(torch.float32).view(ns, group, 2, kvh, D)
+        summ = torch.stack([rows[:, :, 0].amin(dim=1), rows[:, :, 1].amax(dim=1)], dim=1)
+    else:
+        summ = k_sum[torch.clamp(t.view(ns, group)[:, 0], min=0)].to(torch.float32)  # [ns, 2, kvh, D]
     # Padding queries (at the end of the chunk) repeat the first one, so they never raise the max.
     qg = torch.where(valid.view(1, T, 1), q, q[:, :1]).to(torch.float32).reshape(kvh, (nh // kvh) * T, D)
     # Both halves of the bound in one matmul: [relu(q), min(q, 0)] . [max, min].
@@ -799,6 +873,7 @@ class HYV3Attention(nn.Module):
         # EXPERIMENTAL sparse decode: per-group K min / max ([blocks, 2, kvh, D]),
         # allocated with the cache (bind_attention_kv) when HY3_SPARSE_DECODE is set.
         self.k_sum = None
+        self.k_sum_per_block = False
         # FP8 KV quantizing scales q = 1 / dequant (cache = fp8(x * q)), set by
         # load_weights / load_weights_lite (_load_kv_cache_scales); FP8 KV
         # refuses to bind before they are set (kv_scale_t is None).
@@ -981,9 +1056,17 @@ class HYV3Attention(nn.Module):
             _write_packed_k(self.k_cache, k_rows, *index)
         else:
             self.k_cache.index_put_(index, k_rows)
-        if self.k_sum is not None:
+        if self.k_sum is not None and self.dcp_size > 1:
+            # DCP rank: every rank has the whole chunk's K; it writes the summaries of the
+            # sequence blocks it owns into its local blocks.
+            update_k_summary_prefill_dcp_blocks(
+                self.k_sum, k, meta["cached_seq_len"], slot_mapping >= 0,
+                meta["block_table_tensor"][0], block_size, self.dcp_size, dcp_rank,
+            )
+        elif self.k_sum is not None:
             update_k_summary_prefill(
-                self.k_sum, k, slot_mapping, meta["block_table_tensor"][0], block_size, _SPARSE_GROUP
+                self.k_sum, k, slot_mapping, meta["block_table_tensor"][0], block_size,
+                1 if self.k_sum_per_block else _SPARSE_GROUP,
             )
 
         # Step 4: Attention
@@ -1012,6 +1095,7 @@ class HYV3Attention(nn.Module):
                         blocks, prior_tokens = sparse_prefill_blocks(
                             q, self.k_sum, block_table[0], prior_tokens, slot_mapping >= 0, block_size,
                             _SPARSE_GROUP, n_sel, _SPARSE_SINK, _SPARSE_RECENT,
+                            per_block=self.k_sum_per_block,
                         )
                         block_table = blocks.view(1, -1).to(block_table.dtype)
                 fp8_direct = _PREFILL_FP8_DIRECT and self.dcp_size == 1 and block_table is meta["block_table_tensor"]
@@ -1087,7 +1171,8 @@ class HYV3Attention(nn.Module):
             attn_output = self.tp_group.reduce_scatter(attn_output, dim=0)
         return attn_output.contiguous()
 
-    def _sparse_decode_blocks(self, X, positions, slot_mapping, block_table, block_size, n_sel, kvdp_idx=None):
+    def _sparse_decode_blocks(self, X, positions, slot_mapping, block_table, block_size, n_sel, kvdp_idx=None,
+                              dcp_rank=None, local_filled=None):
         """EXPERIMENTAL (HY3_SPARSE_DECODE): fold the step's K into the summaries
         and, when ``n_sel`` is set, select the ``n_sel`` blocks each request
         attends to.
@@ -1121,6 +1206,24 @@ class HYV3Attention(nn.Module):
         q = q * cos + _rotate_half(q) * sin  # [nh, B * S, D]
         k = k * cos + _rotate_half(k) * sin  # [kvh, B * S, D]
         out = None
+        if self.dcp_size > 1:
+            # >>> DCP: this rank's table holds every dcp-th block; summaries, history and the
+            # selection are in its local positions. One rank attends for all the KV head's query
+            # heads (gathered by the DCP kernel), so score with all of them.
+            W = self.dcp_size
+            lpos, owned = dcp_local_positions(positions, block_size, W, dcp_rank)
+            if n_sel:
+                q_all = self.dcp_group.all_gather(q.contiguous(), dim=0)  # [nh * W, B * S, D]
+                out = sparse_select_blocks(
+                    q_all.view(nh * W, B, S, D), self.k_sum, block_table,
+                    local_filled.view(B).to(torch.long), block_size, _SPARSE_GROUP, n_sel,
+                    _SPARSE_SINK, _SPARSE_RECENT, per_block=True,
+                )
+            update_k_summary_decode(
+                self.k_sum, k.view(kvh, B, S, D).permute(1, 2, 0, 3), lpos,
+                torch.where(owned, 0, -1).to(slot_mapping.dtype), block_table, block_size, 1,
+            )
+            return out
         if n_sel:
             # Before this step's K is folded in: the group the step writes is
             # always kept.
@@ -1322,7 +1425,10 @@ class HYV3Attention(nn.Module):
 
         # >>> PARALLELISM: DCP — the block table is already this rank's shard
         # (S_ctx is local). Mask the prior tokens this rank owns and let only
-        # the owning rank count the active token, so it is combined once.
+        # the owning rank count each active token, so it is combined once.
+        # With MTP the step has S_decode = 1 + k tokens: the prior (history before
+        # the span) is the same for all of them, from the span's first position;
+        # the owner is per token, since the span can cross a block boundary.
         local_filled = None
         dcp_active_mask = None
         if self.dcp_size > 1:
@@ -1335,8 +1441,10 @@ class HYV3Attention(nn.Module):
             local_filled = full_vblocks * block_size + torch.clamp(
                 remaining - R * block_size, min=0, max=block_size
             )
-            owner = torch.div(remaining, block_size, rounding_mode="trunc") % W
-            dcp_active_mask = (owner == R).float()
+            pos_all = positions.view(B, S_decode).to(torch.float32)
+            rem_all = pos_all - torch.div(pos_all, vblock, rounding_mode="trunc") * vblock
+            owner = torch.div(rem_all, block_size, rounding_mode="trunc") % W
+            dcp_active_mask = (owner == R).float()  # [B, S_decode]
 
         attention_mask = None
         n_sel = 0
@@ -1361,6 +1469,7 @@ class HYV3Attention(nn.Module):
             selected = self._sparse_decode_blocks(
                 X, positions, slot_mapping, block_table, block_size,
                 0 if reuse is not None else n_sel, kvdp_idx if n_sel else None,
+                dcp_rank=dcp_rank, local_filled=local_filled,
             )
         if n_sel and kvdp_on:
             S_ctx = n_sel * block_size
@@ -1391,11 +1500,15 @@ class HYV3Attention(nn.Module):
                 attention_mask = NF.gen_attention_decode_mask(
                     pos_ids=prior_pos.view(1, B * S_decode).to(torch.float32),
                     bs=B,
-                    q_head=self.num_attention_heads_per_rank,
+                    q_head=self.num_attention_heads_per_rank * self.dcp_size,
                     s_active=S_decode,
                     s_prior=S_ctx,
                     start_pos=None,
                     block_len=block_size,
+                    # DCP: the compacted local table holds `prior` of this rank's history
+                    # tokens; the active tokens are gated by their owner as in dense DCP.
+                    local_filled_slots=prior.to(torch.float32) if self.dcp_size > 1 else None,
+                    dcp_active_mask=dcp_active_mask,
                 )
                 if _SPARSE_SELECT_EVERY > 1:
                     attn_metadata[_SPARSE_SEL_CACHE_KEY] = (block_table, attention_mask)
