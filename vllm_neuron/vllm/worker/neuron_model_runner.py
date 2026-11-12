@@ -5804,6 +5804,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             full_max_blocks_per_req = (
                 self.max_model_len + block_size - 1
             ) // block_size
+            if self._dcp_size > 1:
+                # DCP: the runtime full table is this rank's shard (InputBatch width,
+                # ceil(max_model_len / (block_size * dcp)) aligned like above), so the
+                # draft's spec-decode correction must trace that width, not the global one.
+                full_max_blocks_per_req = (
+                    (self.max_model_len + dcp_block_size - 1) // dcp_block_size
+                    + alignment - 1
+                ) // alignment * alignment
 
             swa_kv_pos_offset = None
             # For SWA decode, warmup must match the trimmed shape that

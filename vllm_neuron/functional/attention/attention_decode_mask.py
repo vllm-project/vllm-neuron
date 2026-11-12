@@ -148,6 +148,45 @@ def gen_attention_decode_mask(
         # gate folds into active_mask. The torch build below is the fallback for
         # when the kernel cannot run (can_run_kernel False: CPU without the NKI
         # simulator, or kernels disabled). The NKI-simulator lane runs the kernel.
+        if s_active > 1:
+            # A span of s_active new tokens per request under DCP (MTP verify: 1 + k).
+            # Same contract as the non-CP mask: the prior is uniform over the span
+            # (this rank's history slots before the span, local_filled), and the
+            # active block is the causal staircase among the span's tokens, gated
+            # per KEY token by its DCP owner: every rank computes all s_active
+            # active K/V (the KV head is replicated over the DCP group), and only
+            # the owner counts a token, so the CP LSE combine sees it once. A span
+            # can cross a block boundary, so the owner differs within a span.
+            lf = local_filled_slots.to(torch.float32).reshape(-1)
+            if lf.numel() == 1 and bs > 1:
+                lf = lf.expand(bs)
+            span_pos_ids = lf.repeat_interleave(s_active).reshape(1, bs * s_active)
+            if is_causal:
+                act = torch.triu(
+                    torch.ones(s_active, s_active, dtype=torch.float32, device=pos_ids.device)
+                )
+            else:
+                act = torch.ones(
+                    s_active, s_active, dtype=torch.float32, device=pos_ids.device
+                )
+            span_active = act[:, None, None, :].expand(s_active, bs, q_head, s_active)
+            if dcp_active_mask is not None:
+                own = dcp_active_mask.to(torch.float32)
+                own = own.reshape(own.shape[0] if own.dim() > 0 else 1, -1)
+                own = own.expand(bs, s_active)  # [bs, s_active (key)]
+                span_active = span_active * own.transpose(0, 1)[:, :, None, None]
+            span_active = span_active.contiguous()
+            if block_len > 0 and _can_use_kernel(pos_ids, bs, s_active, s_prior):
+                return _gen_mask_via_kernel(
+                    span_pos_ids.contiguous(), bs, q_head, s_active, s_prior,
+                    None, block_len, span_active,
+                )
+            return _torch_gen_attention_decode_mask_impl(
+                span_pos_ids, bs=bs, q_head=q_head, s_active=s_active,
+                s_prior=s_prior, start_pos=None, block_len=block_len,
+                active_mask=span_active,
+            )
+
         if (
             s_active == 1
             and block_len > 0

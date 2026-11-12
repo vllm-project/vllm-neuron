@@ -99,7 +99,22 @@ def extract_accepted_tokens(
 def compute_slot_mapping(
     positions: torch.Tensor, block_table_tensor: torch.Tensor, block_size: int
 ) -> torch.Tensor:
-    """KV slot per position from the block table (-1 for inactive blocks)."""
+    """KV slot per position from the block table (-1 for inactive blocks).
+
+    Under DCP the table is this rank's shard: positions another DCP rank owns get -1.
+    """
+    from vllm_neuron.functional.spec_decode_correction import (
+        _dcp_world_and_rank,
+        dcp_local_slot_mapping,
+    )
+
+    dcp_size, dcp_rank = _dcp_world_and_rank()
+    if dcp_size > 1 and dcp_rank is not None:
+        idx = (positions.to(torch.int64) // (block_size * dcp_size)).clamp(
+            max=block_table_tensor.shape[1] - 1
+        )
+        block_ids = block_table_tensor.gather(dim=1, index=idx.view(-1, 1)).view(-1)
+        return dcp_local_slot_mapping(positions, block_ids, block_size, dcp_size, dcp_rank)
     block_ids = block_table_tensor.gather(
         dim=1, index=(positions // block_size).view(-1, 1).long()
     ).view(-1)
