@@ -54,6 +54,7 @@ from vllm_neuron.vllm.patches.shm_reader_spin_patch import (
     apply_shm_reader_spin_patch,
 )
 from vllm_neuron.vllm.platform import NeuronPlatform
+from vllm_neuron.vllm.weight_offload import NeuronWeightOffloader
 from vllm_neuron.vllm.worker.neuron_profiler import (
     NeuronProfilerConfig,
     NeuronProfiler,
@@ -541,6 +542,11 @@ class NeuronWorker(WorkerBase):
         # resident model. _weight_update_active tracks the start/finish session.
         self.weight_transfer_engine = None
         self._weight_update_active = False
+
+        # Weight offload for sleep()/wake_up(). Holds CPU copies of the resident
+        # model's weights across a sleep so wake_up() can restore them in place
+        # without touching the addresses the compiled graph reads.
+        self._weight_offloader = NeuronWeightOffloader()
 
         # Register models with ModelRegistry
         # Put it in the worker as vLLM's model registry overwrites vllm_neuron model registry
@@ -1185,6 +1191,46 @@ class NeuronWorker(WorkerBase):
 
         self.weight_transfer_engine.finish_weight_update()
         self._weight_update_active = False
+
+    # ----------------------------------------------------------------------
+    # Weight offload (sleep / wake_up) — mirrors the upstream GPU worker.
+    # ----------------------------------------------------------------------
+
+    def sleep(self, level: int = 1) -> None:
+        """Offload the resident model's weights to CPU.
+
+        Saves every device parameter's values to CPU and leaves the device
+        tensor intact, preserving the addresses the compiled graph reads.
+        Level 2 additionally offloads buffers. This moves the weight values to
+        CPU; it does not reclaim their HBM allocation (see ``NeuronWeightOffloader``).
+
+        Args:
+            level: Sleep level. 1 offloads parameters only; 2 also offloads buffers.
+        """
+        self._weight_offloader.offload(self._get_model_from_runner(), level=level)
+
+    def wake_up(self, tags: list[str] | None = None) -> None:
+        """Restore offloaded weights in place.
+
+        Copies each saved value back into the matching tensor's existing storage.
+        Only the ``weights`` tag is restored on Neuron; ``kv_cache`` is a no-op
+        because Neuron marks KV offloading unsupported.
+
+        Args:
+            tags: Tags selecting what to restore, or ``None`` to restore all.
+        """
+        self._weight_offloader.restore(self._get_model_from_runner(), tags=tags)
+
+    def discard(self, tags: tuple[str, ...]) -> None:
+        """Drop offloaded weights without restoring them.
+
+        Frees the host memory held by the offload. Only the ``weights`` tag is
+        discarded on Neuron; ``kv_cache`` is a no-op.
+
+        Args:
+            tags: Tags selecting what to discard.
+        """
+        self._weight_offloader.discard(tags)
 
     def _configure_torchinductor_cache_dir(self) -> None:
         """Isolate this worker's TorchInductor cache by configuration and rank.
