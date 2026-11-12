@@ -33,7 +33,8 @@ export HY3_SPARSE_DECODE=${HY3_SPARSE_DECODE:-0.0625} HY3_SPARSE_PREFILL=${HY3_S
 export HY3_SPARSE_SELECT_EVERY=${HY3_SPARSE_SELECT_EVERY:-8}
 export HY3_DECODE_MOE_FUSED=${HY3_DECODE_MOE_FUSED:-1} HY3_DECODE_HITS=${HY3_DECODE_HITS:-0}
 export HY3_DECODE_HITS_MAX_T=${HY3_DECODE_HITS_MAX_T:-$((4 * (MTP_K + 1)))}
-export NEURON_RT_CC_ALG_TYPES=${NEURON_RT_CC_ALG_TYPES:-^INTRA_RDH_ALG}
+# Not with DCP: there ^INTRA_RDH_ALG makes the DCP prefill collectives wrong (serve_agentx_dcp.sh).
+if [ "${DCP:-1}" = 1 ]; then export NEURON_RT_CC_ALG_TYPES=${NEURON_RT_CC_ALG_TYPES:-^INTRA_RDH_ALG}; fi
 # The scheduler's worst-case admission (KV tokens / max_model_len) would admit 1-2 requests at
 # 262144; block allocation still bounds what runs.
 SEQS=${SEQS:-16}

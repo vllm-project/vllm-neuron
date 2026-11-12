@@ -118,7 +118,9 @@ print(outputs[0].outputs[0].text)
   whatever the request's real length (vllm-neuron 0.21+ makes this opt-in;
   the NxDI-based 0.2.x bucketed decode by sequence length by default). The
   configs below all set it.
-- Not supported: MTP together with DCP (rejected at startup). Attention DP
+- MTP together with DCP needs `VLLM_NEURON_DCP_SPEC_DECODE=1` (otherwise
+  rejected at startup); see "AgentX on Trn2, one node: DCP=8 + MTP + sparse
+  decode". Attention DP
   (`--data-parallel-size` with `--enable-expert-parallel`) is experimental and
   works without MTP; see "Disaggregated inference (1P1D) and attention DP". FP8 KV cache needs a calibrated KV scale profile
   (the checkpoint ships none); see "FP8 KV cache" below.
@@ -567,7 +569,7 @@ These are for running with no sparse attention at all. They apply only to dense 
 | `HY3_DECODE_POSID=1` | D | Passes `pos_ids` to `attention_block_tkg`, which generates the prior mask on chip with the same `gen_mask_tkg`. Only the active [S, B, H, S] triangle is passed in. A [90112, B, H, S] mask is no longer read from HBM in every layer. |
 | `HY3_PREFILL_FP8_DIRECT=1` | P | Segmented prefill (no DCP, no sparse prefill) reads the packed FP8 cache directly. It no longer makes a BF16 copy of the request's blocks in every layer and chunk. The copy was exact (Q carries the K dequant, the output the V dequant). |
 | `KV_SEGMENTS=[8192]` (serve.sh) | P | Larger kv_segment for dense prefill: a TP=32 instance goes from 0.59 to 0.67 req/s. 16384 is not supported by the kernel. With sparse prefill at TP=32 it ran out of device memory on the first 85k request, so use it for dense prefill only. |
-| `NEURON_RT_CC_ALG_TYPES=^INTRA_RDH_ALG` | D | Runtime only, no recompile. It excludes the intra-node RDH collective algorithm. In our A/B, C = 12 TPOT P50 went from 20.38 to 19.63 / 20.12 ms (two runs). |
+| `NEURON_RT_CC_ALG_TYPES=^INTRA_RDH_ALG` | D | Runtime only, no recompile. It excludes the intra-node RDH collective algorithm. In our A/B, C = 12 TPOT P50 went from 20.38 to 19.63 / 20.12 ms (two runs). Not with DCP prefill on the same instance: there it gives wrong results (see "AgentX on Trn2, one node"). |
 
 **Fully dense 2P1D at 85k / 1.2k, 92% prefix hit, MTP k=3.**
 - Commands:
@@ -811,7 +813,63 @@ Notes:
   - When the decode runs out of KV it preempts. The preempted request re-computes its prompt as a prefill on the decode node.
 - **The decode needs a warmed prefill bucket.** Set `VLLM_NEURON_SKIP_PREFILL_WARMUP=0` and `PREFILL_BUCKETS` equal to the decode's `max_num_batched_tokens` (512), which `pd_serve.sh` now lets you override. Otherwise that re-compute has no compiled graph.
 - **Fixed: unpadded prefills on the decode node.** The scheduler used to run every prefill on a PD decode node unpadded, so the re-compute had an uncompiled length and failed the `fail_on_recompile` stance. The first C = 8 run had 10.1% request errors from this and was invalid. Now only a decode-shaped step (at most 1 + `num_spec_tokens` tokens) runs unpadded. A real prefill, whether a preempted request's re-compute or a recompute after a failed KV load, is padded to a compiled bucket.
-- **C >= 8 needs more decode KV capacity.** Options are attention DP or DCP on the decode, or host-memory KV offload, which vllm-neuron does not have yet.
+- **C >= 8 needs more decode KV capacity.** Options are attention DP or DCP on the decode (next section), or host-memory KV offload, which vllm-neuron does not have yet.
+
+### AgentX on Trn2, one node: DCP=8 + MTP + sparse decode
+
+`scripts/serve_agentx_dcp.sh` serves AgentX from one trn2.48xlarge. It runs TP=64 with DCP=8, MTP k=3, sparse decode 0.0625 and FP8 KV, at max_model_len 262144. DCP=8 shards the KV pool by 32-token blocks over the 8 ranks that hold the same KV head. The pool then holds about 4M tokens instead of about 0.5M, which removes the decode KV limit of the 2P1D run above.
+
+```
+bash scripts/serve_agentx_dcp.sh                    # port 8000; cold compile ~70 min
+PROXY=http://127.0.0.1:8000 D_URL=http://127.0.0.1:8000 P_PORTS= \
+  bash scripts/pd/agentx_trn2.sh results/agentx/single_dcp_c4 4
+```
+
+**What DCP + MTP + sparse needs.**
+- **The MTP verify step under DCP** (`VLLM_NEURON_DCP_SPEC_DECODE=1`). The step runs a span of 1 + k tokens.
+  - Each token carries its own DCP active mask. Only the rank that owns a token's 32-token block writes it.
+  - The active block's mask is causal within the span and limited to keys this rank owns. The LSE combine then counts each active token exactly once.
+  - The same rule applies to the draft's slot mapping and the spec-decode correction (`dcp_local_slot_mapping`).
+  - The rule matches upstream vLLM's cp-aware causal mask (vllm-project/vllm#25049).
+- **Sparse decode under DCP** (`HY3_SPARSE_DECODE`).
+  - The K summaries are per 32-token block, not per group of 4 blocks. Each rank summarizes the blocks it owns: DCP prefill does this in `update_k_summary_prefill_dcp_blocks`, decode does it as it writes.
+  - Block selection uses Q gathered over the DCP group, so all 8 ranks select the same groups. A group scores the max of its blocks' bounds.
+  - The MTP draft layer stays dense (`HY3_SPARSE_DRAFT=0`). With summaries on the draft, the draft graph failed to compile (`NCC_ILLC022` / `NCC_ILLC051`).
+- **Do not set `NEURON_RT_CC_ALG_TYPES=^INTRA_RDH_ALG` with DCP prefill.** It is `serve_agentx.sh`'s default, which now skips it when `DCP` > 1, and `serve_agentx_dcp.sh` refuses to start with it.
+  - With it, the DCP prefill collectives give silently wrong results on the full model: garbage output above about 512 prompt tokens, needle 0/12. This also happened with BF16 KV, no MTP and no sparse decode.
+  - The 4- and 16-layer reduced models never set it, so they never failed.
+  - It is fine on a PD decode-only node.
+- **Prefill buckets stop at 4096** (DCP, `NCC_IGCA037`). `KV_CAP` is 0.40: the prefill and decode graphs share the HBM of one instance.
+- **Compile.**
+  - A cold compile is about 100 NEFFs, about 70 min with `VLLM_NEURON_PARALLEL_COMPILE_WORKERS=4`.
+  - Set `TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT=7200`. With the default timeout, a waiter breaks a running compile's lock and compiles the same NEFF again, over and over.
+
+**Correctness.**
+- Clean prompts (own `cache_salt`) from 544 to 32k tokens give the correct answer.
+- `scripts/needle.py` passes 12/12 at 16k / 32k / 65k / 85k.
+- `scripts/pd/needle_check.py` passes.
+
+**Result** (1x trn2.48xlarge, `harness 1.0.13`, `_256k` corpus). Every run reports `submission_valid` true with 0% request errors. The C = 4 run is 3600 s; the other runs are 1800 s. C = 16 used `SEQS=16 SEQ_BUCKETS='[1, 2, 4, 8, 16]'`.
+
+| C | requests | output tok/s | P90 interactivity | TTFT P50 / P90 / P99 (s) | ITL P50 / P90 / P99 (ms) |
+|---|---|---|---|---|---|
+| 1 | 118 | 55.7 | 22.7 | 1.24 / 3.7 / 12.7 | 18.1 / 25.1 / 45.3 |
+| 2 | 126 | 63.8 | 22.7 | 1.46 / 4.6 / 16.5 | 18.6 / 26.3 / 49.4 |
+| 4 | 468 | 131.1 | 18.6 | 1.33 / 4.7 / 21.1 | 21.7 / 36.7 / 75.5 |
+| 8 | 472 | 175.6 | 10.9 | 2.01 / 11.0 / 32.1 | 29.6 / 50.8 / 88.0 |
+| 16 | 521 | 232.5 | 4.6 | 9.44 / 22.3 / 40.7 | 59.5 / 107.7 / 226.5 |
+
+P90 interactivity is 1 / P90(request latency / output tokens), the InferenceX x-axis.
+
+Notes:
+- **Against the 2P1D run above, at C = 4.** One node gives 468 requests against 435 from two nodes. TTFT P90 / P99 is 4.7 / 21 s against 21 / 72 s. With 8x the KV pool, requests no longer queue for decode KV: on the 2P1D pair the decode queue went from 15.5 s to 2.4 s when its decode moved to DCP=8.
+  - Prefix cache hits are 92-94%, the trace's theoretical rate.
+  - The cost is the ITL tail: prefill steps on the same instance pause decode, so P99 is 75 ms against 28 ms.
+- **C = 16 is saturated.** Requests wait about 17 s in the queue, so TTFT and interactivity degrade.
+- **DCP=8 on a PD decode node.** A 2 x TP=32 prefill node can feed a TP=64 DCP=8 decode node.
+  - The prefill exports the K summaries in the decode's per-block layout (`HY3_SPARSE_EXPORT_DCP=8`) and passes `remote_tp_size` (`pd_serve.sh`).
+  - It needs the matching `NeuronMooncakeConnector` change on top of vllm-project/vllm-neuron#90, which is not part of this branch.
+  - At C = 4 that pair gave 485 requests, TTFT P50 / P90 / P99 1.34 / 4.0 / 16.0 s and ITL P50 / P99 21 / 25 ms.
 
 ## Compatibility Matrix
 
@@ -1546,6 +1604,7 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 | `scripts/tensore_mm_bench.py` | one-core TensorE cost of the decode MoE matmul shapes, BF16 x FP8 vs FP8 x FP8 (W8A8, with and without `double_row`): W8A8 is not faster there (`results/w8a8_decode/`, docs/PROFILE_85K.md) |
 | `scripts/profile_attn_breakdown.py` | attention-module time of a profiled decode step by model.py function (sparse-decode profile, [docs/SPARSE_DECODE.md](docs/SPARSE_DECODE.md)) |
 | `scripts/sparse_select_bench.py` | single-core timing of the sparse-decode block selection variants ([docs/SPARSE_DECODE.md](docs/SPARSE_DECODE.md)) |
+| `scripts/serve_agentx_dcp.sh` | one-node AgentX config with DCP=8 + MTP k=3 + sparse decode, max_model_len 262144 ("AgentX on Trn2, one node") |
 | `scripts/serve_85k.sh` | 85k-context config without DCP (max_model_len 86016, 4 requests at once), for MTP on `bench_data/prefix` |
 | `scripts/gen_prefix_prompts.py` | generates `bench_data/prefix`: real-text shared prefix + distinct suffixes, exact token counts |
 | `scripts/needle.py` | passkey retrieval at 16k-85k (`gen` writes `bench_data/needle.jsonl.gz`, `run` checks a server) |

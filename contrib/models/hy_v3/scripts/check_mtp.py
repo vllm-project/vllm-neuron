@@ -15,6 +15,7 @@ Needs a vllm-neuron with MTP support (vllm_neuron/vllm/spec_decode/mtp.py) and
 the contrib package (pip install -e contrib/models/hy_v3).
 """
 
+import json
 import os
 import sys
 import time
@@ -33,6 +34,12 @@ PROMPTS = [
     "人工智能的未来发展趋势是",
     "Question: what is 17 * 23? Answer:",
 ]
+if os.environ.get("LONG_PROMPT"):  # LONG_PROMPT=<tokens>: one long prompt per entry (past the 512 prefill bucket)
+    from transformers import AutoTokenizer
+    _tok = AutoTokenizer.from_pretrained(ckpt)
+    _n = int(os.environ["LONG_PROMPT"])
+    _base = ("The history of the river town begins with a mill, a bridge and a market square. " * 2000)
+    PROMPTS = [_tok.decode(_tok(f"Story {i}. " + _base)["input_ids"][:_n]) + " The mill" for i in range(4)]
 
 
 def run(spec: bool):
@@ -40,11 +47,15 @@ def run(spec: bool):
         model=ckpt,
         tensor_parallel_size=64,
         enable_expert_parallel=True,
-        max_model_len=2048,
+        # DCP needs segmented prefill: max_num_batched_tokens < max_model_len, kv segments.
+        max_model_len=int(os.environ.get("MAX_LEN", 4096 if int(os.environ.get("DCP", "1")) > 1 else 2048)),
         max_num_seqs=len(PROMPTS),
-        max_num_batched_tokens=2048,
+        max_num_batched_tokens=max(json.loads(os.environ.get("BUCKETS", "[2048]"))),
         block_size=32,
         enable_prefix_caching=prefix,
+        # DCP=<n>: decode context parallelism (with MTP needs VLLM_NEURON_DCP_SPEC_DECODE=1)
+        **({"decode_context_parallel_size": int(os.environ["DCP"]), "cp_kv_cache_interleave_size": 32}
+           if int(os.environ.get("DCP", "1")) > 1 else {}),
         kv_cache_dtype="fp8" if fp8_kv else "auto",
         disable_log_stats=False,
         speculative_config=(
@@ -52,9 +63,9 @@ def run(spec: bool):
         ),
         additional_config={
             "neuron_config": {
-                "num_batched_tokens_buckets": [2048],
+                "num_batched_tokens_buckets": json.loads(os.environ.get("BUCKETS", "[2048]")),
                 "num_seqs_buckets": [1, len(PROMPTS)],
-                **({"kv_segment_size_buckets": [2048]} if prefix else {}),
+                **({"kv_segment_size_buckets": [2048]} if prefix or int(os.environ.get("DCP", "1")) > 1 else {}),
                 **({"fp8_packed_kv": True} if fp8_kv else {}),
             }
         },
