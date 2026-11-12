@@ -186,6 +186,29 @@ PR should include:
    [module test guidelines](../docs/design/accuracy/module_test_guidelines.md)
    for the three-way accuracy pattern and threshold guidance.
 
+### Developer Certificate of Origin (DCO)
+
+Like every change to this repository, contrib-model commits must include a
+`Signed-off-by` line confirming that you have the
+right to contribute the code under this repository's license. Create signed-off
+commits with:
+
+```bash
+git commit -s
+```
+
+If the DCO check fails for an existing commit, amend it and update your pull
+request:
+
+```bash
+git commit --amend --no-edit --signoff
+git push --force-with-lease
+```
+
+Confirm that the DCO check passes before requesting review. See the top-level
+[contributing guide](../CONTRIBUTING.md#developer-certificate-of-origin-dco) for
+instructions to install the repository's automatic `commit-msg` sign-off hook.
+
 After you open a PR, the Neuron team will review it and request changes as
 needed.
 
