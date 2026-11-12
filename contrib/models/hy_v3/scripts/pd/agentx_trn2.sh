@@ -8,13 +8,14 @@
 # The client needs its own venv (agentx-harness bundles a forked aiperf) on Python 3.11-3.13, e.g.
 #   python3 -m venv ~/agentx-venv && ~/agentx-venv/bin/pip install agentx-harness==1.0.13 'datasets>=4.7.0'
 # Env: PROXY (http://127.0.0.1:8000), D_URL (http://127.0.0.1:8200), AGENTX (~/agentx-venv/bin/agentx),
-#      MODEL (tokenizer path, /mnt/nvme/models/Hy3-FP8), DURATION (3600), P_PORTS ("8100 8101").
+#      MODEL (tokenizer path, /mnt/nvme/models/Hy3-FP8), DURATION (3600), P_PORTS ("8100 8101"; empty: no
+#      prefill /metrics, e.g. for a single server).
 set -uo pipefail
 OUT=$1; C=$2
 PROXY=${PROXY:-http://127.0.0.1:8000}; D_URL=${D_URL:-http://127.0.0.1:8200}
 mkdir -p "$OUT"
 metrics=()
-for p in ${P_PORTS:-8100 8101}; do metrics+=("http://127.0.0.1:$p/metrics"); done
+for p in ${P_PORTS-8100 8101}; do metrics+=("http://127.0.0.1:$p/metrics"); done
 metrics+=("$D_URL/metrics")
 # Smoke test: a streamed request must come back as text/event-stream with content.
 echo "$(date +%T) smoke:"

@@ -4689,10 +4689,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # NOTE: A request is in prefill if num_computed_tokens < num_prompt_tokens.
         # We cannot use "num_computed_tokens == 0" because prefix caching may have
         # already set num_computed_tokens to a non-zero value for cached tokens.
+        # The scheduler pads every prefill-shaped request (_apply_padding_and_log_stats),
+        # including a preempted request that re-computes only output tokens, whose
+        # num_computed_tokens is already past the prompt: pad wherever it did, or the
+        # step runs at an uncompiled length ("Detected recompile").
+        padded_counts = scheduler_output.num_scheduled_tokens_padded
+        sched_counts = scheduler_output.num_scheduled_tokens
         has_prefill = any(
             req_id in self.requests
-            and self.requests[req_id].num_computed_tokens
-            < self.requests[req_id].num_prompt_tokens
+            and (
+                self.requests[req_id].num_computed_tokens
+                < self.requests[req_id].num_prompt_tokens
+                or padded_counts.get(req_id, 0) > sched_counts.get(req_id, 0)
+            )
             for req_id in req_ids
         )
 
@@ -10247,6 +10256,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         """Return request IDs whose current chunked-prefill step is not final."""
         if scheduler_output is None:
             return set()
+
+        # The scheduler's own view (NeuronScheduler.schedule): exact also for a
+        # preempted request re-computing past its prompt, where the prompt-length
+        # test below would sample, and emit, a token on every chunk.
+        sched_partial = getattr(scheduler_output, "_partial_prefill_req_ids", None)
+        if sched_partial is not None:
+            return {req_id for req_id in req_ids if req_id in sched_partial}
 
         partial_prefill_req_ids = set()
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens

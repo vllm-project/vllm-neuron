@@ -48,6 +48,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Decode-only steps after a prefill step that could not schedule (KV cache full).
+_PREFILL_BACKOFF_STEPS = 16
+
 
 def _kv_capacity_guidance() -> str:
     """Return capacity guidance for the active KV budget policy."""
@@ -192,6 +195,14 @@ class NeuronScheduler(Scheduler):
             and not kv_transfer_config.is_kv_consumer
         )
         self._pending_kv_send: set[str] = set()
+        # Decode-only steps left after a prefill step that scheduled nothing (see schedule()).
+        self._prefill_backoff_steps = 0
+        # No second prefill next to a prefill or a decode batch: every engine with a KV connector
+        # but a pure consumer (a PD decode, whose remote-KV waiters are decode-shaped and admitted
+        # together).
+        self._hold_second_prefill = kv_transfer_config is not None and not (
+            kv_transfer_config.is_kv_consumer and not kv_transfer_config.is_kv_producer
+        )
         # Keep the running decodes when every admissible waiter is a pure asynchronous KV pull.
         # Branch 3.2 hides all running decodes so a waiter can prefill, but a pure pull needs no
         # forward pass: the base scheduler parks it in WAITING_FOR_REMOTE_KVS with zero tokens.
@@ -321,6 +332,7 @@ class NeuronScheduler(Scheduler):
         else:
             # Fallback for attention-free models or empty groups
             total_kv_tokens = kv_cache_config.num_blocks * block_size
+            max_concurrency = 0.0
             max_concurrent = (
                 total_kv_tokens // self.max_model_len if self.max_model_len > 0 else 0
             )
@@ -328,6 +340,35 @@ class NeuronScheduler(Scheduler):
         self._max_kv_concurrent = (
             max_concurrent if max_concurrent > 0 else self.max_num_seqs
         )
+        # A pure KV consumer (PD decode) compiles no prefill graphs (the worker skips the
+        # prefill warmup for it), so it cannot run a local prefill: a request preempted on
+        # it, or a KV load that falls back to recompute, has no compiled shape. Admission
+        # therefore keeps decode headroom (VLLM_NEURON_CONSUMER_KV_RESERVE_TOKENS per
+        # request holding KV) so running decodes are not preempted, and a request that still
+        # needs a local prefill is finished with an error instead of crashing the engine.
+        self._pure_kv_consumer = (
+            kv_transfer_config is not None
+            and kv_transfer_config.is_kv_consumer
+            and not kv_transfer_config.is_kv_producer
+        )
+        self._kv_tokens_per_block = float(block_size)
+        if kv_cache_config.kv_cache_groups and kv_cache_config.num_blocks > 0:
+            self._kv_tokens_per_block = (
+                max_concurrency * self.max_model_len / kv_cache_config.num_blocks
+            )
+        self._consumer_kv_reserve_tokens = int(
+            os.environ.get("VLLM_NEURON_CONSUMER_KV_RESERVE_TOKENS", "8192")
+        )
+        self._consumer_reserve_warned = False
+        if self._pure_kv_consumer and self.recompute_kv_load_failures:
+            # A failed KV load (e.g. "Timeout waiting for P side ready") would be re-computed
+            # locally, which a pure consumer has no compiled prefill graph for.
+            logger.warning(
+                "kv_load_failure_policy=recompute on a pure KV consumer: it cannot re-compute "
+                "(no prefill graph is compiled), so a failed KV load finishes the request with "
+                "an error instead."
+            )
+            self.recompute_kv_load_failures = False
         # VLLM_NEURON_MAX_KV_CONCURRENT overrides the worst-case cap above, which assumes every
         # request fills max_model_len with no prefix-cache sharing. Block allocation still
         # bounds what actually runs.
@@ -367,6 +408,28 @@ class NeuronScheduler(Scheduler):
         # EngineCoreOutput + scheduler-driven ec_connector.request_finished) lands
         # in the pinned vLLM, delete all three and use the stock path.
         self._ec_locator_by_mm_hash: dict[str, dict] = {}
+
+    def _update_from_kv_xfer_finished(self, kv_connector_output):
+        """Drop finished KV transfers of requests the scheduler has already freed.
+
+        The base asserts that every finished_recving / finished_sending id is still a known
+        request. A transfer can be reported for a request that is gone: e.g. a KV pull whose
+        result arrives after the request was already finished (and freed) on another path. Its
+        blocks were freed with the request, so there is nothing left to do; asserting kills the
+        engine.
+        """
+        for field in ("finished_recving", "finished_sending"):
+            ids = getattr(kv_connector_output, field, None)
+            if not ids:
+                continue
+            unknown = {req_id for req_id in ids if req_id not in self.requests}
+            if unknown:
+                logger.warning(
+                    "KV transfer %s reported for %d request(s) no longer in the scheduler, "
+                    "ignored: %s", field, len(unknown), sorted(unknown)[:8],
+                )
+                setattr(kv_connector_output, field, set(ids) - unknown)
+        super()._update_from_kv_xfer_finished(kv_connector_output)
 
     def update_from_output(self, scheduler_output, model_runner_output):
         """Process output. Additionally, check if we can advance
@@ -634,28 +697,42 @@ class NeuronScheduler(Scheduler):
         """
         if not self.waiting:
             return False
-        for request in self.waiting:
-            transfer_params = request.kv_transfer_params
-            if not transfer_params or not transfer_params.get(
-                "do_remote_prefill", False
-            ):
-                return False
-            # Count the tokens the same way the connector does, from the token ids rather than
-            # from num_prompt_tokens. A prompt_embeds request has no token ids, so
-            # num_prompt_tokens is the embed count while the connector sees zero and returns
-            # load_async=False, which is a real prefill and does need the holdback.
-            prompt_token_ids = request.prompt_token_ids
-            if not prompt_token_ids:
-                return False
-            if len(prompt_token_ids) - request.num_computed_tokens <= 1:
-                return False
-        return True
+        return all(self._is_async_kv_pull(request) for request in self.waiting)
+
+    @staticmethod
+    def _is_async_kv_pull(request: Request) -> bool:
+        """Report whether ``request`` is a pure asynchronous KV pull (see above)."""
+        transfer_params = request.kv_transfer_params
+        if not transfer_params or not transfer_params.get("do_remote_prefill", False):
+            return False
+        # Count the tokens the same way the connector does, from the token ids rather than
+        # from num_prompt_tokens. A prompt_embeds request has no token ids, so
+        # num_prompt_tokens is the embed count while the connector sees zero and returns
+        # load_async=False, which is a real prefill and does need the holdback.
+        prompt_token_ids = request.prompt_token_ids
+        if not prompt_token_ids:
+            return False
+        return len(prompt_token_ids) - request.num_computed_tokens > 1
+
+    def _waiting_has_local_prefill(self) -> bool:
+        """Report whether a waiter would run a local prefill when admitted.
+
+        On a pure KV consumer (PD decode) the waiters are normally remote-KV pulls, which are
+        decode-shaped. A preempted request is not: vLLM prepends it to ``waiting`` and it
+        re-computes its prompt and outputs locally, so admitted next to running decodes it
+        makes a mixed batch.
+        """
+        return any(not self._is_async_kv_pull(request) for request in self.waiting)
 
     def _is_prefill_request(self, request: Request) -> bool:
         """Check if a request is in prefill phase.
 
-        A request is in prefill if it hasn't finished processing all prompt tokens.
-        This is independent of which queue (waiting/running) it's in.
+        A request is in prefill if it hasn't finished processing all prompt tokens,
+        or if it has tokens left to re-compute: a preempted request whose prompt came
+        back from the prefix cache (or a KV connector) re-computes the output tokens it
+        had generated, which is prefill work although the prompt is done. A decode step
+        leaves at most the last token uncomputed. This is independent of which queue
+        (waiting/running) it's in.
 
         Args:
             request: The request to check.
@@ -663,7 +740,10 @@ class NeuronScheduler(Scheduler):
         Returns:
             True if request is in prefill phase, False if in decode phase.
         """
-        return request.num_computed_tokens < request.num_prompt_tokens
+        return (
+            request.num_computed_tokens < request.num_prompt_tokens
+            or request.num_computed_tokens < request.num_tokens - 1
+        )
 
     def _kv_in_use(self) -> int:
         """Requests currently pinning KV blocks against the worst-case cap
@@ -864,7 +944,80 @@ class NeuronScheduler(Scheduler):
                 )
             return False
 
+        if self._pure_kv_consumer and not self._consumer_has_kv_headroom(request):
+            return False
+
         return True
+
+    def _consumer_has_kv_headroom(self, request: Request) -> bool:
+        """On a pure KV consumer, admit ``request`` only if decode headroom stays free.
+
+        Every request holding KV (running, parked on a KV pull, or admitted this step) keeps
+        ``VLLM_NEURON_CONSUMER_KV_RESERVE_TOKENS`` free for its output. A new request's prompt
+        is counted without prefix-cache hits, so the check is conservative. With nothing
+        holding KV the request is always admitted, so a single long request cannot deadlock.
+        """
+        reserve = self._consumer_kv_reserve_tokens
+        if reserve <= 0:
+            return True
+        holders = list(self.running) + [
+            r for r in self.skipped_waiting
+            if r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        ]
+        if not holders and not self.waiting:
+            return True
+        free_tokens = (
+            self.kv_cache_manager.block_pool.get_num_free_blocks()
+            * self._kv_tokens_per_block
+        )
+        lookahead = 1 + self.num_spec_tokens
+        pending = sum(r.num_tokens + lookahead for r in self.waiting)
+        need = request.num_tokens + lookahead
+        headroom = (len(holders) + len(self.waiting) + 1) * reserve
+        if free_tokens - pending - need >= headroom:
+            return True
+        if not self._consumer_reserve_warned:
+            logger.warning(
+                "KV consumer admission deferred: %.0f free KV tokens < %d (request) + %d "
+                "(admitted) + %d decode headroom (%d tokens x %d requests). Further deferrals "
+                "are logged at debug level.",
+                free_tokens, need, pending, headroom, reserve,
+                len(holders) + len(self.waiting) + 1,
+            )
+            self._consumer_reserve_warned = True
+        return False
+
+    def _error_out_consumer_local_prefills(self) -> None:
+        """Finish, with an error, requests a pure KV consumer would have to prefill locally.
+
+        A preempted request re-computes its prompt and outputs, and a KV load that fell back
+        to recompute re-computes the prompt. A pure consumer has no compiled prefill graph for
+        either, so running it fails the ``fail_on_recompile`` stance and kills the engine.
+        The request leaves the queues here and is finished with FINISHED_ERROR in the next
+        ``update_from_output`` (through the base scheduler's error-request set), so its client
+        gets a finished response.
+        """
+        if not self._pure_kv_consumer:
+            return
+        lookahead = 1 + self.num_spec_tokens
+        doomed = [
+            r for r in list(self.waiting) + list(self.skipped_waiting)
+            if r.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+            and r.num_tokens - r.num_computed_tokens > lookahead
+            and not self._is_async_kv_pull(r)
+        ]
+        if not doomed:
+            return
+        self.waiting.remove_requests(doomed)
+        self.skipped_waiting.remove_requests(doomed)
+        for r in doomed:
+            logger.error(
+                "KV consumer cannot prefill request %s locally (status=%s, computed=%d, "
+                "tokens=%d, preemptions=%d): finishing it with an error.",
+                r.request_id, r.status.name, r.num_computed_tokens, r.num_tokens,
+                r.num_preemptions,
+            )
+            self.grammar_compile_error_reqs.add(r.request_id)
 
     @staticmethod
     def _is_structured_output_grammar_waiter(request: Request) -> bool:
@@ -886,6 +1039,15 @@ class NeuronScheduler(Scheduler):
             self._is_structured_output_grammar_waiter(req)
             for req in self.skipped_waiting
         )
+
+    def _strip_prefill_spec(self) -> None:
+        """Clear ``spec_token_ids`` on every prefill-shaped request (see schedule())."""
+        if not self.num_spec_tokens:
+            return
+        for queue in (self.running, self.waiting, self.skipped_waiting):
+            for req in queue:
+                if req.spec_token_ids and req.num_computed_tokens < req.num_tokens - 1:
+                    req.spec_token_ids = []
 
     def _should_skip_prefilling_padding_in_di(
         self, scheduler_output: "SchedulerOutput", req_id: str
@@ -973,7 +1135,12 @@ class NeuronScheduler(Scheduler):
 
             # Use num_computed_tokens from SchedulerOutput (pre-increment value)
             num_computed = req_num_computed.get(req_id, request.num_computed_tokens)
-            is_prefill = num_computed < request.num_prompt_tokens
+            # Re-computed output tokens after a preemption are prefill work too (see
+            # _is_prefill_request): classified as decode they would run unpadded.
+            is_prefill = (
+                num_computed < request.num_prompt_tokens
+                or num_computed < request.num_tokens - 1
+            )
 
             # A last-token re-compute (the prompt is already available; only
             # the final token is re-computed for sampling) is decode-shaped
@@ -1126,6 +1293,8 @@ class NeuronScheduler(Scheduler):
             len(self.running),
         )
 
+        self._error_out_consumer_local_prefills()
+
         # Step 1: Move all waiting to holdback queue (preserving priority)
         while self.waiting:
             self.holdback_queue.append(self.waiting.popleft())
@@ -1149,6 +1318,16 @@ class NeuronScheduler(Scheduler):
             and not self.has_prefill_in_running
             and self._kv_in_use() < self._max_kv_concurrent
         )
+        # A prefill step hides every running decode. When the waiting prefill cannot get its
+        # KV blocks (the cache is full of the running requests' KV), that step schedules
+        # nothing, the hidden decodes never run to free blocks, and every following step is
+        # the same empty prefill step: a livelock. After such a step run decode-only steps
+        # for a while, so the decodes make progress and free blocks.
+        decode_only_backoff = False
+        if can_start_prefill and self._prefill_backoff_steps > 0 and self.running:
+            self._prefill_backoff_steps -= 1
+            can_start_prefill = False
+            decode_only_backoff = True
         running_holdback: list[Request] = []
         max_num_running_reqs_override: int | None = None
         if self.has_prefill_in_running:
@@ -1159,7 +1338,16 @@ class NeuronScheduler(Scheduler):
             self.running = [
                 req for req in self.running if self._is_prefill_request(req)
             ]
-            if has_structured_output_waiting:
+            # No new admission next to an ongoing prefill: the base scheduler would
+            # schedule a waiter (e.g. a preempted request it prepended to
+            # ``waiting``) as a second prefill in this step. A pure consumer (PD
+            # decode) admits decode-shaped remote-KV pulls and is exempt.
+            if (
+                has_structured_output_waiting
+                or self._hold_second_prefill
+                or not self.connector
+                or self._waiting_has_local_prefill()
+            ):
                 max_num_running_reqs_override = len(self.running)
             logger.debug(
                 "Scheduling prefill step: keeping %d prefill in running, "
@@ -1214,9 +1402,17 @@ class NeuronScheduler(Scheduler):
             if (
                 has_ready_structured_output_waiting
                 and len(self.running) < self.max_num_running_reqs
+            ) or (
+                self.running
+                and (self._hold_second_prefill or self._waiting_has_local_prefill())
             ):
                 # Prevent ready SO waiters from admitting a prefill into a
-                # decode batch after the Neuron pre-check.
+                # decode batch after the Neuron pre-check. The same holds for a
+                # waiter the base scheduler would promote in this call (e.g. a
+                # preempted request it prepended to ``waiting``) with a KV
+                # connector that is not a pure consumer, and for a local prefill
+                # waiting on a pure consumer: the base stops admitting once
+                # num_running reaches the cap.
                 max_num_running_reqs_override = len(self.running)
             logger.debug(
                 "Scheduling decode step: scheduling %d decode request(s), "
@@ -1272,6 +1468,41 @@ class NeuronScheduler(Scheduler):
             for req in deferred:
                 self.skipped_waiting.add_request(req)
 
+        # A decode-only backoff step must not admit a prefill into the decode batch (Neuron runs
+        # prefill and decode in separate steps): hide every waiter until Step 5.
+        backoff_skipped: list[Request] = []
+        if decode_only_backoff:
+            while self.waiting:
+                self.holdback_queue.append(self.waiting.pop_request())
+            while self.skipped_waiting:
+                backoff_skipped.append(self.skipped_waiting.pop_request())
+
+        # A request with tokens left to compute beyond the last one (a resumed
+        # preempted request re-computing its prompt and outputs, or a prefill) must
+        # not carry draft tokens: under async scheduling the spec placeholders set
+        # on an earlier step survive into the re-compute, which then runs as a
+        # prefill-plus-spec step (an uncompiled shape) and delivers more tokens than
+        # its placeholders cover. Drop them before the base scheduler sizes the step.
+        self._strip_prefill_spec()
+
+        # At most max_prefills_per_batch prefills per step. can_schedule() admits one
+        # waiter at a time, but the base scheduler prepends a preempted request to
+        # ``waiting`` directly, so ``waiting`` can hold a new prefill and a preempted
+        # one (re-computing) at once, and the base scheduler then schedules both:
+        # two padded prefills in one step have an uncompiled total length. Keep the
+        # first ones visible (a preempted request keeps its place at the front) and
+        # return the rest after the call. A pure consumer (PD decode) is exempt: its
+        # remote-KV waiters are decode-shaped and admitted together.
+        extra_waiting: list[Request] = []
+        if self._hold_second_prefill or not self.connector:
+            while len(self.waiting) > self.max_prefills_per_batch:
+                keep = [self.waiting.pop_request() for _ in range(self.max_prefills_per_batch)]
+                extra_waiting = []
+                while self.waiting:
+                    extra_waiting.append(self.waiting.pop_request())
+                for req in keep:
+                    self.waiting.add_request(req)
+
         # Step 4: Delegate to parent scheduler (sync or async)
         original_max_num_running_reqs = self.max_num_running_reqs
         if max_num_running_reqs_override is not None:
@@ -1292,13 +1523,43 @@ class NeuronScheduler(Scheduler):
             scheduler_output = self._call_base_schedule(throttle_prefills)
         finally:
             self.max_num_running_reqs = original_max_num_running_reqs
+        if (
+            running_holdback
+            and not self.has_prefill_in_running
+            and scheduler_output.total_num_scheduled_tokens == 0
+            and any(
+                r.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED) for r in self.waiting
+            )
+        ):
+            if self._prefill_backoff_steps == 0:
+                logger.info(
+                    "Prefill step scheduled nothing (no KV blocks for the waiting prefill); "
+                    "%d decode-only steps for the %d hidden decodes",
+                    _PREFILL_BACKOFF_STEPS,
+                    len(running_holdback),
+                )
+            self._prefill_backoff_steps = _PREFILL_BACKOFF_STEPS
+
+        # Requests whose step this is a non-final prefill chunk (the base scheduler
+        # set ``is_prefill_chunk`` while sizing the step): the runner discards their
+        # sampled tokens. It cannot tell on its own: a preempted request re-computing
+        # its output tokens is past ``num_prompt_tokens`` on every chunk.
+        scheduler_output._partial_prefill_req_ids = {
+            req_id
+            for req_id in scheduler_output.num_scheduled_tokens
+            if req_id in self.requests and self.requests[req_id].is_prefill_chunk
+        }
 
         # Step 5: Restore holdbacks
         self.running = self.running + running_holdback
+        for req in extra_waiting:
+            self.waiting.add_request(req)
         while self.holdback_queue:
             self.waiting.append(self.holdback_queue.popleft())
         # Restore the structured-output grammar waiters held back in Step 3.5.
         for req in skipped_holdback:
+            self.skipped_waiting.add_request(req)
+        for req in backoff_skipped:
             self.skipped_waiting.add_request(req)
 
         # Check if we can add JF tokens to requests (assuming we're in decode phase).
@@ -1501,6 +1762,32 @@ class NeuronAsyncScheduler(NeuronScheduler, AsyncScheduler):
             include_finished_set=include_finished_set,
             log_stats=log_stats,
         )
+
+    def _update_request_with_output(self, request, new_token_ids, is_stale: bool = False):
+        """Keep ``num_output_placeholders`` from underflowing.
+
+        After a preemption the placeholders are zeroed, and a resumed request can
+        get an output (or a spec rejection rollback, which upstream subtracts with
+        only a ``> 0`` check) that its re-registered placeholders do not cover: on
+        Neuron the resume re-compute is a padded prefill step that skips the
+        placeholder increment (``is_prefill_chunk``) yet can carry the spec tokens
+        left from before the preemption. Upstream then asserts
+        ``num_output_placeholders >= 0`` and kills the engine. The placeholders only
+        count tokens still in flight; topping them up to the delivered count leaves
+        them at 0 after this output, which is the true in-flight count here.
+        """
+        n = len(new_token_ids)
+        if not is_stale and request.num_output_placeholders < n:
+            if not getattr(request, "_ph_underflow_warned", False):
+                request._ph_underflow_warned = True
+                logger.warning(
+                    "Request %s: %d output placeholders for %d delivered tokens "
+                    "(preemptions=%d); clamping to 0",
+                    request.request_id, request.num_output_placeholders, n,
+                    request.num_preemptions,
+                )
+            request.num_output_placeholders = n
+        return super()._update_request_with_output(request, new_token_ids, is_stale)
 
     def _call_base_schedule(self, throttle_prefills: bool = False) -> "SchedulerOutput":
         """Override to use AsyncScheduler.schedule() instead of Scheduler.schedule().

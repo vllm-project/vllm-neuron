@@ -157,9 +157,14 @@ elif [ "$CONNECTOR" = NeuronMooncakeConnector ]; then
   [ -f "$CODE/vllm_neuron/vllm/kv_connector/neuron_mooncake_connector.py" ] || { echo "$CODE has no NeuronMooncakeConnector: apply vllm-project/vllm-neuron#90" >&2; exit 1; }
   mc_mod=vllm_neuron.vllm.kv_connector.neuron_mooncake_connector
   export VLLM_MOONCAKE_BOOTSTRAP_PORT=${MC_BOOTSTRAP_PORT:-8998}
+  # How long the prefill side waits for a request's prefill before it fails the decode's pull
+  # (vLLM default 480 s). AgentX warm-up queues long cold first turns past 480 s. A failed pull
+  # fails the request (KV_LOAD_FAILURE_POLICY, default fail): a PD decode compiles no prefill
+  # graph, so it cannot re-compute (the scheduler forces fail on a pure KV consumer anyway).
+  export VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT=${VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT:-1800}
   # Prefill into a DCP decode: the prefill side maps its blocks onto the decode's DCP shards.
   mc_dcp=""; [ "$ROLE" = prefill ] && [ "${D_DCP:-1}" != 1 ] && mc_dcp=",\"remote_dcp_size\":$D_DCP"
-  kvt="{\"kv_connector\":\"NeuronMooncakeConnector\",\"kv_connector_module_path\":\"$mc_mod\",\"kv_role\":\"$kv_role\",\"kv_connector_extra_config\":{\"mooncake_protocol\":\"efa\",\"num_workers\":${MC_WORKERS:-10}$mc_dcp}}"
+  kvt="{\"kv_connector\":\"NeuronMooncakeConnector\",\"kv_connector_module_path\":\"$mc_mod\",\"kv_role\":\"$kv_role\",\"kv_load_failure_policy\":\"${KV_LOAD_FAILURE_POLICY:-fail}\",\"kv_connector_extra_config\":{\"mooncake_protocol\":\"efa\",\"num_workers\":${MC_WORKERS:-10}$mc_dcp}}"
 elif [ "$CONNECTOR" = NeuronNixlConnector ]; then
   kvt="{\"kv_connector\":\"NeuronNixlConnector\",\"kv_connector_module_path\":\"vllm_neuron.vllm.kv_connector.neuron_nixl_connector\",\"kv_role\":\"$kv_role\",\"kv_buffer_device\":\"cuda\",\"kv_connector_extra_config\":{\"backends\":[\"$BACKEND\"]}}"
 else

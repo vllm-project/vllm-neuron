@@ -9,6 +9,7 @@ import itertools
 import os
 import urllib
 import uuid
+import time
 import zlib
 from contextlib import asynccontextmanager
 from typing import Any
@@ -329,6 +330,39 @@ async def stream_service_response(
             yield chunk
 
 
+# Session -> prefill instance. A static hash of the session id leaves the instances unevenly
+# loaded whenever the few live sessions hash unevenly (seen 3:1 in prefill tokens at C=8), so
+# PREFILL_ROUTING=balanced (default) places a new session on the instance with the fewest live
+# sessions (seen within PREFILL_SESSION_TTL s) and keeps it there, so its prefix cache and host
+# KV tier stay on one instance. PREFILL_ROUTING=hash restores the crc32 placement.
+_PREFILL_ROUTING = os.environ.get("PREFILL_ROUTING", "balanced")
+_PD_DISPATCH = os.environ.get("PD_DISPATCH", "serial")
+_PREFILL_SESSION_TTL = float(os.environ.get("PREFILL_SESSION_TTL", "600"))
+_session_route: dict[str, list] = {}
+
+
+def _session_prefill_index(app, session: str) -> int:
+    n = len(app.state.prefill_clients)
+    if _PREFILL_ROUTING == "hash":
+        return zlib.crc32(session.encode()) % n
+    now = time.monotonic()
+    for sid in [k for k, v in _session_route.items() if now - v[1] > _PREFILL_SESSION_TTL]:
+        del _session_route[sid]
+    entry = _session_route.get(session)
+    if entry is None or entry[0] >= n:
+        live = [0] * n
+        for idx, _ in _session_route.values():
+            if idx < n:
+                live[idx] += 1
+        idx = min(range(n), key=lambda i: (live[i], i))
+        entry = [idx, now]
+        _session_route[session] = entry
+        print(f"prefill routing: session {session[:16]} -> instance {idx} (live sessions {live})",
+              flush=True)
+    entry[1] = now
+    return entry[0]
+
+
 async def _handle_completions(api: str, request: Request):
     if not app.state.ready.is_set():
         raise HTTPException(status_code=503, detail="Service Unavailable")
@@ -344,16 +378,23 @@ async def _handle_completions(api: str, request: Request):
         session = request.headers.get("x-session-id")
         if session and len(request.app.state.prefill_clients) > 1:
             pc = request.app.state.prefill_clients
-            prefill_client_info, prefill_dp_rank = pc[zlib.crc32(session.encode()) % len(pc)], 0
+            prefill_client_info, prefill_dp_rank = pc[_session_prefill_index(request.app, session)], 0
         else:
             prefill_client_info, prefill_dp_rank = get_next_client(request.app, "prefill")
 
-        # Send request to prefill service
-        asyncio.create_task(
+        # Send request to prefill service. PD_DISPATCH=serial (default) waits for the prefill to
+        # finish before the decode gets the request. With PD_DISPATCH=concurrent (upstream) the
+        # decode admits the request and allocates its KV blocks right away, while the prefill
+        # may still be queued: when both sides are KV-bound, the decode blocks wait on prefills
+        # that wait on prefill KV, held by finished prefills the decode has no room to admit
+        # (AgentX C=16: a KV pull timed out after 1800 s).
+        prefill_task = asyncio.create_task(
             send_request_to_service(
                 prefill_client_info, prefill_dp_rank, api, req_data, request_id
             )
         )
+        if _PD_DISPATCH == "serial":
+            await prefill_task
 
         decode_client_info = get_next_client(request.app, "decode")
 
