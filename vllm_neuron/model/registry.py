@@ -5,6 +5,7 @@ from .llama3 import LlamaForCausalLM
 from .gpt_oss import GptOssForCausalLM
 from .llama3 import Eagle3LlamaForCausalLM, PEagleLlamaForCausalLM
 from .qwen3 import DFlashQwen3ForCausalLM, Qwen3ForCausalLM
+from .qwen3_5 import Qwen3_5ForCausalLM
 from .qwen3_vl import Qwen3VLForConditionalGeneration
 from .qwen3_asr import Qwen3ASRForConditionalGeneration
 
@@ -25,6 +26,7 @@ def get_models() -> list[tuple[str, type]]:
         ("PEagleLlamaForCausalLM", PEagleLlamaForCausalLM),
         ("DFlashDraftModel", DFlashQwen3ForCausalLM),
         ("Qwen3ForCausalLM", Qwen3ForCausalLM),
+        ("Qwen3_5ForCausalLM", Qwen3_5ForCausalLM),
         ("Qwen3VLForConditionalGeneration", Qwen3VLForConditionalGeneration),
         ("Qwen3ASRForConditionalGeneration", Qwen3ASRForConditionalGeneration),
     ]

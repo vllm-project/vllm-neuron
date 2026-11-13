@@ -233,8 +233,10 @@ def get_neuron_model_runner_v2_policy(
     # serving features continue to use MRv1.
     if getattr(vllm_config, "ec_transfer_config", None) is not None:
         unsupported.append("EC transfer")
-    if getattr(vllm_config, "weight_transfer_config", None) is not None:
-        unsupported.append("weight transfer")
+    # Weight transfer is served by the "neuron" backend registered in
+    # platform.py (pre_register_and_update). The engine applies weights in place
+    # into the resident model's parameter tensors, so the compiled graph stays
+    # valid across updates — no need to decline MRv2 for it.
     if getattr(vllm_config, "lora_config", None) is not None:
         unsupported.append("LoRA")
     if getattr(vllm_config, "reasoning_config", None) is not None:

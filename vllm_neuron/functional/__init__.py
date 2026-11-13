@@ -8,6 +8,14 @@ from .attention.attention_decode import attention_decode
 from .attention.qkv import qkv_proj
 from .attention.o_proj import o_proj
 from .attention.attention_cte import flash_attention
+from .attention.gdn_attention import (
+    gdn_causal_conv1d_fn,
+    gdn_causal_conv1d_update,
+    gdn_chunk_gated_delta_rule,
+    gdn_gating,
+    gdn_l2norm,
+    gdn_recurrent_gated_delta_rule,
+)
 from .attention.attention_segmented_cte import (
     segmented_attention,
     segmented_attention_cp,
@@ -77,6 +85,12 @@ __all__ = [
     "gpt_oss_mega_decode",
     "gen_attention_decode_mask",
     "get_group_slice_indices",
+    "gdn_causal_conv1d_fn",
+    "gdn_causal_conv1d_update",
+    "gdn_chunk_gated_delta_rule",
+    "gdn_gating",
+    "gdn_l2norm",
+    "gdn_recurrent_gated_delta_rule",
     "get_local_expert_affinities",
     "hierarchical_all2all_combine_reduce",
     "hierarchical_all2all_dispatch_permute",
