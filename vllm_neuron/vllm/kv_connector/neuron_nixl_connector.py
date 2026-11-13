@@ -47,6 +47,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 from vllm.logger import init_logger
 
 from vllm_neuron import envs
+from vllm_neuron.vllm.kv_connector.neuron_hbm_registration import (
+    coalesce_enabled,
+    coalesce_neuron_spans,
+    extra_kv_tensors,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -58,6 +63,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
 
 # Serialises the binding swap below, which is process-global for the length of one block. Two
 # connectors built at once would otherwise each restore the other's wrapper.
@@ -351,6 +357,8 @@ class NeuronNixlConnectorWorker(NixlConnectorWorker):
         # passed to the base read as expected_consumers, which puts it on the wire
         # so the producer frees on the true per-rank reader count.
         self._producer_fanin: dict[str, dict[int, int]] = {}
+        # {remote_engine_id: {unread producer rank: designated decode rank}}
+        self._unread_producers: dict[str, dict[int, int]] = {}
         # Per-engine remote geometry for our DCP paths. add_remote_agent fully
         # replaces the base (no super()), so we own these dicts and their
         # cleanup (see _cleanup_remote_engine).
@@ -467,6 +475,28 @@ class NeuronNixlConnectorWorker(NixlConnectorWorker):
                 self.device_id = max(cache.get_device(), 0)
                 caches_data.append((base_addr, curr_size_bytes, self.device_id, ""))
 
+        # Extra per-layer tensors (see neuron_hbm_registration), after every K/V slab so the region order is
+        # the same on both sides. Each is copied whole per block (homogeneous TP only).
+        extra = extra_kv_tensors()
+        n_extra = 0
+        for layer_name in kv_caches:
+            t = extra.get(layer_name)
+            if t is None or layer_name not in self._layer_specs:
+                continue
+            assert t.shape[0] == self.num_blocks and t.is_contiguous(), (
+                f"{layer_name}: extra KV tensor {tuple(t.shape)} must be contiguous and indexed "
+                f"by the {self.num_blocks} KV blocks"
+            )
+            row = t.stride(0) * t.element_size()
+            seen_base_addresses.append(t.data_ptr())
+            self.block_len_per_layer.append(row)
+            self.block_stride_per_layer.append(row)
+            self._region_is_mla.append(False)
+            caches_data.append((t.data_ptr(), self.num_blocks * row, self.device_id, ""))
+            n_extra += 1
+        if n_extra:
+            logger.info("Neuron NIXL: %d extra per-layer KV tensors registered as regions", n_extra)
+
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = seen_base_addresses
         self.num_regions = len(caches_data)
         self.num_descs = self.num_regions * self.num_blocks
@@ -481,13 +511,23 @@ class NeuronNixlConnectorWorker(NixlConnectorWorker):
                 self.num_regions // num_local_layers
             ) * start_layer
 
-        descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
+        # Register one 2 MiB-aligned span per /dev/neuron mapping rather than each slab, so the
+        # Neuron driver maps it with 2 MiB pages (see neuron_hbm_registration). The regions above
+        # still define the transfer descriptors; they only have to lie in registered memory.
+        reg_data = caches_data
+        if coalesce_enabled():
+            ptrs, lens = coalesce_neuron_spans(
+                [c[0] for c in caches_data], [c[1] for c in caches_data]
+            )
+            reg_data = [(p, n, self.device_id, "") for p, n in zip(ptrs, lens)]
+        descs = self.nixl_wrapper.get_reg_descs(reg_data, self.nixl_memory_type)
         self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
         self._registered_descs.append(descs)
         logger.info(
-            "Registered %d K/V slab regions (%d layers x 2) with %d descs",
+            "Registered %d KV regions (%d extra) as %d memory registrations, %d descs",
             self.num_regions,
-            self.num_regions // 2,
+            n_extra,
+            len(reg_data),
             self.num_descs,
         )
 
@@ -614,11 +654,20 @@ class NeuronNixlConnectorWorker(NixlConnectorWorker):
         ), "KV group count mismatch between P and D"
         remote_block_len = nixl_agent_meta.block_lens[0]
         local_block_len = self.block_len_per_layer[0]
-        assert all(bl == remote_block_len for bl in nixl_agent_meta.block_lens), (
-            f"Remote block_lens not uniform: {nixl_agent_meta.block_lens}"
-        )
-        assert all(bl == local_block_len for bl in self.block_len_per_layer), (
-            f"Local block_lens not uniform: {self.block_len_per_layer}"
+        # The K/V slab regions share one block length; extra per-layer regions
+        # (neuron_hbm_registration.extra_kv_tensors) have their own, and must sit at the same positions with the
+        # same lengths on both sides (they are copied whole, homogeneous TP).
+        remote_extra = [
+            (i, bl) for i, bl in enumerate(nixl_agent_meta.block_lens) if bl != remote_block_len
+        ]
+        local_extra = [
+            (i, bl) for i, bl in enumerate(self.block_len_per_layer) if bl != local_block_len
+        ]
+        assert remote_extra == local_extra and (
+            not local_extra or remote_block_len == local_block_len
+        ), (
+            "Remote / local block_lens differ outside the uniform K/V slabs: "
+            f"remote={nixl_agent_meta.block_lens}, local={self.block_len_per_layer}"
         )
         ratio = remote_block_len / local_block_len
         inv_ratio = local_block_len / remote_block_len
@@ -769,11 +818,14 @@ class NeuronNixlConnectorWorker(NixlConnectorWorker):
         """Register NIXL descriptors for a remote agent's blocks."""
         kv_addrs = nixl_agent_meta.kv_caches_base_addr
         blocks_data = []
+        kv_page = nixl_agent_meta.block_lens[0]
         for kv_group_idx, base_addr in enumerate(kv_addrs):
             page_size = nixl_agent_meta.block_lens[kv_group_idx]
+            # Extra per-layer tensors (a different per-block size than the K/V slabs) are read whole.
+            dl, off = (desc_len, offset) if page_size == kv_page else (page_size, 0)
             for block_id in range(nixl_agent_meta.num_blocks):
-                addr = base_addr + block_id * page_size + offset
-                blocks_data.append((addr, desc_len, nixl_agent_meta.device_id))
+                addr = base_addr + block_id * page_size + off
+                blocks_data.append((addr, dl, nixl_agent_meta.device_id))
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
         handle = self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
         self.dst_xfer_side_handles[eid][remote_tp_rank] = handle
@@ -797,6 +849,7 @@ class NeuronNixlConnectorWorker(NixlConnectorWorker):
             super()._cleanup_remote_engine(engine_id, *args, **kwargs)
             self._inverse_handle_cache.pop(engine_id, None)
             self._producer_fanin.pop(engine_id, None)
+            self._unread_producers.pop(engine_id, None)
             self._remote_dcp.pop(engine_id, None)
             self._head_ratio.pop(engine_id, None)
             self._remote_prefill_bs.pop(engine_id, None)
@@ -886,6 +939,11 @@ class NeuronNixlConnectorWorker(NixlConnectorWorker):
         # present: p_rank_id is a rank THIS decode rank reads from, hence in the
         # enumerated union by construction.
         fanin_map = self._producer_fanin_map(eid)
+        # Producer ranks no decode rank reads (more KV-head replicas on the producer than on this
+        # side): without a notif they free this request's KV only on lease expiry (30 s), and the
+        # producer cannot admit new prefills meanwhile. Their designated decode rank tells them now;
+        # the request is still freed only once every producer rank reports done.
+        self._notify_unread_producers(req_id, meta, eid)
 
         P_DCP = self._remote_dcp.get(eid, 1)
         D_DCP = self._local_dcp_size
@@ -922,6 +980,10 @@ class NeuronNixlConnectorWorker(NixlConnectorWorker):
         D_num_kv_replica = max(1, D_ranks_per_dcp_group // num_kv_heads)
         P_num_kv_replica = max(1, P_ranks_per_dcp_group // num_kv_heads)
         D_kv_head_rank = D_rank // (D_DCP * D_num_kv_replica)
+        # Read the producer replica with this rank's replica index (mod the producer's count), not
+        # always replica 0: with KV heads replicated across TP ranks (Hy3: 8 heads at TP=64, 8
+        # replicas), replica 0 alone took every read and replicas 1..7 were never read or notified.
+        p_replica = ((D_rank // D_DCP) % D_num_kv_replica) % P_num_kv_replica
 
         # --- Determine which prefill KV head ranks to read from ---
         if head_ratio >= 1:
@@ -960,7 +1022,11 @@ class NeuronNixlConnectorWorker(NixlConnectorWorker):
                 p_dcp_ranks = [D_DCP_rank % P_DCP]
             for p_dcp_rank in p_dcp_ranks:
                 for p_kv_head_rank in P_kv_head_ranks_to_read:
-                    p_rank_id = p_kv_head_rank * (P_DCP * P_num_kv_replica) + p_dcp_rank
+                    p_rank_id = (
+                        p_kv_head_rank * (P_DCP * P_num_kv_replica)
+                        + p_replica * P_DCP
+                        + p_dcp_rank
+                    )
                     self._read_blocks(
                         read_spec=ReadSpec(
                             remote_rank=p_rank_id,
@@ -1045,9 +1111,10 @@ class NeuronNixlConnectorWorker(NixlConnectorWorker):
             # with dcp_rank the inner (fastest-varying) dimension:
             #   rank = kv_head_rank * (P_DCP * P_num_kv_replica)
             #          + replica_idx * P_DCP + dcp_rank
-            # Pick replica 0 (replicas hold identical KV). For P_DCP == 1 this
-            # reduces to the standard-TP mapping kv_head_rank * P_num_kv_replica.
-            return p_kv_head_rank * (P_DCP * P_num_kv_replica) + p_dcp_rank
+            # Replicas hold identical KV; read this rank's own replica index (p_replica above) so
+            # every producer replica has a reader. For P_DCP == 1 this reduces to the standard-TP
+            # mapping kv_head_rank * P_num_kv_replica + replica.
+            return p_kv_head_rank * (P_DCP * P_num_kv_replica) + p_replica * P_DCP + p_dcp_rank
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -1302,6 +1369,7 @@ class NeuronNixlConnectorWorker(NixlConnectorWorker):
         fanin: dict[int, int] = {}
         for d in range(D_TP):
             D_kv_head_rank = d // (D_DCP * D_num_kv_replica)
+            p_replica = ((d // D_DCP) % D_num_kv_replica) % P_num_kv_replica
             D_DCP_rank = d % D_DCP
             if head_ratio >= 1:
                 p_kv_head_ranks = [D_kv_head_rank // int(head_ratio)]
@@ -1319,11 +1387,43 @@ class NeuronNixlConnectorWorker(NixlConnectorWorker):
                 p_dcp_ranks = [D_DCP_rank % P_DCP]
             for p_dcp in p_dcp_ranks:
                 for p_kv in p_kv_head_ranks:
-                    R = p_kv * (P_DCP * P_num_kv_replica) + p_dcp
+                    if seq_ratio > 1 and page_R > 1:
+                        R = p_kv * (P_DCP * P_num_kv_replica) + p_dcp  # fragment reader: replica 0
+                    else:
+                        R = p_kv * (P_DCP * P_num_kv_replica) + p_replica * P_DCP + p_dcp
                     fanin[R] = fanin.get(R, 0) + 1
 
         self._producer_fanin[eid] = fanin
+        # Producer ranks with no reader, each assigned to one decode rank that sends it an empty
+        # (notif-only) read; see _notify_unread_producers.
+        self._unread_producers[eid] = {
+            R: R % D_TP for R in range(P_TP) if R not in fanin
+        }
+        if self._unread_producers[eid]:
+            logger.info(
+                "Neuron NIXL: %d of %d producer ranks of %s have no reader; notified by "
+                "a designated decode rank so they do not hold the KV until lease expiry",
+                len(self._unread_producers[eid]), P_TP, eid,
+            )
         return fanin
+
+    def _notify_unread_producers(self, req_id, meta, eid) -> None:
+        """Send this rank's designated unread producer ranks a notif-only read (fan-in 1)."""
+        mine = [R for R, d in self._unread_producers.get(eid, {}).items() if d == self.tp_rank]
+        if not mine:
+            return
+        remote_block_size = self.transfer_topo.get_engine_info(eid).remote_block_size
+        local_handle = self.src_xfer_handles_by_block_size[remote_block_size]
+        for R in mine:
+            self._read_blocks(
+                read_spec=ReadSpec(remote_rank=R, local_block_ids=[], remote_block_ids=[]),
+                dst_engine_id=eid,
+                request_id=req_id,
+                remote_request_id=meta.remote.request_id,
+                local_xfer_side_handle=local_handle,
+                remote_xfer_side_handle=self.dst_xfer_side_handles[eid][R],
+                **_supported_kwargs(self._read_blocks, expected_consumers=1),
+            )
 
 
 class NeuronNixlConnectorScheduler(NixlConnectorScheduler):
