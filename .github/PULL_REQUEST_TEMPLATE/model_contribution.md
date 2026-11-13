@@ -40,6 +40,7 @@ Please ensure your PR includes the following. See
 
 - [ ] **Unit tests** under `contrib/models/<model_name>/test/unit/` (CPU-mode via `VLLM_NEURON_CPU_MODE=1` and/or Neuron-based).
 - [ ] **Module tests** under `contrib/models/<model_name>/test/module/` (CPU-mode via `VLLM_NEURON_CPU_MODE=1` and/or Neuron-based).
+- [ ] **`pyproject.toml`** with a `vllm.general_plugins` entry point, so `pip install -e` registers the model for `vllm serve` and TP > 1 (see Option 3 in `contrib/README.md`).
 
 ## Folder structure
 
@@ -48,6 +49,7 @@ Confirm your contribution follows this structure:
 ```text
 /contrib/models/<model_name>/
   README.md
+  pyproject.toml  (optional)
   /src
     <modeling code>
   /test
@@ -85,6 +87,7 @@ Confirm your contribution follows this structure:
 **By submitting this PR, I confirm that:**
 
 - [ ] I have read and followed the [contributing guidelines](../../contrib/README.md).
+- [ ] Every commit includes a DCO `Signed-off-by` line (created with `git commit -s`).
 - [ ] This is a community contribution and may have limited testing compared to officially-supported models.
 - [ ] The code follows best practices and is documented.
 - [ ] All required components listed above are included.

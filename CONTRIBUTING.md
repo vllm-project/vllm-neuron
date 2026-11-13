@@ -36,6 +36,34 @@ To send us a pull request, please:
 5. Send us a pull request, answering any default questions in the pull request interface.
 6. Stay involved in the conversation and address any review feedback.
 
+## Developer Certificate of Origin (DCO)
+
+Every commit to this repository must include a `Signed-off-by` line confirming
+that you have the right to contribute the change under the repository license.
+Create signed-off commits with:
+
+```bash
+git commit -s
+```
+
+To add the sign-off automatically when creating commits, install the
+repository's `commit-msg` hook:
+
+```bash
+python3 -m pip install pre-commit
+pre-commit install
+```
+
+If an existing commit fails the DCO check, amend it and update your branch:
+
+```bash
+git commit --amend --no-edit --signoff
+git push --force-with-lease
+```
+
+The local hook adds a sign-off using your configured Git name and email. The
+DCO status reported on the pull request remains authoritative.
+
 GitHub provides additional document on [forking a repository](https://help.github.com/articles/fork-a-repo/) and
 [creating a pull request](https://help.github.com/articles/creating-a-pull-request/).
 

@@ -44,9 +44,9 @@ in `vllm_neuron/model/registry.py`. Contrib models are **not** in `get_models()`
 by design. This keeps them opt-in and community-owned. So you register a contrib
 model yourself.
 
-Pick the option that matches how you run vLLM. Option 1 keeps the model opt-in
-and needs no change to the plugin's core code. Option 2 adds the model to the
-plugin's registry.
+Pick the option that matches how you run vLLM. Options 1 and 3 keep the model
+opt-in and need no change to the plugin's core code. Option 2 adds the model to
+the plugin's registry.
 
 #### Option 1 — Offline (the `LLM(...)` API)
 
@@ -70,6 +70,10 @@ llm = LLM(model="/path/to/checkpoint")
 
 The contrib model's sample test (`test/integration/test_model.py`) uses this
 option.
+
+This call runs only in your script's process. With tensor parallelism
+(`tensor_parallel_size` > 1), vLLM builds the model in separate worker processes
+that do not run your script, so use Option 3 instead.
 
 #### Option 2 — Online (the `vllm serve` CLI)
 
@@ -107,6 +111,44 @@ an officially-supported one.
 This registration also covers the offline `LLM(...)` API, so you do not need the
 Option 1 call after you register the model here.
 
+#### Option 3 — Install the model as a vLLM plugin (optional)
+
+Use this option to serve a contrib model with `vllm serve`, or with any
+`tensor_parallel_size`, without editing the plugin's core code. The model folder
+becomes a small pip package that declares a `vllm.general_plugins` entry point.
+vLLM calls the entry point in every process it starts: the API server, the
+engine, and each tensor-parallel worker. The `vllm-neuron` plugin uses the same
+mechanism.
+
+1. Copy `contrib/models/template/pyproject.toml` into your model folder. Rename
+   the project, the package (`your_model_neuron`), and the entry point
+   (`your_model`). The entry point name must be unique among installed plugins.
+   vLLM keys plugins by this name, so a clash silently drops one of them.
+2. Add a `register()` function to `src/__init__.py`, as in
+   `contrib/models/template/src/__init__.py`:
+
+   ```python
+   def register() -> None:
+       from vllm import ModelRegistry
+
+       ModelRegistry.register_model(
+           "YourModelForCausalLM",
+           "your_model_neuron.factory:YourModelForCausalLM",
+       )
+   ```
+
+3. Install the model, then serve it.
+
+   ```bash
+   pip install -e contrib/models/<model_name>
+   vllm serve /path/to/checkpoint
+   ```
+
+The package is installed from `src/` under the name in `pyproject.toml`, so
+import your modeling code by that name (for example
+`your_model_neuron.factory`). `pip uninstall your-model-neuron` removes the
+registration. Document the install step in your model's `README.md`.
+
 For the end-to-end procedure, including compilation, CPU-mode iteration
 (`VLLM_NEURON_CPU_MODE=1`), and accuracy validation, follow the
 [model onboarding guide](../docs/model-dev/onboarding-models.md). For general
@@ -128,6 +170,7 @@ describes the model and the vLLM / Neuron SDK versions it was tested with.
   /models
     /template                  (example/starting point — copy this)
       README.md
+      pyproject.toml           (optional — installs the model as a vLLM plugin)
       /src                     (self-contained modeling code)
         __init__.py
         config.py
@@ -141,6 +184,7 @@ describes the model and the vLLM / Neuron SDK versions it was tested with.
           test_model.py        (accuracy test — serves the model through vLLM)
     /<your_model_name>
       README.md
+      pyproject.toml           (optional)
       /src
         __init__.py
         config.py
@@ -185,6 +229,29 @@ PR should include:
    CPU (`VLLM_NEURON_CPU_MODE=1`) or on device. See the
    [module test guidelines](../docs/design/accuracy/module_test_guidelines.md)
    for the three-way accuracy pattern and threshold guidance.
+
+### Developer Certificate of Origin (DCO)
+
+Like every change to this repository, contrib-model commits must include a
+`Signed-off-by` line confirming that you have the
+right to contribute the code under this repository's license. Create signed-off
+commits with:
+
+```bash
+git commit -s
+```
+
+If the DCO check fails for an existing commit, amend it and update your pull
+request:
+
+```bash
+git commit --amend --no-edit --signoff
+git push --force-with-lease
+```
+
+Confirm that the DCO check passes before requesting review. See the top-level
+[contributing guide](../CONTRIBUTING.md#developer-certificate-of-origin-dco) for
+instructions to install the repository's automatic `commit-msg` sign-off hook.
 
 After you open a PR, the Neuron team will review it and request changes as
 needed.
