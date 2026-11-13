@@ -20,6 +20,44 @@ from __future__ import annotations
 import torch
 
 
+def _dcp_world_and_rank():
+    """(DCP world size, this rank's DCP rank as a runtime tensor or None) from vLLM's DCP group."""
+    try:
+        from vllm.distributed.parallel_state import get_dcp_group
+        g = get_dcp_group()
+    except Exception:  # no DCP group initialized (unit tests, CPU)
+        return 1, None
+    if g.world_size <= 1:
+        return 1, None
+    return g.world_size, getattr(g, "rank_in_group_tensor", None)
+
+
+def dcp_local_slot_mapping(
+    positions: torch.Tensor,
+    block_ids: torch.Tensor,
+    block_size: int,
+    dcp_size: int,
+    dcp_rank,
+) -> torch.Tensor:
+    """Slot of each position in this DCP rank's cache.
+
+    A position another DCP rank owns maps to slot 0 (the null block, NULL_BLOCK_ID), as in the
+    runner's ``_compute_slot_mapping_cpu``; an inactive block (table entry < 0) maps to -1.
+
+    ``block_ids`` are this rank's blocks looked up at ``positions // (block_size * dcp_size)``.
+    Same ownership as the runner's ``_compute_slot_mapping_cpu`` with
+    cp_kv_cache_interleave_size == block_size: block ``j`` of the sequence lives on rank
+    ``j % dcp_size``, as that rank's local block ``j // dcp_size``.
+    """
+    pos = positions.to(torch.int64)
+    vblock = pos % (block_size * dcp_size)
+    owner = vblock // block_size
+    slot = block_ids.to(torch.int64) * block_size + vblock % block_size
+    local = owner == dcp_rank.to(torch.int64) if torch.is_tensor(dcp_rank) else owner == int(dcp_rank)
+    slot = torch.where(local, slot, torch.zeros_like(slot))  # NULL_BLOCK_ID
+    return torch.where(block_ids < 0, torch.full_like(slot, -1), slot)
+
+
 def correct_spec_decode_positions_and_slot_mapping(
     positions: torch.Tensor,
     attn_metadata: dict,
@@ -129,6 +167,14 @@ def _compute_slot_mapping_per_token(
         block is the inactive-block sentinel (``-1``), so the attention
         kernel DMA-skips that position.
     """
+    dcp_size, dcp_rank = _dcp_world_and_rank()
+    if dcp_size > 1 and dcp_rank is not None:
+        # DCP: the table is this rank's shard (local block j = sequence block j * dcp + rank).
+        block_numbers = positions.to(torch.int64) // (block_size * dcp_size)
+        max_blocks = block_table_tensor.shape[1]
+        flat_idx = req_indices_per_token * max_blocks + block_numbers.clamp(max=max_blocks - 1)
+        block_ids = block_table_tensor.view(-1)[flat_idx]
+        return dcp_local_slot_mapping(positions, block_ids, block_size, dcp_size, dcp_rank)
     block_numbers = positions.to(torch.int64) // block_size  # [total_scheduled]
     max_blocks = block_table_tensor.shape[1]
     flat_idx = req_indices_per_token * max_blocks + block_numbers

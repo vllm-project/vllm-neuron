@@ -1,0 +1,12 @@
+{
+  "description": "Development mix (4-layer model): same sources, fewer samples.",
+  "seed": 20261023,
+  "max_seq_len": 2048,
+  "sources": [
+    {"name": "ultrachat_en", "hf": "HuggingFaceH4/ultrachat_200k", "split": "train_sft", "n": 8, "format": "messages"},
+    {"name": "alpaca_zh", "hf": "llamafactory/alpaca_gpt4_zh", "split": "train", "n": 8, "format": "alpaca"},
+    {"name": "gsm8k", "hf": "openai/gsm8k", "config": "main", "split": "train", "n": 8, "format": "qa"},
+    {"name": "code_alpaca", "hf": "sahil2801/CodeAlpaca-20k", "split": "train", "n": 8, "format": "alpaca"}
+  ],
+  "long": {"n": 2, "lengths": [4096, 8192], "from": ["ultrachat_en", "alpaca_zh"]}
+}

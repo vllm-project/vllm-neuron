@@ -1,0 +1,36 @@
+{
+ "config": "scripts/serve.sh 16384 32 '[1, 4, 16, 32]' '[4096, 8192]', PREFILL_BUCKETS 512..8192, NUM_BLOCKS=8139, DCP=1",
+ "profile": "kv_profiles/Hy3-FP8_neuron.safetensors (sha256 3c708f14607b1b0d...)",
+ "commit": "55772b8 (PR #3 head at test time)",
+ "bf16": {
+  "kv_pool_bytes_per_rank": 10667950080,
+  "kv_cache_tokens": 260448,
+  "peak_device_bytes_all_ranks": {
+   "constants": 12983973376,
+   "model_code": 144368623616,
+   "model_shared_scratchpad": 21474836480,
+   "runtime_memory": 1269460992,
+   "tensors": 1110808006196,
+   "device_total": 1290301494208
+  },
+  "math500_greedy_no_think": 0.97
+ },
+ "fp8": {
+  "kv_pool_bytes_per_rank": 5333975040,
+  "kv_cache_tokens": 260448,
+  "peak_device_bytes_all_ranks": {
+   "constants": 13070213632,
+   "model_code": 155008946176,
+   "model_shared_scratchpad": 21474836480,
+   "runtime_memory": 1269460992,
+   "tensors": 769530642892,
+   "device_total": 959627025892
+  },
+  "math500_greedy_no_think": 0.968
+ },
+ "math500_paired": {
+  "bf16_only_correct": 6,
+  "fp8_only_correct": 5,
+  "exact_mcnemar_p": 1.0
+ }
+}
