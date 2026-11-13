@@ -378,6 +378,26 @@ _ORIGINAL_DESTROY_MODEL_PARALLEL = None
 # ---------------------------------------------------------------------------
 
 
+def _uses_trn2_torus_mesh() -> bool:
+    """Whether the hand-laid Trn2 8x8 mesh applies to this host.
+
+    True on Trn2, and when the instance family cannot be read (CPU mode, or a
+    host without the sysfs product name), which keeps the long-standing
+    default. False on every other family, Trn3 included.
+    """
+    from vllm_neuron import envs
+
+    if envs.VLLM_NEURON_CPU_MODE:
+        return True
+    from vllm_neuron.utils.hardware_config import get_instance_family
+
+    try:
+        family = get_instance_family()
+    except RuntimeError:
+        return True
+    return family == "trn2"
+
+
 def _build_2d_mesh(
     ranks: list[int],
     row_size: int,
@@ -408,8 +428,20 @@ def _build_2d_mesh(
 
     total = row_size * num_rows
 
-    # Special case: 8x8 topology for TRN2
-    if not envs.VLLM_NEURON_SWITCH_CC and total == 64 and row_size == 8:
+    # Special case: 8x8 topology for TRN2. The pairing below (devices 0+3, 1+2,
+    # ...) follows Trn2's 4x4 torus; on a Trn3 box the device graph is a switch
+    # and those pairs are not linked, so the runtime refuses the group:
+    #   ENC:enc_post_operation Collective operation ALLREDUCE ... over group id 0
+    #   (rank_n:8 node_n:1) is currently not supported.
+    #   Replica-group 0: [0,1,2,3,12,13,14,15]
+    # So the mesh is applied to Trn2 only; every other family keeps contiguous
+    # rows, whose device pairs (0+1, 2+3, ...) are linked on Trn3.
+    if (
+        not envs.VLLM_NEURON_SWITCH_CC
+        and total == 64
+        and row_size == 8
+        and _uses_trn2_torus_mesh()
+    ):
         mesh = [
             [0, 1, 2, 3, 12, 13, 14, 15],
             [4, 5, 6, 7, 8, 9, 10, 11],
