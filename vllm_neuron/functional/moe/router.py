@@ -381,6 +381,18 @@ def _torch_router_impl(
         )
 
 
+def _topk(x: Tensor, k: int) -> Tuple[Tensor, Tensor]:
+    # torch.topk(x, k, dim=-1) by max-and-mask, as trn2 rejects sort (NCC_EVRF029).
+    cols = torch.arange(x.shape[-1], device=x.device)
+    values, indices = [], []
+    for _ in range(k):
+        v, i = torch.max(x, dim=-1, keepdim=True)
+        values.append(v)
+        indices.append(i)
+        x = torch.where(cols == i, torch.full_like(x, float("-inf")), x)
+    return torch.cat(values, dim=-1), torch.cat(indices, dim=-1)
+
+
 def _torch_router_impl_prenorm_linear_topk_act_scatter(
     hidden_states: Tensor,
     router_weights: Tensor,
@@ -427,9 +439,7 @@ def _torch_router_impl_prenorm_linear_topk_act_scatter(
     )  # [T, E]
 
     # Step 3: Top-k expert selection
-    router_top_values, router_indices = torch.topk(
-        router_logits, top_k, dim=-1
-    )  # [T, top_k]
+    router_top_values, router_indices = _topk(router_logits, top_k)  # [T, top_k]
 
     # Step 4: Apply activation function to top-k values only
     router_top_probs = _apply_activation(activation, router_top_values)  # [T, top_k]
@@ -490,9 +500,7 @@ def _torch_router_impl_prenorm_linear_act_topk_renorm_scatter(
     router_probs = _apply_activation(activation, router_logits)  # [T, E]
 
     # Step 4: Top-k selection from activated values
-    router_top_probs, router_indices = torch.topk(
-        router_probs, top_k, dim=-1
-    )  # [T, top_k]
+    router_top_probs, router_indices = _topk(router_probs, top_k)  # [T, top_k]
 
     # Step 5: L1 renormalization of top-k probabilities (always applied for this computation order)
     router_top_probs = router_top_probs / router_top_probs.sum(dim=-1, keepdim=True)
@@ -550,9 +558,7 @@ def _torch_router_impl_prenorm_linear_topk_scatter_act(
     )  # [T, E]
 
     # Step 3: Top-k selection based on raw logits
-    router_top_values, router_indices = torch.topk(
-        router_logits, top_k, dim=-1
-    )  # [T, top_k]
+    router_top_values, router_indices = _topk(router_logits, top_k)  # [T, top_k]
 
     # Step 4: Scatter raw logit values to matrix initialized with -inf (not zeros)
     expert_affinities = torch.full(
