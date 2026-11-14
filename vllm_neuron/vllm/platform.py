@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 import torch
 from vllm_neuron import envs
 
+from vllm.exceptions import VLLMValidationError
 from vllm.platforms import Platform, PlatformEnum
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -832,14 +833,17 @@ class NeuronPlatform(Platform):
     ) -> None:
         """Reject requests unsupported by the current Neuron server config.
 
-        Called per-request before scheduling. Raises ValueError before model
-        execution so SO-off servers do not enter the SO mask path.
+        Called per-request before scheduling. Raises VLLMValidationError, which
+        the client gets as a 400, before model execution so SO-off servers do
+        not enter the SO mask path.
         """
         if (
             not cls._enable_structured_outputs
             and getattr(params, "structured_outputs", None) is not None
         ):
-            raise ValueError(SO_DISABLED_MESSAGE)
+            raise VLLMValidationError(
+                SO_DISABLED_MESSAGE, parameter="structured_outputs"
+            )
 
         if cls._max_embeds_per_image is None:
             return
@@ -856,7 +860,7 @@ class NeuronPlatform(Platform):
                 # encoder actually produces. For images they are equal.
                 num_embeds = mm_pos.get_num_embeds()
                 if num_embeds > cls._max_embeds_per_image:
-                    raise ValueError(
+                    raise VLLMValidationError(
                         f"One {modality} item in this request produces "
                         f"{num_embeds} embedding tokens. This value is more "
                         f"than the maximum that the compiled encoder "
