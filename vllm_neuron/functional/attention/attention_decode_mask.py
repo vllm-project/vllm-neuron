@@ -33,6 +33,7 @@ def maybe_transpose_mask_for_qk_swap(
     d_head: int,
     is_fp8_kv: bool = False,
     fp8_packed: bool = False,
+    kv_heads: int = 1,
 ) -> Optional[Tensor]:
     """Transpose a pre-generated decode mask to the kernel's QK-swap layout when
     ``attention_block_tkg`` will select that path for the mask's shape.
@@ -50,6 +51,12 @@ def maybe_transpose_mask_for_qk_swap(
     invokes the predicate for the decode path; ``d_head``/fp8 flags only gate the
     predicate's early returns. kwargs are filtered to the installed signature so
     nkilib parameter drift (e.g. added ``p_max``/``kv_heads``) doesn't break the call.
+
+    ``kv_heads`` is the KV head count of the cache (GQA). ``attention_block_tkg``
+    asks the predicate with it, because the kernel folds the KV heads into the
+    batch. With more than one KV head per rank the folded and unfolded answers
+    differ (for example Qwen3 at TP=1, 8 KV heads, a 16-token verify step), and a
+    mask in the wrong layout gives wrong attention with no error.
     """
     if (
         _nki_is_qk_swapped is None
@@ -73,6 +80,7 @@ def maybe_transpose_mask_for_qk_swap(
         "is_2byte_kv": not is_fp8_kv,
         "fp8_packed": fp8_packed,
         "fuse_rope": False,
+        "kv_heads": kv_heads,
     }
     swapped = _nki_is_qk_swapped(
         **{k: v for k, v in kwargs.items() if k in _QK_SWAP_PARAMS}

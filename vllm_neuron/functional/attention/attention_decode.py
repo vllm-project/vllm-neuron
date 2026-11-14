@@ -123,6 +123,7 @@ def _maybe_transpose_mask_for_qk_swap(
         d_head=int(V_cache.shape[-1]),
         is_fp8_kv=k_scale is not None,
         fp8_packed=fp8_packed,
+        kv_heads=_infer_kv_heads(V_cache),
     )
 
 
