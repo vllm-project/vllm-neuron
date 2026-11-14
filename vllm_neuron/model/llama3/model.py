@@ -1456,6 +1456,9 @@ class LlamaModel(nn.Module):
         rank: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         is_token_ids: torch.Tensor | None = None,
+        encoder_embedding_buffer: torch.Tensor | None = None,
+        encoder_block_ids: torch.Tensor | None = None,
+        encoder_positions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         first_layer_name = "layers.0.self_attn"
         max_query_len = attn_metadata[first_layer_name]["max_query_len"]
@@ -1506,6 +1509,22 @@ class LlamaModel(nn.Module):
             hidden_states, inputs_embeds, is_token_ids
         )
 
+        # Multimodal prefill: scatter the encoder cache rows into the placeholder
+        # positions. Decode has no encoder inputs. The merge does the SP remap.
+        if (
+            is_prefill
+            and encoder_embedding_buffer is not None
+            and encoder_block_ids is not None
+            and encoder_positions is not None
+        ):
+            hidden_states, _ = NF.merge_multimodal_embeddings(
+                hidden_states,
+                encoder_embedding_buffer,
+                encoder_block_ids,
+                encoder_positions,
+                self.tp_group.rank_in_group_tensor,
+            )
+
         position_embeddings = self.rotary_emb(
             positions, device=hidden_states.device, dtype=hidden_states.dtype
         )
@@ -1541,6 +1560,34 @@ class LlamaModel(nn.Module):
 # =============================================================================
 
 
+def _prefix_mappings(model: nn.Module, mappings: dict, prefix: str) -> dict:
+    """Add ``prefix`` to every checkpoint name that ``mappings`` gives."""
+    out = {}
+    for name, _ in model.named_parameters():
+        src = mappings.get(name, name)
+        out[name] = [prefix + k for k in src] if isinstance(src, list) else prefix + src
+    return out
+
+
+class _TextOnlyView(nn.Module):
+    """Show only the text parameters of a multimodal wrapper to the loader."""
+
+    def __init__(self, model: nn.Module, skip_prefixes: tuple[str, ...]):
+        super().__init__()
+        object.__setattr__(self, "_model", model)
+        object.__setattr__(self, "_skip_prefixes", skip_prefixes)
+
+    def named_parameters(self, *args, **kwargs):
+        return (
+            (n, p)
+            for n, p in self._model.named_parameters(*args, **kwargs)
+            if not n.startswith(self._skip_prefixes)
+        )
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_model"), name)
+
+
 @async_speculative_decoding
 class LlamaForCausalLM(nn.Module, SupportsEagle3):
     """Llama model with language modeling head.
@@ -1550,6 +1597,12 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
     <-- MODEL-SPECIFIC: Llama-3.2-1B uses tied embeddings (lm_head shares
     weights with the embedding layer).
     """
+
+    # A multimodal subclass sets these. checkpoint_prefix is the checkpoint
+    # prefix of the text weights. load_weights skips parameters that start with
+    # a name in own_weight_prefixes, because the subclass loads them itself.
+    checkpoint_prefix: str = ""
+    own_weight_prefixes: tuple[str, ...] = ()
 
     def __init__(self, config: LlamaConfig):
         super().__init__()
@@ -1644,6 +1697,9 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
         spec_decode_metadata=None,
         logit_mask: torch.Tensor | None = None,
         rank: torch.Tensor | None = None,
+        encoder_embedding_buffer: torch.Tensor | None = None,
+        encoder_block_ids: torch.Tensor | None = None,
+        encoder_positions: torch.Tensor | None = None,
         **kwargs,  # @async_speculative_decoding injects async-spec args
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         positions = positions.to(torch.int32)
@@ -1670,6 +1726,9 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
             rank=rank,
             inputs_embeds=inputs_embeds,
             is_token_ids=is_token_ids,
+            encoder_embedding_buffer=encoder_embedding_buffer,
+            encoder_block_ids=encoder_block_ids,
+            encoder_positions=encoder_positions,
         )
 
         # >>> PARALLELISM: Slice to local before sampling position selection <<<
@@ -1959,9 +2018,17 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
         if self.config.tie_word_embeddings:
             mappings["lm_head.weight"] = "model.embed_tokens.weight"
 
+        # A multimodal subclass keeps the text weights under a prefix. It loads
+        # its own encoder weights separately.
+        target = self
+        if self.own_weight_prefixes:
+            target = _TextOnlyView(self, self.own_weight_prefixes)
+        if self.checkpoint_prefix:
+            mappings = _prefix_mappings(target, mappings, self.checkpoint_prefix)
+
         checkpoint = SafetensorsCheckpoint(checkpoint_path, cache_dir)
         rank_sharded = checkpoint.load_sharded_pipelined(
-            tp_rank, tp_size, self, mappings, device
+            tp_rank, tp_size, target, mappings, device
         ).state_dict
 
         # <-- QUANTIZATION: load static-FP8 scale buffers from the

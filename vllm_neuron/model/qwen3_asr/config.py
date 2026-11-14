@@ -15,6 +15,7 @@ from dataclasses import dataclass, fields
 import torch
 from transformers import PretrainedConfig
 
+from vllm_neuron.model.config_utils import hoist_rope_parameters
 from vllm_neuron.model.neuron_config import EncoderNeuronConfig, NeuronConfig
 from vllm_neuron.model.qwen3_asr.utils.audio_preprocessing import (
     _ATTN_SEQ_ALIGN,
@@ -48,6 +49,7 @@ def _from_hf_sub_config(cls, hf_sub_config, neuron_config=None):
     else:
         raise TypeError(f"Unsupported config type: {type(hf_sub_config)}")
 
+    config_dict = hoist_rope_parameters(config_dict)
     field_names = {f.name for f in fields(cls)}
     filtered = {k: v for k, v in config_dict.items() if k in field_names}
 

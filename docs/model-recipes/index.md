@@ -47,6 +47,13 @@ Model recipe for Qwen3-Embedding 8B (pooling / embeddings) on Trn2/Trn3.
 Model recipe for Qwen3-ASR 1.7B speech recognition on Trn2.
 :::
 
+:::{grid-item-card} Deploy Voxtral
+:link: voxtral
+:link-type: doc
+
+Model recipe for Voxtral-Mini-3B (audio) on Trn2.
+:::
+
 ::::
 
 :::{toctree}
@@ -59,4 +66,5 @@ Qwen3-32B <qwen3-32b>
 Qwen3-VL <qwen3-vl>
 Qwen3-Embedding <qwen3-embedding-8b>
 Qwen3-ASR <qwen3-asr>
+Voxtral <voxtral>
 :::

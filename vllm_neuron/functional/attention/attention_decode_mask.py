@@ -33,6 +33,7 @@ def maybe_transpose_mask_for_qk_swap(
     d_head: int,
     is_fp8_kv: bool = False,
     fp8_packed: bool = False,
+    kv_heads: int = 1,
 ) -> Optional[Tensor]:
     """Transpose a pre-generated decode mask to the kernel's QK-swap layout when
     ``attention_block_tkg`` will select that path for the mask's shape.
@@ -50,6 +51,12 @@ def maybe_transpose_mask_for_qk_swap(
     invokes the predicate for the decode path; ``d_head``/fp8 flags only gate the
     predicate's early returns. kwargs are filtered to the installed signature so
     nkilib parameter drift (e.g. added ``p_max``/``kv_heads``) doesn't break the call.
+
+    ``kv_heads`` is the KV head count of the cache (GQA). ``attention_block_tkg``
+    asks the predicate with it, because the kernel folds the KV heads into the
+    batch. With more than one KV head per rank the folded and unfolded answers
+    differ (for example Qwen3 at TP=1, 8 KV heads, a 16-token verify step), and a
+    mask in the wrong layout gives wrong attention with no error.
     """
     if (
         _nki_is_qk_swapped is None
@@ -73,6 +80,7 @@ def maybe_transpose_mask_for_qk_swap(
         "is_2byte_kv": not is_fp8_kv,
         "fp8_packed": fp8_packed,
         "fuse_rope": False,
+        "kv_heads": kv_heads,
     }
     swapped = _nki_is_qk_swapped(
         **{k: v for k, v in kwargs.items() if k in _QK_SWAP_PARAMS}
@@ -105,6 +113,7 @@ def gen_attention_decode_mask(
     local_filled_slots: Optional[Tensor] = None,
     dcp_active_mask: Optional[Tensor] = None,
     is_causal: bool = True,
+    use_kernel: bool = True,
 ) -> Tensor:
     """
     Generate an attention mask for token-generation (TKG).
@@ -128,6 +137,8 @@ def gen_attention_decode_mask(
                       broadcast the same way as ``local_filled_slots``.
         is_causal:    Whether active tokens use causal attention. DFlash passes
                       ``False`` for bidirectional block attention.
+        use_kernel:   Set ``False`` to always build the mask with the PyTorch
+                      implementation (same values).
 
     Returns:
         Tensor of shape [s_prior, bs, q_head, s_active] with values in {0, 1}.
@@ -228,7 +239,7 @@ def gen_attention_decode_mask(
     )
 
     # SWA + s_active > 1: NKI mask kernel now supports per-token start bounds.
-    if _can_use_kernel(pos_ids, bs, s_active, s_prior):
+    if use_kernel and _can_use_kernel(pos_ids, bs, s_active, s_prior):
         return _gen_mask_via_kernel(
             pos_ids,
             bs,
@@ -429,6 +440,41 @@ def _build_seq_to_linear_map(s_prior: int, block_len: int) -> Tensor:
     blk_off = within % block_len
     tile_idx = fold_idx * block_len + blk_off
     return tile_idx * P_MAX + partition
+
+
+def relayout_block_kv_mask(
+    mask: Tensor, from_block_len: int, to_block_len: int
+) -> Tensor:
+    """Move a block-KV decode mask from one resized block_len layout to another.
+
+    ``gen_attention_decode_mask`` stores the s_prior axis of a block-KV mask in
+    the kernel's partition-major order for its resized block_len (see
+    ``_build_block_kv_iota``). Two masks with different resized block_len put the
+    same position in different rows. This converts ``mask`` ``[S_ctx, B, H, S]``
+    to sequential order with ``from_block_len``, then back to partition-major
+    order with ``to_block_len``.
+
+    Example:
+        >>> import torch
+        >>> m = torch.arange(512.0).view(512, 1, 1, 1)
+        >>> back = relayout_block_kv_mask(relayout_block_kv_mask(m, 2, 4), 4, 2)
+        >>> torch.equal(back, m)
+        True
+    """
+    if from_block_len == to_block_len:
+        return mask
+    s_ctx, *rest = mask.shape
+    seq = (
+        mask.reshape(-1, from_block_len, P_MAX, *rest)
+        .transpose(1, 2)
+        .reshape(s_ctx, *rest)
+    )
+    return (
+        seq.reshape(-1, P_MAX, to_block_len, *rest)
+        .transpose(1, 2)
+        .reshape(s_ctx, *rest)
+        .contiguous()
+    )
 
 
 def _torch_gen_attention_decode_mask_impl(

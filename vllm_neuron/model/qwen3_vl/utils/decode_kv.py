@@ -19,42 +19,7 @@ from __future__ import annotations
 
 import torch
 
-from ...kv_cache import paged_slot_indices
-
-
-def build_per_head_block_table(
-    block_table_2d: torch.Tensor, kv_heads: int
-) -> torch.Tensor:
-    """Expand a 2D ``[B, num_blocks]`` block table into the per-head 3D table the
-    GQA fused decode mega-kernel requires: ``[B, kv_heads, num_blocks]``.
-
-    The kernel squeezes the 4D KV cache head-inner into a ``[num_blocks*kv_heads]``
-    pool, so each ``(batch, head)`` entry must be the GLOBAL pool index
-    ``base*kv_heads + h``; ``-1`` (inactive) is preserved unchanged. Single source
-    of truth shared by ``Qwen3VLTextAttention.forward_decode`` (bf16),
-    ``Qwen3VLTextAttentionMX.forward_decode`` and the CPU three-way reference, so
-    the kernel's GQA global-index convention is encoded in exactly one place (they
-    cannot drift and mask a shared bug).
-
-    Expects a 2D ``[B, num_blocks]`` table with ``-1`` as the inactive sentinel.
-
-    Example:
-        >>> import torch
-        >>> t = torch.tensor([[0, 1, -1]])
-        >>> build_per_head_block_table(t, kv_heads=2)
-        tensor([[[ 0,  2, -1],
-                 [ 1,  3, -1]]])
-    """
-    assert block_table_2d.dim() == 2, (
-        f"build_per_head_block_table expects a 2D [B, num_blocks] table, got "
-        f"{block_table_2d.dim()}D {tuple(block_table_2d.shape)}"
-    )
-    base_3d = block_table_2d.unsqueeze(1)  # [B, 1, num_blocks]
-    kv_h = torch.arange(
-        kv_heads, dtype=block_table_2d.dtype, device=block_table_2d.device
-    ).view(1, kv_heads, 1)
-    shifted = base_3d * kv_heads + kv_h  # [B, kv_heads, num_blocks]
-    return torch.where(base_3d == -1, base_3d, shifted).contiguous()
+from ...kv_cache import build_per_head_block_table, paged_slot_indices  # noqa: F401  (re-export)
 
 
 def scatter_new_kv(

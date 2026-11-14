@@ -40,6 +40,7 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 import nki
 import nki.isa as nisa
 import nki.language as nl
+from vllm_neuron.utils.hardware_config import get_logical_nc_config
 from nki.isa import oob_mode
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
@@ -253,7 +254,7 @@ def _merge_multimodal_embeddings_nki_wrapper(
     # The kernel returns (hidden, deepstack) when n_ds > 0, else just hidden --
     # a compile-time branch on the static n_ds (see the kernel). Unpack to match.
     if n_ds > 0:
-        out_hidden, out_ds = wrapped[2](
+        out_hidden, out_ds = wrapped[get_logical_nc_config()](
             hidden_states,
             encoder_embedding_buffer,
             encoder_block_ids,
@@ -261,7 +262,7 @@ def _merge_multimodal_embeddings_nki_wrapper(
             local_offset=local_offset,
         )
         return out_hidden, out_ds
-    out_hidden = wrapped[2](
+    out_hidden = wrapped[get_logical_nc_config()](
         hidden_states,
         encoder_embedding_buffer,
         encoder_block_ids,

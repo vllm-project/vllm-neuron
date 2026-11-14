@@ -13,6 +13,7 @@ from nkilib.core.utils.common_types import (
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from vllm_neuron.utils.neuron_utils import can_run_kernel
+from vllm_neuron.utils.hardware_config import get_logical_nc_config
 
 P_MAX = 128
 MAX_VALIDATED_H_SIZE = 16384 + 4321
@@ -257,7 +258,7 @@ def o_proj(
     if _can_use_kernel(active, weight, quantization_type, attention_layout):
         wrapped_output_projection = wrap_nki(output_projection)
 
-        return wrapped_output_projection[2](
+        return wrapped_output_projection[get_logical_nc_config()](
             attention=active,
             weight=weight,
             bias=bias,

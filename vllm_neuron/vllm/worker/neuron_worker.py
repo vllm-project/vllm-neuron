@@ -2055,8 +2055,11 @@ class NeuronWorker(WorkerBase):
                     device=device,
                 )
             )
-            kwargs["write_block_ids"] = torch.zeros(
-                num_blocks, dtype=torch.int64, device=device
+            # A model can give its own write_block_ids when one block does not
+            # hold encoder_attention_block_size of its tokens.
+            kwargs.setdefault(
+                "write_block_ids",
+                torch.zeros(num_blocks, dtype=torch.int64, device=device),
             )
             if native_compile_only:
                 # VISIONGRAD: the grad mode a tensor is created in decides its
@@ -2067,8 +2070,9 @@ class NeuronWorker(WorkerBase):
                         bucket, encoder_neuron_config, device
                     )
                     kwargs["encoder_cache_buffer"] = cache.buffer
-                    kwargs["write_block_ids"] = torch.zeros(
-                        num_blocks, dtype=torch.int64, device=device
+                    kwargs.setdefault(
+                        "write_block_ids",
+                        torch.zeros(num_blocks, dtype=torch.int64, device=device),
                     )
                 jobs.append(
                     (
@@ -2401,8 +2405,11 @@ class NeuronWorker(WorkerBase):
                 dtype=cache.dtype,
                 device=meta,
             )
-            encoder_inputs["write_block_ids"] = torch.zeros(
-                num_blocks, dtype=torch.int64, device=meta
+            # A model can give its own write_block_ids when one block does not
+            # hold encoder_attention_block_size of its tokens.
+            encoder_inputs.setdefault(
+                "write_block_ids",
+                torch.zeros(num_blocks, dtype=torch.int64, device=meta),
             )
             try:
                 # Scope the "encoder" compiler args, so the capture records -O3.
@@ -2667,8 +2674,11 @@ class NeuronWorker(WorkerBase):
                 encoder_inputs["encoder_cache_buffer"] = (
                     self.model_runner.encoder_cache.buffer
                 )
-                encoder_inputs["write_block_ids"] = torch.zeros(
-                    num_blocks, dtype=torch.int64, device=device
+                # A model can give its own write_block_ids when one block does not
+                # hold encoder_attention_block_size of its tokens.
+                encoder_inputs.setdefault(
+                    "write_block_ids",
+                    torch.zeros(num_blocks, dtype=torch.int64, device=device),
                 )
                 # Scope the "encoder" compiler args, so warmup loads the -O3 NEFF.
                 with (

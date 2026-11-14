@@ -61,17 +61,6 @@ class DFlashProposer:
         self.on_device_sampling = on_device_sampling
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
 
-        max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
-        num_verify_tokens = max_num_seqs * (self.num_speculative_tokens + 1)
-        # TODO: Remove this guard once the distributed argmax kernel supports
-        # more than 256 verification rows.
-        assert num_verify_tokens <= 256, (
-            "DFlash currently supports at most 256 verification tokens; "
-            f"max_num_seqs={max_num_seqs} with "
-            f"num_speculative_tokens={self.num_speculative_tokens} would verify "
-            f"{num_verify_tokens} tokens at once"
-        )
-
         draft_hf_config = self.draft_model_config.hf_config
         nested_dflash_config = getattr(draft_hf_config, "dflash_config", {}) or {}
         if "block_size" in nested_dflash_config:
@@ -171,7 +160,8 @@ class DFlashProposer:
                 f"serve this target without DFlash speculation."
             )
 
-        target_num_layers = self.vllm_config.model_config.hf_config.num_hidden_layers
+        target_text_config = self.vllm_config.model_config.hf_text_config
+        target_num_layers = target_text_config.num_hidden_layers
         self.model = self.compile_and_load_draft_model(
             start_layer_idx=target_num_layers,
             target_hidden_size=target_hidden_size,
@@ -456,7 +446,8 @@ class DFlashProposer:
             self.draft_model_config.hf_config
         )
         num_aux_layers = len(target_layer_ids)
-        target_num_layers = self.vllm_config.model_config.hf_config.num_hidden_layers
+        target_text_config = self.vllm_config.model_config.hf_text_config
+        target_num_layers = target_text_config.num_hidden_layers
 
         assert target_num_layers >= num_aux_layers, (
             f"DFlash needs >= {num_aux_layers} target layers to source "
