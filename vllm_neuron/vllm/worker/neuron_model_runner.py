@@ -2834,7 +2834,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 sampling_params
                 and sampling_params.sampling_type == SamplingType.RANDOM_SEED
             ):
-                generator = torch.Generator(device=self.device)
+                # Neuron has no device generator; host-side sampling runs on CPU.
+                generator = torch.Generator(device="cpu")
                 generator.manual_seed(sampling_params.seed)
             else:
                 generator = None
