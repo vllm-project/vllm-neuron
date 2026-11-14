@@ -48,6 +48,7 @@ from nkilib.core.utils.common_types import NormType, QuantizationType
 
 import torch
 import vllm_neuron.functional as NF
+from ..qwen3_vl.utils.decode_kv import build_per_head_block_table, scatter_new_kv
 from libtorch_neuronx_lite.compile.platform import get_platform_target
 from vllm_neuron.functional.attention.attention_decode import (
     _swizzle_packed_k,
@@ -910,6 +911,10 @@ class LlamaAttention(nn.Module):
         mask_q_heads = self.num_q_heads_after_attn_dp_a2a * self.dcp_size
 
         active_blocks_table = block_table
+        # GQA ranks need a per-head 3D table to reach the NKI kernel.
+        gqa_scatter = nkh > 1 and not self.fp8_packed and self.attention_dp_size == 1 and self.dcp_size == 1
+        if gqa_scatter:
+            active_blocks_table = build_per_head_block_table(block_table, nkh).to(torch.int32)
         local_filled = None
         dcp_active_mask = None
         if dcp_active:
@@ -1008,8 +1013,8 @@ class LlamaAttention(nn.Module):
             pos_ids=pos_ids_kernel,
             softmax_scale=self.scaling / self.k_scale_float,
             sink=None,
-            update_cache=True,
-            kv_cache_update_idx=slot_mapping.view(B_local, S_decode).to(torch.uint32),
+            update_cache=not gqa_scatter,
+            kv_cache_update_idx=None if gqa_scatter else slot_mapping.view(B_local, S_decode).to(torch.uint32),
             W_out=self.o_proj_weight,
             bias_out=None,
             quantization_type_out=QuantizationType.STATIC,
@@ -1037,7 +1042,10 @@ class LlamaAttention(nn.Module):
             fp8_fused_mask_allowed=fuse_mask,
             return_updated_kv=_needs_k_back,
         )
-        if _needs_k_back:
+        if gqa_scatter:
+            output, K_new, V_new = _decode_result
+            scatter_new_kv(self.k_cache, self.v_cache, K_new, V_new, slot_mapping, block_size, nkh, self.head_dim)
+        elif _needs_k_back:
             output, _k_updated, _v_updated = _decode_result
         else:
             output = _decode_result
