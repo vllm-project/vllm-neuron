@@ -739,6 +739,13 @@ class NeuronModelRunnerV2:
             self.capture_backend_model = None
             raise
 
+    def state_pool_bytes(self) -> int:
+        """HBM of dedicated recurrent-state pools: none, V2 serves no recurrent-state models."""
+        return 0
+
+    def warm_up_hybrid_graphs(self) -> None:
+        """No recurrent-state helper graphs on V2 (see the V1 runner)."""
+
     def get_kv_cache_spec(self) -> dict:
         """Build per-layer KV-cache specifications.
 

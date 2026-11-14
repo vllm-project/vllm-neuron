@@ -42,7 +42,9 @@ class EagleProposer:
 
         self.draft_model_config = self.speculative_config.draft_model_config
         self.method = self.speculative_config.method
-        assert self.method == "eagle3"
+        # "mtp": the target checkpoint's multi-token-prediction head (e.g. Qwen3.5), driven
+        # through the same propose interface as an EAGLE3 draft.
+        assert self.method in ("eagle3", "mtp")
 
         self.device = device
         self.on_device_sampling = on_device_sampling
@@ -118,7 +120,9 @@ class EagleProposer:
         compile_options: dict | None = None,
     ) -> None:
         # Load draft model
-        target_num_layers = self.vllm_config.model_config.hf_config.num_hidden_layers
+        target_num_layers = (
+            self.vllm_config.model_config.hf_text_config.num_hidden_layers
+        )
         self.model = self.compile_and_load_draft_model(
             start_layer_idx=target_num_layers,
             target_hidden_size=target_hidden_size,
@@ -128,7 +132,12 @@ class EagleProposer:
         logger.info("Completed compilation for draft model.")
 
         # Set draft model attn layer names
-        draft_num_layers = self.draft_model_config.hf_config.num_hidden_layers
+        if self.method == "mtp":
+            draft_num_layers = (
+                getattr(self.draft_model_config.hf_config, "n_predict", None) or 1
+            )
+        else:
+            draft_num_layers = self.draft_model_config.hf_config.num_hidden_layers
         self.attn_layer_names = [
             f"layers.{i}.self_attn"
             for i in range(target_num_layers, target_num_layers + draft_num_layers)
@@ -180,8 +189,10 @@ class EagleProposer:
         hidden_state_rows = (
             num_tokens * target_mlp_dp_size if is_decode_shape else num_tokens
         )
+        # EAGLE3 drafts from three concatenated target layers; MTP from the final one.
+        num_aux = 1 if self.method == "mtp" else 3
         target_hidden_states = torch.ones(
-            hidden_state_rows, hidden_size * 3, dtype=torch.bfloat16
+            hidden_state_rows, hidden_size * num_aux, dtype=torch.bfloat16
         ).to(device)
 
         # last_token_indices: index of last token for each request
@@ -395,19 +406,21 @@ class EagleProposer:
 
         # Set padding config if target has different (padded) hidden_size
         # This allows draft model to work with padded hidden states from target model
-        draft_hf_config.unpadded_hidden_size = draft_hf_config.hidden_size
-        if target_hidden_size != draft_hf_config.hidden_size:
-            draft_hf_config.hidden_size = target_hidden_size
-        # The draft reads the target's aux hidden states, so its fc (and the
-        # optional input_norm) must use the target's padding layout. A wrong
-        # value scrambles every input feature and the draft proposes noise.
-        draft_hf_config.target_hidden_pad_groups = target_hidden_pad_groups
-        logger.info(
-            "Draft hidden layout: unpadded=%d padded=%d target_hidden_pad_groups=%d",
-            draft_hf_config.unpadded_hidden_size,
-            draft_hf_config.hidden_size,
-            target_hidden_pad_groups,
-        )
+        # An MTP head shares the target's (text) config: no hidden-state padding.
+        if self.method != "mtp":
+            draft_hf_config.unpadded_hidden_size = draft_hf_config.hidden_size
+            if target_hidden_size != draft_hf_config.hidden_size:
+                draft_hf_config.hidden_size = target_hidden_size
+            # The draft reads the target's aux hidden states, so its fc (and the
+            # optional input_norm) must use the target's padding layout. A wrong
+            # value scrambles every input feature and the draft proposes noise.
+            draft_hf_config.target_hidden_pad_groups = target_hidden_pad_groups
+            logger.info(
+                "Draft hidden layout: unpadded=%d padded=%d target_hidden_pad_groups=%d",
+                draft_hf_config.unpadded_hidden_size,
+                draft_hf_config.hidden_size,
+                target_hidden_pad_groups,
+            )
 
         # Override to greedy sampling for draft model.
         on_device_sampling_config = None

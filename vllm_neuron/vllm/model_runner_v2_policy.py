@@ -38,7 +38,10 @@ NEURON_MIN_BATCH_QUEUE_DEPTH = 2
 # V2 at the first step. They do not set enforce_eager, so the eager check below
 # cannot catch them.
 UNSUPPORTED_V2_NEURON_RUNNER_ARCHITECTURES = frozenset(
-    {"SyntheticNeuronModel", "SyntheticStackedNeuronModel"}
+    {
+        "SyntheticNeuronModel",
+        "SyntheticStackedNeuronModel",
+    }
 )
 
 # Architectures whose V2 debug-logits emission path has been validated
@@ -63,6 +66,15 @@ V2_COMPATIBLE_SCHEDULER_CLASSES = frozenset(
         "vllm_neuron.vllm.core.scheduler.NeuronAsyncScheduler",
     }
 )
+
+
+def _has_recurrent_state(model_config: object) -> bool:
+    """Whether the registered Neuron model class implements ``HasRecurrentState``."""
+    from vllm_neuron.model.interfaces import HasRecurrentState
+    from vllm_neuron.model.registry import get_model_cls
+
+    model_cls = get_model_cls(_model_architectures(model_config))
+    return model_cls is not None and issubclass(model_cls, HasRecurrentState)
 
 
 def _model_architectures(model_config: object) -> list[str]:
@@ -221,6 +233,12 @@ def get_neuron_model_runner_v2_policy(
         )
         if unsupported_arch is not None:
             unsupported.append(f"model architecture {unsupported_arch}")
+            dense_generate = False
+        # Hybrid models with recurrent-state layers (interfaces.HasRecurrentState): only the
+        # V1 runner allocates their state. The plugin's model classes do not declare vLLM's
+        # IsHybrid interface, so the is_hybrid check above does not see them.
+        if _has_recurrent_state(model_config):
+            unsupported.append("recurrent-state (hybrid) model")
             dense_generate = False
 
     if getattr(vllm_config, "diffusion_config", None) is not None:

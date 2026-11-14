@@ -188,3 +188,30 @@ class SupportsMRoPE(Protocol):
             and delta is the offset for computing decode-phase positions.
         """
         ...
+
+
+@runtime_checkable
+class HasRecurrentState(Protocol):
+    """Hybrid models with fixed-size recurrent-state layers (e.g. Gated DeltaNet) next to
+    attention layers.
+
+    They declare the state layers in their ``KVSpec`` (``StateLayerSpec``). The V1 runner
+    allocates the state as vLLM ``MambaSpec`` KV groups; Model Runner V2 does not support
+    them; prefix caching uses vLLM's Mamba ``align`` mode.
+    """
+
+    @classmethod
+    def num_recurrent_state_layers(cls, hf_config: PretrainedConfig) -> int:
+        """Return the number of recurrent-state layers of the model."""
+        ...
+
+
+@runtime_checkable
+class ServesTextOnly(Protocol):
+    """Models registered under a multimodal checkpoint architecture that serve only its
+    text tower, so the platform configures no vision-encoder buckets for them."""
+
+    @classmethod
+    def serves_text_only(cls) -> bool:
+        """Return True when only the text tower is served."""
+        ...

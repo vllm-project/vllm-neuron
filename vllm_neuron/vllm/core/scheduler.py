@@ -25,7 +25,11 @@ from vllm_neuron.metrics import (
     SCHEDULER_ENCODER_CACHE_HITS,
     SCHEDULER_ENCODER_CACHE_QUERIES,
 )
-from vllm_neuron.model.neuron_config import NeuronConfig, EncoderNeuronConfig
+from vllm_neuron.model.neuron_config import (
+    EncoderNeuronConfig,
+    NeuronConfig,
+    validate_decode_steps_between_prefill_chunks,
+)
 from vllm_neuron.utils.bucket_utils import (
     get_bucket_for_count,
     get_default_kv_segment_size_buckets,
@@ -280,6 +284,16 @@ class NeuronScheduler(Scheduler):
 
         # Prefill batch size limit (currently 1, may expand in future)
         self.max_prefills_per_batch: int = 1
+
+        # Decode steps scheduled between the chunks of an ongoing segmented prefill. Prefill
+        # and decode are separate graphs, so a multi-chunk prefill otherwise pauses every
+        # decoding request until its last chunk. 0 keeps the prefill uninterrupted.
+        self._decode_steps_between_chunks: int = (
+            validate_decode_steps_between_prefill_chunks(
+                neuron_config.get("decode_steps_between_prefill_chunks", 0)
+            )
+        )
+        self._interleave_decodes_left: int = 0
 
         # Parse num_seqs_buckets for decode batch size buckets
         if "num_seqs_buckets" in neuron_config:
@@ -1130,16 +1144,41 @@ class NeuronScheduler(Scheduler):
         )
         running_holdback: list[Request] = []
         max_num_running_reqs_override: int | None = None
-        if self.has_prefill_in_running:
-            # 3.1 Ongoing prefill segments in running queue - hide decode requests
+        decode_running = [
+            req for req in self.running if not self._is_prefill_request(req)
+        ]
+        if (
+            self.has_prefill_in_running
+            and decode_running
+            and self._interleave_decodes_left > 0
+        ):
+            # 3.0 Decode step between two chunks of an ongoing prefill - hide the
+            # prefill. No waiting request can be admitted (can_schedule() holds them
+            # back while a prefill runs; the override blocks ready SO waiters).
             running_holdback = [
-                req for req in self.running if not self._is_prefill_request(req)
+                req for req in self.running if self._is_prefill_request(req)
             ]
+            self.running = decode_running
+            max_num_running_reqs_override = len(self.running)
+            self._interleave_decodes_left -= 1
+            logger.debug(
+                "Scheduling decode step between prefill chunks: %d decode, "
+                "hiding %d prefill, %d more before the next chunk",
+                len(self.running),
+                len(running_holdback),
+                self._interleave_decodes_left,
+            )
+        elif self.has_prefill_in_running:
+            # 3.1 Ongoing prefill segments in running queue - hide decode requests
+            running_holdback = decode_running
             self.running = [
                 req for req in self.running if self._is_prefill_request(req)
             ]
             if has_structured_output_waiting:
                 max_num_running_reqs_override = len(self.running)
+            # After this chunk, let the hidden decodes run before the next one.
+            if running_holdback:
+                self._interleave_decodes_left = self._decode_steps_between_chunks
             logger.debug(
                 "Scheduling prefill step: keeping %d prefill in running, "
                 "hiding %d decode, %d in waiting, %d in skipped_waiting, "
@@ -1160,6 +1199,7 @@ class NeuronScheduler(Scheduler):
             # the base scheduler parks with zero tokens, so hiding the decodes would cost them
             # a step for nothing. ``running_holdback`` keeps its empty default, so the capacity
             # decrement is a no-op and the restore concatenates an empty list.
+            self._interleave_decodes_left = 0
             logger.debug(
                 "Scheduling decode step with an async KV pull: %d decode request(s), "
                 "%d waiting, no holdback",
@@ -1170,6 +1210,8 @@ class NeuronScheduler(Scheduler):
             # 3.2 New requests waiting for prefill - hide decode requests
             running_holdback = self.running
             self.running = []
+            if running_holdback:
+                self._interleave_decodes_left = self._decode_steps_between_chunks
             if has_structured_output_waiting:
                 available_slots = max(
                     0, self.max_num_running_reqs - len(running_holdback)
@@ -1190,6 +1232,7 @@ class NeuronScheduler(Scheduler):
             )
         else:
             # 3.3 No prefill requests - no need to hide decodes
+            self._interleave_decodes_left = 0
             if (
                 has_ready_structured_output_waiting
                 and len(self.running) < self.max_num_running_reqs

@@ -31,8 +31,9 @@ def correct_spec_decode_positions_and_slot_mapping(
     """Correct positions and slot_mapping on device for async spec decode.
 
     For the first decode step after prefill (no prior spec step), callers
-    pass a dummy ``prev_sampled_token_ids`` filled with valid entries so
-    ``valid_count == 1 + num_spec`` and the correction is a no-op.
+    pass a dummy ``prev_sampled_token_ids`` / ``prev_num_draft_tokens`` pair
+    with ``valid_count == 1 + prev_num_draft_tokens`` (for example one valid
+    entry and zero drafts), so the correction is a no-op.
 
     Args:
         positions: Optimistic positions ``[total_scheduled]`` int32,
@@ -75,7 +76,12 @@ def correct_spec_decode_positions_and_slot_mapping(
 
     # Expand per-req rejection count to per-scheduled-token.
     per_token_offset = num_rejected[req_indices_per_token]  # [total_scheduled]
-    positions = positions - per_token_offset
+    # Padded batch rows carry stale previous rows and can go negative; real rows never do.
+    # Clamp them for the position-dependent math and give them the pad slot (-1) below,
+    # so they cannot write into a block that a live request now owns.
+    raw_positions = positions - per_token_offset
+    is_pad = raw_positions < 0
+    positions = raw_positions.clamp(min=0)
 
     # Recompute slot_mapping per layer using corrected positions. For now,
     # recompute per layer — layers in the same KV cache group share the
@@ -95,8 +101,17 @@ def correct_spec_decode_positions_and_slot_mapping(
         slot_mapping = _compute_slot_mapping_per_token(
             positions, block_table_tensor, req_indices_per_token, block_size
         )
+        slot_mapping = torch.where(
+            is_pad, torch.full_like(slot_mapping, -1), slot_mapping
+        )
         new_meta = dict(meta)
         new_meta["slot_mapping"] = slot_mapping
+        if "state_in" in meta:
+            # Recurrent-state layers (MTP verify): the previous step wrote the state after
+            # each of its tokens to its own state block; resume from the last accepted one.
+            new_meta["state_in"] = (
+                (valid_count - 1).clamp(min=0).to(meta["state_in"].dtype)
+            )
         new_attn_metadata[layer_name] = new_meta
     return positions, new_attn_metadata
 

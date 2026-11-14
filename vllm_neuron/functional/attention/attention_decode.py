@@ -1453,6 +1453,8 @@ def attention_decode(
     dcp_active_owner: Optional[Tensor] = None,
     # -- explicit FP8 fused-mask selection
     fp8_fused_mask_allowed: bool = False,
+    # -- model-provided replacement for the (non-DCP) NKI entry point
+    block_kernel=None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """
     Fused Attention Block for Token Generation (TKG).
@@ -1584,6 +1586,10 @@ def attention_decode(
                             the fused ``pos_ids`` path.
         fp8_fused_mask_allowed: Keep ``pos_ids`` on the FP8 fused-mask path
                             instead of rerouting to the external mask.
+        block_kernel:       @nki.jit entry point with the signature of
+                            _torch_compatible_attention_block_tkg_kernel, used instead
+                            of it when dcp_size == 1 (e.g. a model-specific vendored
+                            variant); None keeps the library kernel.
 
     Returns:
         - update_cache=True: ``output`` only — the K/V caches are written in
@@ -1784,7 +1790,9 @@ def attention_decode(
                 swa_start_pos_ids=swa_start_pos_ids,
             )
         else:
-            wrapped = wrap_nki(_torch_compatible_attention_block_tkg_kernel)
+            wrapped = wrap_nki(
+                block_kernel or _torch_compatible_attention_block_tkg_kernel
+            )
             kernel_out = wrapped[lnc_degree](
                 X,
                 X_hidden_dim_actual=X_hidden_dim_actual,
