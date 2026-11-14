@@ -2017,6 +2017,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Disable dynamo cache limit — recompilations are caught at runtime
         # by FailOnRecompileLimitHit, so a static limit adds no value.
         torch._dynamo.config.cache_size_limit = 2**62
+        # One static graph per bucket: NKI kernel calls cannot trace a dynamic dim.
+        torch._dynamo.config.automatic_dynamic_shapes = False
 
         # Build compile options
         self.compile_options = {"alias_meta_to_neuron": True}
