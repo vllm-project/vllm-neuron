@@ -4,7 +4,7 @@ helper modules it calls:
 
     draft_seq.draft_body       `draft_decode_tp32`, a step of one sequence (was `../draft_kernel`)
     draft_batched.draft_body   `draft_decode_batched_tp32`, every sequence of a step in one launch
-                               (was `../../tp8pp8/draft_kernel`)
+                               (was `../../batched/draft_kernel`)
     layout.prepare             the decode drafter's weight layout: `main_proj` and the shared
                                expert's gate / up projections column-sharded over the 64 ranks
                                (`mk_model.draft_weights_decode` applies it once)

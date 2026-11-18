@@ -132,9 +132,8 @@ def main():
     ap.add_argument("--src", action="store_true", help="kv + index source layer (compressor, indexer, top-k)")
     ap.add_argument("--engram", action="store_true", help="engram layer (n-gram table read-out before the block)")
     ap.add_argument("--tap", action="store_true", help="emit the DSpark tap")
-    ap.add_argument("--n-local", type=int, default=6, help="routed experts a rank (6: tp64, 48: a tp8pp8 stage)")
-    ap.add_argument("--scheme", default="tp64", help="tp64 (the generic entry) or tp8pp8 (the stage kernel)")
-    ap.add_argument("--phase", default=None, help="prefill / decode entry of the scheme (default by T)")
+    ap.add_argument("--n-local", type=int, default=6, help="routed experts a rank (6: tp64)")
+    ap.add_argument("--phase", default=None, help="prefill / decode entry (default: the generic layer_forward)")
     args = ap.parse_args()
 
     cfg = DeepseekV41Config()
@@ -275,11 +274,10 @@ def main():
         *mx8(p["sh_w1"], p["sh_s1"]), *mx8(p["sh_w3"], p["sh_s3"]), *mx8(p["sh_w2"], p["sh_s2"]),
         groups, groups, flags,
     ]
-    if args.scheme == "tp64" and args.phase is None:
-        kernel = mk_kernels.pkg(args.scheme).layer_kernel.layer_forward
+    if args.phase is None:
+        kernel = mk_kernels.pkg("tp64").layer_kernel.layer_forward
     else:
-        phase = args.phase or ("decode" if L <= 6 else "prefill")
-        kernel = mk_kernels.layer(phase, (ratio, int(src), int(src), int(args.engram), int(args.tap)), args.scheme)
+        kernel = mk_kernels.layer(args.phase, (ratio, int(src), int(src), int(args.engram), int(args.tap)), "tp64")
     out, ffn_pre_k, topk_k_out, tap_k, *_ = run_nki(kernel, *args_k)
     cache_after = cache_dev.cpu()
     st = args.stage

@@ -86,9 +86,9 @@ def layer_args(T=6, spans=1, ratio=0, src=False, engram=False, tap=False, stage=
     ]
 
 
-def draft_args(at_zero=False, L=6, world=WORLD, stage=9, scheme="tp8pp8"):
+def draft_args(at_zero=False, L=6, world=WORLD, stage=9, scheme="batched"):
     """The drafter's arguments at an 8-rank world (random weights, zero inputs): the
-    batched kernel's layout (`meta [B, 3]`, `rows_c`) for `tp8pp8`, the per-sequence
+    batched kernel's layout (`meta [B, 3]`, `rows_c`) for `batched`, the per-sequence
     kernel's (`meta [1, 3]`) for `tp32`."""
     from test_layer import make_params
     cfg = DeepseekV41Config()
@@ -129,8 +129,8 @@ def draft_args(at_zero=False, L=6, world=WORLD, stage=9, scheme="tp8pp8"):
     groups = mk_host.replica_groups(world, world)
     flags = (int(at_zero), K, win, stage, 0, NOISE, VOCAB, cfg.dspark_num_experts_per_tok, 32)
     from deepseek_v41_8d.mk_model import draft_consts
-    from deepseek_v41_8d.kernels import mk_kernels
-    PT, pad_to = mk_kernels.pkg("tp8pp8").mk_common.PT, mk_kernels.pkg("tp8pp8").mk_common.pad_to
+    from deepseek_v41_8d.kernels.batched import mk_common
+    PT, pad_to = mk_common.PT, mk_common.pad_to
     meta = torch.tensor([[1234, L - 1, start]], dtype=torch.int32)
     head = [meta] if scheme == "tp32" else [meta, draft_consts(1, K, pad_to(win + K, PT))]
     return head + [

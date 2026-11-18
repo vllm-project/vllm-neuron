@@ -106,14 +106,12 @@ def layer_body(
     """The block, traced with `phase` ("prefill" / "decode"), the block's `arch`
     `(ratio, is_kv_src, is_idx_src, has_engram, tap)` and the `scheme` baked in;
     `mk_kernels` makes one `@nki.jit` entry point per combination. The runtime
-    `flags` must agree with `arch`. Under "tp8pp8" `groups_world` is the 8-rank
-    stage: the expert reduce, and the engram table's row sum, span the stage."""
+    `flags` must agree with `arch`."""
     ratio, nspans, win, stage, is_kv_src, is_idx_src, has_engram, tap, kver = flags
     if arch is not None:
         assert (ratio, is_kv_src, is_idx_src, has_engram, tap) == tuple(arch), (
             f"flags {flags} disagree with the baked archetype {arch}")
-    # Under both schemes the engram read-out is in-kernel, over `groups_world` (the
-    # stage under "tp8pp8", where the n-gram table is sharded over the stage's ranks).
+    # The engram read-out is in-kernel, over `groups_world`.
     T, hc, dim = stream.shape
     Tp = pad_to(T, PT)
     width = hc * dim

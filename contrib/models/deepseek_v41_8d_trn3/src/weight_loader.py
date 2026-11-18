@@ -714,29 +714,13 @@ def build_weight_mappings(model: DeepseekV41ForCausalLM) -> dict[str, str | list
         row.
     """
     config = model.config
-    plan = model.mk_plan
     mappings: dict[str, str | list[str]] = {}
-    # Under the pipeline scheme a rank holds its stage's blocks only: the embedding
-    # on the first stage (and the last, whose DSpark stages embed the drafted ids),
-    # the norm, the head and the DSpark stages on the last.
-    if plan.is_first or plan.is_last:
-        mappings["embed.weight"] = "embed.weight"
-    if plan.is_last:
-        mappings["norm.weight"] = "norm.weight"
-        mappings["head.weight"] = "head.weight"
+    mappings["embed.weight"] = "embed.weight"
+    mappings["norm.weight"] = "norm.weight"
+    mappings["head.weight"] = "head.weight"
 
     for layer_id in model.block_ids:
         mappings.update(_block_keys(f"layers.{layer_id}", config, layer_id))
-
-    # The stage's replica of the kv source it receives rows from (`model.src_attn`):
-    # the source layer's attention weights, under the replica's module path.
-    for sid in model.src_attn:
-        src_prefix = f"layers.{sid}.attn"
-        for name, key in _attention_keys(src_prefix, config, int(sid)).items():
-            mappings[name.replace(src_prefix, f"src_attn.{sid}", 1)] = key
-
-    if not plan.is_last:
-        return mappings
 
     for stage in range(config.num_nextn_predict_layers):
         layer_id = config.num_hidden_layers + stage

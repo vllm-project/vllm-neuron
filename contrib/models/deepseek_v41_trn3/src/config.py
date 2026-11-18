@@ -29,26 +29,13 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 #: parameter, so nothing checks it against the official config.
 TENSOR_PARALLEL_SIZE = 64
 
-#: The deployment scheme, `DEEPSEEK_V41_SCHEME`: "tp64" (the default: the 64 ranks
-#: are one tensor-parallel group) or "tp8pp8" (vLLM pipeline parallelism: 8 stages
-#: of 8 tensor-parallel ranks, each stage holding only its own blocks' weights, the
-#: scheduler keeping 8 batches in flight). `mk_model.PipePlan` reads the stage layout
-#: back from vLLM's parallel groups; this constant only sizes the engine arguments.
-SCHEME = os.environ.get("DEEPSEEK_V41_SCHEME", "tp64")
-if SCHEME not in ("tp64", "tp8pp8"):
-    raise ValueError(f"DEEPSEEK_V41_SCHEME={SCHEME!r}; expected 'tp64' or 'tp8pp8'")
-PIPELINE_PARALLEL_SIZE = 8 if SCHEME == "tp8pp8" else 1
-if SCHEME == "tp8pp8":
-    TENSOR_PARALLEL_SIZE = 64 // PIPELINE_PARALLEL_SIZE
-
 #: Ranks the **attention and the dense projections** are split across. Capped at
 #: `o_groups` (8) because `wo_a` is block-diagonal over the groups and
 #: `n_local_groups = o_groups // tp` reaches 0 above it; above the cap attention
 #: is replicated `world_size // this` times and the head-partial all-reduces are
 #: divided back down by `attn_replicas`.
-#: 8 is the cap and the default. `DEEPSEEK_V41_ATTENTION_TP` lowers it, which
-#: is needed to reach TP=4 x PP=16: a 4-rank tensor-parallel group cannot
-#: contain an 8-way attention shard. At 4 each rank holds 2 of the 8 `o_groups`
+#: 8 is the cap and the default. `DEEPSEEK_V41_ATTENTION_TP` lowers it. At 4
+#: each rank holds 2 of the 8 `o_groups`
 #: and the head-partial reduction runs over the 4-rank lane group — one device,
 #: the cheapest collective this host has — replicated 16x.
 ATTENTION_TENSOR_PARALLEL_SIZE = int(
@@ -248,10 +235,9 @@ ASYNC_ENV = "DEEPSEEK_V41_ASYNC"
 def async_decode() -> bool:
     """Whether the engine runs with async scheduling (`ASYNC_ENV`, and a plugin runner that
     replays a device-drafting proposer's drafts across batch-composition changes: without
-    that a step would verify the scheduler's -1 placeholders). The flat scheme only: an async
-    decode step needs the device step prologue, which only the flat scheme's fused decode
-    launches run (`mk_model.fuses_embed`), so the pipeline scheme decodes synchronously."""
-    return (SCHEME == "tp64" and os.environ.get(ASYNC_ENV, "1") not in ("", "0")
+    that a step would verify the scheduler's -1 placeholders). An async decode step runs
+    the device step prologue of the fused decode launches (`mk_model.fuses_embed`)."""
+    return (os.environ.get(ASYNC_ENV, "1") not in ("", "0")
             and _runner_has("device_draft_futures"))
 
 

@@ -107,13 +107,12 @@ def draft_body(
     cache0, cache1, cache2,
     fnorm_w, head_w, mk_embed_w, mk_head_w, conf_w,
     groups_attn, groups_world, flags,
-    phase="decode", scheme="tp64",
+    phase="decode", scheme="tp32",
 ):
     """The drafter, traced with `phase` baked: "prefill" is the `at_zero` step (the
     main-stream KV writes only), "decode" the draft proper, for the `B = meta.shape[0]`
     sequences of the step. `mk_kernels` makes one `@nki.jit` entry per phase and scheme.
-    The drafter's groups are the ranks the head and sampler run on: the world under
-    tp64, the last stage under tp8pp8."""
+    The drafter's groups are the ranks the head and sampler run on: the world."""
     at_zero, K, win, stage, kver, noise_id, vocab_size, topk_e, bs = flags
     assert bool(at_zero) == (phase == "prefill"), f"flags at_zero={at_zero} vs phase {phase}"
     nstages = wq_a.shape[0]

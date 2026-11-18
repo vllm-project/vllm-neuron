@@ -851,13 +851,6 @@ def require_dspark_speculation(vllm_config) -> None:
     if scheduler is not None:
         _match_scheduler_cls(scheduler)
 
-    # One RPC a step (vllm_neuron's `NeuronModelRunner._one_rpc_step`): the engine's
-    # `sample_tokens` and `take_draft_token_ids` RPCs to the 64 workers cost ~1 ms each
-    # of a ~50 ms bs1 step in which the device waits for the host. Set here, before the
-    # engine core and the workers are spawned (they inherit it).
-    # `DEEPSEEK_V41_ONE_RPC_STEP=0` keeps the three RPCs.
-    if os.environ.get("DEEPSEEK_V41_ONE_RPC_STEP", "1") not in ("", "0"):
-        os.environ.setdefault("VLLM_NEURON_ONE_RPC_STEP", "1")
     spec = attach_speculative_config(
         vllm_config, METHOD, num_speculative_tokens
     )

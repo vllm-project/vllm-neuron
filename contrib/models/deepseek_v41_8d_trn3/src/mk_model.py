@@ -234,10 +234,10 @@ _IN_FLIGHT = int(os.environ.get("DEEPSEEK_V41_MK_IN_FLIGHT", "12"))
 #: Small outputs of the megakernel launches submitted by this process and not yet
 #: known complete, oldest first, **across forwards**: the runtime's submission queue
 #: holds `NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS` (32) executions, and under
-#: pipeline parallelism a stage's host launches batch after batch without ever
-#: waiting on the device (the first stage with eight prefills in flight queued 64
-#: executions and died with "Failed to schedule neff execution ... Execution Queue
-#: Full", 2026-10-24), so the window has to span the steps, not sit inside one.
+#: with several batches in flight the host launches batch after batch without ever
+#: waiting on the device (eight prefills in flight queued 64 executions and died with
+#: "Failed to schedule neff execution ... Execution Queue Full", 2026-10-24), so the
+#: window has to span the steps, not sit inside one.
 #: The compiled graphs around the kernels (the forward's tail, the drafter's
 #: prologue / epilogue) sit on the same queue untracked: 12 tracked launches plus
 #: a tail's worth of graphs stays under 32 now that a step drafts in one launch
@@ -289,125 +289,50 @@ def _track(small: torch.Tensor) -> None:
     _pending.append(small)
     if len(_pending) > _IN_FLIGHT:
         _pending.pop(0).cpu()
-#: `DEEPSEEK_V41_MK_TRACE=1`: log every megakernel launch on each stage's first rank (which entry,
+#: `DEEPSEEK_V41_MK_TRACE=1`: log every megakernel launch on rank 0 (which entry,
 #: the step's phase and shape), to pin a device hang on one kernel.
 _MK_TRACE = os.environ.get("DEEPSEEK_V41_MK_TRACE", "") not in ("", "0")
-#: The scheme is read back from vLLM's parallel groups (`PipePlan.from_groups`):
-#: "tp32" when the engine runs one tensor-parallel group, "tp8pp8" when it runs
-#: `pipeline_parallel_size` stages of `tensor_parallel_size` ranks (`config.SCHEME`
-#: sizes the engine arguments). Under "tp8pp8" each stage owns 5 blocks, builds and
-#: loads only those, reduces over the stage, and hands its activations to the next
-#: stage through `pp_kernels.boundary_body` (a 2-rank collective per tensor-parallel
-#: offset); vLLM's scheduler keeps `pipeline_parallel_size` batches in flight.
+#: The scheme is read back from vLLM's tensor-parallel group (`PipePlan.from_groups`):
+#: "tp32", one tensor-parallel group of the whole world, every rank holding every block.
 
 
 @dataclass
 class PipePlan:
-    """Where this rank sits in the deployment scheme and which blocks it owns."""
+    """Where this rank sits in the deployment scheme and which blocks it owns: the flat
+    "tp32" scheme, one tensor-parallel group of `world` ranks, every block on every rank."""
 
     scheme: str
     world: int
     rank: int
-    tp: int                     # ranks a stage (the world under tp32)
-    pp: int                     # stages
-    stage: int
-    stage_rank: int
-    block_stage: list           # stage of each backbone block
-
-    @staticmethod
-    def build(scheme: str, world: int, rank: int, n_layers: int, attn_tp: int) -> "PipePlan":
-        if scheme == "tp32":
-            return PipePlan(scheme, world, rank, world, 1, 0, rank, [0] * n_layers)
-        pp = 8
-        if world % pp:
-            raise ValueError(f"tp8pp8 wants a world divisible by 8, got {world}")
-        tp = world // pp
-        if tp != attn_tp:
-            raise ValueError(f"tp8pp8: a stage is {tp} ranks but the attention shards {attn_tp} ways")
-        block_stage = [i * pp // n_layers for i in range(n_layers)]
-        return PipePlan(scheme, world, rank, tp, pp, rank // tp, rank % tp, block_stage)
+    n_layers: int
 
     @staticmethod
     def from_groups(n_layers: int) -> "PipePlan":
-        """The plan vLLM's parallel groups imply: a stage is one tensor-parallel group
-        (consecutive global ranks), the pipeline rank is the stage. Global rank ids are
-        what the in-kernel collectives' replica groups name, so `rank` is global."""
+        """The plan vLLM's tensor-parallel group implies. Global rank ids are what the
+        in-kernel collectives' replica groups name, so `rank` is global."""
         import torch.distributed as dist
-        from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+        from vllm.distributed.parallel_state import get_tp_group
 
-        tp_group, pp_group = get_tp_group(), get_pp_group()
-        tp, pp = int(tp_group.world_size), int(pp_group.world_size)
-        stage, stage_rank = int(pp_group.rank_in_group), int(tp_group.rank_in_group)
-        world = tp * pp
-        rank = stage * tp + stage_rank
+        tp_group = get_tp_group()
+        world, rank = int(tp_group.world_size), int(tp_group.rank_in_group)
         if dist.is_initialized() and dist.get_rank() != rank:
             raise RuntimeError(
-                f"rank {dist.get_rank()}: vLLM placed it at tensor-parallel rank {stage_rank} of "
-                f"pipeline stage {stage}, which is not the consecutive layout "
-                f"(stage * tp + tp_rank = {rank}) the kernels' replica groups assume"
+                f"rank {dist.get_rank()}: vLLM placed it at tensor-parallel rank {rank}, which "
+                "is not the consecutive layout the kernels' replica groups assume"
             )
-        if pp == 1:
-            return PipePlan("tp32", world, rank, world, 1, 0, rank, [0] * n_layers)
-        scheme = "tp8pp8"
-        if (tp, pp) != (8, 8):
-            raise ValueError(f"the pipeline scheme is written for 8 stages x 8 ranks, got pp={pp} tp={tp}")
-        block_stage = [i * pp // n_layers for i in range(n_layers)]
-        return PipePlan(scheme, world, rank, tp, pp, stage, stage_rank, block_stage)
+        return PipePlan("tp32", world, rank, n_layers)
 
-    def owns(self, layer_id: int) -> bool:
-        return self.block_stage[layer_id] == self.stage
+    @property
+    def tp(self) -> int:
+        """Ranks of the tensor-parallel group: the world."""
+        return self.world
 
     def owned(self) -> list:
-        """The blocks of this stage, in order."""
-        return [i for i, st in enumerate(self.block_stage) if st == self.stage]
+        """The blocks of this rank, in order: all of them."""
+        return list(range(self.n_layers))
 
-    @property
-    def is_first(self) -> bool:
-        return self.stage == 0
-
-    @property
-    def is_last(self) -> bool:
-        return self.stage == self.pp - 1
-
-    @property
-    def first_block(self) -> int:
-        return self.owned()[0]
-
-    @property
-    def last_block(self) -> int:
-        return self.owned()[-1]
-
-    def ends_stage(self, layer_id: int) -> bool:
-        n = len(self.block_stage)
-        return layer_id + 1 < n and self.block_stage[layer_id + 1] != self.block_stage[layer_id]
-
-    @property
-    def lead_last(self) -> int:
-        """The rank that broadcasts the final stream: the first rank of the last stage."""
-        return (self.pp - 1) * self.tp
-
-    def groups_stage(self):
-        return mk_host.replica_groups(self.world, self.tp)
-
-    def groups_full(self):
+    def groups_world(self):
         return mk_host.replica_groups(self.world, self.world)
-
-    def boundary_groups(self, parity: int):
-        """32 pairs `(8s + t, 8(s+1) + t)` for the sending stages `s` of this parity
-        (the odd layout pairs stage 7 with stage 0: a pair where nobody sends)."""
-        pairs = []
-        for st in range(parity, self.pp, 2):
-            nxt = (st + 1) % self.pp
-            for t in range(self.tp):
-                pairs.append((st * self.tp + t, nxt * self.tp + t))
-        return tuple(sorted(pairs))
-
-    def boundary_role(self, sending_stage: int) -> int:
-        if self.stage == sending_stage:
-            return 1
-        if self.stage == sending_stage + 1:
-            return 2
-        return 0
 #: `DEEPSEEK_V41_MK_DEBUG=<layer>:<stage>` runs that layer's kernel at the debug
 #: `stage` (see `layer_kernel`'s docstring), saves its `dbg` output from rank 0 to
 #: `DEEPSEEK_V41_DUMP_DIR/mk_layer<layer>_stage<stage>.pt` and stops the forward.
@@ -647,16 +572,16 @@ def kernel_version(kind: str = "block", scheme: str = "tp32") -> int:
     The files are the scheme's own package (`kernels/<scheme>`: each scheme has
     its own copies of every megakernel module, so an edit for one scheme never
     touches the other's NEFFs). `kind` "block": the block kernel and the helper
-    modules; "draft": the drafter and the helpers; "pp": the stage boundary and
-    the helpers it imports. Each kind leaves out the other kinds' own modules, so
-    an edit to the drafter or the boundary does not invalidate the 40 block
-    kernels' NEFFs (and vice versa). An optimized block kernel's kind is its package
+    modules; "draft": the drafter and the helpers (scheme "batched": the batched
+    drafter's package, `kernels/batched`). Each kind leaves out the other kinds' own
+    modules, so an edit to the drafter does not invalidate the 40 block kernels' NEFFs
+    (and vice versa). An optimized block kernel's kind is its package
     ("r2_prefill", "r2_decode", "r1_prefill", "r1_decode": `mk_kernels.OPTIMIZED_KINDS`),
     which has its own helper copies in `kernels/<scheme>/<kind>/`; the hash covers that
     package only (`mk_kernels.version_kind`)."""
     h = hashlib.sha256()
     kdir = os.path.join(_HERE, "kernels", scheme)
-    own = {"block": ("layer_kernel.py",), "draft": ("draft_kernel.py",), "pp": ("pp_kernels.py",),
+    own = {"block": ("layer_kernel.py",), "draft": ("draft_kernel.py",),
            "head": ("head_kernel.py",), "step": ("step_kernel.py",)}
     if kind not in own and kind not in mk_kernels.OPTIMIZED_KINDS:
         raise ValueError(f"kernel_version: unknown kind {kind!r}")
@@ -822,8 +747,7 @@ def _host_slots(p) -> torch.Tensor:
 #: under the flat scheme: a step starts after the previous one's launches completed (rank 0
 #: read its tokens back, and every rank's launches finished before the drafter's collectives
 #: on rank 0 could), and within a step each is written once, before the first launch that
-#: reads it is submitted (`for_ratio` / `hash_cols` build a column on first use). Not under
-#: the pipeline scheme, which keeps several batches in flight.
+#: reads it is submitted (`for_ratio` / `hash_cols` build a column on first use).
 _STEP_BUFS: dict = {}
 
 
@@ -1303,8 +1227,8 @@ def layer_args(model, block, stream, pre_mix, step: StepIndices, stage: int = 9)
     plan = model.mk_plan
     hash_ids = d.i32
     engram = lw.engram
-    # The engram read-out is in-kernel under both schemes: the table is sharded over
-    # the ranks of `_mk_groups_world` (the world under tp32, the stage under tp8pp8).
+    # The engram read-out is in-kernel: the table is sharded over the ranks of
+    # `_mk_groups_world` (the world).
     in_kernel_engram = lw.has_engram
     if in_kernel_engram:
         hash_ids = step.hash_cols(list(model.config.engram_layer_ids).index(attn.layer_id),
@@ -1344,7 +1268,7 @@ def run_layer(model, block, stream: torch.Tensor, pre_mix: torch.Tensor, step: S
     kernel, args, lw, arch = layer_args(model, block, stream, pre_mix, step, stage)
     plan = model.mk_plan
     T, B = int(step.T), len(step.spans)
-    if _MK_TRACE and plan.stage_rank == 0:
+    if _MK_TRACE and plan.rank == 0:
         # (the kind tells an optimized kernel from the generic body's entry of the same name)
         _mk_log.warning("mk launch %s [%s] layer=%d T=%d B=%d spans=%s", kernel.func.__name__,
                         mk_kernels.version_kind(step.phase, arch, plan.scheme), attn.layer_id, T, B,
@@ -2213,7 +2137,7 @@ def run_fused(model, blocks, stream: torch.Tensor, pre_mix: torch.Tensor, step: 
     step.compress_cache, step.index_cache = cc, ic
     if zt is not None and step.topk is None:
         step.topk = zt
-    if _MK_TRACE and plan.stage_rank == 0:
+    if _MK_TRACE and plan.rank == 0:
         _mk_log.warning("mk launch %s [%s] T=%d B=%d spans=%s", fp.name, fp.trace, step.T,
                         len(step.spans), step.spans)
     if PROF is not None:
@@ -2442,8 +2366,7 @@ def _prologue_draft_rows(model, begin: int, length: int):
 
 
 def _run_draft_seq(model, seed_ids, tap, main_hidden, span, paged, meta=None):
-    """The flat scheme's drafter launch for one sequence (`draft_kernel_seq`): the
-    path as it was before the pipeline work, so `tp32` keeps its behaviour."""
+    """The flat scheme's drafter launch for one sequence (`draft_kernel_seq`)."""
     from . import model as M
 
     cfg = model.config
@@ -2474,7 +2397,7 @@ def _run_draft_seq(model, seed_ids, tap, main_hidden, span, paged, meta=None):
             model._mk_groups_attn, model._mk_groups_full, flags]
     keep_alive(meta, row_pos, write_slots, table)
     kernel = mk_kernels.draft(dphase, model.mk_plan.scheme)
-    if _MK_TRACE and model.mk_plan.stage_rank == 0:
+    if _MK_TRACE and model.mk_plan.rank == 0:
         _mk_log.warning("mk launch %s span=%s", kernel.func.__name__, span)
     dcap = _dcapture_target(model) if _DCAPTURE else None
     if dcap is not None:
@@ -2601,7 +2524,7 @@ def run_draft_tail(model, greedy, ids, sel, taps, span, paged):
     # rows: vLLM samples every row, `logits_indices = arange(K + 1)` -- as a resident column)
     starts, sel, table, rest = _draft_tail_rest(model, span, paged, ids, None if _DRAFT_DIRECT else sel)
     kernel = mk_kernels.draft_tail("decode")
-    if _MK_TRACE and model.mk_plan.stage_rank == 0:
+    if _MK_TRACE and model.mk_plan.rank == 0:
         _mk_log.warning("mk launch %s span=%s", kernel.func.__name__, span)
     if _DRAFT_DIRECT and _DIRECT and _execute_context() is None:
         # straight on its executor (`_launch`): the launch's own tensors as they are (no views),
@@ -2659,14 +2582,14 @@ def run_draft(model, seeds, taps, main_hidden, spans, paged, meta=None):
     confidence [1, K] fp32)]`, one per span; a batched launch also leaves its
     `[B, K+1]` ids in `model.last_draft_ids` (what `DSparkProposer.propose` reads back
     in one copy), the per-sequence launches None there. The flat scheme launches its drafter
-    once per sequence (`_run_draft_seq`, the path as before); the pipeline scheme
-    drafts all of them in one launch (below).
+    once per sequence (`_run_draft_seq`) unless the step has several sequences, which
+    it drafts in one launch (below, `mk_kernels.draft_batched`).
 
-    launch: `[(output_ids [1, K+1] int64, None, confidence [1, K] fp32)]`, one per
+    The batched launch: `[(output_ids [1, K+1] int64, None, confidence [1, K] fp32)]`, one per
     span. The kernel drafts the B sequences' blocks side by side (B * K rows of one
     tile), so a step's drafting costs one kernel's collectives however many
-    sequences it has -- a 10-sequence batch on the pipeline's last stage drafted
-    one sequence after another at ~15 ms each before (2026-10-24)."""
+    sequences it has -- a 10-sequence batch drafted one sequence after another at
+    ~15 ms each before (2026-10-24)."""
     batched_tp32 = model.mk_plan.scheme == "tp32" and _DRAFT_BATCHED and len(spans) > 1
     model.last_draft_ids = None
     if model.mk_plan.scheme == "tp32" and not batched_tp32:
@@ -2726,8 +2649,8 @@ def run_draft(model, seeds, taps, main_hidden, spans, paged, meta=None):
     dphase = "prefill" if at_zero else "decode"
     opt = mk_kernels.draft_optimized(dphase, model.mk_plan.scheme)
     weights, tail = draft_weights_decode(model) if opt else model._mk_draft()
-    kscheme = "tp8pp8" if batched_tp32 else model.mk_plan.scheme   # the drafter body's package
-    kver = kernel_version(mk_kernels.DRAFT_DECODE_KIND, "tp32") if opt else kernel_version("draft", kscheme)
+    # the drafter body's package: `kernels/batched` (the decode phase: the optimized body)
+    kver = kernel_version(mk_kernels.DRAFT_DECODE_KIND, "tp32") if opt else kernel_version("draft", "batched")
     flags = (at_zero, K, win, 9, kver,
              int(cfg.dspark_noise_token_id), int(cfg.vocab_size), int(cfg.dspark_num_experts_per_tok),
              int(paged[0].block_size))
@@ -2735,20 +2658,17 @@ def run_draft(model, seeds, taps, main_hidden, spans, paged, meta=None):
     args = [meta, rows_c, main, row_pos, write_slots, table, *weights, *caches, *tail,
             model._mk_groups_attn, model._mk_groups_full, flags]
     keep_alive(meta, row_pos, write_slots, table, pos)
-    # The drafter runs on the ranks that hold the head and the sampler: the flat
-    # world under tp32, the last stage under tp8pp8 (`_mk_groups_full` is that
-    # stage's groups); it is a distinct entry per scheme, `draft_<phase>_<scheme>`,
-    # as every other kernel is.
-    kernel = mk_kernels.draft_batched(dphase) if batched_tp32 else mk_kernels.draft(dphase, model.mk_plan.scheme)
-    if _MK_TRACE and model.mk_plan.stage_rank == 0:
+    # The drafter runs on the ranks that hold the head and the sampler: the world
+    # (`_mk_groups_full`).
+    kernel = mk_kernels.draft_batched(dphase)
+    if _MK_TRACE and model.mk_plan.rank == 0:
         _mk_log.warning("mk launch %s B=%d spans=%s", kernel.func.__name__, B, spans)
     dcap = _dcapture_target(model) if _DCAPTURE else None
     if dcap is not None:
         if opt:
-            pkg = mk_kernels._draft_decode_pkg()
-            body = (pkg.draft_batched if batched_tp32 else pkg.draft_seq).draft_body
+            body = mk_kernels._draft_decode_pkg().draft_batched.draft_body
         else:
-            body = (mk_kernels._tp8pp8 if batched_tp32 else mk_kernels.pkg(model.mk_plan.scheme)).draft_kernel.draft_body
+            body = mk_kernels._batched.draft_kernel.draft_body
         out = _dcapture_run(model, dcap, kernel, body, args)
     else:
         out = entry(kernel)(*args)
@@ -2759,135 +2679,9 @@ def run_draft(model, seeds, taps, main_hidden, spans, paged, meta=None):
     return [(output_ids[b : b + 1], None, conf[b : b + 1]) for b in range(B)]
 
 
-@torch._dynamo.disable
-@dataclass
-class SourceReplica:
-    """This stage's replica of a kv-source block another stage owns: the rows the
-    source wrote this step arrive through the stage boundary and are scattered into
-    these caches, which the stage's consumers of that source then read."""
-
-    layer_id: int
-    compress_ratio: int
-    window_size: int
-    compress_kv_cache: torch.Tensor
-    index_k_cache: torch.Tensor
-    is_kv_source = True
-
-
-def shipped_source_id(config, stage_first_block: int):
-    """The kv-source block whose cache rows cross the boundary *into* the stage whose
-    first block is `stage_first_block`: the latest source before it, or None."""
-    srcs = [sid for sid in config.kv_source_layer_ids if sid < stage_first_block]
-    return max(srcs) if srcs else None
-
-
-def topk_width(model, step, upto_layer: int) -> int:
-    """Columns of the index top-k the latest index source at or before `upto_layer`
-    produced this step: the kernel keeps `min(index_topk, read_len)` of its ratio's
-    compressed read (`layer_kernel`: `topk = min(topk_in.shape[1], read_len)`), so the
-    width follows the context length (384 at a 608-token context for ratio 2, 512 at
-    2104). Both sides of a stage boundary size the top-k payload with this, or their
-    kernels would be traced for different shapes and the runtime would refuse the
-    pair's collective ("replica group signature mismatch")."""
-    # The width is a running minimum along the blocks: an index source keeps
-    # `min(width of the top-k it was handed, its own read length)`, so a later
-    # source with a longer read (ratio 1 after ratio 2) inherits the narrower width.
-    cfg = model.config
-    width = int(cfg.index_topk)
-    for sid in sorted(cfg.index_source_layer_ids):
-        if sid > upto_layer:
-            break
-        ratio = int(cfg.compress_ratios[sid])
-        if ratio:
-            width = min(width, int(step.read_len(ratio)))
-    return width
-
-
-def _boundary_args(model, step, src, T, upto_layer):
-    """`(topk, cmp_cache, idx_cache, slots)` for a boundary carrying `src`'s rows and
-    the top-k of the latest index source at or before `upto_layer`."""
-    d = model._mk_dummies
-    width = topk_width(model, step, upto_layer)
-    topk = step.topk if step.topk is not None else torch.zeros(
-        T, width, dtype=torch.int32, device=step.device)
-    if int(topk.shape[1]) != width:
-        raise RuntimeError(
-            f"stage {model.mk_plan.stage}: the index top-k is {int(topk.shape[1])} wide, the "
-            f"boundary expects {width} (the latest index source up to block {upto_layer})"
-        )
-    if src is None:
-        return topk, d.bf16, d.bf16, d.i32
-    idx = step.for_ratio(int(src.compress_ratio), int(src.window_size))
-    return topk, src.compress_kv_cache, src.index_k_cache, idx.grp_wslots
-
-
-@torch._dynamo.disable
-def run_recv(model, step, T):
-    """A pipeline stage's entry (every stage but the first): the previous stage's
-    stream, pre_mix and index top-k, and the rows the shipped kv source wrote this
-    step, scattered into this stage's replica of its caches."""
-    plan = model.mk_plan
-    cfg = model.config
-    src_id = shipped_source_id(cfg, plan.first_block)
-    src = model._mk_nearest_source(src_id, "kv") if src_id is not None else None
-    stream = torch.zeros(T, cfg.hc_mult, cfg.hidden_size, dtype=torch.bfloat16, device=step.device)
-    pre_mix = torch.zeros(T, cfg.hc_mult, dtype=torch.float32, device=step.device)
-    topk, cmp_cache, idx_cache, slots = _boundary_args(model, step, src, T, plan.first_block - 1)
-    parity = (plan.stage - 1) % 2
-    kernel = mk_kernels.boundary(parity)
-    if _MK_TRACE and plan.stage_rank == 0:
-        _mk_log.warning("mk launch %s (recv) stage=%d T=%d src=%s args=%s", kernel.func.__name__, plan.stage, T, src_id,
-                        _arg_sig([stream, pre_mix, topk, cmp_cache, idx_cache, slots]))
-    out = entry(kernel)(stream, pre_mix, topk, cmp_cache, idx_cache, slots, _role_tensor(model, 0.0),
-                        plan.boundary_groups(parity), (kernel_version("pp", "tp8pp8"),))
-    _track(out[1])
-    step.topk = out[2]
-    if src is not None:
-        step.compress_cache, step.index_cache = src.compress_kv_cache, src.index_k_cache
-    return out[0], out[1]
-
-
-@torch._dynamo.disable
-def run_send(model, stream, pre_mix, step):
-    """A pipeline stage's exit (every stage but the last): hand the stream, pre_mix,
-    the current index top-k and the current kv source's rows of this step to the
-    next stage. Returns a small device tensor that completes with the hand-off."""
-    plan = model.mk_plan
-    T = int(stream.shape[0])
-    src = model._mk_nearest_source(plan.last_block, "kv")
-    topk, cmp_cache, idx_cache, slots = _boundary_args(model, step, src, T, plan.last_block)
-    parity = plan.stage % 2
-    kernel = mk_kernels.boundary(parity)
-    if _MK_TRACE and plan.stage_rank == 0:
-        _mk_log.warning("mk launch %s (send) stage=%d T=%d src=%d args=%s", kernel.func.__name__, plan.stage, T, src.layer_id,
-                        _arg_sig([stream, pre_mix, topk, cmp_cache, idx_cache, slots]))
-    out = entry(kernel)(stream, pre_mix, topk, cmp_cache, idx_cache, slots, _role_tensor(model, 1.0),
-                        plan.boundary_groups(parity), (kernel_version("pp", "tp8pp8"),))
-    _track(out[1])
-    return out[1]
-
-
-def _arg_sig(tensors) -> list:
-    """`(shape, dtype, stride, contiguous)` of each tensor, for the launch trace."""
-    return [(tuple(t.shape), str(t.dtype).replace("torch.", ""), tuple(t.stride()), bool(t.is_contiguous()))
-            for t in tensors]
-
-
-def _role_tensor(model, value: float) -> torch.Tensor:
-    """`[1, 1]` fp32 on the device: 1.0 on the sending side of a boundary, 0.0 on
-    the receiving one (the kernel's runtime role; see `pp_kernels`)."""
-    cache = model.__dict__.setdefault("_mk_role_tensors", {})
-    t = cache.get(value)
-    if t is None:
-        t = torch.full((1, 1), float(value), dtype=torch.float32).to(model.device)
-        cache[value] = t
-    return t
-
-
 def run_blocks(model, stream, pre_mix, step, dump=None, head=False, embed=False, draft=False):
-    """This rank's backbone blocks through the megakernels (every block under tp32,
-    the stage's five under tp8pp8). Returns `(stream, pre_mix)`; `step.taps` holds
-    the DSpark taps on the stage that owns the tapped blocks. `head` (an all-greedy
+    """This rank's backbone blocks through the megakernels (every block under tp32).
+    Returns `(stream, pre_mix)`; `step.taps` holds the DSpark taps. `head` (an all-greedy
     step, `fuses_head`): the last fused launch also runs the greedy head and
     `step.greedy_ids` holds its tokens. `embed` (`fuses_embed`): the first fused launch
     embeds `step.embed_ids` itself (`stream` / `pre_mix` are None)."""

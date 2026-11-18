@@ -1,27 +1,19 @@
 # Contrib Model: DeepSeek-V4.1-Flash (text) on 8 Trainium3 devices
 
-Serving [`deepseek-ai/DeepSeek-V4.1-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
-with vLLM on **8 of a trn3.48xlarge's 16 devices** through the `vllm-neuron` plugin.
-The architecture string is `DeepseekV41ForCausalLM`, taken from the checkpoint's own
-`config.json`.
+Serving [`deepseek-ai/DeepSeek-V4.1-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) with vLLM on **8 of a trn3.48xlarge's 16 devices** through the `vllm-neuron` plugin. The architecture string is `DeepseekV41ForCausalLM`, taken from the checkpoint's own `config.json`.
 
-This folder is the 8-device variant of [`contrib/models/deepseek_v41_trn3`](../deepseek_v41_trn3/README.md)
-(the 16-device, 64-rank Trainium3 port). It was copied from it and changed where 32 ranks need
-it, then optimized further for a batch-1 decode step; the architecture and the megakernels are
-documented there and in [`src/README.md`](src/README.md). The two folders are independent:
-different package names (`deepseek_v41` / `deepseek_v41_8d`) and no shared files.
+This folder is the 8-device variant of [`contrib/models/deepseek_v41_trn3`](../deepseek_v41_trn3/README.md) (the 16-device, 64-rank Trainium3 port). It was copied from it and changed where 32 ranks need it, then optimized further for a batch-1 decode step; the architecture and the megakernels are documented there and in [`src/README.md`](src/README.md). The two folders are independent: different package names (`deepseek_v41` / `deepseek_v41_8d`) and no shared files.
 
-> **Note:** Contrib models are community contributions and may have limited
-> testing or performance optimization compared to the officially-supported
-> models under `vllm_neuron/model/`. The compatibility matrix below records
-> exactly what was tested.
+The folder is self-contained: everything the model needs is under `contrib/models/deepseek_v41_8d_trn3/`. The few changes it needs inside the `vllm-neuron` plugin ship as a patch in [`plugin-core/`](plugin-core/README.md), applied with one script (see [Reproducing the results](#reproducing-the-results)). The patch is the same as the 16-device port's; applying either copy is enough.
+
+> **Note:** Contrib models are community contributions and may have limited testing or performance optimization compared to the officially-supported models under `vllm_neuron/model/`. The compatibility matrix below records exactly what was tested.
 
 ## What differs from the 16-device port
 
 | | `deepseek_v41_trn3` (16 devices) | `deepseek_v41_8d_trn3` (this folder) |
 | --- | --- | --- |
 | Ranks | 64 (16 devices x 4 logical cores, LNC=2) | **32** (8 devices x 4), `config.TENSOR_PARALLEL_SIZE = 32` |
-| Scheme | `tp64` (default) or `tp8pp8` | **`tp32`** only (`DEEPSEEK_V41_SCHEME`; the 64-rank pipeline scheme is rejected) |
+| Scheme | `tp64` | **`tp32`** (`DEEPSEEK_V41_SCHEME`) |
 | Attention / dense projections | TP8, replicated 8 times | TP8, replicated 4 times; world all-reduces over 32 ranks |
 | Decode MoE (fused bs1 launches) | TP8 x EP8: 8 groups of 48 experts, 288 hidden columns a rank | **TP8 x EP4**: 4 groups of 96 experts, 288 hidden columns a rank |
 | Routed experts, deployment layout (prefill, bs10) | 6 a rank | 12 a rank |
@@ -37,20 +29,9 @@ different package names (`deepseek_v41` / `deepseek_v41_8d`) and no shared files
 
 Why each change is there:
 
-- **HBM.** A logical core has 36 GiB. At 32 ranks the resident weights are twice as many
-  bytes a rank (12 routed experts a layer, a twice-larger engram shard), and the fused bs1
-  decode launches add their TP x EP copy of every layer's MoE (0.235 GiB a layer, 9.4 GiB).
-  As copied, the port ran out of device memory building that copy (28.7 GiB in use before
-  it). Keeping the engram shards in fp8 and freeing the per-op fp8 weights brought it to
-  20.4 GiB before and ~29.7 GiB after; the expert / engram budgets
-  (`DEEPSEEK_V41_EXPERT_CACHE_BYTES`, `DEEPSEEK_V41_ENGRAM_TABLE_BYTES`) default to 12 GiB.
-- **The decode MoE.** With 4 groups a group's 96 experts see about twice the active experts
-  of a 48-expert group, so a rank streams and multiplies about twice the routed weights a
-  step, and more than 8 active experts in a group (the dynamic overflow loop, ~50 us) became
-  common. The packed down contraction (3 matmuls a 512-column tile for a core's slots
-  instead of one a slot) and one shared term made a static slot cheap enough for a fifth.
-- **The shared expert** has 72 blocks of 32 hidden columns: one a core at 64 ranks, two a core
-  here (zero blocks where there are fewer).
+- **HBM.** A logical core has 36 GiB. At 32 ranks the resident weights are twice as many bytes a rank (12 routed experts a layer, a twice-larger engram shard), and the fused bs1 decode launches add their TP x EP copy of every layer's MoE (0.235 GiB a layer, 9.4 GiB). As copied, the port ran out of device memory building that copy (28.7 GiB in use before it). Keeping the engram shards in fp8 and freeing the per-op fp8 weights brought it to 20.4 GiB before and ~29.7 GiB after; the expert / engram budgets (`DEEPSEEK_V41_EXPERT_CACHE_BYTES`, `DEEPSEEK_V41_ENGRAM_TABLE_BYTES`) default to 12 GiB.
+- **The decode MoE.** With 4 groups a group's 96 experts see about twice the active experts of a 48-expert group, so a rank streams and multiplies about twice the routed weights a step, and more than 8 active experts in a group (the dynamic overflow loop, ~50 us) became common. The packed down contraction (3 matmuls a 512-column tile for a core's slots instead of one a slot) and one shared term made a static slot cheap enough for a fifth.
+- **The shared expert** has 72 blocks of 32 hidden columns: one a core at 64 ranks, two a core here (zero blocks where there are fewer).
 
 ## Requirements
 
@@ -58,26 +39,94 @@ Why each change is there:
 | --- | --- |
 | Instance | `trn3.48xlarge`; the engine uses **8 devices** (devices 0-7, logical cores 0-31, by default) |
 | Parallelism | `tensor_parallel_size = 32`, set by `src/config.py` |
+| Software | DLAMI venv `aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0` (Neuron SDK 2.33) |
+| Plugin | `vllm-neuron` at [`fe7bf43`](https://github.com/vllm-project/vllm-neuron/commit/fe7bf43c9ae9d0e2731a0765496186c11e6152bd) plus [`plugin-core/deepseek-v41-plugin-core.patch`](plugin-core/README.md) |
 | Checkpoint | 475.3 GiB over 48 shards, on **local NVMe** |
 | HBM | ~30 GiB of a logical core's 36 at bs1 decode |
 
-The engine's workers take logical cores `0 .. 31`, i.e. devices 0-7 (the plugin's
-`neuron_worker` default; `NEURON_VISIBLE_DEVICES` is its knob for another set of 32 logical
-cores, not tested here, and it rejects `NEURON_RT_VISIBLE_CORES`). Devices 0-7 are what
-everything below was measured on; the other 8 devices stay free.
+The engine's workers take logical cores `0 .. 31`, i.e. devices 0-7 (the plugin's `neuron_worker` default; `NEURON_VISIBLE_DEVICES` is its knob for another set of 32 logical cores, not tested here, and it rejects `NEURON_RT_VISIBLE_CORES`). Devices 0-7 are what everything below was measured on; the other 8 devices stay free.
 
-The checkpoint has to be on instance store, not EBS (32 ranks read it at startup), and
-`vm.overcommit_memory` must stay at `0`: compiling forks `neuronx-cc` out of every worker.
-Speculative decoding needs the plugin change described in [`plugin-core/`](plugin-core/README.md)
-(already in this branch's plugin); without it the model serves one token a step.
+The checkpoint has to be on instance store, not EBS (32 ranks read it at startup), and `vm.overcommit_memory` must stay at `0`: compiling forks `neuronx-cc` out of every worker. The plugin patch is required: speculative decoding through the DSpark stages, async scheduling and the Trn3 bring-up fixes depend on it, and every result below was measured with it applied.
+
+## Reproducing the results
+
+Every command below runs **from the repository root**. That is what makes Python import the patched checkout's `vllm_neuron` rather than the copy installed in the venv: `python -m ...` and `python -m pytest` put the current directory first on `sys.path`, and vLLM's spawned workers inherit it.
+
+### 1. Check out the code
+
+```bash
+git clone https://github.com/vllm-project/vllm-neuron.git
+cd vllm-neuron
+# this contribution (vllm-project/vllm-neuron#89); use `main` once it has merged
+git fetch origin pull/89/head:deepseek-v41-trn3
+git checkout deepseek-v41-trn3
+```
+
+The contribution changes nothing outside `contrib/`, so `vllm_neuron/` is that of its base commit [`fe7bf43`](https://github.com/vllm-project/vllm-neuron/commit/fe7bf43c9ae9d0e2731a0765496186c11e6152bd) (vllm-neuron 0.29.0.1.2.0), the commit the patch was generated against. `git diff --stat fe7bf43 -- vllm_neuron` prints nothing on such a checkout.
+
+### 2. Apply the plugin patch
+
+```bash
+contrib/models/deepseek_v41_8d_trn3/plugin-core/apply_plugin_core.sh --check   # "not applied; would apply cleanly."
+contrib/models/deepseek_v41_8d_trn3/plugin-core/apply_plugin_core.sh           # "applied deepseek-v41-plugin-core.patch."
+```
+
+The script is idempotent and refuses a half-patched tree. `--revert` undoes it. On a checkout newer than `fe7bf43` it falls back to a three-way merge and stops if that leaves conflicts.
+
+### 3. Activate the environment and check which plugin is imported
+
+```bash
+source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0/bin/activate
+python -c "import vllm_neuron.vllm.spec_decode as s; print(s.__file__, hasattr(s, 'register_proposer'))"
+```
+
+The output must be a path inside this checkout followed by `True`. A path into the venv's `site-packages` means the command was not run from the repository root.
+
+### 4. Download the checkpoint
+
+```bash
+hf download deepseek-ai/DeepSeek-V4.1-Flash \
+    --revision 314113f8a7dadb388215396ba5fbee2c610a04d6 \
+    --local-dir /mnt/nvme/hf
+```
+
+### 5. Run the integration test
+
+```bash
+DEEPSEEK_V41_CHECKPOINT=/mnt/nvme/hf \
+python -m pytest contrib/models/deepseek_v41_8d_trn3/test/integration/test_model.py -v -s --timeout=14400
+```
+
+About 10 minutes against a warm compile cache (20 cold). It needs devices 0-7 to itself. See [Accuracy](#accuracy-integration) for what it asserts.
+
+### 6. Run the benchmark
+
+```bash
+# batch 1, input 512 / 1024 / 2048 / 8192
+python contrib/models/deepseek_v41_8d_trn3/test/performance/run_bench.py --model /mnt/nvme/hf \
+    --dataset-path contrib/models/deepseek_v41_8d_trn3/test/performance/sonnet.txt \
+    --report contrib/models/deepseek_v41_8d_trn3/test/performance/bench_report.json \
+    --bench-timeout 7200 --batch-sizes 1
+
+# batch 10, on engines that admit ten sequences
+DEEPSEEK_V41_MAX_NUM_SEQS=10 \
+python contrib/models/deepseek_v41_8d_trn3/test/performance/run_bench.py --model /mnt/nvme/hf \
+    --dataset-path contrib/models/deepseek_v41_8d_trn3/test/performance/sonnet.txt \
+    --report contrib/models/deepseek_v41_8d_trn3/test/performance/bench_report_ms10.json \
+    --bench-timeout 7200 --input-lens 512,1024,2048,8192 --batch-sizes 10
+```
+
+See [Speed](#speed-performance) for the output.
+
+### 7. Undo the patch (optional)
+
+```bash
+contrib/models/deepseek_v41_8d_trn3/plugin-core/apply_plugin_core.sh --revert
+```
 
 ## Registering the model
 
-Importing the package is the whole registration step (see the
-[16-device README](../deepseek_v41_trn3/README.md#registering-the-model) for what it does and
-why the import has to come first). The package here is named **`deepseek_v41_8d`**:
-`test/deepseek_v41_8d` is a symlink to `src/`, and `test/model_package.py` loads it and puts
-the folder on `PYTHONPATH` for vLLM's subprocesses.
+Importing the package is the whole registration step (see the [16-device README](../deepseek_v41_trn3/README.md#registering-the-model) for what it does and why the import has to come first). The package here is named **`deepseek_v41_8d`**: `test/deepseek_v41_8d` is a symlink to `src/`, and `test/model_package.py` loads it and puts the folder on `PYTHONPATH` for vLLM's subprocesses.
 
 Offline:
 
@@ -99,8 +148,7 @@ out = llm.generate(["What is the capital of France?"], SamplingParams(temperatur
 print(out[0].outputs[0].text)
 ```
 
-Online, through the thin entry point the benchmark uses (it imports the package, then runs
-vLLM's `api_server`):
+Online, through the thin entry point the benchmark uses (it imports the package, then runs vLLM's `api_server`):
 
 ```bash
 PYTHONPATH=contrib/models/deepseek_v41_8d_trn3/test \
@@ -111,8 +159,7 @@ python -m performance._serve_main \
     --max-num-seqs 1
 ```
 
-Both packages register the same `transformers` model type (`deepseek_v41`) and vLLM
-architecture, so load one of them per process.
+Both packages register the same `transformers` model type (`deepseek_v41`) and vLLM architecture, so load one of them per process.
 
 ## Compatibility Matrix
 
@@ -121,21 +168,11 @@ architecture, so load one of them per process.
 | Trn3 (8 devices) | Working | Not tested |
 | Trn2 | Not tested | Not tested |
 
-Validated 2026-11-05 on a `trn3.48xlarge` with the DLAMI venv
-`aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0` (vLLM 0.29.0, torch 2.13.0,
-`libtorch-neuronx-lite` 2.13.0.1.0.3112, `neuronx-cc` 2.28.7631.0, `nki` 0.7.0, runtime
-2.35.30.0, driver 2.31.7.0) and this branch's `vllm-neuron`, checkpoint revision
-`314113f8a7dadb388215396ba5fbee2c610a04d6`.
+Validated 2026-11-05 on a `trn3.48xlarge` with the DLAMI venv `aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0` (vLLM 0.29.0, torch 2.13.0, `libtorch-neuronx-lite` 2.13.0.1.0.3112, `neuronx-cc` 2.28.7631.0, `nki` 0.7.0, runtime 2.35.30.0, driver 2.31.7.0), `vllm-neuron` 0.29.0.1.2.0 ([`fe7bf43`](https://github.com/vllm-project/vllm-neuron/commit/fe7bf43c9ae9d0e2731a0765496186c11e6152bd)) with `plugin-core/deepseek-v41-plugin-core.patch` applied, and checkpoint revision `314113f8a7dadb388215396ba5fbee2c610a04d6`.
 
 ## Performance
 
-Measured 2026-11-05 on devices 0-7 (32 ranks) with every optimization at its default and the
-stack above, by `test/performance/run_bench.py` (see [Testing](#speed-performance)): sonnet
-prompts, 128 output tokens, greedy, one server per input length, warmed before it is measured.
-A batch-1 cell sends 8 requests one at a time; a batch-10 cell sends 10 concurrent requests to
-an engine built for ten, and its output tok/s is their aggregate. `accept %` is the share of
-DSpark drafts accepted; the median inter-token latency is one decode step. In parentheses: the
-16-device port on all 16 devices (`deepseek_v41_trn3`, measured the same day the same way):
+Measured 2026-11-05 on devices 0-7 (32 ranks) with every optimization at its default and the stack above, by `test/performance/run_bench.py` ([step 6](#6-run-the-benchmark)): sonnet prompts, 128 output tokens, greedy, one server per input length, warmed before it is measured. A batch-1 cell sends 8 requests one at a time; a batch-10 cell sends 10 concurrent requests to an engine built for ten, and its output tok/s is their aggregate. `accept %` is the share of DSpark drafts accepted; the median inter-token latency is one decode step. In parentheses: the 16-device port on all 16 devices (`deepseek_v41_trn3`, measured the same day the same way):
 
 | Cell | TTFT p50 ms | TPOT p50 ms | output tok/s | accept % | median ITL ms |
 |------|-------------|-------------|--------------|----------|---------------|
@@ -148,21 +185,9 @@ DSpark drafts accepted; the median inter-token latency is one decode step. In pa
 | in2048_bs10 | 2300 (2236) | 27.03 (26.64) | 214.3 (218.4) | 47.8 (48.5) | 43.28 (41.18) |
 | in8192_bs10 | 9403 (9149) | 80.55 (71.51) | 64.6 (68.9) | 46.6 (48.1) | 49.74 (44.61) |
 
-A batch-1 decode step is ~0.5 ms shorter on these 8 devices than on all sixteen (median ITL -3.3 to
--4.5 %): the 8-device-only changes in the table at the top -- the four-execution step, the packed decode
-MoE, the decode launches optimized on their recorded 32-rank launch, the drafter -- more than offset the
-doubled routed experts and engram rows a rank. Batch-1 TPOT differs through the draft acceptance (in1024:
-43.5 against 51.2 %), not the step time. Batch 10 is 3-12 % slower a step and prefill 2-10 % slower; bs10
-acceptance moves from run to run with the batch's arrival order (42-48 % over the runs of this code),
-and bs10 TPOT with it. Every request of every cell completed with its 128 tokens, and the texts are
-coherent answers to the prompts. See [`src/README.md`](src/README.md#the-8-device-deployment) for the
-switches and what was tried and dropped.
+A batch-1 decode step is ~0.5 ms shorter on these 8 devices than on all sixteen (median ITL -3.3 to -4.5 %): the 8-device-only changes in the table at the top (the four-execution step, the packed decode MoE, the decode launches optimized on their recorded 32-rank launch, the drafter) more than offset the doubled routed experts and engram rows a rank. Batch-1 TPOT differs through the draft acceptance (in1024: 43.5 against 51.2 %), not the step time. Batch 10 is 3-12 % slower a step and prefill 2-10 % slower; bs10 acceptance moves from run to run with the batch's arrival order (42-48 % over the runs of this code), and bs10 TPOT with it. Every request of every cell completed with its 128 tokens, and the texts are coherent answers to the prompts. See [`src/README.md`](src/README.md#the-8-device-deployment) for the switches and what was tried and dropped.
 
-The integration test passes: `short-prose`, `smoke-test` and `trivia-capital-france` are
-token-for-token the 16-device port's (32 / 32 / 18 tokens, `...The capital of France is **Paris**.`),
-and `long-needle-2048-0` recalls `5591-C67` with the same 32 tokens up to the sentence after the code,
-then continues `...The maintenance log for sector 159 ...`, one of the continuations the 16-device
-port's own validated runs produced.
+The integration test passes: `short-prose`, `smoke-test` and `trivia-capital-france` are token-for-token the 16-device port's (32 / 32 / 18 tokens, `...The capital of France is **Paris**.`), and `long-needle-2048-0` recalls `5591-C67` with the same 32 tokens up to the sentence after the code, then continues `...The maintenance log for sector 159 ...`, one of the continuations the 16-device port's own validated runs produced.
 
 During serving the 32 workers hold `/dev/neuron0` .. `/dev/neuron7` only.
 
@@ -170,49 +195,12 @@ During serving the 32 workers hold `/dev/neuron0` .. `/dev/neuron7` only.
 
 ### Accuracy (integration)
 
-Serves the model through vLLM on 32 ranks and checks the generated text. Needs devices
-0-7 to itself. From the repository root:
-
-```bash
-source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0/bin/activate
-DEEPSEEK_V41_CHECKPOINT=/mnt/nvme/hf \
-python -m pytest contrib/models/deepseek_v41_8d_trn3/test/integration/test_model.py \
-    -v -s --timeout=14400
-```
-
-About 10 minutes against a warm compile cache (20 cold). It asserts that every phase ran,
-every case produced tokens and every case declaring an expected substring contains it
-(`long-needle-2048-0` must recall an access code planted 2008 tokens deep,
-`trivia-capital-france` must say Paris); every completion is printed. See the
-[16-device README](../deepseek_v41_trn3/README.md#accuracy-integration) for why the test checks
-text rather than logits.
+`test/integration/test_model.py` serves the model through vLLM on 32 ranks and checks the generated text; run it as in [step 5](#5-run-the-integration-test). It asserts that every phase ran, every case produced tokens and every case declaring an expected substring contains it (`long-needle-2048-0` must recall an access code planted 2008 tokens deep, `trivia-capital-france` must say Paris); every completion is printed. See the [16-device README](../deepseek_v41_trn3/README.md#accuracy-integration) for why the test checks text rather than logits.
 
 ### Speed (performance)
 
-`run_bench.py` serves the model and drives it with `vllm bench serve --dataset-name sonnet`
-(greedy, one server per input length, warmed before it is measured):
-
-```bash
-source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0/bin/activate
-
-# batch 1, input 512 / 1024 / 2048 / 8192
-python contrib/models/deepseek_v41_8d_trn3/test/performance/run_bench.py --model /mnt/nvme/hf \
-    --dataset-path contrib/models/deepseek_v41_8d_trn3/test/performance/sonnet.txt \
-    --report contrib/models/deepseek_v41_8d_trn3/test/performance/bench_report.json \
-    --bench-timeout 7200 --batch-sizes 1
-
-# batch 10, on engines that admit ten sequences
-DEEPSEEK_V41_MAX_NUM_SEQS=10 \
-python contrib/models/deepseek_v41_8d_trn3/test/performance/run_bench.py --model /mnt/nvme/hf \
-    --dataset-path contrib/models/deepseek_v41_8d_trn3/test/performance/sonnet.txt \
-    --report contrib/models/deepseek_v41_8d_trn3/test/performance/bench_report_ms10.json \
-    --bench-timeout 7200 --input-lens 512,1024,2048,8192 --batch-sizes 10
-```
-
-Per-cell results and server logs land next to the report (`cells/`; neither is versioned). See
-[`test/performance/README.md`](test/performance/README.md) for the flags and the output.
+`test/performance/run_bench.py` serves the model and drives it with `vllm bench serve --dataset-name sonnet` (greedy, one server per input length, warmed before it is measured); run it as in [step 6](#6-run-the-benchmark). Per-cell results and server logs land next to the report (`cells/`; neither is versioned). See [`test/performance/README.md`](test/performance/README.md) for the flags and the output.
 
 ### Optional: unit tests
 
-`test/unit/` is the 16-device port's kernel test suite, copied with the package renamed
-(`kharness_mp.py <N> <test>` runs a test on N cores); the integration test is the gate.
+`test/unit/` is the 16-device port's kernel test suite, copied with the package renamed (`python kharness_mp.py <N> <test>` from `test/unit/` runs a test on N cores); the integration test is the gate.

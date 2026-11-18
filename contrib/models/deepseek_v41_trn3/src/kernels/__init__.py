@@ -6,10 +6,9 @@ the default): one `@nki.jit` per backbone block and one for the DSpark drafter,
 both launched on both physical cores of a logical core (`nl.program_id(0)`
 splits the work) and doing their own collectives (`nki.collectives`). The
 bodies below are traced into **separate entry points** by `mk_kernels`: one per
-phase (prefill / decode), per block archetype (`ratio`, kv source, index source,
-engram, DSpark tap) and per parallelization scheme (`DEEPSEEK_V41_SCHEME`:
-`tp64`, the flat world, or `tp8pp8`, the model-internal pipeline of 8 stages of
-8 ranks, whose seams are `pp_kernels`):
+phase (prefill / decode) and per block archetype (`ratio`, kv source, index
+source, engram, DSpark tap), for the flat scheme `tp64` (one tensor-parallel
+world of 64 ranks):
 
     module                      kernel.entry                 call site
     ------------------------------------------------------------------------------
@@ -28,7 +27,7 @@ engram, DSpark tap) and per parallelization scheme (`DEEPSEEK_V41_SCHEME`:
       in, the 384-expert router,
       the routed + shared
       experts and their
-      all-reduce, hc sublayer-out <scheme>/layer_kernel.layer_forward  mk_model.run_layer
+      all-reduce, hc sublayer-out tp64/layer_kernel.layer_forward  mk_model.run_layer
                                                               <- model._run_block
     the DSpark drafter -- the
       tap projection, the
@@ -39,8 +38,10 @@ engram, DSpark tap) and per parallelization scheme (`DEEPSEEK_V41_SCHEME`:
       MoE), the head, the markov
       bias, the argmax over the
       sharded vocabulary, the
-      confidence head             <scheme>/draft_kernel.draft_forward  mk_model.run_draft
+      confidence head             tp64/draft_kernel.draft_forward  mk_model.run_draft
                                                               <- model.forward_spec
+      (every sequence of a step
+      in one launch)              batched/draft_kernel         mk_model.run_draft
       (the flat scheme's decode
       phase: the optimized copy,
       own helpers and weight
@@ -68,16 +69,9 @@ engram, DSpark tap) and per parallelization scheme (`DEEPSEEK_V41_SCHEME`:
       resident transposed slot
       table -- and the router)    mk_common, mk_compress       (imported by both)
     the specialized entry points
-      `layer_<phase>_<arch>_<scheme>`,
-      `draft_<phase>_<scheme>`,
-      `pp_boundary_{even,odd}`    mk_kernels                   (what mk_model runs)
-    the tp8pp8 seam: the pairwise
-      stage boundary (stream,
-      pre_mix, top-k, this step's
-      compressed and index-key rows
-      into the next stage's cache
-      replica), one program for
-      both sides                    tp8pp8/pp_kernels            mk_model.run_recv / run_send
+      `layer_<phase>_<arch>_tp64`,
+      `draft_<phase>_tp64`,
+      `draft_<phase>_batched_tp64` mk_kernels                  (what mk_model runs)
     the per-step index columns
       (window/compressed slot
       tables, group members)      ../mk_host.py                mk_model.StepIndices
@@ -86,9 +80,9 @@ The two megakernels borrow `blockquant`'s activation quantization (`_qdq_fp8`,
 for the values written to the KV caches) and its bf16 `_gemm` (compressor,
 indexer keys, the draft head) and nothing from any library: every other
 operation is written out in `mk_mx` / `mk_moe` / `mk_common` / `mk_compress`.
-Every megakernel module exists once per parallelization scheme (`kernels/tp64/`,
-`kernels/tp8pp8/`): the schemes are separate paths and their kernels never share
-source, so a change for one cannot alter the other (`mk_kernels.pkg(scheme)`).
+The batched drafter's body (`kernels/batched/`) has its own copies of the helper
+modules, so a change to it cannot alter the flat scheme's other kernels
+(`kernels/tp64/`), and vice versa.
 Unit tests: `test/unit/test_layer.py`, `test/unit/test_draft.py` (N ranks
 through `kharness_mp.py`); device probes of the hardware conventions the
 kernels rely on: `test/unit/probe_mx.py`, `probe_dyn.py`, `probe_ti.py`.

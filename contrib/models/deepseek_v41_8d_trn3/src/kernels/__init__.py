@@ -8,8 +8,7 @@ splits the work) and doing their own collectives (`nki.collectives`). The
 bodies below are traced into **separate entry points** by `mk_kernels`: one per
 phase (prefill / decode), per block archetype (`ratio`, kv source, index source,
 engram, DSpark tap) and per parallelization scheme (`DEEPSEEK_V41_SCHEME`:
-`tp32`, the flat world, or `tp8pp8`, the model-internal pipeline of 8 stages of
-8 ranks, whose seams are `pp_kernels`):
+`tp32`, the flat world, the only one this port serves):
 
     module                      kernel.entry                 call site
     ------------------------------------------------------------------------------
@@ -70,14 +69,7 @@ engram, DSpark tap) and per parallelization scheme (`DEEPSEEK_V41_SCHEME`:
     the specialized entry points
       `layer_<phase>_<arch>_<scheme>`,
       `draft_<phase>_<scheme>`,
-      `pp_boundary_{even,odd}`    mk_kernels                   (what mk_model runs)
-    the tp8pp8 seam: the pairwise
-      stage boundary (stream,
-      pre_mix, top-k, this step's
-      compressed and index-key rows
-      into the next stage's cache
-      replica), one program for
-      both sides                    tp8pp8/pp_kernels            mk_model.run_recv / run_send
+      `draft_<phase>_batched_tp32` mk_kernels                  (what mk_model runs)
     the per-step index columns
       (window/compressed slot
       tables, group members)      ../mk_host.py                mk_model.StepIndices
@@ -86,9 +78,10 @@ The two megakernels borrow `blockquant`'s activation quantization (`_qdq_fp8`,
 for the values written to the KV caches) and its bf16 `_gemm` (compressor,
 indexer keys, the draft head) and nothing from any library: every other
 operation is written out in `mk_mx` / `mk_moe` / `mk_common` / `mk_compress`.
-Every megakernel module exists once per parallelization scheme (`kernels/tp32/`,
-`kernels/tp8pp8/`): the schemes are separate paths and their kernels never share
-source, so a change for one cannot alter the other (`mk_kernels.pkg(scheme)`).
+Every megakernel module lives in the scheme's package (`kernels/tp32/`,
+`mk_kernels.pkg(scheme)`); the batched drafter (every sequence of a step in one
+launch, `mk_kernels.draft_batched`) has its own copies in `kernels/batched/`, so a
+change to one path cannot alter the other.
 Unit tests: `test/unit/test_layer.py`, `test/unit/test_draft.py` (N ranks
 through `kharness_mp.py`); device probes of the hardware conventions the
 kernels rely on: `test/unit/probe_mx.py`, `probe_dyn.py`, `probe_ti.py`.

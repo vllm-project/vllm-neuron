@@ -1,120 +1,104 @@
 #!/usr/bin/env bash
-# Apply (or check, or revert) the plugin-core change this model needs for
-# speculative decoding. See README.md in this folder for why it exists.
+# Apply, check or revert the vllm-neuron plugin-core changes this model needs.
+# See README.md in this folder for what the patch contains and why.
 #
-#   ./apply_plugin_core.sh [--check | --revert]
+#   ./apply_plugin_core.sh [--check | --revert] [--target DIR]
 #
-# Safe to run twice: if the change is already present — because the upstream PR
-# merged, or because this script ran before — it reports that and exits 0
-# without touching anything.
+# DIR is the directory that holds the `vllm_neuron/` package to patch. It defaults to
+# the root of the vllm-neuron checkout this script lives in. Pass an installed copy's
+# parent (e.g. a venv's site-packages) to patch that copy instead.
+#
+# Safe to run twice: when the patch is already applied it says so and exits 0.
 set -euo pipefail
 
-PATCH_NAME="deepseek-v41-spec-decode.patch"
+PATCH_NAME="deepseek-v41-plugin-core.patch"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCH="$HERE/$PATCH_NAME"
 
-#: Generated against this commit. Recorded so a failure can say "the tree has
-#: moved" rather than only "the patch did not apply".
-BASE_COMMIT="f32079d84c2330602e68c58db98e9c28fa0c44cc"
+#: The vllm-project/vllm-neuron `main` commit the patch was generated against
+#: (vllm-neuron 0.29.0.1.2.0; its `vllm_neuron/` is byte-identical to the package the
+#: DLAMI venv `aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0` installs).
+BASE_COMMIT="fe7bf43c9ae9d0e2731a0765496186c11e6152bd"
 
-#: The two things the change adds. Both present means applied; one without the
-#: other means a half-applied tree, which is worth refusing rather than
-#: compounding.
-SENTINEL_FILE="vllm_neuron/vllm/patches/in_model_proposer_patch.py"
-SENTINEL_SYMBOL="def register_proposer"
-SENTINEL_SYMBOL_FILE="vllm_neuron/vllm/spec_decode/__init__.py"
+usage() { echo "usage: $(basename "$0") [--check | --revert] [--target DIR]" >&2; exit 2; }
+die() { echo "error: $*" >&2; exit 1; }
 
 MODE="apply"
-case "${1:-}" in
-    --check)  MODE="check" ;;
-    --revert) MODE="revert" ;;
-    "")       ;;
-    *) echo "usage: $(basename "$0") [--check | --revert]" >&2; exit 2 ;;
-esac
-
-die() { echo "error: $*" >&2; exit 1; }
+TARGET=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --check)  MODE="check" ;;
+        --revert) MODE="revert" ;;
+        --target) [ $# -ge 2 ] || usage; TARGET="$2"; shift ;;
+        -h|--help) usage ;;
+        *) usage ;;
+    esac
+    shift
+done
 
 [ -f "$PATCH" ] || die "$PATCH_NAME is missing from $HERE"
 
-ROOT="$(git -C "$HERE" rev-parse --show-toplevel 2>/dev/null)" \
-    || die "not inside a git checkout; this script applies the patch with \`git apply\`"
-cd "$ROOT"
+if [ -z "$TARGET" ]; then
+    TARGET="$(git -C "$HERE" rev-parse --show-toplevel 2>/dev/null)" \
+        || die "not inside a git checkout; pass --target DIR (the directory holding vllm_neuron/)"
+fi
+TARGET="$(cd "$TARGET" && pwd)" || die "no such directory: $TARGET"
+[ -d "$TARGET/vllm_neuron" ] || die "$TARGET has no vllm_neuron/ package to patch"
+cd "$TARGET"
 
-[ -f "$SENTINEL_SYMBOL_FILE" ] || die \
-    "$SENTINEL_SYMBOL_FILE not found. Run this from a vllm-neuron checkout."
+# Inside a git checkout, `git apply` resolves paths from the repository root, so the
+# target has to be that root. Outside one, it behaves like `patch -p1`.
+IN_REPO=false
+if TOP="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    [ "$TOP" = "$TARGET" ] || die "$TARGET is inside the git checkout $TOP but is not its root"
+    IN_REPO=true
+fi
 
-has_file=false; has_symbol=false
-[ -f "$SENTINEL_FILE" ] && has_file=true
-grep -q "$SENTINEL_SYMBOL" "$SENTINEL_SYMBOL_FILE" && has_symbol=true
-
-if $has_file && $has_symbol; then
-    applied=true
-elif ! $has_file && ! $has_symbol; then
-    applied=false
+if git apply --check "$PATCH" 2>/dev/null; then
+    STATE="unapplied"
+elif git apply --reverse --check "$PATCH" 2>/dev/null; then
+    STATE="applied"
 else
-    die "the tree is half-patched: $SENTINEL_FILE $($has_file && echo exists || echo missing), \
-and '$SENTINEL_SYMBOL' $($has_symbol && echo present || echo absent) in \
-$SENTINEL_SYMBOL_FILE. Resolve that before running this script."
+    STATE="neither"
 fi
 
-if [ "$MODE" = "revert" ]; then
-    $applied || { echo "not applied; nothing to revert."; exit 0; }
-    git apply --reverse "$PATCH" \
-        || die "reverse apply failed. If the upstream PR merged, the plugin
-  carries these changes permanently and reverting them is not what you want."
-    echo "reverted $PATCH_NAME."
-    exit 0
+echo "target: $TARGET/vllm_neuron"
+if $IN_REPO && [ "$STATE" = "neither" ] && git cat-file -e "$BASE_COMMIT^{commit}" 2>/dev/null \
+    && ! git diff --quiet "$BASE_COMMIT" -- vllm_neuron; then
+    echo "note: vllm_neuron/ differs from the patch's base $BASE_COMMIT."
 fi
 
-if $applied; then
-    echo "The proposer registry is already in this tree:"
-    echo "  - $SENTINEL_FILE exists"
-    echo "  - '$SENTINEL_SYMBOL' is in $SENTINEL_SYMBOL_FILE"
-    echo
-    echo "Either the upstream change merged or this script has already run."
-    echo "Nothing to do; speculative decoding will be available."
-    exit 0
-fi
+case "$MODE:$STATE" in
+    check:unapplied) echo "not applied; would apply cleanly."; exit 0 ;;
+    check:applied)   echo "already applied."; exit 0 ;;
+    check:neither)
+        if $IN_REPO && git apply --3way --check "$PATCH" 2>/dev/null; then
+            echo "not applied; would apply only with a three-way merge."
+            exit 0
+        fi
+        die "the patch neither applies nor reverses cleanly: vllm_neuron/ has moved away from $BASE_COMMIT or is partly patched." ;;
 
-echo "The proposer registry is not in this tree, so DSpark speculative decoding"
-echo "would be unavailable without $PATCH_NAME."
-if [ "$(git rev-parse HEAD)" != "$BASE_COMMIT" ]; then
-    echo
-    echo "note: the patch was generated against $BASE_COMMIT and HEAD is"
-    echo "      $(git rev-parse --short HEAD). A three-way merge will be used if the"
-    echo "      context has moved."
-fi
-echo
+    revert:applied)
+        git apply --reverse "$PATCH"
+        echo "reverted $PATCH_NAME."; exit 0 ;;
+    revert:unapplied) echo "not applied; nothing to revert."; exit 0 ;;
+    revert:neither)   die "the patch does not reverse cleanly; revert the files by hand (git checkout -- vllm_neuron)." ;;
 
-if [ "$MODE" = "check" ]; then
-    if git apply --check "$PATCH" 2>/dev/null; then
-        echo "would apply cleanly."
-    elif git apply --3way --check "$PATCH" 2>/dev/null; then
-        echo "would apply with a three-way merge."
-    else
-        die "would NOT apply. The plugin has moved too far from $BASE_COMMIT;
-  take the change from the upstream pull request instead of this patch."
-    fi
-    exit 0
-fi
-
-echo "applying ..."
-if git apply "$PATCH" 2>/dev/null; then
-    echo "applied cleanly."
-elif git apply --3way "$PATCH"; then
-    # --3way can leave conflict markers and still exit 0, so this is checked
-    # rather than assumed.
-    if git ls-files --unmerged | grep -q .; then
-        echo >&2
-        die "applied with conflicts. Resolve the files listed by
-  \`git status\`, or take the change from the upstream pull request."
-    fi
-    echo "applied with a three-way merge."
-else
-    die "the patch did not apply. The plugin has moved too far from
-  $BASE_COMMIT; take the change from the upstream pull request instead."
-fi
+    apply:applied)    echo "already applied; nothing to do."; exit 0 ;;
+    apply:unapplied)
+        git apply "$PATCH"
+        echo "applied $PATCH_NAME." ;;
+    apply:neither)
+        $IN_REPO || die "the patch does not apply to $TARGET/vllm_neuron; it was generated against vllm-neuron $BASE_COMMIT (0.29.0.1.2.0)."
+        echo "the patch does not apply cleanly; trying a three-way merge ..."
+        git apply --3way "$PATCH" || die "three-way merge failed; resolve the conflicts listed by \`git status\`."
+        # --3way can leave conflict markers and still exit 0.
+        if git ls-files --unmerged | grep -q .; then
+            die "applied with conflicts; resolve the files listed by \`git status\`."
+        fi
+        echo "applied $PATCH_NAME with a three-way merge." ;;
+esac
 
 echo
-echo "Done. Verify with:"
-echo "  python -c \"from vllm_neuron.vllm.spec_decode import register_proposer; print('ok')\""
+echo "Verify (from the directory that should provide vllm_neuron):"
+echo "  python -c \"import vllm_neuron.vllm.spec_decode as s; print(s.__file__, hasattr(s, 'register_proposer'))\""

@@ -30,26 +30,22 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 #: sibling `contrib/models/deepseek_v41_trn3` (64 ranks).
 TENSOR_PARALLEL_SIZE = 32
 
-#: The deployment scheme, `DEEPSEEK_V41_SCHEME`: only "tp32" here (the 32 ranks are one
+#: The deployment scheme, `DEEPSEEK_V41_SCHEME`: only "tp32" (the 32 ranks are one
 #: tensor-parallel group: attention / dense projections TP8 in 4 replicas, the decode MoE
-#: TP8 x EP4). The pipeline scheme of the 16-device port ("tp8pp8", 64 ranks) does not
-#: fit 8 devices and is rejected; its code paths are kept only because the flat scheme's
-#: batched drafter reuses the `kernels/tp8pp8` package's body.
+#: TP8 x EP4).
 SCHEME = os.environ.get("DEEPSEEK_V41_SCHEME", "tp32")
 if SCHEME != "tp32":
     raise ValueError(f"DEEPSEEK_V41_SCHEME={SCHEME!r}; the 8-device port serves 'tp32' only")
-PIPELINE_PARALLEL_SIZE = 1
 
 #: Ranks the **attention and the dense projections** are split across. Capped at
 #: `o_groups` (8) because `wo_a` is block-diagonal over the groups and
 #: `n_local_groups = o_groups // tp` reaches 0 above it; above the cap attention
 #: is replicated `world_size // this` times and the head-partial all-reduces are
 #: divided back down by `attn_replicas`.
-#: 8 is the cap and the default. `DEEPSEEK_V41_ATTENTION_TP` lowers it, which
-#: is needed to reach TP=4 x PP=16: a 4-rank tensor-parallel group cannot
-#: contain an 8-way attention shard. At 4 each rank holds 2 of the 8 `o_groups`
-#: and the head-partial reduction runs over the 4-rank lane group — one device,
-#: the cheapest collective this host has — replicated 16x.
+#: 8 is the cap and the default. `DEEPSEEK_V41_ATTENTION_TP` lowers it. At 4 each
+#: rank holds 2 of the 8 `o_groups` and the head-partial reduction runs over the
+#: 4-rank lane group — one device, the cheapest collective this host has —
+#: replicated 16x.
 ATTENTION_TENSOR_PARALLEL_SIZE = int(
     os.environ.get("DEEPSEEK_V41_ATTENTION_TP", "8") or 8
 )

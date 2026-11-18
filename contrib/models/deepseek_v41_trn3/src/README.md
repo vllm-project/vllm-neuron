@@ -15,8 +15,8 @@ supports.
 | `model.py` | The implementation: attention, MoE, hyper-connections, engram, the DSpark stages, `forward`, `get_kv_spec`, `bind_kv_cache`, `load_weights`. |
 | `weight_loader.py` | Checkpoint-to-parameter mapping and sharding. Module names are the checkpoint's own paths, so "is this the weight the reference uses here" is a string comparison against `model.safetensors.index.json`. |
 | `drafter.py` | `DSparkProposer`, the in-model speculative proposer registered with `vllm_neuron.vllm.spec_decode`. |
-| `kernels/` | The NKI kernels. `kernels/__init__.py` maps each kernel entry point to its call site in `model.py`. The per-op kernels sit at the top level; the megakernels live in **one package per parallelization scheme**, `kernels/tp64/` and `kernels/tp8pp8/`, each with its own copies of `layer_kernel.py` and `draft_kernel.py` (the two megakernels, see below), `mk_mx.py` (the block-scaled fp8/fp4 GEMMs on the tensor engine's MX matmul), `mk_moe.py` (the token-grouped routed experts) and `mk_common.py` / `mk_compress.py` (their helpers); `tp8pp8/` also holds `pp_kernels.py`, the stage boundary. `mk_kernels.py` builds the entries from the scheme's package, and `mk_model.kernel_version` hashes only that package, so work on one scheme cannot touch the other's kernels or their compiled artifacts. |
-| `mk_model.py` | The bridge from the modules to the megakernels: the deployment scheme (`PipePlan`), gathers each block's weights into the kernel's argument order once, builds the per-step index columns, selects the specialized kernel entry (phase, archetype, scheme) and runs the block loop, with the stage boundaries under `tp8pp8`. |
+| `kernels/` | The NKI kernels. `kernels/__init__.py` maps each kernel entry point to its call site in `model.py`. The per-op kernels sit at the top level; the megakernels live in `kernels/tp64/`, with `layer_kernel.py` and `draft_kernel.py` (the two megakernels, see below), `mk_mx.py` (the block-scaled fp8/fp4 GEMMs on the tensor engine's MX matmul), `mk_moe.py` (the token-grouped routed experts) and `mk_common.py` / `mk_compress.py` (their helpers). `kernels/batched/` holds the batched drafter (every sequence of a step in one launch) with its own copies of the helpers. `mk_kernels.py` builds the entries, and `mk_model.kernel_version` hashes only the package a kernel is built from, so work on one cannot touch the other's kernels or their compiled artifacts. |
+| `mk_model.py` | The bridge from the modules to the megakernels: where the rank sits (`PipePlan`), gathers each block's weights into the kernel's argument order once, builds the per-step index columns, selects the specialized kernel entry (phase, archetype) and runs the block loop. |
 | `mk_host.py` | The host-side index arithmetic (window and compressed slot tables, compression groups) over the scheduler's block tables. |
 | `chat_template.jinja` | The checkpoint's chat template, applied to cases with `role=user`. |
 | `verifier/` | The accuracy harness the integration test drives. Lives here rather than under `test/` because its modules import the model with package-relative imports (`from ..config`), so it has to sit inside the same package. |
@@ -58,14 +58,14 @@ engram     5.7 GiB    by row, ~6.0M of 384M a table
 ## Megakernels
 
 Every backbone block runs as **one** NKI kernel
-(`kernels/<scheme>/layer_kernel.py:layer_forward`) and the whole DSpark draft
-path as another (`kernels/<scheme>/draft_kernel.py:draft_forward`). The flat
-scheme's own drafter runs once per sequence; the pipeline scheme's copy -- which
-the flat scheme also launches for a step of several sequences (below) -- drafts
+(`kernels/tp64/layer_kernel.py:layer_forward`) and the whole DSpark draft
+path as another (`kernels/tp64/draft_kernel.py:draft_forward`). That drafter
+runs once per sequence; the batched copy (`kernels/batched/draft_kernel.py`),
+launched for a step of several sequences (below), drafts
 **every sequence of the step in one launch** (the B
 sequences' draft blocks are B x 5 rows of one tile, each with its own window in
 the kernel's slot table, and the token loop drafts the i-th token of all of them
-at once, so a step's drafting on the last stage costs one kernel's collectives
+at once, so a step's drafting costs one kernel's collectives
 however many sequences it carries -- drafting ten sequences one by one took
 ~15 ms each). Each is a single `@nki.jit`
 launched on both physical NeuronCores of a logical core (`nl.program_id(0)`
@@ -88,83 +88,20 @@ is assumed a no-op, which holds while the context reads at most
 `candidate_topk_blocks x candidate_block_size` compressed groups (16384 tokens)
 and is asserted.
 
-**One entry point per phase, archetype and scheme.** The two bodies
+**One entry point per phase and archetype.** The two bodies
 (`layer_kernel.layer_body`, `draft_kernel.draft_body`) take their configuration
 as baked constants, and `kernels/mk_kernels.py` traces a distinct `@nki.jit`
 function for every combination the deployment uses, named for it:
 `layer_prefill_r2_src_idx_tp64`, `layer_decode_r1_idx_tap_tp64`,
-`draft_prefill_tp64`, `engram_tp8pp8`, `pp_boundary_even_sender`, ... The phase
+`draft_prefill_tp64`, `draft_decode_batched_tp64`, ... The phase
 is decided per step (a decode step's spans have `1 + dspark_block_size` rows):
 prefill kernels keep the slot table transposed in SBUF and select keys on chip,
 decode kernels use the per-token transposes (cheaper for a handful of tokens).
 The archetype is the block's `(compress_ratio, kv source, index source, engram,
-DSpark tap)`; the eight that occur are traced on first use. The scheme is
-`DEEPSEEK_V41_SCHEME`:
-
-* `tp64` (default): the flat world. The attention is sharded 8 ways and
-  replicated across the 8 groups, the 384 routed experts are 6 a rank, every
-  expert reduce spans the 64 ranks.
-* `tp8pp8`: **pipeline parallelism**, vLLM's own (`tensor_parallel_size=8,
-  pipeline_parallel_size=8`, which `config.SCHEME` sets from
-  `DEEPSEEK_V41_SCHEME=tp8pp8`). The 64 workers form 8 stages of 8 consecutive
-  ranks; a stage builds, loads and runs **only its own 5 blocks** -- the
-  attention sharded 8 ways within the stage, 48 of the 384 routed experts a
-  rank, every reduce over the stage -- while the embedding lives on the first
-  stage (and the last, whose DSpark stages embed the drafted ids) and the norm,
-  the vocab-sharded head, the sampler and the drafter on the last. Each stage's
-  weights are a separate shard of the checkpoint (`weight_loader`), the engram
-  table of a stage's engram block is sharded over that stage's 8 ranks, and
-  the KV caches a stage declares (`get_kv_spec`) are its own blocks'. The
-  scheduler keeps `pipeline_parallel_size` batches in flight, so the stages
-  overlap on different batches; a non-last stage runs its blocks and returns
-  nothing to sample (`neuron_model_runner._pp_not_last_stage`), the last stage
-  samples and drafts as the flat scheme does. The stages schedule synchronously
-  (`async_scheduling=False`: the async scheduler's -1 draft placeholders can only
-  be substituted on the sampling stage, and the first stage embeds real ids), and
-  the drafter's tokens travel **inside each step's `ModelRunnerOutput`**
-  (`neuron_model_runner._attach_pp_drafts` sets `neuron_pp_drafts`, the result
-  queue pickles the object; `NeuronScheduler.update_from_output` attaches them
-  right after the sampled tokens of the same step, only for requests that
-  committed a token in it) and `vllm/patches/pp_draft_patch.py` makes the
-  engine's `post_step` skip its `take_draft_token_ids` RPC under PP. That RPC
-  is answered by the last stage only after the `execute_model` queued ahead of
-  it, i.e. after the step has drained the whole pipeline, so with it the engine
-  never scheduled the next batch before the previous one had finished (no two
-  batches overlapped), and its drafts reached the scheduler several outputs
-  ahead of the step they belong to -- at 8192-token inputs (2048-token prefill
-  chunks) a non-final chunk's drafts made the request schedulable with five
-  spec tokens and no bonus token, and the last stage died tracing a 1-row
-  logits tensor against 6-row sampling metadata. The same patch module sizes
-  the executor's RPC ring (`MessageQueue`, 10 chunks by default, reused only
-  once every worker has read them, two messages a step) to `4 x
-  pipeline_parallel_size` chunks so a full pipeline of steps fits in flight.
-  On the stages before the last, the runner's cached request state also gets
-  the drafts the last stage accepted (`_update_states`: the scheduler ships
-  only the newly scheduled bonus token, and a request re-added to the batch
-  after another request's batch ran -- every step under PP with several
-  requests -- was rebuilt that many tokens short, so its input slice read past
-  its known tokens: garbage text at `max_num_seqs=4`, exact at 1).
-  The hand-off between stages is
-  in-kernel (`kernels/tp8pp8/pp_kernels.py:boundary_body`): a 2-rank collective per
-  tensor-parallel offset carries the hyper-connection stream, `pre_mix`, the
-  current index top-k and the rows this step wrote into the current kv
-  source's compressed-KV / index-key caches -- one compiled program on both
-  sides, the role a runtime 0/1 weight on the payload, and both sides traced from
-  identical shapes (the runtime hashes a program's collectives per replica group
-  and refuses a pair whose two programs differ, which a placeholder top-k of the
-  wrong width once caused; `mk_model.topk_width`); the receiving stage keeps a
-  **replica** of that source (`model.src_attn`: the source layer's attention
-  module, loaded from the source's own checkpoint keys, with caches the
-  boundary scatters into) which its consumers read, and forwards the rows at
-  its own exit. The collectives of a stage name their replica groups over the
-  full 64-rank mesh and run on the stage's ranks alone while the other stages
-  run their own kernels; `test/unit/probe_pp_subset.py` checks that the runtime
-  allows exactly that (16 ranks, two stages with different kernels and trip
-  counts, then the pair hand-off), and `test/unit/test_pp.py` checks the
-  boundary kernel bit for bit. The hand-off is a 2-rank all-reduce (the receiver
-  adds zeros); `nki.collectives.collective_permute` is the point-to-point
-  primitive that would carry the payload once instead of summing it, and is
-  the next step for this seam.
+DSpark tap)`; the eight that occur are traced on first use. The scheme is the
+flat world (`tp64`): the attention is sharded 8 ways and replicated across the
+8 groups, the 384 routed experts are 6 a rank, every expert reduce spans the 64
+ranks.
 
 **Optimized block kernels (flat scheme).** Every (phase, archetype) of the flat
 scheme runs a hand-optimized kernel instead of the generic body's specialization,
@@ -335,21 +272,15 @@ the step is built from as few launches as keep the device fed:
   n-gram ids, the incoming stream / top-k. `DEEPSEEK_V41_FUSED_PLAN_CHECK=1` rebuilds
   the plan every step and checks the cached one against it.
 * The drafter drafts every sequence of a step of several in one launch
-  (`mk_kernels.draft_batched`: the pipeline scheme's batched body specialized for the
+  (`mk_kernels.draft_batched`: the batched body specialized for the
   world; `DEEPSEEK_V41_DRAFT_BATCHED=0` for one launch per sequence), one sequence
   with the per-sequence kernel. Its int32 ids reach the scheduler in one read-back:
   `DSparkProposer.propose` slices them on the host (stacking device slices was two
   eager device ops a step, no int64 cast graph).
-* One RPC a step (`VLLM_NEURON_ONE_RPC_STEP`, set by `require_dspark_speculation`;
-  `DEEPSEEK_V41_ONE_RPC_STEP=0` keeps vLLM's three): the runner samples inside
-  `execute_model` when no scheduled request needs a grammar, so the engine skips its
-  `sample_tokens` RPC, and the drafts ride in the step's own output as they do under
-  pipeline parallelism (`neuron_pp_drafts`; `pp_draft_patch` skips
-  `take_draft_token_ids`).
 
 **On-chip decode blocks and merged launches (flat scheme).** In the optimized decode
 launches a 6-row span's whole block runs on chip (`DEEPSEEK_V41_B1`, default 1;
-`kernels/<scheme>/fused/<launch>/r?_decode/b1*.py`). The residual stream stays in SBUF between
+`kernels/tp64/fused/<launch>/r?_decode/b1*.py`). The residual stream stays in SBUF between
 consecutive members in a 128-partition layout, the hyper-connection maps run as tensor-engine
 matmuls (the hc mix weights as a hi | lo bf16 pair, `fn_bd`), and the index sources'
 queries, scores and top-k (`b1idx.py`), the compressors (`b1src.py`), the engram gate
@@ -357,7 +288,7 @@ queries, scores and top-k (`b1idx.py`), the compressors (`b1src.py`), the engram
 loop) stay on chip too. A block's DMAs are issued after the previous block's all-reduce
 result (`b1.GATE_DMAS`): hoisted into the all-reduce window, they slowed the collective. Blocks
 8-23 and 24-39 are one launch each (`DEEPSEEK_V41_FUSE_GROUPS`, default `8,16,16`;
-`kernels/<scheme>/fused/merge_launch.py` merges two optimized launches into one), which saves two
+`kernels/tp64/fused/merge_launch.py` merges two optimized launches into one), which saves two
 launch entries a step, and the merged 8-23 launch hands the stream from block to block across
 its two halves on chip. The norms take the hardware rsqrt as is (no Newton step; it is within
 1 ulp). `DEEPSEEK_V41_B1=0` falls back to the earlier members.
@@ -397,7 +328,7 @@ changes remove it:
   (`keep_alive`), and before a step's launches the host waits for the step two back
   (`steps_ahead_wait`, `DEEPSEEK_V41_STEPS_AHEAD`), so the runtime's execution queue
   (`NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS`, at most 63) cannot overflow.
-  The runner side is two changes in this branch's plugin (`RUNNER_CAPABILITIES` in
+  The runner side is two changes in the plugin-core patch (`plugin-core/`; `RUNNER_CAPABILITIES` in
   `neuron_model_runner.py`): the step's host positions, slot mapping and block table for
   a model that plans on the host (`wants_host_step_inputs`, so `_step_rows` reads
   nothing back), and the draft replay across batch-composition changes for a
@@ -421,7 +352,7 @@ changes remove it:
 Measured on the live system trace (three ranks, `nc_exec_running`): the device idles
 0.68-0.75 ms a decode step at in512 bs1 and at in1024 bs10 -- the gaps between its eight
 back-to-back executions -- where the synchronous engine idled 4.4-5.1 ms plus the entry
-barrier's wait. `DEEPSEEK_V41_ASYNC=0` serves synchronously (one RPC a step, as before).
+barrier's wait. `DEEPSEEK_V41_ASYNC=0` serves synchronously.
 
 `DEEPSEEK_V41_HOST_PROF=1` logs each forward's host time by part and the runner's RPCs
 with the waits between them (`DEEPSEEK_V41_HOST_PROF_SYNC=1` waits for the device at
@@ -488,12 +419,11 @@ prefill-shaped step, re-trace the frame and recompile its all-gather graph while
 the other 63 ranks already sat in the collective, and the engine hung without an
 error (the verifier's second prompt, 2026-10-23). The bias is a buffer now
 (`vocab_pad_bias`, materialized in `allocate_staging_buffers`). To localize a
-hang: `DEEPSEEK_V41_MK_TRACE=1` logs every kernel launch on each stage's first
-rank, `DEEPSEEK_V41_MK_IN_FLIGHT=0` syncs after each launch (default: 12
-outstanding launches per process, counted across forwards and including the drafter's per-sequence graphs -- under pipeline
-parallelism a stage's host launches batch after batch without waiting on the
-device, and the runtime's queue held 32 executions: eight prefills in flight on
-the first stage overflowed it, "Execution Queue Full", 2026-10-24; the port now asks for
+hang: `DEEPSEEK_V41_MK_TRACE=1` logs every kernel launch on rank 0,
+`DEEPSEEK_V41_MK_IN_FLIGHT=0` syncs after each launch (default: 12
+outstanding launches per process, counted across forwards and including the drafter's
+per-sequence graphs -- a host that launches without waiting on the device overflows
+the runtime's queue of 32 executions, "Execution Queue Full", 2026-10-24; the port now asks for
 128, which the runtime caps at 63, for async scheduling's steps in flight),
 `NEURON_RT_EXEC_TIMEOUT=120` turns a device wait into an error, and
 `TORCH_LOGS=recompiles` names the frame and the failed guard.

@@ -178,7 +178,7 @@ def draft_body(
     main-stream KV writes only), "decode" the draft proper, for the `B = meta.shape[0]`
     sequences of the step. `mk_kernels` makes one `@nki.jit` entry per phase and scheme.
     The drafter's groups are the ranks the head and sampler run on: the world under
-    tp64, the last stage under tp8pp8."""
+    tp64."""
     at_zero, K, win, stage, kver, noise_id, vocab_size, topk_e, bs = flags
     assert bool(at_zero) == (phase == "prefill"), f"flags at_zero={at_zero} vs phase {phase}"
     nstages = wq_a.shape[0]

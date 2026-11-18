@@ -29,32 +29,30 @@ source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0/bin/activate
 cd <vllm-neuron repo root>
 
 # batch 1: the four input lengths (the default matrix), one-sequence engines
-DEEPSEEK_V41_SCHEME=tp64 \
 python contrib/models/deepseek_v41_trn3/test/performance/run_bench.py --model /mnt/nvme/hf \
     --dataset-path contrib/models/deepseek_v41_trn3/test/performance/sonnet.txt \
     --report contrib/models/deepseek_v41_trn3/test/performance/bench_report.json \
     --bench-timeout 7200 --batch-sizes 1
 
 # batch 10: the same input lengths on ten-sequence engines
-DEEPSEEK_V41_SCHEME=tp64 DEEPSEEK_V41_MAX_NUM_SEQS=10 \
+DEEPSEEK_V41_MAX_NUM_SEQS=10 \
 python contrib/models/deepseek_v41_trn3/test/performance/run_bench.py --model /mnt/nvme/hf \
     --dataset-path contrib/models/deepseek_v41_trn3/test/performance/sonnet.txt \
     --report contrib/models/deepseek_v41_trn3/test/performance/bench_report_ms10.json \
     --bench-timeout 7200 --input-lens 512,1024,2048,8192 --batch-sizes 10
 ```
 
-Nothing else is set: every optimization in the reports is the default
-(`DEEPSEEK_V41_SCHEME=tp64` is too, spelled out for clarity). The knobs, each `1` by
+Nothing else is set: every optimization in the reports is the default. The knobs, each `1` by
 default unless noted, are `DEEPSEEK_V41_OPT_KERNELS` (`all`: the optimized block kernels and the
 decode drafter `draft_decode`), `DEEPSEEK_V41_FUSED_OPT`
 (`all`), `DEEPSEEK_V41_FUSE_DECODE` (`8` blocks a decode launch),
 `DEEPSEEK_V41_FUSE_EMBED`, `DEEPSEEK_V41_FUSE_HEAD`, `DEEPSEEK_V41_DRAFT_BATCHED`,
-`DEEPSEEK_V41_ONE_RPC_STEP` (synchronous scheduling only), `DEEPSEEK_V41_STEP_PROLOGUE`,
+`DEEPSEEK_V41_STEP_PROLOGUE`,
 `DEEPSEEK_V41_ASYNC`, `DEEPSEEK_V41_FUSE_TAIL`, `DEEPSEEK_V41_MOE_TP`,
 `DEEPSEEK_V41_DRAFT_MOE_TP`, `DEEPSEEK_V41_ENGRAM_TP`, `DEEPSEEK_V41_COMPRESS_BF16`,
 `DEEPSEEK_V41_FN_T_TILED`, `DEEPSEEK_V41_B1` and `DEEPSEEK_V41_FUSE_GROUPS` (`8,16,16`);
 `src/README.md` ("A decode step is a handful of launches", "On-chip decode blocks and
-merged launches", "A decode step's inputs are made on the device") says what each does. The async engine needs this branch's plugin (the runner's `RUNNER_CAPABILITIES`,
+merged launches", "A decode step's inputs are made on the device") says what each does. The async engine needs the plugin-core patch (`plugin-core/`; the runner's `RUNNER_CAPABILITIES`,
 the scheduler's holdbacks); on another the port serves synchronously. `--bench-timeout` only bounds a wedged run. Without
 `DEEPSEEK_V41_MAX_NUM_SEQS=10` the port clamps the engine to one sequence and a
 batch-10 cell queues its ten requests one at a time. A first run against a cold

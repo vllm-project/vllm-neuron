@@ -296,9 +296,7 @@ _ALLREDUCE_CHUNK_ELEMS = int(
 #     (974.2 ms), because the column leg costs what the 16-device world leg
 #     costs.
 #   * So a total sum cannot be made cheap: every rank needs data from every
-#     device. The way to stop paying for it is to stop needing it, which is
-#     what pipeline parallelism does — and that is now the measured case for
-#     TP=8 x PP=8, with `kernels/pp_permute.py` as the stage transport.
+#     device. The way to stop paying for it is to stop needing it.
 #
 # The two probes that produced these numbers are
 # `.autohelix/notes/iter-3-probes.patch` (apply, measure, revert): they are not
@@ -313,18 +311,16 @@ _ALLREDUCE_CHUNK_ELEMS = int(
 #: partial — each rank gets w/64 of the shards — so **the tokens are nonsense**
 #: and nothing but a latency may be read off a run with this set.
 #:
-#: It exists because it isolates the one term a TP x PP factorization moves.
-#: TP x PP = 64 in every candidate, so per-rank arithmetic and per-rank weight
-#: footprint (384 experts x 41 layers / 64 = 246 slots) are identical at TP=4,
-#: 8, 16 and 64; what differs is how many ranks — and, iteration 3's result,
-#: how many *devices* — each tensor-parallel all-reduce spans. Rank r is on
+#: It isolates the cost of the all-reduce width: per-rank arithmetic and
+#: per-rank weight footprint (384 experts x 41 layers / 64 = 246 slots) stay
+#: the same, and what changes is how many ranks — and, iteration 3's result,
+#: how many *devices* — each all-reduce spans. Rank r is on
 #: device r // 4, so width 4 is one device, 8 is two column-adjacent devices
 #: (the floorplan's scheme-c group, one torus hop), 16 is four devices.
 #:
 #: Iteration 3 measured width 8 by substituting the EP-TP group: -73.7 ms of a
 #: 947.4 ms prefill and -82.5 ms of a 403 ms decode step. This generalizes that
-#: probe to any width, so TP=4 x PP=16 and TP=16 x PP=4 can be priced the same
-#: way without first building a pipeline.
+#: probe to any width (4, 8, 16, ...).
 #:
 #: Requires `DEEPSEEK_V41_LANE_WIDTHS` to have created the group. Never leave
 #: it set: `verifier` would fail on gibberish.
@@ -333,53 +329,6 @@ _PROBE_AR_WIDTH = int(os.environ.get("DEEPSEEK_V41_PROBE_AR_WIDTH", "0") or 0)
 #: `[group]` once the model has resolved the probe's lane group, `[None]` when
 #: the probe is off. Nothing reads it unless `_PROBE_AR_WIDTH` is set.
 _NARROW_AR_GROUP: list = [None]
-
-#: **A pipeline-latency emulation, and the whole of what this port can measure
-#: about pipeline parallelism without a stage-aware weight plan.**
-#: `DEEPSEEK_V41_PP_EMULATE=p` runs the forward with the *latency structure* of
-#: TP=(64/p) x PP=p on all 64 real ranks, real weights and real collectives:
-#:
-#:   * **blocks are divided between p stages** and a rank executes only its
-#:     own stage's — so the critical path is, as in a real pipeline, the sum
-#:     over all 40 blocks of *one stage's* cost for that block;
-#:   * **each block's expert-parallel all-reduce reduces over the stage**, the
-#:     lane group of 64/p consecutive ranks, instead of over the world;
-#:   * **each block's routed-expert loop runs p times**, because a rank of a
-#:     64/p-wide tensor-parallel group owns `384/(64/p) = 6p` expert slots per
-#:     block where a rank of the flat world owns 6. Repeating the plan gives
-#:     the right launch count, the right FLOPs and the right HBM read volume —
-#:     the same experts are re-read, and they are resident, so a byte from HBM
-#:     costs what a byte from HBM costs;
-#:   * **each stage boundary moves the hyper-connection stream** to every rank,
-#:     including one after the last stage so the vocab-sharded head and the
-#:     sampler are reached unchanged.
-#:
-#: What it does **not** model, in both directions, because honesty about this
-#: is the whole value of the number:
-#:
-#:   * the tokens are **wrong**. Each block's expert sum covers 64/p of the 64
-#:     expert shards, and the blocks a rank skips leave their KV unwritten. So
-#:     this is a latency probe exactly like `_PROBE_AR_WIDTH`, and `verifier`
-#:     must never be run under it.
-#:   * the transport is **pessimistic**: two world-wide all-reduces per
-#:     boundary (~1.9 ms each, iteration 3) where a real pipeline would use a
-#:     neighbour permute — `kernels/pp_permute.py` priced the wire at ~0.4 ms a
-#:     boundary at 1024 tokens. So the emulation overstates a real pipeline's
-#:     transport by ~3 ms a boundary.
-#:   * per-rank **weight footprint** is unchanged (13.16 GiB), where a real
-#:     pipeline would hold 1/p of the replicated dense weights and the same
-#:     258 expert slots. That is a capacity difference, not a latency one.
-#:   * it holds `MAX_NUM_SEQS` at whatever the engine was built for, so it
-#:     measures the pipeline **without microbatching** — which is the
-#:     configuration this port is actually in, and the one the floorplan's own
-#:     `decode_micro_batch: 4` / `pipeline_chunks: true` are designed to avoid.
-#:
-#: Run it with `DEEPSEEK_V41_NO_SPEC_DECODE=1`. The DSpark taps come off
-#: backbone layers 37-39, which land in the last stage, so with speculation on
-#: the ranks of other stages would reach `_draft` with no `main_hidden` and
-#: take a different path through its collectives — a mismatched collective
-#: across 64 ranks is the one failure this deployment must not have.
-_PP_EMULATE = int(os.environ.get("DEEPSEEK_V41_PP_EMULATE", "0") or 0)
 
 #: `DEEPSEEK_V41_TRACE_INPUTS=1` logs each forward's inputs on rank 0; see `_trace_inputs`.
 _TRACE_INPUTS = os.environ.get("DEEPSEEK_V41_TRACE_INPUTS", "") not in ("", "0")
@@ -1072,10 +1021,7 @@ _EXPERT_CACHE_BYTES = int(
 #: 6 GiB covers the 5.72 GiB two 64-rank shards come to in bf16.
 _ENGRAM_TABLE_BYTES = int(
     os.environ.get(
-        "DEEPSEEK_V41_ENGRAM_TABLE_BYTES",
-        # Under the pipeline scheme a stage holds at most one table, sharded over
-        # its 8 ranks (~23 GiB bf16 a rank); the flat scheme two 64-rank shards.
-        (26 << 30) if os.environ.get("DEEPSEEK_V41_SCHEME", "tp64") == "tp8pp8" else (6 << 30),
+        "DEEPSEEK_V41_ENGRAM_TABLE_BYTES", 6 << 30,
     )
 )
 
@@ -2877,10 +2823,6 @@ class MoE(nn.Module):
         super().__init__()
         n_routed, n_activated = _moe_config(config, layer_id)
         self.layer_id = layer_id
-        #: True for the three `mtp.*` stages, whose layer ids continue past the
-        #: backbone. `_PP_EMULATE` divides the backbone between stages and
-        #: leaves the MTP stages world-wide, so this is what tells them apart.
-        self.is_mtp = layer_id >= config.num_hidden_layers
         self.hidden_size = config.hidden_size
         self.n_routed_experts = n_routed
         self.n_activated_experts = n_activated
@@ -3147,16 +3089,6 @@ class MoE(nn.Module):
         flat = x.reshape(-1, self.hidden_size)
         weights, indices = self.gate(flat, image_mask)
         plan = self._route_plan(indices, weights, live_rows, weight_store)
-        if _PP_EMULATE > 1 and not self.is_mtp:
-            # A rank of a `64 // p`-wide tensor-parallel group owns
-            # `384 / (64/p) = 6p` expert slots in this block where a rank of
-            # the flat world owns 6, so its routed-expert loop is p times as
-            # long. Repeating the plan reproduces that: the same launch count,
-            # the same FLOPs and the same HBM read volume, against the same
-            # resident weights. The *sum* is then p times too large as well as
-            # being over the wrong shard set — which is why `_PP_EMULATE` is a
-            # latency probe and says so.
-            plan = list(plan) * _PP_EMULATE
 
         y = _compiled(_moe_carry)(flat)
         limit, ones = swiglu_consts(self.expert_slot.swiglu_limit, flat.device)
@@ -4211,9 +4143,7 @@ class DeepseekV41ForCausalLM(nn.Module):
                 else:
                     # The EP-TP group is 8 consecutive ranks, which is the
                     # right group only at ATTENTION_TENSOR_PARALLEL_SIZE=8.
-                    # Below that — TP=4 x PP=16 needs 4, since a 4-rank
-                    # tensor-parallel group cannot contain an 8-way attention
-                    # shard — a lane group of the right width is the same
+                    # Below that a lane group of the right width is the same
                     # shape of membership (consecutive ranks, so one device at
                     # width 4) and is what this reduction wants. Falling
                     # through to the world would turn a one-device collective
@@ -4246,30 +4176,6 @@ class DeepseekV41ForCausalLM(nn.Module):
                             self.attn_tp_group.ranks,
                         )
         _LOG_RANK[0] = self.rank == 0
-
-        #: Pipeline emulation state. `pp_size == 1` is the shipped
-        #: configuration and every branch below collapses to today's path:
-        #: `stage_group is tp_group`, `block_stage` is all zeros and
-        #: `pp_stage` is 0, so every rank owns every block.
-        self.pp_size = 1
-        self.pp_stage = 0
-        self.pp_tp_width = self.world_size
-        self.stage_group = self.tp_group
-        self.block_stage = [0] * config.num_hidden_layers
-        #: Blocks every stage runs, whichever stage owns them. The attention's
-        #: compressed KV, its index top-k and its candidate blocks are produced
-        #: at `kv_source_layer_ids` / `index_source_layer_ids` and read by every
-        #: later block through `SharedAttentionState`, so a stage whose first
-        #: compressing block is not a source would reach
-        #: `shared.topk_idxs.to(...)` with `None`. Running the twelve source
-        #: blocks everywhere seeds that state on every rank and costs the
-        #: critical path **nothing**: all 64 ranks execute them at the same
-        #: point in the program, concurrently, each with its own stage's
-        #: TP-width structure — which is exactly what a real pipeline pays for
-        #: the one stage that owns them.
-        self.pp_always: set[int] = set()
-        if _PP_EMULATE > 1:
-            self._init_pp_emulation(_PP_EMULATE)
 
         _log_two_core_plan()
 
@@ -4318,40 +4224,16 @@ class DeepseekV41ForCausalLM(nn.Module):
         #: on the meta device).
         self.register_buffer("vocab_pad_bias", None, persistent=False)
 
-        #: Where this rank sits (`mk_model.PipePlan.from_groups`): the flat scheme
-        #: (one tensor-parallel group of 64) or the pipeline scheme (vLLM's 8 stages
-        #: of 8). A stage builds, loads and runs only its own blocks; their MoE is
-        #: built with the stage's tensor-parallel rank and width (48 experts a rank)
-        #: and the attention is sharded 8 ways within the stage, as it already is in
-        #: the flat scheme. The embedding lives on the first stage (and the last,
-        #: whose DSpark stages embed the drafted ids); the norm, the head and the
-        #: DSpark stages on the last.
-        self.mk_plan = mk_model.PipePlan.from_groups(config.num_hidden_layers)
+        #: Where this rank sits (`mk_model.PipePlan.from_groups`): one
+        #: tensor-parallel group of 64 ranks, every rank holding every block.
+        self.mk_plan = mk_model.PipePlan.from_groups()
         plan = self.mk_plan
-        if plan.pp > 1 and not _MEGAKERNEL:
-            raise NotImplementedError("pipeline_parallel_size > 1 runs on the megakernel path only")
-        if plan.pp > 1 and plan.tp != self.world_size:
-            raise RuntimeError(f"stage width {plan.tp} != tensor-parallel world {self.world_size}")
-        self.block_ids: list[int] = plan.owned()
-        if plan.is_first or plan.is_last:
-            self.register_buffer(
-                "embed_weight",
-                torch.empty(self.part_vocab_size, config.hidden_size, dtype=torch.bfloat16),
-            )
-        else:
-            self.embed_weight = None
-        block_tp, block_rank = plan.tp, plan.stage_rank
-        if plan.pp > 1:
-            logger.info(
-                "deepseek_v41: pipeline scheme -- vLLM runs %d stages x %d tensor-parallel ranks; "
-                "this rank (global %d) is rank %d of stage %d, holds blocks %d-%d with %d of the "
-                "%d routed experts and %d-way attention, reduces over its stage, and hands its "
-                "activations to the next stage through the in-kernel collectives of "
-                "kernels/pp_kernels.py",
-                plan.pp, plan.tp, plan.rank, plan.stage_rank, plan.stage,
-                self.block_ids[0], self.block_ids[-1], config.n_routed_experts // block_tp,
-                config.n_routed_experts, self.attn_tp,
-            )
+        self.block_ids: list[int] = list(range(config.num_hidden_layers))
+        self.register_buffer(
+            "embed_weight",
+            torch.empty(self.part_vocab_size, config.hidden_size, dtype=torch.bfloat16),
+        )
+        block_tp, block_rank = plan.tp, plan.rank
         # A `ModuleDict` keyed by the layer id, so the state-dict paths stay
         # `layers.<layer_id>.*` whichever blocks this rank holds.
         self.layers = nn.ModuleDict(
@@ -4369,41 +4251,23 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.blocks_by_id: dict[int, Block] = {
             layer_id: self.layers[str(layer_id)] for layer_id in self.block_ids
         }
-        #: The kv-source block whose cache rows cross the boundary into this stage
-        #: (`mk_model.shipped_source_id`), when another stage owns it: its attention
-        #: module stands in for the source here -- the compressor and indexer weights
-        #: the consumers' kernel arguments borrow, and the caches the boundary fills
-        #: (`bind_kv_cache`). Loaded from the source layer's own checkpoint keys.
-        self.src_attn = nn.ModuleDict()
-        shipped = mk_model.shipped_source_id(config, self.block_ids[0]) if plan.pp > 1 else None
-        if shipped is not None and shipped not in self.blocks_by_id:
-            self.src_attn[str(shipped)] = Attention(
-                config, shipped, self.attn_tp, self._max_batch_size(),
-                replicas=1 if not self.attn_group_is_world else block_tp // self.attn_tp,
-                attn_group=None if self.attn_group_is_world else self.attn_tp_group,
-            )
-        if plan.is_last:
-            self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-            self.register_buffer(
-                "head_weight",
-                torch.empty(self.part_vocab_size, config.hidden_size, dtype=torch.bfloat16),
-            )
-            self.mtp = nn.ModuleList(
-                [
-                    DSparkBlock(
-                        config, stage, self.world_size, self.rank,
-                        self._max_batch_size(),
-                        attn_tp=self.attn_tp, attn_rank=self.attn_rank,
-                        attn_group=None if self.attn_group_is_world
-                        else self.attn_tp_group,
-                    )
-                    for stage in range(config.num_nextn_predict_layers)
-                ]
-            )
-        else:
-            self.norm = None
-            self.head_weight = None
-            self.mtp = nn.ModuleList([])
+        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.register_buffer(
+            "head_weight",
+            torch.empty(self.part_vocab_size, config.hidden_size, dtype=torch.bfloat16),
+        )
+        self.mtp = nn.ModuleList(
+            [
+                DSparkBlock(
+                    config, stage, self.world_size, self.rank,
+                    self._max_batch_size(),
+                    attn_tp=self.attn_tp, attn_rank=self.attn_rank,
+                    attn_group=None if self.attn_group_is_world
+                    else self.attn_tp_group,
+                )
+                for stage in range(config.num_nextn_predict_layers)
+            ]
+        )
 
         #: Set by `weight_loader.load_weights`. The handle on the streamed
         #: families; `forward` reaches the routed experts and the engram rows
@@ -4437,94 +4301,6 @@ class DeepseekV41ForCausalLM(nn.Module):
         self._shard_plan = self._build_shard_plan()
         self._check_kernel_constants()
 
-
-    def _init_pp_emulation(self, pp_size: int) -> None:
-        """Set up `_PP_EMULATE`'s stage map and stage-local group. See the
-        `_PP_EMULATE` docstring for what this does and does not model.
-        """
-        if self.world_size % pp_size:
-            raise ValueError(
-                f"DEEPSEEK_V41_PP_EMULATE={pp_size} does not divide the world "
-                f"size {self.world_size}: TP x PP has to be the whole world, "
-                "or the factorization is not of this deployment."
-            )
-        tp_width = self.world_size // pp_size
-        if tp_width < self.attn_tp:
-            raise ValueError(
-                f"DEEPSEEK_V41_PP_EMULATE={pp_size} leaves a {tp_width}-rank "
-                f"tensor-parallel group, narrower than the {self.attn_tp}-way "
-                "attention shard, so the attention's own group would straddle "
-                "two stages. Lower ATTENTION_TENSOR_PARALLEL_SIZE first."
-            )
-        self.pp_size = pp_size
-        self.pp_tp_width = tp_width
-        self.pp_stage = self.rank // tp_width
-        n_layers = self.config.num_hidden_layers
-        #: Stage of each backbone block, balanced: block i goes to stage
-        #: `i * pp / n_layers`, which gives ceil/floor(n_layers/pp) blocks a
-        #: stage and keeps consecutive blocks together so a boundary is crossed
-        #: `pp - 1` times rather than once a block.
-        self.block_stage = [i * pp_size // n_layers for i in range(n_layers)]
-        self.pp_always = set(self.config.kv_source_layer_ids) | set(
-            self.config.index_source_layer_ids
-        )
-        if tp_width < self.world_size:
-            from vllm_neuron.parallel.neuron_parallel_state import (
-                get_neuron_lane_group,
-            )
-
-            self.stage_group = get_neuron_lane_group(tp_width)
-        counts = [self.block_stage.count(s) for s in range(pp_size)]
-        logger.warning(
-            "deepseek_v41: DEEPSEEK_V41_PP_EMULATE=%d — emulating TP=%d x "
-            "PP=%d. Rank %d is in stage %d and runs blocks %s of %d; each "
-            "block's expert all-reduce reduces over %d consecutive ranks (%s) "
-            "and its routed-expert loop runs %dx to match a %d-wide "
-            "tensor-parallel rank's %d owned slots. Blocks a stage: %s. "
-            "THE TOKENS ARE WRONG — every expert sum covers %d of the 64 "
-            "shards and skipped blocks leave their KV unwritten. This is a "
-            "LATENCY PROBE; never run `verifier` under it.",
-            pp_size, tp_width, pp_size, self.rank, self.pp_stage,
-            [i for i, s in enumerate(self.block_stage) if s == self.pp_stage],
-            n_layers, tp_width, self.stage_group.ranks, pp_size, tp_width,
-            self.config.n_routed_experts // tp_width, counts, tp_width,
-        )
-
-    def _pp_boundary(
-        self, stream: torch.Tensor, pre_mix: torch.Tensor, owner: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Move `owner`'s hyper-connection stream to every rank.
-
-        A world-wide sum in which exactly one rank contributes: the lead rank
-        of the owning stage sends its values and all 63 others send exact
-        zeros, so the sum is the sender's tensor bit for bit. `zeros_like`
-        rather than `x * 0.0` on purpose — a non-owning rank's `stream` is
-        whatever the last boundary left there, and `0.0 * inf` is `nan`.
-
-        This is the emulation's transport, and it is the pessimistic one: two
-        64-rank all-reduces, ~1.9 ms each, against ~0.4 ms for the neighbour
-        permute a real pipeline would use (`kernels/pp_permute.py`). A real
-        pipeline's figure is therefore *better* than what this measures by
-        about 3 ms a boundary.
-        """
-        lead = self.pp_stage == owner and self.rank % self.pp_tp_width == 0
-        send_stream = stream if lead else torch.zeros_like(stream)
-        send_mix = pre_mix if lead else torch.zeros_like(pre_mix)
-        # One collective, not two. At p = 16 that is 16 world-wide all-reduces
-        # a forward instead of 32, and collective *resources* — not time — are
-        # what killed the first 16-stage attempt: `ENC:enc_barrier_internal
-        # ... failed to get NCCL comm for a replica` while loading a NEFF,
-        # three decode steps into the measured pass. Same family as iteration
-        # 3 §5's CC-barrier exhaustion.
-        flat = torch.cat(
-            [send_stream.reshape(-1), send_mix.reshape(-1)], dim=0
-        )
-        summed = tp_all_reduce(flat, self.tp_group)
-        cut = send_stream.numel()
-        return (
-            summed[:cut].reshape(stream.shape),
-            summed[cut:].reshape(pre_mix.shape),
-        )
 
     def _check_kernel_constants(self) -> None:
         """The constants the kernels bake in; make sure the config agrees."""
@@ -4635,10 +4411,6 @@ class DeepseekV41ForCausalLM(nn.Module):
 
         for layer_id in range(config.num_hidden_layers):
             add_block(f"layers.{layer_id}", layer_id)
-        # The pipeline stage's replica of the kv source it receives rows from
-        # (`src_attn`): the source layer's attention rules under the replica's path.
-        for sid in self.src_attn:
-            add_attention(f"src_attn.{sid}", int(sid))
         for stage in range(config.num_nextn_predict_layers):
             add_block(f"mtp.{stage}", config.num_hidden_layers + stage)
 
@@ -4839,19 +4611,6 @@ class DeepseekV41ForCausalLM(nn.Module):
                     for t in (attn.compress_kv_cache, attn.index_k_cache)
                 )
             attn.build_freqs_cis(max_len, device)
-        # The replica of a kv source another stage owns: the caches the stage boundary
-        # scatters this step's rows into (no compressor state: the source stage pools).
-        for attn in self.src_attn.values():
-            attn.compress_kv_cache = torch.zeros(
-                num_slots, attn.head_dim, dtype=self.config.torch_dtype, device=device
-            )
-            attn.index_k_cache = torch.zeros(
-                num_slots, self.config.index_head_dim, dtype=self.config.torch_dtype, device=device
-            )
-            own_bytes += sum(
-                t.numel() * t.element_size() for t in (attn.compress_kv_cache, attn.index_k_cache)
-            )
-
         owns_engram = any(
             self.blocks_by_id[lid].engram is not None
             for lid in self.config.engram_layer_ids if lid in self.blocks_by_id
@@ -5078,11 +4837,11 @@ class DeepseekV41ForCausalLM(nn.Module):
         if _DUMP_DIR:
             _DUMP_LIVE[0] = live_rows
             _DUMP_STEP[0] += 1
-        # A decode step of the flat scheme embeds its tokens in its first fused launch
+        # A decode step embeds its tokens in its first fused launch
         # (`mk_model.fuses_embed`).
-        fuse_embed = (_MEGAKERNEL and plan.is_first and inputs_embeds is None and not _DUMP_DIR
+        fuse_embed = (_MEGAKERNEL and inputs_embeds is None and not _DUMP_DIR
                       and mk_model.fuses_embed(self, spans))
-        if plan.is_first and not fuse_embed:
+        if not fuse_embed:
             hidden = self.embed_input_ids(input_ids)
             hidden = NF.merge_prompt_embeds(hidden, inputs_embeds, is_token_ids)
             if _DUMP_DIR:
@@ -5090,8 +4849,7 @@ class DeepseekV41ForCausalLM(nn.Module):
             stream, pre_mix = _nki_entry("hc_expand")(hidden.unsqueeze(0))
             stream, pre_mix = stream.squeeze(0), pre_mix.squeeze(0)
         else:
-            # A later pipeline stage: the stream arrives from the previous stage
-            # (`mk_model.run_recv`, below); or the first fused launch embeds.
+            # The first fused launch embeds.
             stream = pre_mix = None
 
         # A fused decode step hashes its n-grams and makes its token column on the device
@@ -5102,8 +4860,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         ids_host = (mk_model.host_ids(input_ids)
                     if _MEGAKERNEL and prologue is None and (self.ngram_hash is not None or fuse_embed)
                     else None)
-        # The n-gram ids of the engram blocks this rank holds (the hash state is
-        # only built on stages with one).
+        # The n-gram ids of the engram blocks.
         hashes = (self._engram_hashes(input_ids, paged, ids_host)
                   if self.ngram_hash is not None and prologue is None else None)
 
@@ -5115,8 +4872,6 @@ class DeepseekV41ForCausalLM(nn.Module):
             # One specialized megakernel per block (`mk_kernels`: by phase, block
             # archetype and scheme): the engram read-out, the DSpark tap and every
             # collective happen inside the kernels. See `mk_model.run_blocks`.
-            if self.pp_size != 1:
-                raise NotImplementedError("the megakernel path serves pp_size == 1")
             T = int(input_ids.shape[0])
             if bucket_rows != T:
                 raise NotImplementedError(
@@ -5131,8 +4886,6 @@ class DeepseekV41ForCausalLM(nn.Module):
                 mk_model.PROF.mark("m_mkstep")
             host_heap_trim("layers", self.world_size)
             dump = (lambda name, t: self._dump(name, t, live_rows)) if _DUMP_DIR else None
-            if not plan.is_first:
-                stream, pre_mix = mk_model.run_recv(self, step, T)
             # An all-greedy speculative decode step: the last fused launch also runs the
             # head and the argmax (`mk_model.fuses_head`); its logits are never read
             # (the step returns the rejection sampler's tokens).
@@ -5140,7 +4893,7 @@ class DeepseekV41ForCausalLM(nn.Module):
             head = (dump is None and not _TRACE_INPUTS and self.sampler is not None and logit_mask is None
                     and sampling_params is not None and sampling_hint is not None
                     and bool(sampling_hint[0]) and spec_decode_metadata is not None
-                    and plan.is_last and mk_model.fuses_head(self, step))
+                    and mk_model.fuses_head(self, step))
             # Async scheduling: the runner's positions assume every draft of the previous
             # step was accepted; the prologue subtracts the rejected ones (from the previous
             # step's rejection output) on the device, and the drafts this step verifies are
@@ -5164,69 +4917,36 @@ class DeepseekV41ForCausalLM(nn.Module):
                 step.embed_ids = mk_model.embed_ids(input_ids, ids_host)
             stream, pre_mix = mk_model.run_blocks(self, stream, pre_mix, step, dump=dump, head=head,
                                                   embed=fuse_embed)
-            if not plan.is_last:
-                # Hand off to the next stage; nothing to sample here (the runner's
-                # non-last-stage path ignores the value, which completes with the
-                # hand-off).
-                self.last_draft = None
-                return mk_model.run_send(self, stream, pre_mix, step)
             main_hiddens = step.taps
 
         for layer_id, block in ([] if _MEGAKERNEL else zip(self.block_ids, self.layers.values())):
             if layer_id % _HEAP_TRIM_EVERY == 0:
                 host_heap_trim(f"layer {layer_id}", self.world_size)
-            # `owns` is True for every block when pp_size == 1, which is the
-            # shipped configuration. Under `_PP_EMULATE` the engram *gather*
-            # still runs on every rank — its rows are sharded world-wide and
-            # rejoined by a world-wide all-reduce, so all 64 ranks have to
-            # reach that collective whichever stage owns the block that
-            # consumes it.
-            owns = (
-                self.pp_size == 1
-                or self.block_stage[layer_id] == self.pp_stage
-                or layer_id in self.pp_always
-            )
             if block.engram is not None:
                 index = list(self.config.engram_layer_ids).index(layer_id)
                 rows = self._engram_rows(layer_id, hashes, index, stream.device)
                 if _DUMP_DIR:
                     self._dump(f"engram{layer_id}_rows", rows.reshape(rows.shape[1], *rows.shape[2:]), live_rows)
                     self._dump(f"engram{layer_id}_hashes", hashes.reshape(hashes.shape[1], *hashes.shape[2:]), live_rows)
-                if owns:
-                    updated = block.engram(
-                        stream[:bucket_rows].unsqueeze(0), rows, None
-                    ).squeeze(0)
-                    if bucket_rows < stream.shape[0]:
-                        stream = _compiled(_splice_rows)(
-                            updated, stream[bucket_rows:]
-                        )
-                    else:
-                        stream = updated
-            # Tapped on every rank, owner or not. `_draft` raises when
-            # `main_hidden` is None and it runs on all 64 ranks, so a tap that
-            # only the owning stage collected would send the other stages down
-            # a different path through the MTP stages' own collectives — the
-            # one thing 64 ranks must not do. A non-owner's tap is of a stale
-            # stream, which costs one cheap compiled call and no collective,
-            # and the emulation's tokens are wrong anyway.
+                updated = block.engram(
+                    stream[:bucket_rows].unsqueeze(0), rows, None
+                ).squeeze(0)
+                if bucket_rows < stream.shape[0]:
+                    stream = _compiled(_splice_rows)(
+                        updated, stream[bucket_rows:]
+                    )
+                else:
+                    stream = updated
             if layer_id in target_layers:
                 main_hiddens.append(_compiled(_dspark_tap)(stream))
-            if owns:
-                if _DUMP_DIR and block.engram is not None:
-                    self._dump(f"engram{layer_id}", stream, live_rows)
-                stream, pre_mix = self._run_block(
-                    block, stream, pre_mix, slices, paged, shared, bucket_rows
-                )
-                if _DUMP_DIR:
-                    self._dump(f"layer{layer_id}", stream, live_rows)
-                    self._dump(f"premix{layer_id}", pre_mix, live_rows)
-            if self.pp_size > 1 and (
-                layer_id + 1 == self.config.num_hidden_layers
-                or self.block_stage[layer_id + 1] != self.block_stage[layer_id]
-            ):
-                stream, pre_mix = self._pp_boundary(
-                    stream, pre_mix, self.block_stage[layer_id]
-                )
+            if _DUMP_DIR and block.engram is not None:
+                self._dump(f"engram{layer_id}", stream, live_rows)
+            stream, pre_mix = self._run_block(
+                block, stream, pre_mix, slices, paged, shared, bucket_rows
+            )
+            if _DUMP_DIR:
+                self._dump(f"layer{layer_id}", stream, live_rows)
+                self._dump(f"premix{layer_id}", pre_mix, live_rows)
         _MOE_LIVE_ROWS[0] = None
 
         greedy_ids = getattr(self._mk_step, "greedy_ids", None) if _MEGAKERNEL else None
@@ -5417,9 +5137,7 @@ class DeepseekV41ForCausalLM(nn.Module):
                 "allocation and are addressed through its slot_mapping and "
                 "block_table (see PagedSpan)."
             )
-        # The first block this rank holds (block 0 on the flat scheme and the first
-        # pipeline stage; the stage's first block elsewhere): every block's entry is
-        # the same dict.
+        # Block 0's entry: every block's entry is the same dict.
         name = f"layers.{self.block_ids[0]}.attn"
         try:
             meta = attn_metadata[name]
@@ -5659,11 +5377,10 @@ class DeepseekV41ForCausalLM(nn.Module):
 
     @torch._dynamo.disable
     def _dump(self, name: str, tensor: torch.Tensor, live_rows: int) -> None:
-        """`DEEPSEEK_V41_DUMP_DIR`: save the live rows of `tensor` from the first rank of
-        each pipeline stage (rank 0 on the flat scheme), one file per forward and name,
-        for comparison against a reference. `forward` counts the steps."""
-        plan = getattr(self, "mk_plan", None)
-        if (plan.stage_rank if plan is not None else self.rank) != 0:
+        """`DEEPSEEK_V41_DUMP_DIR`: save the live rows of `tensor` from rank 0, one file
+        per forward and name, for comparison against a reference. `forward` counts the
+        steps."""
+        if self.rank != 0:
             return
         step = _DUMP_STEP[0]
         os.makedirs(_DUMP_DIR, exist_ok=True)
@@ -5990,11 +5707,10 @@ class DeepseekV41ForCausalLM(nn.Module):
         """
         if _MEGAKERNEL:
             return mk_model.run_layer(self, block, stream, pre_mix, self._mk_step)
-        # `stage_group` *is* `tp_group` unless `_PP_EMULATE` narrowed it. The
-        # attention and the indexer are unaffected either way: both reduce over
-        # `self.attn_group or tp_group` and `attn_group` is always set here, so
-        # what this selects is the expert-parallel all-reduce inside `MoE`.
-        tp_group = self.stage_group if self.world_size > 1 else None
+        # The attention and the indexer reduce over `self.attn_group or tp_group` and
+        # `attn_group` is always set here, so what this selects is the expert-parallel
+        # all-reduce inside `MoE`.
+        tp_group = self.tp_group if self.world_size > 1 else None
         io_stream, io_residual, io_normed = self._layer_io(stream)
         normed, residual, ffn_pre, ffn_post, ffn_comb = _block_entry(
             block, "attn_half"
@@ -6166,34 +5882,21 @@ class DeepseekV41ForCausalLM(nn.Module):
 
     def _mk_nearest_source(self, layer_id: int, kind: str):
         """The attention of the latest kv ("kv") or index ("index") source at or before
-        `layer_id` (the first one when none precedes it). On a pipeline stage that does
-        not own it, the stage's replica of the shipped kv source stands in: it has the
-        caches the boundary fills and indexer / compressor modules of the right shapes
-        (every kv source is an index source too)."""
+        `layer_id` (the first one when none precedes it)."""
         ids = list(self.config.kv_source_layer_ids if kind == "kv" else self.config.index_source_layer_ids)
         before = [s for s in ids if s <= layer_id]
         sid = max(before) if before else min(ids)
-        block = self.blocks_by_id.get(sid)
-        if block is not None:
-            return block.attn
-        if self.src_attn:
-            return next(iter(self.src_attn.values()))
-        raise RuntimeError(
-            f"layer {layer_id} needs {kind} source {sid}, which this stage neither owns nor "
-            "received a replica of"
-        )
+        return self.blocks_by_id[sid].attn
 
     @property
     def _mk_groups_world(self):
-        """The expert-reduce group of a backbone block: the world under tp64, the
-        stage under tp8pp8."""
-        return self.mk_plan.groups_stage()
+        """The expert-reduce group of a backbone block: the world."""
+        return self.mk_plan.groups_world()
 
     @property
     def _mk_groups_full(self):
-        """The drafter's group: the whole world under tp64, the (last) stage under
-        tp8pp8 -- the same ranks as `_mk_groups_world`."""
-        return self.mk_plan.groups_stage()
+        """The drafter's group: the whole world, the same ranks as `_mk_groups_world`."""
+        return self.mk_plan.groups_world()
 
     @property
     def _mk_groups_attn(self):

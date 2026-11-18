@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""One `@nki.jit` megakernel per phase, block archetype and parallelization scheme.
+"""One `@nki.jit` megakernel per phase and block archetype of the flat scheme (`tp64`).
 
-The bodies (`layer_kernel.layer_body`, `draft_kernel.draft_body`, `pp_kernels.*`)
-take their configuration as keyword constants. This module makes a distinct
-`@nki.jit` entry point for every combination the deployment uses, each a plain
-function with the body's positional signature and a name that says what it is:
+The bodies (`layer_kernel.layer_body`, `draft_kernel.draft_body`) take their
+configuration as keyword constants. This module makes a distinct `@nki.jit` entry
+point for every combination the deployment uses, each a plain function with the
+body's positional signature and a name that says what it is:
 
-    layer_prefill_r2_src_tp64, layer_decode_r1_idx_tap_tp64, layer_decode_r0_e_tp8pp8,
-    draft_prefill_tp64, draft_decode_tp8pp8, pp_boundary_even, pp_boundary_odd, ...
+    layer_prefill_r2_src_tp64, layer_decode_r1_idx_tap_tp64,
+    draft_prefill_tp64, draft_prefill_batched_tp64, ...
 
 so that a kernel is one function with its constants baked rather than one
 function branching on flags, and the compiled artifacts carry the name.
@@ -49,18 +49,21 @@ import sys
 import nki
 import nki.language as _nl
 
+from . import batched as _batched
 from . import tp64 as _tp64
-from . import tp8pp8 as _tp8pp8
 
 #: The scheme's kernel package: its own block kernel, drafter and helpers.
-_PKG = {"tp64": _tp64, "tp8pp8": _tp8pp8}
+_PKG = {"tp64": _tp64}
 
 
 def pkg(scheme: str):
-    """The kernel package of `scheme` (`kernels/tp64`, `kernels/tp8pp8`)."""
+    """The kernel package of `scheme` (`kernels/tp64`)."""
     return _PKG[scheme]
 
-SCHEMES = ("tp64", "tp8pp8")
+#: The batched drafter's package (`kernels/batched`: its body and its own helper copies);
+#: its `mk_model.kernel_version` package name.
+BATCHED_PKG = "batched"
+SCHEMES = ("tp64",)
 PHASES = ("prefill", "decode")
 
 
@@ -195,25 +198,26 @@ def _draft_decode_pkg():
     return importlib.import_module(".tp64.draft_decode", __package__)
 
 
-def draft(phase: str, scheme: str):
-    """The drafter entry of a scheme: the flat scheme's kernel drafts one sequence
-    per launch, the pipeline scheme's every sequence of the step in one launch
-    (`pkg(scheme).draft_kernel`). The flat scheme's decode phase runs the optimized
-    body (`draft_optimized`)."""
+def draft(phase: str, scheme: str = "tp64"):
+    """The per-sequence drafter entry: one sequence per launch (`pkg(scheme).draft_kernel`).
+    The decode phase runs the optimized body (`draft_optimized`)."""
     assert phase in PHASES and scheme in SCHEMES
     body = _draft_decode_pkg().draft_seq.draft_body if draft_optimized(phase, scheme) else pkg(scheme).draft_kernel.draft_body
     return specialize(body, f"draft_{phase}_{scheme}", (("phase", phase), ("scheme", scheme)))
 
 
-def draft_batched(phase: str):
+def draft_batched(phase: str, optimized: bool | None = None):
     """The flat scheme's drafter for every sequence of a step in one launch: the batched
-    body (`tp8pp8/draft_kernel.draft_body`, whose groups are the ranks the head and sampler
-    run on -- the world here) specialized for tp64. `mk_model.run_draft` launches it
+    body (`batched/draft_kernel.draft_body`, whose groups are the ranks the head and sampler
+    run on -- the world) specialized for tp64. `mk_model.run_draft` launches it
     unless `DEEPSEEK_V41_DRAFT_BATCHED=0` (one launch per sequence: `draft(phase, "tp64")`).
-    Its `mk_model.kernel_version` is `kernel_version("draft", "tp8pp8")`, the package it is
-    built from (the decode phase: the optimized body, `draft_optimized`, kind `DRAFT_DECODE_KIND`)."""
+    Its `mk_model.kernel_version` is `kernel_version("draft", BATCHED_PKG)`, the package it is
+    built from (the decode phase: the optimized body, `draft_optimized`, kind `DRAFT_DECODE_KIND`).
+    `optimized=False` forces the generic batched body (`test/unit/test_draft.py`)."""
     assert phase in PHASES
-    body = _draft_decode_pkg().draft_batched.draft_body if draft_optimized(phase) else _tp8pp8.draft_kernel.draft_body
+    if optimized is None:
+        optimized = draft_optimized(phase)
+    body = _draft_decode_pkg().draft_batched.draft_body if optimized else _batched.draft_kernel.draft_body
     return specialize(body, f"draft_{phase}_batched_tp64", (("phase", phase), ("scheme", "tp64")))
 
 
@@ -235,13 +239,6 @@ def embed_expand():
     from .tp64 import head_kernel
 
     return specialize(head_kernel.embed_expand_body, "embed_expand_decode_tp64", ())
-
-
-def boundary(parity: int):
-    """The stage-boundary kernel of the even / odd sending-stage pair layout. One
-    program for both sides of a boundary: the role is a runtime input."""
-    return specialize(_tp8pp8.pp_kernels.boundary_body,
-                      f"pp_boundary_{'even' if parity == 0 else 'odd'}", ())
 
 
 #: The module flags that make a decode kernel return copies of the caches it was given

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The DSpark drafter -- `model.forward_spec` for one sequence -- as a single NKI kernel:
-the flat scheme's drafter, launched once per sequence. The pipeline scheme's copy
-(`../tp8pp8/draft_kernel.py`) drafts every sequence of a step in one launch; this
+the flat scheme's drafter, launched once per sequence. The batched copy
+(`../batched/draft_kernel.py`) drafts every sequence of a step in one launch; this
 one is the pre-batching kernel kept as it was, so the flat scheme's path is unchanged.
 
     main_x   = main_norm(main_proj(main_hidden))                 the three taps, fp8 GEMM
@@ -105,7 +105,7 @@ def draft_body(
     """The drafter, traced with `phase` baked: "prefill" is the `at_zero` step (the
     main-stream KV writes only), "decode" the draft proper. `mk_kernels` makes one
     `@nki.jit` entry per phase and scheme. The drafter's groups are the ranks the
-    head and sampler run on: the world under tp64, the last stage under tp8pp8."""
+    head and sampler run on: the world under tp64."""
     at_zero, K, win, stage, kver, noise_id, vocab_size, topk_e, bs = flags
     assert bool(at_zero) == (phase == "prefill"), f"flags at_zero={at_zero} vs phase {phase}"
     nstages = wq_a.shape[0]

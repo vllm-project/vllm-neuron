@@ -132,8 +132,8 @@ def main():
     ap.add_argument("--src", action="store_true", help="kv + index source layer (compressor, indexer, top-k)")
     ap.add_argument("--engram", action="store_true", help="engram layer (n-gram table read-out before the block)")
     ap.add_argument("--tap", action="store_true", help="emit the DSpark tap")
-    ap.add_argument("--n-local", type=int, default=6, help="routed experts a rank (6: tp32, 48: a tp8pp8 stage)")
-    ap.add_argument("--scheme", default="tp32", help="tp32 (the generic entry) or tp8pp8 (the stage kernel)")
+    ap.add_argument("--n-local", type=int, default=6, help="routed experts a rank")
+    ap.add_argument("--scheme", default="tp32", help="tp32 (the generic entry)")
     ap.add_argument("--phase", default=None, help="prefill / decode entry of the scheme (default by T)")
     args = ap.parse_args()
 

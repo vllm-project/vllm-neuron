@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The batched drafter megakernel (the pipeline scheme's, `draft_kernel.py`) against a CPU
-reference of `model.forward_spec`, on N ranks; `test_draft_seq.py` covers the flat scheme's
-per-sequence kernel.
+"""The batched drafter megakernel (`kernels/batched/draft_kernel.py`, the generic body)
+against a CPU reference of `model.forward_spec`, on N ranks; `test_draft_seq.py` covers
+the per-sequence kernel.
 
     python kharness_mp.py 8 test_draft.py --L 6 --start 200 --stage 9
     python kharness_mp.py 8 test_draft.py --B 3                       # three sequences, one launch
@@ -135,7 +135,7 @@ def main():
     row_pos = torch.cat([torch.arange(st, st + L) for st in starts])
     write_slots = torch.cat([mk_host.slots_of(t, torch.arange(st, st + L), block_size) for t, st in zip(tables, starts)])
     from deepseek_v41.mk_model import draft_consts
-    _PT, _pad_to = mk_kernels.pkg("tp8pp8").mk_common.PT, mk_kernels.pkg("tp8pp8").mk_common.pad_to
+    _PT, _pad_to = mk_kernels._batched.mk_common.PT, mk_kernels._batched.mk_common.pad_to
     meta = torch.tensor([[seeds[b], taps[b], starts[b]] for b in range(B)], dtype=torch.int32)
     rows_c = draft_consts(B, K, _pad_to(win + K, _PT))
     seq_inputs = []
@@ -156,10 +156,10 @@ def main():
     # ---- kernel ---------------------------------------------------------------------
     groups = mk_host.replica_groups(world, world)
     flags = (at_zero, K, win, args.stage, 0, NOISE, VOCAB, cfg.dspark_num_experts_per_tok, block_size)
-    # The batched drafter is the pipeline scheme's entry (`draft_<phase>_tp8pp8`); the flat
-    # scheme launches the per-sequence kernel (`test_draft_seq.py`). The groups here are
-    # the 8-rank world either way.
-    kern = mk_kernels.draft("prefill" if at_zero else "decode", "tp8pp8")
+    # The batched drafter's generic body (`draft_<phase>_batched_tp64`, not the optimized
+    # decode body, whose weight layout differs); the per-sequence kernel is
+    # `test_draft_seq.py`'s. The groups here are the 8-rank world.
+    kern = mk_kernels.draft_batched("prefill" if at_zero else "decode", optimized=False)
     stack = lambda key: torch.stack([p[key] for p in ps]).contiguous()  # noqa: E731
 
     def stack8(wkey, skey):

@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """One `@nki.jit` megakernel per phase, block archetype and parallelization scheme.
 
-The bodies (`layer_kernel.layer_body`, `draft_kernel.draft_body`, `pp_kernels.*`)
+The bodies (`layer_kernel.layer_body`, `draft_kernel.draft_body`)
 take their configuration as keyword constants. This module makes a distinct
 `@nki.jit` entry point for every combination the deployment uses, each a plain
 function with the body's positional signature and a name that says what it is:
 
-    layer_prefill_r2_src_tp32, layer_decode_r1_idx_tap_tp32, layer_decode_r0_e_tp8pp8,
-    draft_prefill_tp32, draft_decode_tp8pp8, pp_boundary_even, pp_boundary_odd, ...
+    layer_prefill_r2_src_tp32, layer_decode_r1_idx_tap_tp32, draft_prefill_tp32,
+    draft_decode_batched_tp32, ...
 
 so that a kernel is one function with its constants baked rather than one
 function branching on flags, and the compiled artifacts carry the name.
@@ -49,18 +49,18 @@ import sys
 import nki
 import nki.language as _nl
 
+from . import batched as _batched
 from . import tp32 as _tp32
-from . import tp8pp8 as _tp8pp8
 
 #: The scheme's kernel package: its own block kernel, drafter and helpers.
-_PKG = {"tp32": _tp32, "tp8pp8": _tp8pp8}
+_PKG = {"tp32": _tp32}
 
 
 def pkg(scheme: str):
-    """The kernel package of `scheme` (`kernels/tp32`, `kernels/tp8pp8`)."""
+    """The kernel package of `scheme` (`kernels/tp32`)."""
     return _PKG[scheme]
 
-SCHEMES = ("tp32", "tp8pp8")
+SCHEMES = ("tp32",)
 PHASES = ("prefill", "decode")
 
 
@@ -199,8 +199,8 @@ def _draft_decode_pkg():
 
 def draft(phase: str, scheme: str):
     """The drafter entry of a scheme: the flat scheme's kernel drafts one sequence
-    per launch, the pipeline scheme's every sequence of the step in one launch
-    (`pkg(scheme).draft_kernel`). The flat scheme's decode phase runs the optimized
+    per launch (`pkg(scheme).draft_kernel`; `draft_batched` drafts every sequence of
+    the step in one launch). The flat scheme's decode phase runs the optimized
     body (`draft_optimized`)."""
     assert phase in PHASES and scheme in SCHEMES
     body = _draft_decode_pkg().draft_seq.draft_body if draft_optimized(phase, scheme) else pkg(scheme).draft_kernel.draft_body
@@ -219,14 +219,25 @@ def draft_tail(phase: str = "decode"):
 
 def draft_batched(phase: str):
     """The flat scheme's drafter for every sequence of a step in one launch: the batched
-    body (`tp8pp8/draft_kernel.draft_body`, whose groups are the ranks the head and sampler
-    run on -- the world here) specialized for tp32. `mk_model.run_draft` launches it
+    body (`batched/draft_kernel.draft_body`, whose groups are the ranks the head and sampler
+    run on -- the world) specialized for tp32. `mk_model.run_draft` launches it
     unless `DEEPSEEK_V41_DRAFT_BATCHED=0` (one launch per sequence: `draft(phase, "tp32")`).
-    Its `mk_model.kernel_version` is `kernel_version("draft", "tp8pp8")`, the package it is
+    Its `mk_model.kernel_version` is `kernel_version("draft", "batched")`, the package it is
     built from (the decode phase: the optimized body, `draft_optimized`, kind `DRAFT_DECODE_KIND`)."""
     assert phase in PHASES
-    body = _draft_decode_pkg().draft_batched.draft_body if draft_optimized(phase) else _tp8pp8.draft_kernel.draft_body
-    return specialize(body, f"draft_{phase}_batched_tp32", (("phase", phase), ("scheme", "tp32")))
+    if not draft_optimized(phase):
+        return draft_batched_generic(phase)
+    return specialize(_draft_decode_pkg().draft_batched.draft_body, f"draft_{phase}_batched_tp32",
+                      (("phase", phase), ("scheme", "tp32")))
+
+
+def draft_batched_generic(phase: str):
+    """The batched drafter's generic body (`batched/draft_kernel.draft_body`) for `phase`,
+    whatever `draft_optimized` says: what `draft_batched` launches at prefill (and at
+    decode when the optimized body is left out), and what `test/unit/test_draft.py` tests."""
+    assert phase in PHASES
+    return specialize(_batched.draft_kernel.draft_body, f"draft_{phase}_batched_tp32",
+                      (("phase", phase), ("scheme", "tp32")))
 
 
 @functools.lru_cache(maxsize=None)
@@ -256,13 +267,6 @@ def embed_expand():
     from .tp32 import head_kernel
 
     return specialize(head_kernel.embed_expand_body, "embed_expand_decode_tp32", ())
-
-
-def boundary(parity: int):
-    """The stage-boundary kernel of the even / odd sending-stage pair layout. One
-    program for both sides of a boundary: the role is a runtime input."""
-    return specialize(_tp8pp8.pp_kernels.boundary_body,
-                      f"pp_boundary_{'even' if parity == 0 else 'odd'}", ())
 
 
 #: The module flags that make a decode kernel return copies of the caches it was given
