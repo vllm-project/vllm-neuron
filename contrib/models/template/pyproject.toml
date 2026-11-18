@@ -1,0 +1,33 @@
+# Optional: makes this contrib model a pip-installable vLLM plugin.
+#
+#   pip install -e contrib/models/<your_model_name>
+#
+# The install adds a `vllm.general_plugins` entry point. vLLM then calls
+# `register()` in every process it starts (the API server, the engine, and each
+# tensor-parallel worker), so `vllm serve` and `LLM(...)` with TP > 1 find the
+# model without editing `vllm_neuron/model/registry.py`.
+# See contrib/README.md, "Option 3".
+
+[build-system]
+requires = ["setuptools>=77.0.3,<80.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# TODO: rename for your model.
+name = "your-model-neuron"
+version = "0.1.0"
+description = "<Your model> for vLLM Neuron (contrib model)"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = []  # runs inside an environment that already has vllm-neuron
+
+# The entry point name must be unique across installed plugins: vLLM keys
+# plugins by this name, so a clash (for example with vllm-neuron's own
+# `neuron`) silently drops one of them.
+[project.entry-points."vllm.general_plugins"]
+your_model = "your_model_neuron:register"
+
+# Installs `src/` as the importable package `your_model_neuron`.
+[tool.setuptools]
+package-dir = {"your_model_neuron" = "src"}
+packages = ["your_model_neuron"]
