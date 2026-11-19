@@ -8,74 +8,36 @@ by one full layer with no position embedding, repeated through the stack. See
 
 > **Note:** Contrib models are community contributions and may have limited
 > testing or performance optimization compared to the officially-supported
-> models under `vllm_neuron/model/`. The compatibility matrix and the
-> validation report below record exactly what was tested.
+> models under `vllm_neuron/model/`. The compatibility matrix below records
+> exactly what was tested.
 
 ## Usage
 
 Install `vllm-neuron` in your Neuron environment (see the top-level
-`README.md` for installation). Registration needs one extra thought for this
-model: vLLM already has an `Exaone4ForCausalLM` of its own, so the
-architecture must be *re-*registered to point at the class in `src/`,
-otherwise vLLM builds its own implementation. See
-[contrib/README.md](../../README.md) ("How do I register a custom model with
-vLLM?").
+`README.md` for installation), then install this folder:
 
-> **Read this before you serve the model.** Option 1 of
-> [contrib/README.md](../../README.md) — calling
-> `ModelRegistry.register_model(...)` from your own script — works only for the
-> offline `LLM(...)` API, and **cannot** work for `vllm serve` or any other
-> vLLM CLI entrypoint. For most contrib models that mistake ends in a clean
-> "architecture not registered" error. For this one it does not, because
-> upstream vLLM ships this architecture name. A process that misses the
-> registration resolves *vLLM's* `Exaone4ForCausalLM` instead of reporting an
-> unsupported architecture, and then fails inside the Neuron model runner's
-> `load_model` with an `AttributeError` on `from_configs`. Both Neuron model
-> runners follow the same pattern: resolve the architecture with
-> `ModelRegistry.resolve_model_cls(...)`, then call
-> `model_cls.from_configs(...)` (see
-> `vllm_neuron/vllm/worker/neuron_model_runner.py` and
-> `neuron_model_runner_v2.py`). `from_configs` is the plugin's own factory
-> convention — every plugin factory provides it, including `src/factory.py`
-> and `vllm_neuron/model/llama3/factory.py`, and vLLM's own model classes do
-> not. So the failure is loud, and it does **not** produce wrong output or
-> wrong numbers; it is just confusing, because it names a missing attribute
-> rather than the registration you skipped. Use option 2 for serving, as
-> described below.
->
-> Why: the plugin runs the engine core and the workers as separate processes
-> (`distributed_executor_backend="mp"`, see `vllm_neuron/vllm/platform.py`).
-> When you drive vLLM as a library, those processes are `fork`ed, so they
-> inherit your process's `sys.modules` and your populated `ModelRegistry`, and
-> your registration is in effect without being repeated. The vLLM CLI instead
-> starts the engine core with `spawn`, which re-executes a fresh interpreter
-> that never runs your script. A registered *class object* cannot cross
-> `spawn` at all; only the lazy `"module:Class"` string form can, which is the
-> form option 2 uses. This is read from the plugin's code, not from a recorded
-> run — see the Exceptions section.
+```bash
+pip install -e contrib/models/exaone4
+```
+
+The install adds a `vllm.general_plugins` entry point (`src/plugin.py`) that
+registers `Exaone4ForCausalLM` in every vLLM process, so `vllm serve` and
+`LLM(...)` need no other setup. vLLM ships its own `Exaone4ForCausalLM`; while
+this folder is installed, the entry point replaces it with the class in
+`src/`. `pip uninstall vllm-neuron-contrib-exaone4` removes the registration.
 
 The 32B checkpoint is about 64 GB in BF16; the recorded runs used TP8 on
 `trn2.48xlarge`.
 
 ### Serve with the OpenAI-compatible server
 
-`vllm serve` starts the engine directly, so there is no script of yours in
-which to call `ModelRegistry.register_model` — and a wrapper script that calls
-it before invoking the CLI does not help, because the CLI's engine-core
-process is spawned and starts from a fresh interpreter. Use option 2 of
-[contrib/README.md](../../README.md): move `src/` to
-`vllm_neuron/model/exaone4/` and add
-`("Exaone4ForCausalLM", "vllm_neuron.model.exaone4:Exaone4ForCausalLM")` to
-`_MODELS` in `vllm_neuron/model/registry.py`. That entry is a lazy
-`"module:Class"` string, which a spawned worker can import by name. The plugin
-registers its models inside the worker (`get_models()` in
-`vllm_neuron/vllm/worker/neuron_worker.py`), after vLLM's own registry is in
-place, so the entry replaces vLLM's EXAONE 4.0 class. This PR deliberately
-does not make that edit: it crosses the community-owned, opt-in boundary that
-the contrib guide draws, so it is the user's step. Then:
+These are the flags of the recorded `vllm serve` run (see the validation
+report):
 
 ```bash
 vllm serve LGAI-EXAONE/EXAONE-4.0-32B \
+    --host 127.0.0.1 \
+    --port 8000 \
     --dtype bfloat16 \
     --tensor-parallel-size 8 \
     --max-model-len 4096 \
@@ -87,7 +49,7 @@ vllm serve LGAI-EXAONE/EXAONE-4.0-32B \
 Then send a request:
 
 ```bash
-curl http://localhost:8000/v1/completions \
+curl http://127.0.0.1:8000/v1/completions \
     -H "Content-Type: application/json" \
     -d '{
         "model": "LGAI-EXAONE/EXAONE-4.0-32B",
@@ -99,22 +61,18 @@ curl http://localhost:8000/v1/completions \
 ### Offline inference with the Python API
 
 ```python
-from vllm import LLM, ModelRegistry, SamplingParams
+from vllm import LLM, SamplingParams
 
-# Copy contrib/models/exaone4/src/ into your own application package and
-# import the factory from there (option 1 of contrib/README.md).
-from your_package.exaone4 import Exaone4ForCausalLM
-
-# Register the contrib architecture before you construct the engine. The call
-# must *replace* vLLM's own Exaone4ForCausalLM, not just add an entry.
-ModelRegistry.register_model("Exaone4ForCausalLM", Exaone4ForCausalLM)
-
+# The installed entry point registers Exaone4ForCausalLM; no
+# ModelRegistry call is needed.
 llm = LLM(
     model="LGAI-EXAONE/EXAONE-4.0-32B",
     dtype="bfloat16",
     tensor_parallel_size=8,
     max_model_len=2048,
+    max_num_batched_tokens=2048,
     max_num_seqs=4,
+    enable_prefix_caching=False,
 )
 
 sampling_params = SamplingParams(temperature=0.0, max_tokens=32)
@@ -123,17 +81,6 @@ for output in outputs:
     print(output.outputs[0].text)
 ```
 
-This works because the engine-core and worker processes are `fork`ed from your
-process and inherit the registry you populated. It therefore depends on the
-default start method: do not set `VLLM_WORKER_MULTIPROC_METHOD=spawn` with
-this registration style, or the worker will resolve vLLM's own
-`Exaone4ForCausalLM` and crash on `from_configs`, as described above. The
-plugin's own `get_models()` has no EXAONE 4.0 entry (contrib models are opt-in
-by design), so the worker's registration pass does not evict yours.
-
-Prefill runs sequence-parallel, so a prompt length must be greater than the
-tensor-parallel size and a multiple of it.
-
 To iterate without Neuron hardware, run in CPU mode by setting
 `VLLM_NEURON_CPU_MODE=1` in the environment; the tiny end-to-end unit test
 does exactly that. See the top-level `README.md` and `AGENTS.md` for the full
@@ -141,18 +88,22 @@ list of `VLLM_NEURON_*` environment variables.
 
 ## Compatibility Matrix
 
-| Instance | Status | Software |
+| Instance / SDK version | 2.33 (vLLM Neuron 0.29.0.1.2.0) | 2.32 and earlier |
 | --- | --- | --- |
-| Trn2 (trn2.48xlarge) | Working — see the validation report | `vllm-neuron` 0.31.0.1.2.0, vLLM 0.31.0, `VLLM_NEURON_BACKEND=neuron_native` |
-| Trn3 | Not tested | — |
+| Trn3 | Not tested | Not tested |
+| Trn2 | Working (TP 8) | Not tested |
 
-The Neuron SDK release is not part of the evidence we hold for this model. The
-container images that the runs used pin the toolchain, and this README does not
-list them.
+Tested in the Neuron Deep Learning Container
+`public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04`;
+the validation report lists the versions. It also records earlier runs of the
+port on `vllm-neuron` 0.31.0.1.2.0, with test suites this folder does not
+ship; the folder as shipped has not been run on that version.
 
 ## Example Checkpoints
 
-- <https://huggingface.co/LGAI-EXAONE/EXAONE-4.0-32B>
+- <https://huggingface.co/LGAI-EXAONE/EXAONE-4.0-32B/tree/a1d54d1c148c30881ed27e035b650da489b51b92>
+  (revision `a1d54d1c148c30881ed27e035b650da489b51b92`; the 0.29 run loaded
+  `main`, which has pointed at this commit since 2025-08-04)
 
 ## Testing
 
@@ -175,7 +126,7 @@ and keep working after this folder is copied into an application — they only
 need `vllm-neuron` itself installed, and several contrib models can be
 collected in one pytest run without resolving each other's code.
 
-### Unit tests (CPU mode)
+### Optional: unit tests
 
 ```bash
 VLLM_NEURON_CPU_MODE=1 EXAONE4_CHECKPOINT_PATH=/path/to/EXAONE-4.0-32B \
@@ -188,7 +139,7 @@ and skips when `EXAONE4_CHECKPOINT_PATH` is not set.
 random-weight tiny EXAONE 4.0 model and runs the full vLLM pipeline on CPU at
 TP2 and TP1.
 
-### Module tests
+### Optional: module tests
 
 ```bash
 VLLM_NEURON_CPU_MODE=1 EXAONE4_CHECKPOINT_PATH=/path/to/EXAONE-4.0-32B \
@@ -208,7 +159,57 @@ checkpoint MLP). See the Exceptions section.
 
 ## Validation report
 
-### Source and environment
+### vLLM Neuron 0.29.0.1.2.0 (2026-11-18)
+
+#### Environment
+
+| Image | Instance | TP | vLLM | vllm-neuron | torch | transformers | neuronx-cc |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04` (+ `pytest-timeout`) | `trn2.48xlarge` (LNC 2) | 8 | 0.29.0 | 0.29.0.1.2.0 | 2.13.0 | 5.17.0 | 2.28.7631.0+8f7b0cf5 |
+
+#### Results
+
+| Test | Configuration | Result |
+| --- | --- | --- |
+| CPU unit tests, `test/unit/` | `VLLM_NEURON_CPU_MODE=1` | 3 passed, 6 skipped (checkpoint tests of `test_exaone4_loading.py`; `EXAONE4_CHECKPOINT_PATH` not set) |
+| `test_model_accuracy[4-2048]` | TP 8, BF16, batch 4, `max_model_len` 2048, 16 generated tokens per prompt | PASSED (544.90 s) |
+| `vllm serve` smoke | Usage flags, after `pip install -e contrib/models/exaone4` | Passed (3/3 prompts) |
+
+Not run on 0.29: module test `test/module/test_exaone4_rope.py`.
+
+#### Logit validation
+
+| Prompt | Overall Status | Max divergence (≤ 1 ULP) | Max K5 (≤ 0.025) | Max K50 (≤ 0.04) | Max K1000 (≤ 0.06) | Max All (≤ 0.065) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 of 2 | PASSED | 0.0000 | 0.0154 | 0.0154 | 0.0154 | 0.0154 |
+| 2 of 2 | PASSED | 0.2500 | 0.0120 | 0.0120 | 0.0130 | 0.0130 |
+
+No value over threshold. Accepted argmax divergences: prompt 1 at generated token 11 (Δ 0.0000), prompt 2 at generated token 1 (Δ 0.2500).
+Test passed on 2/2 prompts (`multi_prompt_logit_validation`); the aggregate block reports `agg_sigma_ratio` 1.2516 (> 1.0) and FAIL for its other `agg_*` checks.
+
+#### Serve smoke
+
+`/v1/completions`, `max_tokens` 32, `temperature` 0; `\n` marks a newline.
+
+| Prompt | First 60 characters |
+| --- | --- |
+| `The capital of France is` | ` Paris."\n\nThe answer is: "The capital of France is Paris."` |
+| `1, 2, 3, 4, 5,` | ` 6, 7, 8, 9, 10, 11, 12, 13, 14,` |
+| `def fibonacci(n):` | `\n    if n <= 0:\n        return 0\n    elif n == 1:\n        re` |
+
+#### Changes for 0.29
+
+- `src/compat.py` (new): vendors `hoist_rope_parameters`, `build_per_head_block_table` and `scatter_new_kv`, copied unchanged from a later `vllm-neuron` (not in 0.29.0.1.2.0).
+- `src/config.py`, `src/model.py`: import those helpers from `.compat` (`paged_slot_indices` still comes from the plugin).
+- `pyproject.toml`, `src/plugin.py` (new): install the `exaone4_neuron` package and register `exaone4_neuron.factory:Exaone4ForCausalLM` via a `vllm.general_plugins` entry point.
+- Nothing else in `src/` or `test/` changed.
+
+### vllm-neuron 0.31.0.1.2.0 (earlier recorded runs)
+
+These runs used the port before the 0.29 changes above, with test suites that
+are not shipped here (see Exceptions).
+
+#### Source and environment
 
 Four tests passed for this model, across two plugin commits, so no single
 commit covers the whole table:
@@ -228,7 +229,7 @@ The checkpoint is `LGAI-EXAONE/EXAONE-4.0-32B`. None of the tests pins a
 revision: they resolve the checkpoint by path or Hub id, so the revision the
 runs used is not part of our evidence.
 
-### Model configuration
+#### Model configuration
 
 The architecture class is `Exaone4ForCausalLM` (factory in `src/factory.py`,
 implementation in `src/model.py`), BF16 weights, no quantization. The model is
@@ -242,10 +243,9 @@ sliding-window block table. The performance run used `--max-model-len 4096`
 with token buckets up to 4096 and sequence buckets `[1]` or `[1, 4]`.
 Model-specific serving arguments are limited to `--dtype bfloat16` and
 disabled prefix caching; the logit run also enables on-device greedy sampling
-and raw-logit logprobs. Registration is the user's step, and for this model it
-must override vLLM's own class; see Usage above.
+and raw-logit logprobs.
 
-### Component validation
+#### Component validation
 
 The CPU loading test passed with 10 of 10 cases (commit `9bac9de6`). Eight of
 those cases are the loading suite: registration and resolution, the config
@@ -271,24 +271,25 @@ The two-node run also asserted kernel dispatch: the prefill node must show
 prefill lines and the decode node decode lines, for all 8 ranks and all 64
 layers, with `kernel=True`. It passed as part of that suite's 2 of 2 cases.
 
-### Numerical correctness
+#### Numerical correctness
 
-The disaggregated run is the logit evidence: a 1P1D deployment on two
-`trn2.48xlarge` nodes, one TP8 engine per node with NIXL moving the KV cache
-from prefill to decode, which compares the served logits of 16 generated
-tokens per prompt against a HuggingFace reference (FP32 baseline plus a
-same-dtype teacher-forced pass) with `multi_prompt_logit_validation`,
-replicated to the 4-sequence batch. It reports the aggregate and the stricter
-per-prompt result separately and asserts both. The observed verdict is PASS,
-2 of 2 cases (one per node), at commit `9bac9de6`. We hold that verdict and
-those counts only — no logit metric was read out.
+The disaggregated run is the logit evidence for this version: a 1P1D
+deployment on two `trn2.48xlarge` nodes, one TP8 engine per node with NIXL
+moving the KV cache from prefill to decode, which compares the served logits
+of 16 generated tokens per prompt against a HuggingFace reference (FP32
+baseline plus a same-dtype teacher-forced pass) with
+`multi_prompt_logit_validation`, replicated to the 4-sequence batch. It
+reports the aggregate and the stricter per-prompt result separately and
+asserts both. The observed verdict is PASS, 2 of 2 cases (one per node), at
+commit `9bac9de6`. We hold that verdict and those counts only — no logit
+metric was read out.
 
 The shipped `test/integration/test_model.py` uses the same tolerance map as
 that run — `(1e-5, 0.025)` at top-5, `(1e-5, 0.04)` at top-50, `(1e-5, 0.06)`
 at top-1000 and `(1e-5, 0.065)` over the full vocabulary — and keeps the
-strict `1e-5` argmax bound. It has not itself been run in CI: it is a
-single-node offline `LLM` run, where the evidence is a two-node disaggregated
-server.
+strict `1e-5` argmax bound. Its vLLM Neuron 0.29.0.1.2.0 result is reported
+above; it runs single-node and offline, whereas this run was a two-node
+disaggregated server.
 
 A GSM8K run also passed (2 of 2 cases, b1 and b4, 100 documents at
 `max_tokens=1024`, commit `f11b15f2`), which means dataset-level accuracy was
@@ -297,7 +298,7 @@ is a 0.0 threshold on the flexible-extract exact match, so a PASS says the run
 completed and produced a score, not that the score reached any particular
 level. We never read the score itself, so this README states none.
 
-### Serving validation
+#### Serving validation
 
 | Workload | Offline | Online |
 | --- | --- | --- |
@@ -330,10 +331,9 @@ figure from it, so none is stated here.
   harness and a metric-publishing layer into the model folder, so the suites
   were dropped. Their results are still the evidence cited above, but a user
   cannot re-run them from this folder.
-- **No logit or serving test in this folder reproduces the recorded
-  deployment.** The recorded logit and serving evidence is 1P1D across two
-  nodes. The shipped integration test is single-node and offline, and it has
-  never been run in CI.
+- **No test in this folder reproduces the two-node deployment.** The
+  0.31.0.1.2.0 logit and serving evidence is 1P1D across two nodes. The
+  shipped integration test, run on 0.29.0.1.2.0, is single-node and offline.
 - **The GSM8K gate is 0.0.** As described under Numerical correctness, the
   accuracy PASS is not a quality bar. No GSM8K score appears in this README,
   for this reason and because we never read one.
@@ -342,8 +342,8 @@ figure from it, so none is stated here.
   (`test/vllm_neuron/utils/logit_test_utils.get_model_checkpoint`) that does
   not ship here. The test now reads `EXAONE4_CHECKPOINT_PATH` and skips when
   it is unset or does not hold a checkpoint. The case count is unchanged, but
-  the suite can now skip instead of running, which the recorded CI run did not
-  do.
+  the suite can now skip instead of running, which the 0.31.0.1.2.0 run did
+  not do.
 - **`PROMPTS_2` is vendored.** The two validation prompts came from
   `test/vllm_neuron/utils/test_prompts.py` and are copied verbatim into the
   integration test, as contrib/README.md sanctions.
@@ -360,14 +360,16 @@ figure from it, so none is stated here.
   `NEURON_PLATFORM_TARGET_OVERRIDE=trn2`) in a `conftest.py` beside the test.
   They now live in an autouse fixture inside the test module, so the loading
   suite in the same directory is unaffected.
-- **The tiny test's `forked` marker now always takes effect.** In the plugin's
-  own test tree, `test/vllm_neuron/conftest.py` blocks `pytest-forked` unless
-  `--forked` is passed, so the marker was inert by default. `contrib/` has no
-  such conftest, so with `pytest-forked` installed each tiny end-to-end case
-  now runs in a forked child. That is what the marker asks for, and the two
-  cases were written to be process-isolated, but it is a behaviour change from
-  the recorded run: the module-scoped fixtures are then built inside each fork,
-  so the tiny checkpoint is written once per case instead of once per module.
+- **The tiny test's `forked` marker takes effect when `pytest-forked` is
+  installed.** In the plugin's own test tree, `test/vllm_neuron/conftest.py`
+  blocks `pytest-forked` unless `--forked` is passed, so the marker was inert
+  by default. `contrib/` has no such conftest, so with `pytest-forked`
+  installed each tiny end-to-end case runs in a forked child. That is what the
+  marker asks for, and the two cases were written to be process-isolated, but
+  the module-scoped fixtures are then built inside each fork, so the tiny
+  checkpoint is written once per case instead of once per module. The
+  0.29.0.1.2.0 run did not have `pytest-forked` installed (pytest warned about
+  an unknown `forked` mark), so the marker had no effect there.
 - **Only one component test is module-shaped.** `test/module/` holds the RoPE
   case, which compares one component against its HuggingFace counterpart.
   The loader and padded-MLP cases stay in `test/unit/` because they check
@@ -375,29 +377,19 @@ figure from it, so none is stated here.
   component against a reference implementation. There is no module test that
   runs attention or the MLP forward pass against a HuggingFace module in the
   sense of `docs/design/accuracy/module_test_guidelines.md`; the full-model
-  evidence (the tiny end-to-end suite and the recorded logit run) is what
+  evidence (the tiny end-to-end suite and the recorded logit runs) is what
   covers those components here.
-- **Registration cannot be made spawn-safe and copy-out-safe at once.** Read
-  from the plugin's code, not from any run: the offline `LLM(...)` path reaches
-  the engine core and the workers by `fork` inheritance, so registering a class
-  object from the test process is enough; the model is then resolved through
-  vLLM's registry (`ModelRegistry.resolve_model_cls` in
-  `vllm_neuron/vllm/worker/neuron_model_runner.py`). Any vLLM CLI entrypoint
-  spawns instead, where a class object cannot cross the process boundary at
-  all — only a lazy `"module:Class"` string can, and that needs a module
-  importable by name in a fresh interpreter, which the `test/_local_src.py`
-  convention deliberately avoids. So the folder is copy-out-safe for the
-  offline API and for the tests, and serving needs option 2 of
-  contrib/README.md. The in-repo precedent for out-of-tree registration
-  (`test/vllm_neuron/accuracy/test_tensor_replacement_e2e.py`) is option 1 for
-  the same reason. Because upstream vLLM ships this architecture name, a
-  process that misses the registration does not report an unsupported
-  architecture: it resolves vLLM's class and then fails on `from_configs`,
-  which the Neuron runners call and vLLM's classes do not define. That is a
-  confusing crash, not wrong output and not wrong numbers. No run in our
-  evidence exercised a spawned engine core for this model, so that failure mode
-  is a code reading, not an observation — and we could not inspect vLLM's class
-  directly here, since vLLM is not installed in this checkout.
+- **Registration must replace vLLM's own class.** vLLM ships an
+  `Exaone4ForCausalLM`, so a process in which this folder's registration has
+  not run resolves vLLM's class instead of reporting an unsupported
+  architecture. The Neuron model runners then call `model_cls.from_configs`
+  (`vllm_neuron/vllm/worker/neuron_model_runner.py`), which vLLM's classes do
+  not define, so the run fails with an `AttributeError` rather than producing
+  wrong output. Installing the folder registers it in every process; the
+  0.29.0.1.2.0 `vllm serve` run used that path. The tests do not need the
+  install: they register the class loaded from `src/`, and the engine and
+  workers inherit it through `fork`, the default start method. That failure
+  mode is read from the code, not observed.
 - **The test imports were converted to a local loader.** The port imported the
   modeling code as `contrib.models.exaone4.src...`, which resolves only with
   the repository root on `sys.path`. The tests now load `src/` by file location

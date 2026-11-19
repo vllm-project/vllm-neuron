@@ -51,19 +51,25 @@ and layer.
 - The embedding and the LM head are sharded on the vocabulary dimension.
 
 TP8 is the only degree with recorded results: one TP8 engine per node in the
-two-node disaggregated run, and TP8 single-node in the performance and GSM8K
-runs. The unit tests check the loader transforms at TP8 (ranks 0, 3 and 7) and
-run the tiny end-to-end cases at TP1 and TP2.
+two-node disaggregated run, TP8 single-node in the performance and GSM8K
+runs, and TP8 single-node in the vLLM Neuron 0.29.0.1.2.0 logit test and
+`vllm serve` run. The unit tests check the loader transforms at TP8 (ranks 0,
+3 and 7) and run the tiny end-to-end cases at TP1 and TP2.
 
 ## Dependencies
 
 The implementation imports only shared building blocks, as
 [contrib/README.md](../../../README.md) sanctions: `vllm_neuron.functional`,
 `vllm_neuron.nn`, `vllm_neuron.model.neuron_config`,
-`vllm_neuron.model.config_utils`, `vllm_neuron.model.kv_cache`,
-`vllm_neuron.parallel`, `vllm_neuron.utils` (checkpoint and weight-loader
-helpers) and vLLM's public APIs. It imports nothing from another model's
-folder.
+`vllm_neuron.model.kv_cache`, `vllm_neuron.parallel`, `vllm_neuron.utils`
+(checkpoint and weight-loader helpers) and vLLM's public APIs. It imports
+nothing from another model's folder.
+
+`compat.py` holds three helpers that vLLM Neuron 0.29.0.1.2.0 does not ship,
+copied unchanged from a later release: `hoist_rope_parameters` (used by
+`config.py`), and `build_per_head_block_table` and `scatter_new_kv` (used by
+`model.py`). `plugin.py` is the `vllm.general_plugins` entry point that
+`../pyproject.toml` declares.
 
 `model.py` also imports two enum types from `nkilib`
 (`nkilib.core.utils.common_types.NormType` and `QKVOutputLayout`). `nkilib` is
@@ -92,12 +98,12 @@ Other limits:
   `vllm_neuron.nn.rejection_sampler` when `spec_decode_metadata` is present),
   with no evidence behind it. Read from the code: this model can only be the
   *target* of speculative decoding, never the draft. A draft architecture is
-  resolved with `dict(get_models())[arch]` in
-  `vllm_neuron/vllm/worker/v2/spec_decode/eagle/speculator.py`, which consults
-  the plugin's own model map and not vLLM's `ModelRegistry`. A contrib model is
-  deliberately absent from that map, so registering it the way the folder README
-  describes does not reach this lookup, and using a contrib architecture as the
-  draft raises `KeyError`. That needs option 2 of contrib/README.md.
+  looked up in `dict(get_models())` in `vllm_neuron/vllm/spec_decode/eagle.py`,
+  which consults the plugin's own model map and not vLLM's `ModelRegistry`. A
+  contrib model is deliberately absent from that map, so registering it the
+  way the folder README describes does not reach this lookup, and using a
+  contrib architecture as the draft raises `ValueError`. That needs option 2
+  of contrib/README.md.
 - No recorded run went past a 4,096-token context, so the behaviour at the
   sliding-window boundary (and the block-table trimming above it) is
   untested; the checkpoint's `max_position_embeddings` is far larger.
@@ -113,7 +119,7 @@ Other limits:
 | TP with prefill sequence parallelism | Supported at TP8 (recorded); TP1 and TP2 in the tiny CPU cases |
 | NKI kernel dispatch on the main path | Supported; asserted per rank and layer by the port's device test |
 | On-device greedy sampling | Supported; used by the recorded logit run |
-| Disaggregated serving (1P1D, NIXL KV transfer) | Supported; the recorded logit and serving run was a two-node 1P1D deployment |
+| Disaggregated serving (1P1D, NIXL KV transfer) | Supported; the vllm-neuron 0.31.0.1.2.0 logit and serving run was a two-node 1P1D deployment |
 | Weight quantization (FP8, MXFP4, ...) | Not supported (no quantized weight path) |
 | FP8 KV cache | Unknown (code path present, no evidence) |
 | Speculative decoding | Unknown (code path present, no evidence) |

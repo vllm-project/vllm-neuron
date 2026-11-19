@@ -21,8 +21,9 @@ from dataclasses import dataclass, field
 import torch
 from transformers import PretrainedConfig
 
-from vllm_neuron.model.config_utils import hoist_rope_parameters
 from vllm_neuron.model.neuron_config import NeuronConfig
+
+from .compat import hoist_rope_parameters
 
 SLIDING_ATTENTION = "sliding_attention"
 FULL_ATTENTION = "full_attention"

@@ -65,11 +65,8 @@ from vllm_neuron.utils.weight_loader import (
 )
 
 import vllm_neuron.nn as neuron_nn
-from vllm_neuron.model.kv_cache import (
-    build_per_head_block_table,
-    paged_slot_indices,
-    scatter_new_kv,
-)
+from vllm_neuron.model.kv_cache import paged_slot_indices
+from .compat import build_per_head_block_table, scatter_new_kv
 from .config import FULL_ATTENTION, SLIDING_ATTENTION, Exaone4Config
 
 logger = logging.getLogger(__name__)
