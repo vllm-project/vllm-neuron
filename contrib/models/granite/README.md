@@ -19,45 +19,17 @@ projection and four extra scalars — an embedding multiplier, an attention
 ## Usage
 
 Install `vllm-neuron` in your Neuron environment (see the top-level
-`README.md` for installation). The plugin auto-registers with vLLM, but a
-contrib architecture is not in the plugin's registry, so you register it
-yourself — see
-[contrib/README.md](../../README.md) — "How do I register a custom model with
-vLLM?". The two options there are not interchangeable for this model, and
-which one you need depends on how the engine starts its subprocesses:
+`README.md` for installation), then install this folder:
 
-- **Option 1 (register the factory from your own script) covers the offline
-  `LLM(...)` API below.** The plugin pins the `mp` executor and leaves the
-  multiprocessing start method at `fork`, so the engine-core and worker
-  processes inherit the `ModelRegistry` that your script populated, and the
-  model runner then resolves the architecture through vLLM's registry. This
-  is read out of the plugin code — `vllm_neuron/vllm/platform.py` (the
-  executor pin, and a `spawn` override scoped to one unrelated model) and
-  `vllm_neuron/vllm/worker/neuron_model_runner.py` /
-  `neuron_model_runner_v2.py` (`ModelRegistry.resolve_model_cls`) — together
-  with vLLM 0.31.0's `vllm/envs.py`, where `VLLM_WORKER_MULTIPROC_METHOD`
-  defaults to `fork`. It is not read from a run of this folder. Pass the
-  factory **class** to `register_model`, not a `"module:Class"` string: vLLM
-  inspects a string entry by importing that module path in a fresh
-  `sys.executable` subprocess, which cannot reach code loaded from a file
-  location. `GraniteForCausalLM` is not one of the plugin's own
-  `_MODELS` entries (`vllm_neuron/model/registry.py`), so the pass that
-  re-registers those inside the worker does not overwrite your class.
-- **Option 2 is what `vllm serve` needs.** A vLLM CLI entrypoint starts its
-  engine core with `spawn`. So the fresh interpreter never runs your
-  `register_model` call. A registered class object cannot cross `spawn` at
-  all. Option 2 moves `src/` into `vllm_neuron/model/` and adds the
-  architecture to `_MODELS`. This contribution deliberately does not make
-  that edit, because it changes plugin core code. Expect the `spawn` failure
-  to be confusing rather than explicit. Upstream vLLM ships this
-  architecture name. So a process that never ran your registration resolves
-  vLLM's class, and does not report an unsupported architecture. The process
-  then fails on `from_configs`. The Neuron model runners call `from_configs`
-  on whatever class they resolve, and vLLM's own classes do not define it.
-  This comes from reading the code, not from a run:
-  `vllm_neuron/vllm/worker/neuron_model_runner.py` and
-  `neuron_model_runner_v2.py` (`ModelRegistry.resolve_model_cls` followed by
-  `model_cls.from_configs(...)`).
+```bash
+pip install -e contrib/models/granite
+```
+
+The install adds a `vllm.general_plugins` entry point (`src/plugin.py`) that
+registers `GraniteForCausalLM` in every vLLM process — the front end, the
+engine core and each Neuron worker — so `vllm serve` and `LLM(...)` need no
+other setup. `pip uninstall vllm-neuron-contrib-granite` removes the
+registration.
 
 The PowerLM-3b checkpoint stores FP32 weights and sets no dtype. The model
 runs them in bfloat16: pass `--dtype bfloat16` so the engine agrees with the
@@ -65,22 +37,27 @@ weight loader.
 
 ### Serve with the OpenAI-compatible server
 
-This needs the Option 2 registration above. Registering from a script does
-not reach a server that the CLI starts.
+These are the flags of the tested serve run:
 
 ```bash
 vllm serve ibm/PowerLM-3b \
+    --host 127.0.0.1 \
     --dtype bfloat16 \
     --tensor-parallel-size 4 \
     --max-model-len 2048 \
     --max-num-batched-tokens 2048 \
-    --max-num-seqs 4
+    --max-num-seqs 4 \
+    --no-enable-prefix-caching
 ```
+
+`--no-enable-prefix-caching` is required on vLLM Neuron 0.29: prefix caching
+(on by default) needs segmented prefill, which the plugin does not turn on when
+`--max-num-batched-tokens` is not smaller than `--max-model-len`, as here.
 
 Then send a request:
 
 ```bash
-curl http://localhost:8000/v1/completions \
+curl http://127.0.0.1:8000/v1/completions \
     -H "Content-Type: application/json" \
     -d '{
         "model": "ibm/PowerLM-3b",
@@ -92,21 +69,18 @@ curl http://localhost:8000/v1/completions \
 ### Offline inference with the Python API
 
 ```python
-from vllm import LLM, ModelRegistry, SamplingParams
+from vllm import LLM, SamplingParams
 
-# Copy contrib/models/granite/src/ into your own package first, then register
-# the factory before you construct the engine. The engine's subprocesses are
-# forked from this one, so they inherit this registration.
-from your_package.granite import GraniteForCausalLM
-
-ModelRegistry.register_model("GraniteForCausalLM", GraniteForCausalLM)
-
+# The pip install above registers GraniteForCausalLM; no register_model call
+# is needed.
 llm = LLM(
     model="ibm/PowerLM-3b",
     dtype="bfloat16",
     tensor_parallel_size=4,
     max_model_len=2048,
+    max_num_batched_tokens=2048,
     max_num_seqs=4,
+    enable_prefix_caching=False,
 )
 
 sampling_params = SamplingParams(temperature=0.0, max_tokens=32)
@@ -115,8 +89,13 @@ for output in outputs:
     print(output.outputs[0].text)
 ```
 
-Prefill runs sequence-parallel, so a prompt must be longer than the
-tensor-parallel size and a multiple of it.
+The integration test runs these engine arguments, plus its revision pin,
+compile buckets and logit-validation settings.
+
+Prefill runs sequence-parallel, so the prefill token count after padding to a
+bucket must be larger than the tensor-parallel size and a multiple of it
+(`src/model.py` raises otherwise). The prompt itself can be shorter: the serve
+smoke in the validation report sent 5-, 6- and 14-token prompts at TP 4.
 
 To iterate without Neuron hardware, run in CPU mode by setting
 `VLLM_NEURON_CPU_MODE=1` in the environment. See the top-level `README.md` and
@@ -124,15 +103,15 @@ To iterate without Neuron hardware, run in CPU mode by setting
 
 ## Compatibility Matrix
 
-Our evidence records container image digests and the plugin and vLLM versions,
-not a Neuron SDK release number, so this matrix is keyed on the plugin version
-instead of the SDK version. Every result we hold was produced on
-`trn2.48xlarge`.
+The matrix is keyed on the Neuron SDK of the container and the vLLM Neuron
+plugin version it ran. Trn2 was tested on `trn2.48xlarge` at TP 4. The
+earlier 0.31.0.1.2.0 runs in the validation report used the implementation
+in-tree, not this folder, so they do not count here.
 
-| Instance / plugin version | 0.31.0.1.2.0 (vLLM 0.31.0) | Other versions |
-| ------------------------- | -------------------------- | -------------- |
-| Trn2                      | Working                    | Not tested     |
-| Trn3                      | Not tested                 | Not tested     |
+| Instance / SDK version | 2.33 (vLLM Neuron 0.29.0.1.2.0) | 2.32 and earlier |
+| ---------------------- | ------------------------------- | ---------------- |
+| Trn3 | Not tested | Not tested |
+| Trn2 | Working (TP 4) | Not tested |
 
 ## Example Checkpoints
 
@@ -147,7 +126,8 @@ this implementation, but none of them was tested here.
 
 The integration test serves the model through vLLM on Neuron and validates its
 per-token logits against a HuggingFace reference. It needs Neuron hardware
-(TP 4 fits on one `trn2.48xlarge`).
+(TP 4 fits on one `trn2.48xlarge`). It registers the model class itself, so it
+does not need the `pip install` above.
 
 ```bash
 pytest contrib/models/granite/test/integration/test_model.py \
@@ -158,7 +138,7 @@ Set `GRANITE_CHECKPOINT_DIR` to a local snapshot of the pinned revision to
 test the exact checkpoint the results below were produced with. Otherwise the
 tests download it.
 
-### Unit tests (CPU mode)
+### Optional: unit tests
 
 `test/unit/` holds the architecture, config, revision and weight-loading
 tests, plus a decoder-layer comparison on CPU ranks. They need no Neuron
@@ -169,7 +149,7 @@ give it memory and time.
 VLLM_NEURON_CPU_MODE=1 pytest contrib/models/granite/test/unit -v
 ```
 
-### Module tests
+### Optional: module tests
 
 `test/module/test_device_modules.py` runs attention, the MLP and a full
 decoder layer on Neuron devices at TP 4 spread over two nodes, so every
@@ -196,6 +176,8 @@ holds the pinned checkpoint, the raw-tensor reads and the HuggingFace
 references. Each test module loads `_local_src.py` by file location too, under
 a name prefixed for this model, so nothing goes on `sys.path` and two contrib
 models in one pytest session cannot resolve against each other's `src/`.
+`test/conftest.py` shuts down the plugin's worker pool when the session ends,
+so pytest exits after its summary.
 
 Collecting more than one contrib model in a single pytest session still needs
 `--import-mode=importlib`, or one pytest invocation per model folder. The
@@ -207,13 +189,59 @@ with the first folder's.
 ## Validation report
 
 This section records what was validated for this contribution, and on which
-configuration. Every result below is a test verdict or a case count. We did
-not read any accuracy score, tolerance measurement, latency or throughput
-figure from the test results, so this README quotes none.
+configuration. The 0.29.0.1.2.0 run below quotes the logit errors from its test
+log. The earlier runs record test verdicts and case counts only. No GSM8K
+score, latency or throughput figure appears in this README.
 
-### Source and environment
+### vLLM Neuron 0.29.0.1.2.0 (2026-11-18)
 
-Four test runs passed for this model:
+#### Environment
+
+| Image | Instance | TP | vLLM | vllm-neuron | torch | transformers | neuronx-cc |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04` | `trn2.48xlarge` | 4 | 0.29.0 | 0.29.0.1.2.0 | 2.13.0 | 5.17.0 | 2.28.7631.0+8f7b0cf5 |
+
+#### Results
+
+| Test | Configuration | Result |
+| --- | --- | --- |
+| CPU unit tests (`test/unit/`) | `VLLM_NEURON_CPU_MODE=1` | 5 passed, 0 failed |
+| `test_model_accuracy[4-2048]` | TP 4, batch 4, `max_model_len` 2,048, 2 prompts × 16 decoded tokens against FP32 and BF16 HuggingFace references | PASSED (per-prompt: 1/2 prompts within bounds; aggregate σ-ratio 0.9358 ≤ 1.0) |
+| `vllm serve` smoke | Folder installed with `pip install -e`, flags under "Usage"; 3 completions at `max_tokens` 32, then 1 request with the 3 prompts at `max_tokens` 16 | Passed (3/3 prompts); the batched request returned the first 16 tokens of the same completions |
+
+Not run on 0.29: module tests (`test/module/`), which need two nodes; this run used one.
+
+#### Logit validation
+
+| Prompt | Overall Status | K5 (0.011) | K50 (0.02) | K1000 (0.03) | All (0.05) | Divergence (1 ULP) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1, "The Amazon rainforest is ..." | PASSED (64 of 64 tokens) | 0.0104 | 0.0104 | 0.0104 | 0.0110 | 0.0000 |
+| 2, "The human genome contains ..." | FAILED | 0.0112 (> 0.011) | 0.0123 | 0.0136 | 0.0159 | 0.0000 |
+
+Prompt 2 over K5 at generated token 6 (0.0112 > 0.011); all four batch rows report the same maxima.
+No argmax divergence. Test passed on aggregate σ-ratio 0.9358 ≤ 1.0 (`multi_prompt_logit_validation`).
+
+#### Serve smoke
+
+`/v1/completions`, `max_tokens` 32, `temperature` 0.
+
+| Prompt | Prompt tokens | First 60 characters of the completion |
+| --- | --- | --- |
+| `The capital of France is` | 5 | `" Paris.\n\nThe capital of Germany is Berlin.\n\nThe capital of S"` |
+| `1, 2, 3, 4, 5,` | 14 | `" 6, 7, 8, 9, 10, 11, 12, 13, 14,"` (whole completion) |
+| `def fibonacci(n):` | 6 | `"\n    if n <= 0:\n        return 0\n    elif n == 1:\n        re"` |
+
+#### Changes for 0.29
+
+- `src/compat.py` (new): `hoist_rope_parameters`, `build_per_head_block_table` and `scatter_new_kv`, absent from 0.29.0.1.2.0, copied unchanged from a later release.
+- `src/config.py`, `src/model.py`: import those helpers from `.compat` instead of `vllm_neuron.model.config_utils` and `vllm_neuron.model.kv_cache`; nothing else in `src/` changed.
+- `pyproject.toml`, `src/plugin.py` (new): `vllm.general_plugins` entry point (see "Usage").
+- `test/conftest.py` (new): session fixture that shuts down the plugin's `MPExecutor` worker pool; no test changed.
+
+### Earlier runs: vLLM Neuron 0.31.0.1.2.0 (in-tree)
+
+These runs used this implementation in-tree, at `vllm_neuron/model/granite/`,
+registered through `get_models()`, not the contrib layout of this folder.
 
 | Validation | Cases | Nodes |
 | --- | --- | --- |
@@ -228,7 +256,7 @@ the same plugin source commit. The checkpoint is `ibm/PowerLM-3b` at revision
 `38a624db4c8c9dd15d8bfb51845b7b177348e104`. The tests fingerprint its
 `config.json` and safetensors index by SHA-256.
 
-### Model configuration
+#### Model configuration
 
 The architecture class is `GraniteForCausalLM`, served in bfloat16; the
 FP32 checkpoint is cast at load time. Every passing device and performance run
@@ -239,12 +267,7 @@ GSM8K runs) set `max_model_len` and `max_num_batched_tokens` to 4,096 with
 token buckets up to 4,096. The CPU loading test loads the checkpoint on 4
 ranks; the CPU decoder-layer test runs at TP 2.
 
-Registration is the user's job, as described under "Usage" above and in
-`contrib/README.md`; nothing outside this folder needs to change. Beyond the
-standard arguments the model needs only `--dtype bfloat16` and prompts whose
-length is a multiple of the tensor-parallel size (sequence-parallel prefill).
-
-### Component validation
+#### Component validation
 
 The CPU run passed all 5 of its cases with no failures. Those cases are the
 tests that this folder ships in two files:
@@ -272,7 +295,7 @@ runs two stages per node, so that run spans both device files:
 We never opened the per-case list. So we cannot say which cases those 6 were,
 or which file each of the 12 passing cases came from. See Exceptions.
 
-### Numerical correctness
+#### Numerical correctness
 
 A logit-validation case ran in that two-node run: the port's
 `test_device_full_model.py` teacher-forced two prompts for 16 tokens at batch
@@ -286,13 +309,14 @@ That test passed no tolerance map, so it used the plugin default, and the
 shipped `test/integration/test_model.py` uses the same values — `(1e-5, 0.011)`
 at top-5, `(1e-5, 0.02)` at top-50, `(1e-5, 0.03)` at top-1000 and
 `(1e-5, 0.05)` over the full vocabulary — keeping the strict `1e-5`
-argmax-divergence bound. It is an offline, single-node adaptation of that
-case, not a rerun of it: see Exceptions.
+argmax-divergence bound. The shipped test is an offline, single-node
+adaptation of that case (same prompts, output length, batch, TP and
+tolerances), not a rerun of it. It ran on 0.29.0.1.2.0, above.
 
 The GSM8K accuracy run passed both its cases, at batch 1 and batch 4. We hold
 its verdict only. We did not read its GSM8K score.
 
-### Serving validation
+#### Serving validation
 
 The serving grid covers 1,024 input / 512 output tokens and 8,192 input /
 1,024 output tokens, offline and online:
@@ -307,7 +331,7 @@ its cases. It requested 1,024 input and 100 output tokens, with 20 measured
 requests at batch 1 and batch 4. This README states the verdict only. It
 quotes no latency or throughput figure.
 
-### Exceptions
+#### Exceptions
 
 - The multi-node device functional run reported 12 of 18 cases passed with 0
   failed, which leaves 6 cases that neither passed nor failed. We never opened
@@ -315,9 +339,6 @@ quotes no latency or throughput figure.
   does not claim 18 of 18. Everything the run covers — the device component
   cases, the online logit case, prefix reuse and the 1,024/512 serving case —
   inherits that uncertainty.
-- The shipped `test/integration/test_model.py` has never been run. It is an
-  offline single-node adaptation of the online logit case (same prompts,
-  output length, batch, TP and tolerances), written for this contribution.
 - Dropped: `test_device_full_model.py`, which held the online reference-logit,
   prefix-reuse and 1,024/512 serving cases and their node-1 follower
   counterparts. It needs shared harness modules outside the model folder
@@ -326,10 +347,7 @@ quotes no latency or throughput figure.
   serving harness into the folder. The integration test replaces its logit
   half in offline form. Its prefix-reuse and serving halves have no
   replacement here. So you cannot reproduce those parts of the 12-of-18 run
-  from this folder. Separately from the case-count gap, those cases served
-  the model over two nodes. The contrib layout cannot reach that setup at
-  all. A served endpoint needs the Option 2 registration (see "Usage"), not
-  the script registration that this folder uses.
+  from this folder.
 - Dropped: `test_native_comparison_accuracy.py` (GSM8K), the
   `test_native_comparison_benchmark.py` performance gate, and their shared
   `native_comparison_support.py`. They need `test.utils.simple_server`,
@@ -345,50 +363,32 @@ quotes no latency or throughput figure.
 - `test/unit/test_loading.py` no longer asserts that
   `vllm_neuron.model.registry.get_models()` maps the architecture to the
   factory, because a contrib model is deliberately absent from that registry.
-  It asserts the pair a user has to register instead — the architecture string
-  in `config.json` and the factory class in `src/`. The config, revision and
-  full-load checks are unchanged.
+  It asserts the pair that `src/plugin.py` registers instead — the
+  architecture string in `config.json` and the factory class in `src/`. The
+  config, revision and full-load checks are unchanged.
 - Nothing under `test/` is a Python package, and the test modules import the
   shared helpers by file location rather than by name. We tried packages and
   rejected them. A `test/__init__.py` makes this tree import as `test.unit`.
   But `test` is already the plugin's own top-level test package. The
   repository's root `conftest.py` imports that package in every pytest
   session. So collection fails with `No module named 'test.unit'`.
-- Option 1 of `contrib/README.md` registers the factory class from your own
-  script. It reaches the engine's subprocesses only because they are forked
-  from the registering process. A vLLM CLI entrypoint uses a spawned engine
-  core, which never runs that call. A class object cannot cross `spawn` at
-  all. The lazy `"module:Class"` string does not solve this either, although
-  the plugin uses that form for its own models. vLLM resolves such an entry
-  by importing the module path in a fresh `sys.executable` subprocess. So the
-  entry needs a module that a clean interpreter can import by name. The
-  file-location loader that this folder uses deliberately avoids that.
-  Registering the class object is therefore the only form that works here.
-  It is what `test/integration/test_model.py` does. This comes from reading
-  the code, not from a run. The sources are `vllm_neuron/vllm/platform.py`,
-  `vllm_neuron/vllm/worker/neuron_worker.py` and the two
-  `neuron_model_runner` files. They also include vLLM 0.31.0's
-  `vllm/envs.py` (the `fork` default) and
-  `vllm/model_executor/models/registry.py` (the two registration forms).
-- All evidence was produced with this implementation in-tree, at
-  `vllm_neuron/model/granite/`, registered through `get_models()`. The contrib
-  layout — code in `contrib/models/granite/src/`, registered by the user — was
-  not itself re-run in CI.
-- Only `ibm/PowerLM-3b` has evidence. Any other Granite checkpoint, including
-  larger ones and instruction-tuned ones, is untested here.
-- Untested in our evidence:
-  - Trn3
-  - any Neuron SDK release number (none was recorded)
-  - any tensor-parallel degree other than 4 on device
-  - prefix caching and chunked prefill beyond the unconfirmed case above (the
-    segmented-attention path exists in `src/model.py`)
-  - speculative decoding (the forward pass has a rejection-sampler branch,
-    never exercised)
-  - any quantized or FP8-KV configuration (none is implemented)
-  - LoRA and multimodal input (neither is implemented; `inputs_embeds` is
-    rejected)
-  - data parallelism (the decode path pins `attention_dp=1`)
-  - the 8,192/1,024 serving row
-  - the offline 1,024/512 serving row
-- No GSM8K score, measured tolerance, latency or throughput figure appears in
-  this README. We hold test verdicts and case counts only.
+
+### Not tested
+
+- Any checkpoint other than `ibm/PowerLM-3b`, including larger and
+  instruction-tuned Granite checkpoints.
+- Trn3.
+- This folder on any plugin version other than 0.29.0.1.2.0.
+- Any tensor-parallel degree other than 4 on device.
+- The module tests (`test/module/`) on 0.29.0.1.2.0.
+- Prefix caching and chunked prefill, beyond the unconfirmed 0.31.0.1.2.0 case
+  above. Every 0.29.0.1.2.0 configuration disables prefix caching and sets
+  `max_num_batched_tokens` equal to `max_model_len`. The segmented-attention
+  path exists in `src/model.py`.
+- Speculative decoding (the forward pass has a rejection-sampler branch,
+  never exercised).
+- Any quantized or FP8-KV configuration (none is implemented).
+- LoRA and multimodal input (neither is implemented; `inputs_embeds` is
+  rejected).
+- Data parallelism (the decode path pins `attention_dp=1`).
+- The 8,192/1,024 serving row and the offline 1,024/512 serving row.

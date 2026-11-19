@@ -1,9 +1,9 @@
 # Granite — architecture and feature status
 
 This card describes the implementation in this folder. Everything in it was
-read out of `config.py`, `factory.py` and `model.py`, or out of the verified CI
-evidence summarized in the model folder's `README.md`. Nothing here is a plan
-or an expectation.
+read out of `config.py`, `factory.py`, `model.py` and `compat.py`, or out of
+the test evidence summarized in the model folder's `README.md`. Nothing here is
+a plan or an expectation.
 
 ## Architecture
 
@@ -34,10 +34,13 @@ loader casts each tensor, so the served model is bfloat16.
 | `config.py` | `GraniteConfig` dataclass and `from_configs`, which accepts a `PretrainedConfig`, a `config.json` path or a dict, and resolves the dtype. |
 | `factory.py` | `GraniteForCausalLM` factory registered with vLLM; validates the config and selects the implementation. |
 | `model.py` | The fused QKV bias loader, RMSNorm, rotary embedding, attention (prefill, decode, segmented), MLP, decoder layer, backbone, and the `ForCausalLM` with `forward`, `get_kv_spec`, `bind_kv_cache`, `checkpoint_mappings` and `load_weights`. |
+| `compat.py` | `hoist_rope_parameters`, `build_per_head_block_table` and `scatter_new_kv`, copied from a later plugin release because vLLM Neuron 0.29.0.1.2.0 does not ship them. |
+| `plugin.py` | The `vllm.general_plugins` entry point that registers the factory with vLLM in every process. |
 
 Attention shards heads across tensor-parallel ranks and the MLP shards the
 intermediate dimension. Prefill is sequence-parallel: each rank takes its slice
-of the prompt, so the prompt length must exceed the TP size and divide by it.
+of the prompt, so the prefill token count, after padding to a bucket, must
+exceed the TP size and divide by it.
 Decode reads a paged KV cache; with more than one key/value head per rank it
 builds a per-head 3D block table and asks the shared decode helper whether the
 fused kernel accepts that geometry, falling back to the 2D table otherwise.
@@ -47,7 +50,7 @@ change there can change this model's decode path.
 
 ## Feature status
 
-"Verified" means the model folder's `README.md` cites CI evidence for it.
+"Verified" means the model folder's `README.md` cites test evidence for it.
 "Unconfirmed" means a case for it ran inside the two-node device run whose
 12-of-18 case count leaves per-case outcomes unknown. "Implemented,
 unverified" means the code path exists in this folder but no evidence covers
@@ -62,7 +65,7 @@ it. "Not implemented" means the code has no such path.
 | Sequence-parallel prefill | Verified (the component runs slice the prompt per rank). |
 | Paged KV cache, BF16 | Verified. |
 | Multi-head attention (36 KV heads) with the per-head block table on decode | Verified at TP 4, where each rank holds 9 key/value heads. |
-| Full-vocabulary logprobs (`max_logprobs=-1`, `raw_logits`) and on-device greedy sampling | Unconfirmed — the logit case that used them is inside the 12-of-18 run. |
+| Full-vocabulary logprobs (`max_logprobs=-1`, `raw_logits`) and on-device greedy sampling | Verified by the integration test on vLLM Neuron 0.29.0.1.2.0 (TP 4, batch 4), which uses both. |
 | Prefix caching (`NF.segmented_attention` path) | Unconfirmed — a prefix-reuse case ran inside the 12-of-18 run. |
 | Chunked prefill | Implemented, unverified. It shares the segmented-attention path with prefix caching; no case names it. |
 | Speculative decoding | Implemented, unverified. `forward` returns `rejection_sampler(...)` when it gets `spec_decode_metadata`; no evidence exercises it. |

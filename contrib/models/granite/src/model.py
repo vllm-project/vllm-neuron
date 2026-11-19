@@ -42,13 +42,7 @@ import vllm_neuron.nn as neuron_nn
 from vllm_neuron.functional.attention.attention_decode import (
     _can_use_attention_block_kernel,
 )
-from vllm_neuron.model.kv_cache import (
-    KVSpec,
-    LayerSpec,
-    build_per_head_block_table,
-    paged_slot_indices,
-    scatter_new_kv,
-)
+from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, paged_slot_indices
 from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.nn.sampler import Sampler
@@ -61,6 +55,7 @@ from vllm_neuron.utils.weight_loader import (
     sharding_weight_loader,
 )
 
+from .compat import build_per_head_block_table, scatter_new_kv
 from .config import GraniteConfig
 
 logger = logging.getLogger(__name__)
