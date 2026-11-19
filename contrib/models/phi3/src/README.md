@@ -81,8 +81,8 @@ the same selection as HF `longrope_frequency_update`.
 ## Example
 
 See the "Usage" section of the model folder's `README.md` for a `vllm serve`
-command and an offline `LLM(...)` script, including the registration step that
-a contrib architecture needs.
+command and an offline `LLM(...)` script, including the
+`pip install -e contrib/models/phi3` step that registers the architecture.
 
 ## Tests
 
@@ -105,4 +105,4 @@ need neither the repository root nor a `sys.path` entry.
 The port also had 2-node serving tests (served logits, and 1024-input /
 512-output chat requests on both model runners). They depend on shared test
 helpers outside the model folder and are not part of this contribution; the
-model folder's `README.md` records them under Exceptions.
+model folder's `README.md` records their results in its validation report.

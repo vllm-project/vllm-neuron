@@ -44,7 +44,6 @@ import vllm_neuron.functional as NF
 from vllm_neuron.model.kv_cache import (
     KVSpec,
     LayerSpec,
-    build_per_head_block_table,
     build_per_head_slot_mapping,
     paged_slot_indices,
 )
@@ -63,6 +62,7 @@ from vllm_neuron.nn.sampler import Sampler
 import vllm_neuron.nn as neuron_nn
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 
+from .compat import build_per_head_block_table
 from .config import Phi3Config
 
 logger = logging.getLogger(__name__)
@@ -593,10 +593,12 @@ class Phi3Attention(nn.Module):
             )
             kv_cache_update_idx = build_per_head_slot_mapping(
                 slot_mapping, block_size, nkh, B
-            )
+            ).to(torch.uint32)
         else:
             active_blocks_table = block_table
-            kv_cache_update_idx = slot_mapping.view(B, S_decode)
+            # The kernel reads the write slots as uint32, as the plugin's own
+            # decoders pass them; vLLM's slot mapping is int64.
+            kv_cache_update_idx = slot_mapping.view(B, S_decode).to(torch.uint32)
 
         # >>> PARALLELISM: Fused megakernel with TP-sharded weights <<<
         output = NF.attention_decode(

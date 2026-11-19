@@ -81,6 +81,25 @@ TENSOR_PARALLEL_SIZE = 8
 torch.manual_seed(42)
 
 
+def _builtin_phi3_loader(model_checkpoint, dtype, config=None):
+    """Load the reference with the ``Phi3ForCausalLM`` built into transformers.
+
+    The Phi-4-mini checkpoint ships remote modeling code that imports
+    ``transformers.utils.LossKwargs``, which transformers 5.17 (the version
+    vLLM Neuron 0.29.0.1.2.0 ships with) no longer has, so the default
+    ``trust_remote_code`` loader cannot import it. The built-in class implements
+    the same architecture and reads the same checkpoint.
+    """
+    from transformers import Phi3ForCausalLM
+
+    kwargs = {"dtype": dtype, "attn_implementation": "sdpa"}
+    if config is not None:
+        kwargs["config"] = config
+    model = Phi3ForCausalLM.from_pretrained(model_checkpoint, **kwargs)
+    model.eval()
+    return model
+
+
 def _load_local_src():
     """Return ``test/_local_src.py``, loaded by file location.
 
@@ -173,6 +192,8 @@ def test_model_accuracy(batch_size: int, seq_len: int) -> None:
         tokenizer=tokenizer,
         prompts=PROMPTS,
         output_length=OUTPUT_LENGTH,
+        model_loader=_builtin_phi3_loader,
+        golden_variant="transformers_builtin_phi3",
     )
 
     # Four of these arguments are required by logit validation, not optional
