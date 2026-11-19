@@ -49,9 +49,9 @@ and TP 3 are rejected at construction. The recorded runs used TP 8.
 The statuses come from two sources only: the code in this folder, and the
 recorded test verdicts in the Validation report of the model folder's
 `README.md`. "Exercised" means a test that covers the path was part of a run
-with a recorded PASS verdict — we hold verdicts and case counts, not per-path
-measurements. "Implemented, not covered" means the code path is here but no
-recorded run covers it. "Not supported" means the code refuses it.
+with a recorded PASS verdict. "Implemented, not covered" means the code path
+is here but no recorded run covers it. "Not supported" means the code refuses
+it.
 
 | Feature | Status |
 |---|---|

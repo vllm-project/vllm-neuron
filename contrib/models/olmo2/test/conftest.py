@@ -13,6 +13,7 @@ Two things live here:
   into the model folder, so the fixture is vendored here.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -36,3 +37,20 @@ def dist_cleanup():
         except Exception as e:  # noqa: BLE001
             print(f"Warning: Runtime close failed: {e}")
     yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _worker_pool_cleanup():
+    """Shut down the plugin's ``MPExecutor`` worker pool when the session ends.
+
+    ``MPExecutor`` keeps its worker processes in a module-level pool so later
+    tests can reuse them. Those workers outlive the last test, so without this
+    shutdown pytest prints its summary and then never exits. The plugin's own
+    test suite shuts the pool down the same way.
+    """
+    pid = os.getpid()
+    yield
+    if os.getpid() == pid:
+        from vllm_neuron.utils.executor import _worker_pool
+
+        _worker_pool.shutdown_all()

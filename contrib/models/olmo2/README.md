@@ -12,24 +12,25 @@ and `src/README.md` describes the architecture and the per-feature status.
 ## Usage
 
 Install `vllm-neuron` in your Neuron environment (see the top-level
-`README.md`). The plugin registers the Neuron platform automatically, but a
-contrib architecture is not in the plugin's registry, so register
-`Olmo2ForCausalLM` yourself first — see
-[contrib/README.md](../../README.md), "How do I register a custom model with
-vLLM?".
+`README.md`), then install this folder:
+
+```bash
+pip install -e contrib/models/olmo2
+```
+
+The install makes `src/` importable as the `olmo2_neuron` package and adds a
+`vllm.general_plugins` entry point (`src/plugin.py`) that registers
+`Olmo2ForCausalLM` in every vLLM process. `vllm serve` and `LLM(...)` then
+find the architecture with no other setup.
 
 ### Serve with the OpenAI-compatible server
 
-`vllm serve` has no script of yours to run the registration call, so this path
-needs option 2 in `contrib/README.md`: move `src/` to
-`vllm_neuron/model/olmo2/` and add `("Olmo2ForCausalLM",
-"vllm_neuron.model.olmo2:Olmo2ForCausalLM")` to `_MODELS` in
-`vllm_neuron/model/registry.py`. As `contrib/README.md` notes, that option
-edits the plugin's core code and so crosses the "community-owned, opt-in"
-boundary; this PR does not make that edit. Then:
+These are the flags of the tested serve run. `--host 127.0.0.1` keeps the
+server local to the host; it listens on port 8000.
 
 ```bash
 vllm serve allenai/OLMo-2-0425-1B \
+    --host 127.0.0.1 \
     --dtype bfloat16 \
     --tensor-parallel-size 8 \
     --max-model-len 2048 \
@@ -44,7 +45,7 @@ vllm serve allenai/OLMo-2-0425-1B \
 Then send a request:
 
 ```bash
-curl http://localhost:8000/v1/completions \
+curl http://127.0.0.1:8000/v1/completions \
     -H "Content-Type: application/json" \
     -d '{
         "model": "allenai/OLMo-2-0425-1B",
@@ -55,18 +56,7 @@ curl http://localhost:8000/v1/completions \
 
 ### Offline inference with the Python API
 
-Your script runs before the engine, so it can register the architecture
-itself. Copy `src/` into your application as an importable package, and then:
-
 ```python
-from vllm import ModelRegistry
-
-# Your copy of contrib/models/olmo2/src/, under whatever name you gave it.
-from your_package.factory import Olmo2ForCausalLM
-
-# Register before you construct LLM(...).
-ModelRegistry.register_model("Olmo2ForCausalLM", Olmo2ForCausalLM)
-
 from vllm import LLM, SamplingParams
 
 llm = LLM(
@@ -95,32 +85,28 @@ for output in outputs:
 `quantization: "bf16"` is not optional for this model: the published
 checkpoint stores FP32 weights and the implementation computes in BF16.
 
-The registration above runs in your process, and vLLM builds the model in its
-engine-core and worker processes. Those processes inherit the registration
-because the offline `LLM(...)` path starts them with the `fork` start method,
-which is the default for a Python script. If you set
-`VLLM_WORKER_MULTIPROC_METHOD=spawn`, the child re-imports from scratch, never
-runs your `register_model` call, and `ModelRegistry.resolve_model_cls` fails to
-find `Olmo2ForCausalLM`. Leave the start method alone, or use option 2 above.
-
 To iterate without Neuron hardware, run in CPU mode by setting
 `VLLM_NEURON_CPU_MODE=1`. See the top-level `README.md` and `AGENTS.md` for the
 full list of `VLLM_NEURON_*` environment variables.
 
 ## Compatibility Matrix
 
-The recorded runs name a plugin version and a vLLM version, not a Neuron SDK
-release, so the columns below are the versions we have evidence for.
+| Instance / version   | vLLM Neuron 0.29.0.1.2.0 (Neuron SDK 2.33) | Other versions |
+| -------------------- | ------------------------------------------ | -------------- |
+| Trn2 (trn2.48xlarge) | Working, TP 8                              | Not tested     |
+| Trn3                 | Not tested                                 | Not tested     |
 
-| Instance / version | `vllm-neuron` 0.31.0.1.2.0 (vLLM 0.31.0) | Other versions |
-| ------------------ | ---------------------------------------- | -------------- |
-| Trn2 (trn2.48xlarge) | Working, TP 8                          | Not tested     |
-| Trn3                 | Not tested                             | Not tested     |
+The earlier runs on `vllm-neuron` 0.31.0.1.2.0 in the validation report used
+the port before the 0.29 changes, so that version is not listed as tested for
+the code in this folder.
 
 ## Example Checkpoints
 
 - <https://huggingface.co/allenai/OLMo-2-0425-1B> — the only checkpoint with
-  recorded runs. The tests pin revision `a1847dff35000b4271fa70afc5db10fd29fedbdf`.
+  recorded runs. The unit tests pin revision
+  `a1847dff35000b4271fa70afc5db10fd29fedbdf` (set `OLMO2_CHECKPOINT_PATH` to a
+  local copy to skip the download); the integration test loads the model by
+  its hub name.
 
 Other OLMo 2 checkpoints have the same architecture, but none was run, and the
 implementation rejects a checkpoint with tied embeddings, an attention bias or
@@ -135,6 +121,11 @@ logits against a HuggingFace reference. It needs 8 NeuronCores:
 pytest contrib/models/olmo2/test/integration/test_model.py \
     -v -s --timeout=7200
 ```
+
+The integration test does not need the `pip install`: it registers the factory
+itself, from the test process, before it builds the engine. vLLM's engine-core
+and worker processes inherit that registration through the default `fork`
+start method, so do not set `VLLM_WORKER_MULTIPROC_METHOD=spawn` for this test.
 
 ### Unit tests
 
@@ -169,155 +160,168 @@ application.
 own helper, vendored into this folder with the model. It sits at the `test/`
 root rather than inside one of them because both import it. `test/conftest.py`
 puts the `test/` directory on `sys.path` so that the three test directories
-find those two modules, and it provides the `dist_cleanup` fixture that the
-plugin's test tree would otherwise supply.
+find those two modules. It also provides the `dist_cleanup` fixture that the
+plugin's test tree would otherwise supply, and a session fixture that shuts
+down the plugin's `MPExecutor` worker pool when the session ends; without it
+pytest prints its summary and then does not exit.
 
 ## Validation report
 
-### Source and environment
+### vLLM Neuron 0.29.0.1.2.0 (2026-11-19)
 
-Two plugin commits carry the recorded results, so no single commit covers the
-whole table:
+#### Environment
 
-- `60e32deb879ef75b67b33628e465f86488a1422e` — the CPU loading/components run
-  and the 2-node device functional run.
-- `4cfa33adbc61f4f2ce5d166fe7fda1dcb8ca0c52` — the GSM8K accuracy run and the
-  performance run.
+One `trn2.48xlarge` (logical NeuronCore config 2), in the Neuron Deep Learning
+Container
+`public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04`
+(Neuron SDK 2.33, Python 3.14.6), with the code in this folder at TP 8 on one
+node:
 
-Every run was on `trn2.48xlarge` with `vllm-neuron` 0.31.0.1.2.0, vLLM 0.31.0
-and the `neuron_native` runtime backend. The checkpoint is
-`allenai/OLMo-2-0425-1B`; the test constants pin HuggingFace revision
-`a1847dff35000b4271fa70afc5db10fd29fedbdf`.
+| Package | Version |
+|---|---|
+| vLLM | 0.29.0 |
+| `vllm-neuron` | 0.29.0.1.2.0 |
+| torch | 2.13.0 |
+| transformers | 5.17.0 |
+| neuronx-cc | 2.28.7631.0+8f7b0cf5 |
+| nki | 0.7.0+37713544100.gfede04bb |
+| libtorch-neuronx-lite | 2.13.0.1.0.3112+653bc48f |
 
-The runs used more than one container image. The evidence does not say which
-image served which row.
+The run downloaded `allenai/OLMo-2-0425-1B` at the pinned revision
+`a1847dff35000b4271fa70afc5db10fd29fedbdf` before the tests; the integration
+test and the serve smoke test load the model by its hub name. The unit and
+integration tests ran first, and the folder was then installed with
+`pip install -e` for the serve smoke test.
+
+#### Results
+
+| Test | Configuration | Result |
+|---|---|---|
+| CPU unit tests, `test/unit/` | `VLLM_NEURON_CPU_MODE=1` | 4 passed |
+| Integration logit test, `test_model_accuracy[1-2048]` | batch 1, max model length 2,048, TP 8 | PASSED |
+| Integration logit test, `test_model_accuracy[4-2048]` | batch 4, max model length 2,048, TP 8 | PASSED |
+| `vllm serve` smoke | the serve command under Usage | Passed, 3 of 3 prompts |
+
+The four unit tests are `test_registry_and_config`,
+`test_checkpoint_mapping_coverage`, `test_weight_loader_transforms` and
+`test_full_model_tp8_load[8]`. The module tests (`test/module/`) were not run
+on this version.
+
+The integration test validates 16 generated tokens for each of its two prompts
+against the HuggingFace BF16 reference, with the FP32 reference as the
+baseline. The logged thresholds are a divergence bound of 1 ULP (dynamic, 7
+mantissa bits) and top-K tolerances (rtol) of 0.03 (K5), 0.05 (K50), 0.08
+(K1000) and 0.09 (All). Per prompt, as logged:
+
+| Case | Prompt | Overall Status | Max divergence (1 ULP) | Max K5 (0.03) | Max K50 (0.05) | Max K1000 (0.08) | Max All (0.09) |
+|---|---|---|---|---|---|---|---|
+| `[1-2048]` | 1/2, `The color of the sky is` | FAILED | 0.0000 | 0.0318 (over) | 0.0263 | 0.0198 | 0.0127 |
+| `[1-2048]` | 2/2, `A short summary of the history of the printing press:` | PASSED | 0.0000 | 0.0253 | 0.0190 | 0.0187 | 0.0177 |
+| `[4-2048]` | 1/2, `The color of the sky is` | FAILED | 0.0000 | 0.0318 (over) | 0.0263 | 0.0198 | 0.0126 |
+| `[4-2048]` | 2/2, `A short summary of the history of the printing press:` | PASSED | 0.0000 | 0.0253 | 0.0190 | 0.0187 | 0.0177 |
+
+Prompt 1 exceeds the K5 tolerance at one generated token (token 10, K5 0.0318
+against 0.03; at batch 4 the same value on all four rows), with no argmax
+divergence, so both cases log `Two-way validation: 1/2 prompts passed`. The
+test asserts `result.passed` from `multi_prompt_logit_validation`. With an
+FP32 baseline (three-way mode), that result also passes when the cross-prompt
+σ-ratio is at most 1.0. The log reports `agg_sigma_ratio: 0.9808 (≤1.0 =
+pass)` at batch 1 and `agg_sigma_ratio: 0.9744 (≤1.0 = pass)` at batch 4, and
+pytest reports `2 passed`.
+
+The serve smoke test started `vllm serve` with the command under Usage and
+sent each prompt to `/v1/completions` with `max_tokens` 32 and `temperature`
+0. The check is that every completion is non-empty. Each returned 32 tokens:
+
+| Prompt | Start of the completion (first 60 characters) |
+|---|---|
+| `The capital of France is` | ` Paris. The French language is spoken in France. The French ` |
+| `1, 2, 3, 4, 5,` | ` 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16` |
+| `def fibonacci(n):` | ` \n    if n < 0: \n        return 0 \n    elif n == 0: \n       ` |
+
+(`\n` is a newline.) One batched request with all three prompts and
+`max_tokens` 16 returned a prefix of the same text for each prompt.
+
+#### Changes for vLLM Neuron 0.29
+
+From the earlier port of this folder, which was written against a later
+plugin release:
+
+- `src/compat.py` (new) vendors three plugin helpers that 0.29.0.1.2.0 does
+  not ship: `hoist_rope_parameters` (0.29 has no
+  `vllm_neuron.model.config_utils`) and `build_per_head_block_table` and
+  `scatter_new_kv` (not in 0.29's `vllm_neuron.model.kv_cache`).
+  `src/config.py` and `src/model.py` import them from `.compat` instead of
+  from the plugin.
+- `pyproject.toml` and `src/plugin.py` (new) install `src/` as the
+  `olmo2_neuron` package with a `vllm.general_plugins` entry point that
+  registers `Olmo2ForCausalLM`.
+- `test/conftest.py` adds a session fixture that shuts down the plugin's
+  `MPExecutor` worker pool (`vllm_neuron.utils.executor._worker_pool`) at the
+  end of the session, so pytest exits after its summary.
+
+The model code, the weight loaders and the test assertions are otherwise
+unchanged.
 
 ### Model configuration
 
 The architecture class is `Olmo2ForCausalLM` (`src/factory.py` validates the
 config and selects `src/model.py`). It is a dense model, so there is no expert
-parallelism; the evidence names tensor parallelism only. Every recorded run
-used TP 8 — on one node for the accuracy and performance runs, and as 2 nodes
-with 4 ranks each for the device functional run. The implementation computes in
-BF16 from the FP32 checkpoint, which is why `neuron_config.quantization` is
-`bf16` in every command above.
+parallelism; every recorded run used tensor parallelism only, at TP 8. The
+implementation computes in BF16 from the FP32 checkpoint, which is why
+`neuron_config.quantization` is `bf16` in every command above.
 
-The serving test constants state a maximum model length of 2048 with a
+The tested serving configuration is a maximum model length of 2048 with a
 matching 2048-token batched-token limit, `--max-num-seqs` 1 or 4, block size
-32, prefix caching off and async scheduling off. Registration is the only
-step outside this folder, and it is the user's: either register the factory
-from your own script (offline) or add the architecture to the plugin registry
-(online), as described under Usage.
+32, prefix caching off and async scheduling off.
 
-### Component validation
+### Earlier runs: `vllm-neuron` 0.31.0.1.2.0 (vLLM 0.31.0)
 
-| Run | Commit | Nodes | Cases |
-|---|---|---|---|
-| CPU Loading and Components (TRN2) | `60e32de` | 1 | PASS, 5 of 5 |
-| Device Functional, 2 nodes (TRN2) | `60e32de` | 2 | PASS, 12 of 12 |
+These runs used the port before the 0.29 changes above, on `trn2.48xlarge` at
+TP 8 with the `neuron_native` runtime backend. Only the verdicts and case
+counts were recorded, and the runs used more than one container image without
+a record of which image served which row.
 
-The CPU run covers the loading path (registration contract, config parse,
-checkpoint mapping coverage, weight-loader transforms, full 8-rank CPU load)
-and the one component case that has a CPU path. The device run covers the four
-layer-0 attention and MLP component cases on each node, plus the port's serving
-cases. Those compositions are read from the test sources — the evidence holds
-the aggregate verdict and the case counts, not a per-case breakdown.
-
-### Numerical correctness
-
-No logit-validation run is on record for this model. None of the recorded test
-ids identifies a logit-validation run, and we hold `test_verdict` values and
-case counts only, so there is no logit result, tolerance or divergence count to
-report here.
-
-The test that ships as `test/integration/test_model.py` does perform logit
-validation: it compares the served raw logits with a HuggingFace golden
-reference and keeps the strict argmax bound of `1e-5`, with top-K logit bounds
-of 0.03 (K=5), 0.05 (K=50), 0.08 (K=1000) and 0.09 (all). That test has no
-recorded verdict.
-
-Accuracy evidence for this model is the GSM8K run instead. That run evaluated
-GSM8K on the native backend at batch 1 and batch 4. It passed, 2 of 2 cases,
-1 node, at commit `4cfa33a`. We hold its verdict and case counts only — no
-GSM8K score was read out of the measurement artifacts, so none appears here.
-
-### Serving validation
-
-Our required grid is 1,024 input / 512 output and 8,192 input / 1,024 output,
-offline and online:
-
-| Workload | Offline (`LLM(...)`) | Online (`vllm serve`) |
+| Run | Nodes | Result |
 |---|---|---|
-| 1,024 in / 512 out | No evidence | Evidence: the 2-node device functional run (PASS, 12 of 12, commit `60e32de`) executed a 1,024-token prompt with exactly 512 generated tokens. The test id does not name the shape; it comes from the test source that run executed. |
-| 8,192 in / 1,024 out | No evidence | No evidence |
+| CPU loading and components | 1 | PASS, 5 of 5 |
+| Device functional | 2 (4 ranks each) | PASS, 12 of 12 |
 
-We do not have the 8,192 / 1,024 row for this model in either mode. Every
-recorded run was configured with a 2,048-token maximum model length, so that
-workload could not have run.
-
-Two further online runs passed at commit `4cfa33a`, both on one node at TP 8
-with batch 1 and batch 4. One is the GSM8K accuracy run (2 of 2 cases). The
-other is a performance comparison run on the native backend (2 of 2 cases).
-This README states only the existence and the verdict of the performance run.
-It publishes no performance figure.
+The CPU run covers the loading path (now `test/unit/test_loading.py`) and the
+one component case with a CPU path. The device run covers the four layer-0
+attention and MLP cases of `test/module/test_components.py` on each node, plus
+the port's serving cases, which include a 1,024-token prompt with 512
+generated tokens. Those compositions are read from the test sources, not from
+a per-case record.
 
 ### Exceptions
 
-- **No logit-validation run on record.** No recorded test id identifies a
-  logit-validation run for this model, and the evidence holds verdicts and case
-  counts only. The shipped integration test does logit validation at the strict
-  `1e-5` argmax bound, but it has no recorded verdict.
-- **No GSM8K score.** The accuracy run's verdict (PASS) and case counts (2 of
-  2) are all we hold.
-- **No performance figures.** This README states the existence and the verdict
-  of the performance run. It publishes no latency or throughput number.
-- **No 8,192 / 1,024 serving row**, offline or online, and **no offline
-  1,024 / 512 row**. The only recorded serving shape is the online
-  1,024 / 512 request inside the device functional run.
-- **Dropped: the port's GSM8K accuracy test** (`test_native_comparison_accuracy.py`).
-  It imports `test.utils.simple_server` and a campaign-local
-  `native_comparison_support` module that carries historical baselines and
-  writes to `WORKLOAD_OUTPUT_RW` — shared helpers and infrastructure outside
-  the model folder. Its result is the GSM8K row above.
-- **Dropped: the port's performance test** (`test_native_comparison_benchmark.py`).
-  Same shared harness plus `test.utils.bench`.
-- **Dropped: the port's 2-node serving test** (`test_serving.py`). It imports
-  `test.utils.network`, `test.utils.simple_server`,
-  `test.vllm_neuron.utils.di_utils`, `test.vllm_neuron.utils.logit_test_utils`
-  and `test.vllm_neuron.utils.test_prompts`. Its logit-validation shape is what
-  `test/integration/test_model.py` carries now, with locally defined prompts.
-- **Dropped: the multi-node launcher** (`launch_multinode.py`, imports
-  `test.utils.network`). The shipped module tests therefore default to one node
-  with all 8 ranks; the recorded 2-node topology cannot be reproduced from this
-  folder alone.
+- **Prompt 1 is over the two-way K5 tolerance.** On 0.29 its max K5 error is
+  0.0318 against 0.03 at one token, at batch 1 and batch 4. The integration
+  test passes on the three-way σ-ratio, as described above.
+- **Module tests not run on 0.29.** `test/module/test_components.py` last
+  passed in the 0.31.0.1.2.0 device run above.
+- **No accuracy-benchmark score and no performance figures.** The serve smoke
+  test checks only that each completion is non-empty.
+- **No 8,192 / 1,024 serving run.** Every run used a 2,048-token maximum
+  model length.
+- **Dropped from the port:** its GSM8K accuracy test, its performance test,
+  its 2-node serving test and its multi-node launcher. They depend on shared
+  test helpers outside this folder. The serving test's logit-validation shape
+  is what `test/integration/test_model.py` carries now, with locally defined
+  prompts. The module tests default to one node with all 8 ranks, so the
+  2-node topology above cannot be reproduced from this folder alone.
 - **Rewritten assertion.** The port's CPU test asserted that
   `vllm_neuron.model.registry.get_models()` maps `Olmo2ForCausalLM` to the
   factory. A contrib model is deliberately absent from that registry, so the
   shipped test checks the registration contract instead (the checkpoint's
-  architecture string and the factory that `src/__init__.py` exports). The
-  original registry assertion is no longer covered by anything here.
-- **Rewritten checkpoint resolution.** The port resolved the checkpoint through
-  `test.vllm_neuron.utils.logit_test_utils.get_model_checkpoint`. The vendored
-  helper downloads the pinned revision from the HuggingFace hub instead, or
-  uses `OLMO2_CHECKPOINT_PATH`.
-- **Case composition is inferred.** The mapping from the recorded case counts
-  (5 and 12) to the test functions in this folder is read from the test
-  sources; the evidence records only aggregate verdicts and counts.
+  architecture string and the factory that `src/__init__.py` exports).
+- **Rewritten checkpoint resolution.** The port resolved the checkpoint
+  through the plugin's shared test utilities. The vendored helper in
+  `test/olmo2_test_utils.py` downloads the pinned revision from the
+  HuggingFace hub instead, or uses `OLMO2_CHECKPOINT_PATH`.
 - **Untested configurations.** Prefix caching and the segmented-prefill path
-  (every recorded serving run set `--no-enable-prefix-caching`), tensor
-  parallel sizes other than 8, context beyond 2,048 tokens, speculative
-  decoding, Trn3, and any plugin or vLLM version other than 0.31.0.1.2.0 /
-  0.31.0.
-- **Image ambiguity.** The runs used more than one container image. The
-  evidence does not map an image to a test row.
-- **Registration reaches the engine by `fork` only.** Option 1 in
-  `contrib/README.md` — register the factory from your own script, which is
-  what `test/integration/test_model.py` does — relies on vLLM's engine-core
-  and worker processes inheriting the registration from the process that made
-  it. That holds for the default `fork` start method. Under
-  `VLLM_WORKER_MULTIPROC_METHOD=spawn` it cannot work, because a spawned child
-  re-imports from scratch and never runs the registration call. This is read
-  from the code, not from a run: the evidence records no offline serving run
-  for this model at all, so the shipped integration test's registration path
-  has no recorded verdict either way. See the note under "Offline inference
-  with the Python API".
+  (every serving run set `--no-enable-prefix-caching`), tensor parallel sizes
+  other than 8, context beyond 2,048 tokens, speculative decoding, Trn3, and
+  any `vllm-neuron` version other than 0.29.0.1.2.0 for the code in this
+  folder.

@@ -28,12 +28,7 @@ from torch import nn
 from vllm.distributed.parallel_state import get_tp_group
 
 import vllm_neuron.functional as NF
-from vllm_neuron.model.kv_cache import (
-    KVSpec,
-    LayerSpec,
-    build_per_head_block_table,
-    scatter_new_kv,
-)
+from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.weight_loader import (
     fused_qkv_weight_loader,
@@ -48,6 +43,7 @@ from vllm_neuron.nn.sampler import Sampler
 import vllm_neuron.nn as neuron_nn
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 
+from .compat import build_per_head_block_table, scatter_new_kv
 from .config import Olmo2Config
 
 logger = logging.getLogger(__name__)
