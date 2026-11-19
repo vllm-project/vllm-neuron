@@ -43,10 +43,12 @@ wrappers use, so a test can assert that the kernel path was taken.
   divide the head counts, and a size that does not raises at construction.
 - The embedding and the LM head are sharded on the vocabulary dimension.
 
-TP8 and TP16 both have recorded results on `trn2.48xlarge`: TP8 for each
-engine of the two-node disaggregated logit and serving run, TP16 for the
-single-node performance comparison. The CPU tests construct the model at TP8
-on the meta device and run the numerics at TP1.
+TP8 and TP16 both have recorded results on `trn2.48xlarge`. With vLLM Neuron
+0.29.0.1.2.0, the single-node integration logit test ran at TP8 and the
+`vllm serve` smoke at TP16. With 0.31.0.1.2.0, TP8 was the degree of each
+engine of the two-node disaggregated logit and serving run, and TP16 that of
+the single-node performance comparison. The CPU tests construct the model at
+TP8 on the meta device and run the numerics at TP1.
 
 ## Limits
 

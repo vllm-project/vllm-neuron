@@ -7,34 +7,36 @@ Llama-style decoder whose Q, K and V projections carry a bias. See
 
 > **Note:** Contrib models are community contributions and may have limited
 > testing or performance optimization compared to the officially-supported
-> models under `vllm_neuron/model/`. The compatibility matrix and the
-> validation report below record exactly what was tested.
+> models under `vllm_neuron/model/`. The compatibility matrix below records
+> exactly what was tested.
 
 ## Usage
 
 Install `vllm-neuron` in your Neuron environment (see the top-level
-`README.md` for installation). A contrib model is not in the plugin's model
-registry, so register the architecture `SeedOssForCausalLM` yourself, as
-described in [contrib/README.md](../../README.md) ("How do I register a custom
-model with vLLM?").
+`README.md` for installation), then install this folder:
+
+```bash
+pip install -e contrib/models/seed_oss
+```
+
+The install registers the architecture `SeedOssForCausalLM` in every vLLM
+process (the API server, the engine core and each tensor-parallel worker)
+through a `vllm.general_plugins` entry point (`pyproject.toml`,
+`src/plugin.py`), so `vllm serve` and `LLM(...)` need no other setup.
+`pip uninstall vllm-neuron-contrib-seed-oss` removes the registration.
 
 The 36B checkpoint is about 72 GB in BF16, so it needs several Neuron cores:
-the recorded runs used TP8 (per engine) and TP16 on `trn2.48xlarge`.
+the vLLM Neuron 0.29.0.1.2.0 runs used TP8 (integration test) and TP16
+(`vllm serve`) on `trn2.48xlarge`.
 
 ### Serve with the OpenAI-compatible server
 
-`vllm serve` starts the engine directly, so there is no script of yours in
-which to call `ModelRegistry.register_model`; the plugin's own code also notes
-that the CLI starts its engine core and workers in fresh interpreters, where a
-class registered in another process is not present (see Exceptions). Use
-option 2 of
-[contrib/README.md](../../README.md): move `src/` to
-`vllm_neuron/model/seed_oss/` and add
-`("SeedOssForCausalLM", "vllm_neuron.model.seed_oss:SeedOssForCausalLM")` to
-`_MODELS` in `vllm_neuron/model/registry.py`. Then:
+These are the flags of the tested `vllm serve` run:
 
 ```bash
 vllm serve ByteDance-Seed/Seed-OSS-36B-Instruct \
+    --host 127.0.0.1 \
+    --port 8000 \
     --dtype bfloat16 \
     --tensor-parallel-size 16 \
     --max-model-len 2048 \
@@ -58,16 +60,10 @@ curl http://localhost:8000/v1/completions \
 ### Offline inference with the Python API
 
 ```python
-from vllm import LLM, ModelRegistry, SamplingParams
+from vllm import LLM, SamplingParams
 
-# Copy contrib/models/seed_oss/src/ into your own application package first,
-# then import the factory from there. The code under src/ imports only the
-# plugin's shared building blocks, so it needs no other file from this repo.
-from your_package.seed_oss import SeedOssForCausalLM
-
-# Register the architecture before you construct the engine.
-ModelRegistry.register_model("SeedOssForCausalLM", SeedOssForCausalLM)
-
+# `pip install -e contrib/models/seed_oss` has registered SeedOssForCausalLM,
+# so no ModelRegistry call is needed here.
 llm = LLM(
     model="ByteDance-Seed/Seed-OSS-36B-Instruct",
     dtype="bfloat16",
@@ -82,15 +78,11 @@ for output in outputs:
     print(output.outputs[0].text)
 ```
 
-Option 1 works for this offline path because the plugin's multiprocessing
-executor leaves the engine-core and worker processes on the default `fork`
-start method,
-so they inherit the `ModelRegistry` your script populated, and the model
-loader resolves the architecture through vLLM's registry. See Exceptions for
-the limits of that.
-
-Prefill runs sequence-parallel, so a prompt length must be greater than the
-tensor-parallel size and a multiple of it.
+Prefill runs sequence-parallel, so every prefill token bucket (by default the
+powers of two from 128, then `--max-num-batched-tokens` as the last bucket)
+must be larger than the tensor-parallel size and a multiple of it. Prompts are
+padded up to a bucket, so the prompt itself can be shorter: the serve smoke
+below sent 5- and 14-token prompts at TP16.
 
 To iterate without Neuron hardware, run in CPU mode by setting
 `VLLM_NEURON_CPU_MODE=1` in the environment. See the top-level `README.md` and
@@ -98,17 +90,20 @@ To iterate without Neuron hardware, run in CPU mode by setting
 
 ## Compatibility Matrix
 
-| Instance | Status | Software |
-| --- | --- | --- |
-| Trn2 (trn2.48xlarge) | Working — see the validation report | `vllm-neuron` 0.31.0.1.2.0, vLLM 0.31.0, `VLLM_NEURON_BACKEND=neuron_native` |
-| Trn3 | Not tested | — |
+| Instance / SDK version | 2.33 (vLLM Neuron 0.29.0.1.2.0) | 2.32 and earlier |
+| ---------------------- | ------------------------------- | ---------------- |
+| Trn3 | Not tested | Not tested |
+| Trn2 | Working (TP 8 and TP 16) | Not tested |
 
-The evidence that we hold for this model does not record the Neuron SDK
-release.
+The earlier runs in the validation report used `vllm-neuron` 0.31.0.1.2.0
+with the code as first ported, before the 0.29 changes listed there, so the
+matrix does not count them.
 
 ## Example Checkpoints
 
-- <https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct>
+- <https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct> at revision
+  `497f1dca95ebdec98e41d517b9f060ee753c902f`, the revision the 0.29.0.1.2.0
+  runs used and whose `config.json` the unit tests embed.
 
 ## Testing
 
@@ -126,9 +121,10 @@ pytest contrib/models/seed_oss/test/integration/test_model.py \
 
 Set `SEED_OSS_CHECKPOINT_PATH` to a local checkpoint directory to avoid a Hub
 download. The test compiles one graph for a 36B model, so allow a long
-timeout.
+timeout. It registers the local `src/` factory itself, so it does not need the
+`pip install` above.
 
-### Unit tests (CPU mode)
+### Optional: unit tests
 
 ```bash
 VLLM_NEURON_CPU_MODE=1 VLLM_NEURON_BACKEND=neuron_native \
@@ -140,7 +136,7 @@ and factory resolution, config mapping from the published `config.json`, the
 TP8 geometry and checkpoint-key coverage on the meta device, and the fused QKV
 bias loader layout.
 
-### Module tests (CPU mode)
+### Optional: module tests
 
 ```bash
 VLLM_NEURON_CPU_MODE=1 VLLM_NEURON_BACKEND=neuron_native \
@@ -157,17 +153,64 @@ see Exceptions.
 
 ## Validation report
 
-### Source and environment
+### vLLM Neuron 0.29.0.1.2.0 (2026-11-18)
 
-Four tests passed for this model, across two plugin commits, so no single
-commit covers the whole table:
+#### Environment
 
-| Test | Verdict | Cases | Nodes | Plugin commit |
-| --- | --- | --- | --- | --- |
-| `[vLLM Neuron Functional] Seed-OSS-36B BF16 Loading and Component Tests CPU` | PASS | 19 / 19 | 1 | `a9c4da907c3fc287c8a1606f60846082670ae218` |
-| `[vLLM Neuron Full Model] Seed-OSS-36B BF16: DI 1P1D Multi-Node TP8 Logits, Serving and Dispatch TRN2` | PASS | 2 / 2 | 2 | `a9c4da907c3fc287c8a1606f60846082670ae218` |
-| `[Performance] Seed-OSS-36B-Instruct TP16 Native comparison b1/b4` | PASS | 2 / 2 | 1 | `f9ee9c4727640c752f22e7b6e2960d1a0deca8c0` |
-| `[Accuracy] ByteDance-Seed/Seed-OSS-36B-Instruct Native GSM8K b1/b4` | PASS | 2 / 2 | 1 | `f9ee9c4727640c752f22e7b6e2960d1a0deca8c0` |
+| Image | Instance | TP | vLLM | vllm-neuron | torch | transformers | neuronx-cc |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04` | `trn2.48xlarge`, LNC 2 | 8 (integration), 16 (serve smoke) | 0.29.0 | 0.29.0.1.2.0 | 2.13.0 | 5.17.0 | 2.28.7631.0+8f7b0cf5 |
+
+#### Results
+
+| Test | Configuration | Result |
+| --- | --- | --- |
+| CPU unit tests (`test/unit/`) | `VLLM_NEURON_CPU_MODE=1 VLLM_NEURON_BACKEND=neuron_native` | 14 passed |
+| `test_model_accuracy[1-2048]` | TP 8, `batch_size=1`, `seq_len=2048` | PASSED (421.45 s) |
+| `vllm serve` smoke | TP 16, flags as in Usage, after `pip install -e contrib/models/seed_oss` | passed (3/3 completions non-empty) |
+
+Not run on 0.29: module tests (`test/module/`); the run covered only the unit tests, the integration test and the serve smoke.
+
+#### Logit validation
+
+| Prompt | Overall Status | Max divergence (1 ULP) | Max K5 (0.03) | Max K50 (0.05) | Max K1000 (0.08) | Max All (0.09) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 of 2 | PASSED, all 16 tokens | 0.0000 | 0.0060 | 0.0060 | 0.0060 | 0.0072 |
+| 2 of 2 | PASSED, all 16 tokens | 0.0000 | 0.0085 | 0.0118 | 0.0118 | 0.0153 |
+
+No value over its threshold, no argmax divergence; test passed on per-prompt validation, 2/2 prompts (`multi_prompt_logit_validation`).
+Informational aggregates in the log: `agg_l2_1.5x` PASS; `agg_bc`, `agg_l2_1.2x`, `agg_linf_1.2x`, `agg_linf_1.5x` FAIL; `agg_sigma_ratio` 1.0007 (> 1.0).
+
+#### Serve smoke
+
+`/v1/completions`, temperature 0; completions JSON-escaped, `...` marks a cut.
+
+| Prompt | Single request, `max_tokens` 32 (first 60 chars) | All three prompts in one request, `max_tokens` 16 (first 60 chars) |
+| --- | --- | --- |
+| `The capital of France is` | `" Paris.\nThe capital of France is Paris.\nThe capital of Franc"` ... | `" Paris.\nParis is the capital of France.\nWhich of the followi"` ... |
+| `1, 2, 3, 4, 5,` | `" 6, 7, 8, 9, 10, 11, 12, 13, 14,"` | `" 6, 7, 8, 9, 10,"` |
+| `def fibonacci(n):` | `"\n    \"\"\"\n    Calculate the nth Fibonacci number using recurs"` ... | `"\n    \"\"\"\n    Calculate the nth Fibonacci number using recurs"` ... |
+
+#### Changes for 0.29
+
+- `src/compat.py` (new): `hoist_rope_parameters`, copied unchanged from a later vLLM Neuron release; 0.29.0.1.2.0 has no `vllm_neuron.model.config_utils`.
+- `src/config.py`: imports `hoist_rope_parameters` from `src/compat.py` instead of the plugin.
+- `pyproject.toml`, `src/plugin.py` (new): install `src/` as package `seed_oss_neuron`; register `SeedOssForCausalLM` via `vllm.general_plugins` entry point `seed_oss_neuron`.
+- `src/model.py`, `src/factory.py`, `src/__init__.py`, `test/`: unchanged.
+
+### Earlier recorded runs (vLLM Neuron 0.31.0.1.2.0)
+
+#### Source and environment
+
+These runs used the code as first ported, before the changes above. Four
+tests passed, at two plugin commits of that version:
+
+| Test | Verdict | Cases | Nodes |
+| --- | --- | --- | --- |
+| CPU loading and component tests | PASS | 19 / 19 | 1 |
+| Two-node 1P1D disaggregated TP8 logits, serving and kernel dispatch | PASS | 2 / 2 | 2 |
+| TP16 performance comparison, b1 and b4 | PASS | 2 / 2 | 1 |
+| GSM8K accuracy, b1 and b4 | PASS | 2 / 2 | 1 |
 
 Every run used `vllm-neuron` 0.31.0.1.2.0 with vLLM 0.31.0 on the native
 runtime backend (`neuron_native`), on `trn2.48xlarge`.
@@ -177,7 +220,7 @@ pins its published `config.json` at revision
 `497f1dca95ebdec98e41d517b9f060ee753c902f`; the device tests resolve the
 checkpoint by path or Hub id and do not pin a revision.
 
-### Model configuration
+#### Model configuration
 
 The architecture class is `SeedOssForCausalLM` (factory in `src/factory.py`,
 implementation in `src/model.py`), BF16 weights, no quantization. The model is
@@ -189,21 +232,20 @@ disaggregated run adds `--max-num-batched-tokens 1024 --max-num-seqs 1`, and
 the TP16 runs add `--max-num-batched-tokens 2048` with sequence buckets `[1]`
 or `[1, 4]`. Model-specific serving arguments are limited to `--dtype
 bfloat16` and disabled prefix caching; the logit run also enables on-device
-greedy sampling and raw-logit logprobs. Registration is the user's step; see
-Usage above.
+greedy sampling and raw-logit logprobs.
 
-### Component validation
+#### Component validation
 
-The CPU loading-and-component test passed with 19 of 19 cases (commit
-`a9c4da90`). It covers factory resolution and config mapping from the
-published `config.json`, construction of all 64 layers on the meta device at
-TP8 for the first and last rank with parameter-shape checks and full coverage
-of the 771 published checkpoint keys, the fused QKV bias loader against the
-fused QKV weight loader for every TP8 rank, and five numerics cases on a tiny
-random Seed-OSS checkpoint (prefill attention, decode attention, MLP in both
-phases, and full-model prefill logits) against an independent HuggingFace
-reference, plus the kernel-dispatch log lines. That suite ships here split by
-shape: the 14 registration, config, construction and loader cases in
+The CPU loading-and-component test passed with 19 of 19 cases. It covers
+factory resolution and config mapping from the published `config.json`,
+construction of all 64 layers on the meta device at TP8 for the first and last
+rank with parameter-shape checks and full coverage of the 771 published
+checkpoint keys, the fused QKV bias loader against the fused QKV weight loader
+for every TP8 rank, and five numerics cases on a tiny random Seed-OSS
+checkpoint (prefill attention, decode attention, MLP in both phases, and
+full-model prefill logits) against an independent HuggingFace reference, plus
+the kernel-dispatch log lines. That suite ships here split by shape: the 14
+registration, config, construction and loader cases in
 `test/unit/test_seed_oss_loading.py`, and the 5 component and full-model
 numerics cases in `test/module/test_seed_oss_components.py` — 19 in total, the
 same cases the recorded run ran.
@@ -213,36 +255,33 @@ prefill node and each of the 8 ranks on the decode node must have selected the
 NKI kernel for every main-path operation. It passed as part of that suite's 2
 of 2 cases.
 
-### Numerical correctness
+#### Numerical correctness
 
-The disaggregated run is the logit evidence: a 1P1D deployment on two
-`trn2.48xlarge` nodes, one TP8 engine per node, which compares the served
-logits of 16 generated tokens per prompt against a HuggingFace reference
-(FP32 baseline plus a same-dtype teacher-forced pass) with
-`multi_prompt_logit_validation` at a single sequence (`max_num_seqs` is 1 in
-that test). It reports both the aggregate and the per-prompt result and
-asserts both. The
-observed verdict is PASS, 2 of 2 cases (one per node), at commit `a9c4da90`.
-We hold that verdict and those counts only — no logit metric was read out.
+The disaggregated run is the logit evidence for this version: a 1P1D
+deployment on two `trn2.48xlarge` nodes, one TP8 engine per node, which
+compares the served logits of 16 generated tokens per prompt against a
+HuggingFace reference (FP32 baseline plus a same-dtype teacher-forced pass)
+with `multi_prompt_logit_validation` at a single sequence (`max_num_seqs` is 1
+in that test). It reports both the aggregate and the per-prompt result and
+asserts both. The observed verdict is PASS, 2 of 2 cases (one per node). We
+hold that verdict and those counts only — no logit metric was read out.
 
 The shipped `test/integration/test_model.py` uses the same tolerance map as
 that run — `(1e-5, 0.03)` at top-5, `(1e-5, 0.05)` at top-50, `(1e-5, 0.08)`
 at top-1000 and `(1e-5, 0.09)` over the full vocabulary — and keeps the strict
-`1e-5` argmax bound. It has not itself been run in CI: it is a single-node
-offline `LLM` run, where the evidence is a two-node disaggregated server.
+`1e-5` argmax bound. Its own device result is the 0.29.0.1.2.0 run above.
 
-A GSM8K run also passed (2 of 2 cases, b1 and b4, commit `f9ee9c47`), which
-means dataset-level accuracy was exercised end to end. Read that verdict
-narrowly: the test's only score gate is a 0.0 threshold on the
-flexible-extract exact match, so a PASS says the run completed and produced a
-score, not that the score reached any particular level. We never read the
-score itself, so this README states none.
+A GSM8K run also passed (2 of 2 cases, b1 and b4), which means dataset-level
+accuracy was exercised end to end. Read that verdict narrowly: the test's only
+score gate is a 0.0 threshold on the flexible-extract exact match, so a PASS
+says the run completed and produced a score, not that the score reached any
+particular level. We never read the score itself, so this README states none.
 
-### Serving validation
+#### Serving validation
 
 | Workload | Offline | Online |
 | --- | --- | --- |
-| 1,024 in / 512 out | No evidence | Evidence: one request through the 1P1D proxy, asserted at 1,024 prompt and 512 completion tokens, inside the disaggregated run (2/2 PASS, commit `a9c4da90`) |
+| 1,024 in / 512 out | No evidence | Evidence: one request through the 1P1D proxy, asserted at 1,024 prompt and 512 completion tokens, inside the disaggregated run (2/2 PASS) |
 | 8,192 in / 1,024 out | No evidence | No evidence |
 
 The online 1,024 / 512 row is the required grid's first row. We have no
@@ -250,8 +289,8 @@ offline (`LLM.generate`) measurement at that shape, and no run at
 8,192 / 1,024 in either mode. The performance test is a separate, narrower
 workload: `vllm bench serve` with random data at 1,024 input and 100 output
 tokens, 20 measured requests after 5 warmups, at TP16 and concurrency 1 and 4.
-It passed (2 of 2 cases, commit `f9ee9c47`); we hold no latency or throughput
-figure from it, so none is stated here.
+It passed (2 of 2 cases); we hold no latency or throughput figure from it, so
+none is stated here.
 
 ### Exceptions
 
@@ -267,12 +306,12 @@ figure from it, so none is stated here.
   the `WORKLOAD_OUTPUT_RW` result-publishing contract. Vendoring that
   infrastructure would have meant copying a server launcher, a proxy, an MPI
   harness and a metric-publishing layer into the model folder, so the suites
-  were dropped. Their results are still the evidence cited above, but a user
-  cannot re-run them from this folder.
-- **No logit or serving test in this folder reproduces the recorded
-  deployment.** The recorded logit and serving evidence is 1P1D across two
-  nodes. The shipped integration test is single-node and offline, and it has
-  never been run in CI.
+  were dropped. Their results are still the 0.31.0.1.2.0 evidence cited above,
+  but a user cannot re-run them from this folder.
+- **No logit or serving test in this folder reproduces the disaggregated
+  deployment.** The 0.31.0.1.2.0 logit and serving evidence is 1P1D across two
+  nodes. The shipped integration test is single-node and offline, and the
+  0.29.0.1.2.0 serve smoke is a single-node server.
 - **The GSM8K gate is 0.0.** As described under Numerical correctness, the
   accuracy PASS is not a quality bar. No GSM8K score appears in this README,
   for this reason and because we never read one.
@@ -298,28 +337,18 @@ figure from it, so none is stated here.
   prefill-logits case, which is a full-model stage rather than a single
   component, because it shares the tiny-checkpoint fixtures with the component
   cases.
-- **Option 1 works offline only. `vllm serve` needs option 2.** The
-  integration test and the offline example register the factory class with
-  vLLM's `ModelRegistry` before they build the engine (option 1 of
-  contrib/README.md). This registration reaches the engine-core and worker
-  processes only because the plugin keeps the default `fork` start method for
-  this model. Under `spawn`, a registered class does not reach the new
-  processes. The local-src loader that keeps this folder copyable cannot make
-  option 1 `spawn`-safe. `vllm serve` starts its engine core and workers in new
-  interpreters, so serving needs option 2. This PR does not make the option-2
-  edit. Option-1 registration also does not reach the draft-model lookup of
-  the untested speculative-decoding branch. We read these limits from the
-  plugin's code, not from a run of this folder. No recorded run for this model
-  used option 1. A plugin test in CI uses the same pattern on hardware.
-- **Untested configurations.** Only TP8 (two-node, one engine per node) and
-  TP16 (single node) have results; no other tensor-parallel degree, no Trn3,
-  no quantized weights, no speculative decoding (the code has a
-  rejection-sampling branch with no evidence behind it), no context length
-  beyond 2,048 tokens even though the checkpoint allows 524,288, and no
-  prefix caching (every run disabled it). A 4-sequence batch appears only in
-  the b4 arms of the performance and GSM8K runs, never in the logit run, so
-  the shipped integration test keeps the single sequence of the logit run —
-  each `(batch_size, seq_len)` pair also costs a separate 36B graph compile.
+- **Untested configurations.** Only TP8 and TP16 have results (0.29.0.1.2.0:
+  the TP8 integration test and the TP16 serve smoke; 0.31.0.1.2.0: TP8 per
+  engine in the two-node run and TP16 on a single node); no other
+  tensor-parallel degree, no Trn3, no quantized weights, no speculative
+  decoding (the code has a rejection-sampling branch with no evidence behind
+  it), no context length beyond 2,048 tokens even though the checkpoint allows
+  524,288, and no prefix caching (every run disabled it). Batches of more than
+  one sequence appear only in the b4 arms of the 0.31.0.1.2.0 performance and
+  GSM8K runs and in the 0.29.0.1.2.0 serve smoke (`--max-num-seqs 4`, one
+  three-prompt request), never in a logit run, so the shipped integration test
+  keeps the single sequence of the logit run — each `(batch_size, seq_len)`
+  pair also costs a separate 36B graph compile.
 - **No performance figures.** A performance test passed, but we hold only its
   verdict and case counts, so this README states no throughput, latency or
   time-to-first-token number.

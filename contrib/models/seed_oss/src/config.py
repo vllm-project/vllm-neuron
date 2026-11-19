@@ -16,8 +16,9 @@ from dataclasses import dataclass
 import torch
 from transformers import PretrainedConfig
 
-from vllm_neuron.model.config_utils import hoist_rope_parameters
 from vllm_neuron.model.neuron_config import NeuronConfig
+
+from .compat import hoist_rope_parameters
 
 
 @dataclass
