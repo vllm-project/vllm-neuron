@@ -112,10 +112,10 @@ To iterate without Neuron hardware, run in CPU mode by setting
 This matrix shows the instance types and versions this folder was tested
 with. The Trn2 result was produced on `trn2.48xlarge`.
 
-| Instance / version | vLLM Neuron 0.29.0.1.2.0 (Neuron SDK 2.33) | Other versions |
-| ------------------ | ------------------------------------------ | -------------- |
-| Trn2               | Working (TP 1)                             | Not tested     |
-| Trn3               | Not tested                                 | Not tested     |
+| Instance / SDK version | 2.33 (vLLM Neuron 0.29.0.1.2.0) | 2.32 and earlier |
+| ---------------------- | ------------------------------- | ---------------- |
+| Trn3 | Not tested | Not tested |
+| Trn2 | Working (TP 1) | Not tested |
 
 The earlier runs in the validation report used vLLM Neuron 0.31.0.1.2.0 with
 this implementation in-tree, not this folder, so that version is not listed
@@ -225,98 +225,51 @@ run first.
 
 #### Environment
 
-- Instance: one `trn2.48xlarge` (logical NeuronCore config 2), TP 1.
-- Container: the Neuron DLC
-  `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04`
-  (Neuron SDK 2.33), Python 3.14.6.
-- Versions: vLLM `0.29.0`, vllm-neuron `0.29.0.1.2.0`, torch `2.13.0`,
-  transformers `5.17.0`, neuronx-cc `2.28.7631.0+8f7b0cf5`, nki
-  `0.7.0+37713544100.gfede04bb`, libtorch-neuronx-lite
-  `2.13.0.1.0.3112+653bc48f`.
-- Checkpoint: `baidu/ERNIE-4.5-0.3B-PT` at revision
-  `b565cf6caebdb7a1eadf00100857b1ed5e044f12`, bfloat16.
-- Order: CPU unit tests, then the integration test (which registers the
-  factory in-process), then `pip install -e contrib/models/ernie4_5`, then the
-  serve smoke. After the install, the `vllm.general_plugins` group listed
-  `ernie4_5_neuron.plugin:register`, and the serve smoke ran through that entry
-  point with the flags under "Usage".
+| Image | Instance | TP | vLLM | vllm-neuron | torch | transformers | neuronx-cc |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04` | `trn2.48xlarge` (logical NeuronCore config 2) | 1 | `0.29.0` | `0.29.0.1.2.0` | `2.13.0` | `5.17.0` | `2.28.7631.0+8f7b0cf5` |
 
 #### Results
 
-| Test | Result |
-| --- | --- |
-| CPU unit tests (`VLLM_NEURON_CPU_MODE=1 pytest contrib/models/ernie4_5/test/unit`) | 5 passed, 0 failed |
-| Integration logit test, `test_model_accuracy[1-2048]` (batch 1, `max_model_len` 2,048) | PASSED. Both prompts: Overall Status PASSED. Two-way validation: 2/2 prompts passed. |
-| Integration logit test, `test_model_accuracy[4-2048]` (batch 4, `max_model_len` 2,048) | PASSED. Both prompts: Overall Status PASSED. Two-way validation: 2/2 prompts passed. |
-| `vllm serve` smoke (3 completions at `max_tokens` 32 and one batched request of the 3 prompts at `max_tokens` 16, `temperature` 0) | Passed. Every completion returned non-empty text. |
+| Test | Configuration | Result |
+| --- | --- | --- |
+| CPU unit tests | `VLLM_NEURON_CPU_MODE=1 pytest contrib/models/ernie4_5/test/unit` | 5 passed, 0 failed |
+| `test_model_accuracy[1-2048]` | batch 1, `max_model_len` 2,048, 2 prompts x 16 tokens | PASSED (2/2 prompts) |
+| `test_model_accuracy[4-2048]` | batch 4, `max_model_len` 2,048, 2 prompts x 16 tokens | PASSED (2/2 prompts) |
+| `vllm serve` smoke | flags in Usage, after `pip install -e contrib/models/ernie4_5`; 3 completions at `max_tokens` 32, then the 3 prompts in one request at `max_tokens` 16; `temperature` 0 | Passed: 3/3 completions non-empty |
 
-The integration test decodes 16 tokens for each of 2 prompts and compares the
-Neuron logits against HuggingFace FP32 and BF16 references. Max errors per
-prompt, with the thresholds the test applies:
+Not run on 0.29: module tests (`test/module/`), not part of this run (`test_components_multinode.py` needs two nodes; this run had one).
 
-| Prompt | Overall Status | Divergence | K5 | K50 | K1000 | All |
+#### Logit validation
+
+| Prompt | Overall Status | Divergence (≤ 1 ULP) | K5 (≤ 0.04) | K50 (≤ 0.04) | K1000 (≤ 0.06) | All (≤ 0.065) |
 | --- | --- | --- | --- | --- | --- | --- |
-| Threshold | | 1 ULP | 0.04 | 0.04 | 0.06 | 0.065 |
 | 1/2 | PASSED | 0.0000 | 0.0350 | 0.0388 | 0.0388 | 0.0601 |
 | 2/2 | PASSED | 0.0000 | 0.0165 | 0.0165 | 0.0165 | 0.0165 |
 
-Both parametrizations measured these values. At batch 4, each of the 4 batch
-rows reported the same max errors as batch 1. The K5 to All maxima are at
-token 1 for prompt 1 and at token 4 for prompt 2. At prompt 2, token 2, the
-argmax diverged ("Acceptable divergence Δ = 0.0000"), and the test continued
-with teacher forcing.
+No value over its bound, at batch 1 and in each of the 4 batch-4 rows (same values); maxima at generated token 1 (prompt 1) and token 4 (prompt 2); prompt 2 argmax diverged at token 2, accepted (Δ = 0.0000).
 
-The K5 bound is 0.04. The template uses 0.03, and the port used 0.015. The
-comment at `TOL_MAP` in `test/integration/test_model.py` gives the reason: one
-early token per prompt is numerically sensitive. At generation token 1 the
-BF16 CPU baseline is itself 0.2153 (prompt 1) and 0.2391 (prompt 2) L-inf from
-FP32, against 0.2598 and 0.2358 for Neuron, and the measured K5 error is
-0.0350. The K50, K1000 and All bounds are the port's, tighter than the
-template's 0.05, 0.08 and 0.09.
+Test passed on two-way validation, 2/2 prompts (`multi_prompt_logit_validation`); informational checks that missed: aggregate σ-ratio 1.0885 (> 1.0), `agg_bc` FAIL, `agg_linf_1.2x` FAIL, `pp_static_0.03` 0/2, `pp_static_0.05` 0/2, `pp_tok_linf_1.5x` 1/2; the rest passed.
 
-The test log also prints aggregate thresholds that it labels informational and
-that do not decide the verdict. At both batch sizes they reported
-`agg_bc: FAIL`, `agg_linf_1.2x: FAIL`, `pp_static_0.03: 0/2`,
-`pp_static_0.05: 0/2`, `pp_tok_linf_1.5x: 1/2` and
-`agg_sigma_ratio: 1.0885`; the other aggregate and per-prompt checks passed.
+#### Serve smoke
 
-Serve smoke outputs (greedy, first 60 characters as JSON strings):
+`/v1/completions`, `max_tokens` 32, `temperature` 0; output as JSON strings.
 
-| Prompt | Output |
+| Prompt | First 60 characters |
 | --- | --- |
 | `The capital of France is` | `" the capital of the French Republic.\n\nThe capital of France "` ... |
 | `1, 2, 3, 4, 5,` | `" 6, 7, 8, 9, 10, 11, 12, 13, 14,"` (full output) |
 | `def fibonacci(n):` | `"\n\n    if n == 0:\n        return 0\n    elif n == 1:\n        r"` ... |
 
-Module tests (`test/module/`) were not part of this run.
+#### Changes for 0.29
 
-#### Changes for vLLM Neuron 0.29
-
-Relative to the port, which targeted the repository's vLLM 0.32 pin:
-
-- `pyproject.toml` and `src/plugin.py` (new) install the folder as a vLLM
-  plugin that registers `Ernie4_5ForCausalLM` in every process (see "Usage").
-- `src/compat.py` (new) vendors `hoist_rope_parameters` and
-  `build_per_head_block_table`, which vLLM Neuron 0.29.0.1.2.0 does not ship,
-  copied unchanged from a later release. `src/config.py` and `src/model.py`
-  import them from there.
-- `src/model.py`: decode casts the per-head KV write slots to `uint32`. The
-  decode kernel reads them as `uint32`; with vLLM's `int64` slot mapping the
-  runtime refused to load the decode NEFF ("invalid offset").
-- `test/unit/test_decode_kv_contract.py` (new) captures the arguments of the
-  decode attention call at TP 1 and checks the dtype, shape and values of the
-  write slots and the per-head block table. It runs no kernel.
-- `test/conftest.py` adds a session fixture that shuts down the plugin's
-  `MPExecutor` worker pool, so pytest exits after the last test.
-- `test/integration/test_model.py` uses its own full-vocabulary
-  `generate_fn` in place of the plugin's `create_offline_vllm_generate_fn`.
-  That helper requests `tokenizer.vocab_size` logprobs (100,295 base tokens
-  for this tokenizer) while the model scores 103,424 ids, so its rows got
-  different lengths and it stopped in `torch.stack` before validation. The new
-  function requests and packs all `config.vocab_size` ids.
-  `multi_prompt_logit_validation` is unchanged.
-- `test/integration/test_model.py`: the K5 tolerance is 0.04 instead of 0.015
-  (see above).
+- `pyproject.toml`, `src/plugin.py` (new): `vllm.general_plugins` entry point that registers `Ernie4_5ForCausalLM` in every vLLM process.
+- `src/compat.py` (new): vendors `hoist_rope_parameters` and `build_per_head_block_table` (not in 0.29.0.1.2.0; copied unchanged from a later release), imported by `src/config.py` and `src/model.py`.
+- `src/model.py`: decode casts the per-head KV write slots to `uint32` (with `int64` slots the runtime refused to load the decode NEFF, "invalid offset").
+- `test/unit/test_decode_kv_contract.py` (new): checks dtype, shape and values of the decode write slots and per-head block table at TP 1; runs no kernel.
+- `test/conftest.py`: session fixture that shuts down the plugin's `MPExecutor` worker pool, so pytest exits.
+- `test/integration/test_model.py`: own full-vocabulary `generate_fn` (all `config.vocab_size` ids) replaces the plugin's `create_offline_vllm_generate_fn` (it requested `tokenizer.vocab_size` = 100,295 logprobs of 103,424 ids and stopped in `torch.stack`); `multi_prompt_logit_validation` unchanged.
+- `test/integration/test_model.py`: K5 = 0.04 on 0.29 (template 0.03; the port used 0.015).
 
 ### Earlier runs: vLLM Neuron 0.31.0.1.2.0 (implementation in-tree)
 
