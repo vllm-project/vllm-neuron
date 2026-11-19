@@ -19,65 +19,39 @@ conversion and the rest of the implementation.
 ## Usage
 
 Install `vllm-neuron` in your Neuron environment (see the top-level
-`README.md` for installation). The plugin auto-registers with vLLM, but a
-contrib architecture is not in the plugin's registry, so you register it
-yourself — see
-[contrib/README.md](../../README.md) — "How do I register a custom model with
-vLLM?".
+`README.md` for installation), then install this folder:
 
-Which option you need depends on how you start the engine, and for this model
-it is worth getting right before you try to serve.
+```bash
+pip install -e contrib/models/ernie4_5
+```
 
-> **Read this before serving.** Upstream vLLM ships its own
-> `Ernie4_5ForCausalLM`: the architecture string this folder uses is already in
-> vLLM's built-in model table. So a process that lacks your registration does
-> **not** tell you the architecture is unsupported, the way it would for a
-> contrib name vLLM has never heard of. It resolves vLLM's class instead, and
-> then fails inside the Neuron model runner on `from_configs` — a plugin
-> convention that vLLM's own model classes do not define. The resulting
-> `AttributeError` names nothing about registration, so a missed registration
-> shows up as a confusing crash rather than as a clear "unsupported
-> architecture" message. On the working path the signal is the reverse: vLLM
-> logs "already registered ... will be overwritten" when your registration
-> replaces the built-in entry.
+The folder's `pyproject.toml` installs `src/` as the `ernie4_5_neuron` package
+and declares a `vllm.general_plugins` entry point (`src/plugin.py`). vLLM runs
+that entry point in every process it starts (the front end, the engine core
+and each Neuron worker), so it registers `Ernie4_5ForCausalLM` everywhere, and
+`vllm serve` and `LLM(...)` need no other setup. This is Option 3 in
+[contrib/README.md](../../README.md). To remove the registration, run
+`pip uninstall vllm-neuron-contrib-ernie4-5`.
 
-- **Option 1 (register from your own script) covers the offline `LLM(...)` API
-  below, and only that.** The plugin pins the multi-process executor and the
-  Neuron worker (`vllm_neuron/vllm/platform.py`), so the topology is your
-  process → an engine-core process → the executor's workers. Nothing copies a
-  registry entry between processes; the children get yours by inheriting your
-  memory, which requires the `fork` start method. `fork` is
-  `VLLM_WORKER_MULTIPROC_METHOD`'s default (read from vLLM 0.31.0 source;
-  this repo now pins vLLM 0.32.0, which we did not read), and the only place
-  in the plugin that sets that variable forces `spawn` for Qwen3-ASR alone.
-- **Option 2 (move `src/` into `vllm_neuron/model/` and add the architecture to
-  `_MODELS`) is what `vllm serve` needs.** The reason holds whatever the start
-  method is: `vllm serve` gives you no script in which to call
-  `register_model` at all. Separately, two comments in the plugin say the CLI
-  starts its engine core with `spawn` — in which case an Option 1 registration
-  could not reach it even if you had somewhere to put the call — while a third
-  comment describes a *forked* engine core, so we report that as the plugin's
-  own commentary rather than as a verified fact. Either way, the `vllm serve`
-  example below assumes you have done Option 2. That option edits plugin core
-  code, which this contribution deliberately does not do — see
-  [contrib/README.md](../../README.md) for the trade-off it describes.
-
-These statements were read out of the plugin's and vLLM's code, not out of a
-run of this contribution; see Exceptions.
+Upstream vLLM ships its own `Ernie4_5ForCausalLM`, so the install replaces a
+built-in entry of vLLM's model table rather than adding a new one. Without the
+install, vLLM does not report an unsupported architecture: it picks its own
+class, and the engine then fails in the Neuron model runner on `from_configs`,
+a plugin convention that vLLM's own model classes do not define. If you see
+that failure, check that the package is installed.
 
 This implementation runs on the `neuron_native` route only, so set
 `VLLM_NEURON_BACKEND=neuron_native` for every process, including the server.
 
 ### Serve with the OpenAI-compatible server
 
-This needs Option 2 above (the architecture in the plugin's `_MODELS`). With
-only an Option 1 registration the server has nowhere to run your registration
-call, and because vLLM ships its own `Ernie4_5ForCausalLM` the server resolves
-that one and then fails on `from_configs` instead of telling you the
-architecture is unregistered.
+These are the flags of the serve smoke test in the validation report.
+`--host 127.0.0.1` keeps the server reachable from this host only.
 
 ```bash
 VLLM_NEURON_BACKEND=neuron_native vllm serve baidu/ERNIE-4.5-0.3B-PT \
+    --host 127.0.0.1 \
+    --port 8000 \
     --dtype bfloat16 \
     --tensor-parallel-size 1 \
     --max-model-len 2048 \
@@ -89,7 +63,7 @@ VLLM_NEURON_BACKEND=neuron_native vllm serve baidu/ERNIE-4.5-0.3B-PT \
 Then send a request:
 
 ```bash
-curl http://localhost:8000/v1/completions \
+curl http://127.0.0.1:8000/v1/completions \
     -H "Content-Type: application/json" \
     -d '{
         "model": "baidu/ERNIE-4.5-0.3B-PT",
@@ -105,22 +79,16 @@ import os
 
 os.environ["VLLM_NEURON_BACKEND"] = "neuron_native"
 
-from vllm import LLM, ModelRegistry, SamplingParams
+from vllm import LLM, SamplingParams
 
-# Copy contrib/models/ernie4_5/src/ into your own package first, then register
-# the factory before you construct the engine. The engine core and its workers
-# are forks of this process, so they inherit this registration; do not set
-# VLLM_WORKER_MULTIPROC_METHOD=spawn with this arrangement, or the child
-# resolves vLLM's own Ernie4_5ForCausalLM and fails on from_configs.
-from your_package.ernie4_5 import Ernie4_5ForCausalLM
-
-ModelRegistry.register_model("Ernie4_5ForCausalLM", Ernie4_5ForCausalLM)
-
+# The installed package registers Ernie4_5ForCausalLM in every vLLM process,
+# so no register_model call is needed here.
 llm = LLM(
     model="baidu/ERNIE-4.5-0.3B-PT",
     dtype="bfloat16",
     tensor_parallel_size=1,
     max_model_len=2048,
+    max_num_batched_tokens=2048,
     max_num_seqs=4,
     enable_prefix_caching=False,
 )
@@ -141,15 +109,17 @@ To iterate without Neuron hardware, run in CPU mode by setting
 
 ## Compatibility Matrix
 
-Our evidence records container image digests and the plugin and vLLM versions,
-not a Neuron SDK release number, so this matrix is keyed on the plugin version
-instead of the SDK version. Every result we hold was produced on
-`trn2.48xlarge`.
+This matrix shows the instance types and versions this folder was tested
+with. The Trn2 result was produced on `trn2.48xlarge`.
 
-| Instance / plugin version | 0.31.0.1.2.0 (vLLM 0.31.0) | Other versions |
-| ------------------------- | -------------------------- | -------------- |
-| Trn2                      | Working                    | Not tested     |
-| Trn3                      | Not tested                 | Not tested     |
+| Instance / version | vLLM Neuron 0.29.0.1.2.0 (Neuron SDK 2.33) | Other versions |
+| ------------------ | ------------------------------------------ | -------------- |
+| Trn2               | Working (TP 1)                             | Not tested     |
+| Trn3               | Not tested                                 | Not tested     |
+
+The earlier runs in the validation report used vLLM Neuron 0.31.0.1.2.0 with
+this implementation in-tree, not this folder, so that version is not listed
+as tested.
 
 ## Example Checkpoints
 
@@ -171,14 +141,20 @@ VLLM_NEURON_BACKEND=neuron_native pytest \
     -v -s --timeout=3600
 ```
 
+The test registers the factory from `src/` in its own process, so it does not
+need the `pip install`. It skips itself unless `VLLM_WORKER_MULTIPROC_METHOD`
+is unset or `fork` (see Exceptions).
+
 Set `ERNIE4_5_CHECKPOINT_DIR` to a local snapshot of the pinned revision to
 test the exact checkpoint the results below were produced with. Otherwise the
 tests download it.
 
 ### Unit tests (CPU mode)
 
-`test/unit/` holds the architecture and config checks and the weight-loading
-tests. They run on CPU, without Neuron hardware.
+`test/unit/` holds the architecture and config checks, the weight-loading
+tests and a decode KV contract test, which checks the block table and the
+write-slot tensor (dtype, shape, values) that decode passes to the attention
+kernel. They run on CPU, without Neuron hardware.
 
 ```bash
 VLLM_NEURON_CPU_MODE=1 pytest contrib/models/ernie4_5/test/unit -v
@@ -226,9 +202,11 @@ share therefore exist once, at the `test/` root:
 | `_component_utils.py` | `_local_src.load_helper("component_utils")` | HuggingFace goldens, KV-cache seeding and the picklable `model_load` functions for the component tests. |
 
 Those unique module names are what lets several contrib models load in one
-process. `test/conftest.py` holds one thing only: it forces
+process. `test/conftest.py` does two things: it forces
 `VLLM_NEURON_BACKEND=neuron_native` (the only route this implementation
-supports) before pytest imports a test module.
+supports) before pytest imports a test module, and at the end of the session
+it shuts down the plugin's `MPExecutor` worker pool, whose workers otherwise
+outlive the last test and keep pytest from exiting.
 
 One caveat is left, and the loader is not its cause: this folder uses the
 conventional test file names (`test/integration/test_model.py`, as the template
@@ -240,31 +218,125 @@ model folder per invocation.
 
 ## Validation report
 
-This section records the validation evidence for this contribution.
-Every result below is a test verdict or a case count that we read out of our
-CI records. No accuracy score, tolerance measurement, latency or throughput
-figure was read out of the measurement artifacts, so none is quoted here.
+This section records the validation evidence for this contribution, newest
+run first.
 
-### Source and environment
+### vLLM Neuron 0.29.0.1.2.0 (2026-11-19)
 
-Four CI tests passed for this model, and they do not share a single plugin
-commit, so each row below cites its own:
+#### Environment
 
-| Test | Cases | Nodes | Plugin commit |
-| --- | --- | --- | --- |
-| Loading and components on CPU, BF16 | 6/6 passed, 0 failed | 1 | `60e32deb879ef75b67b33628e465f86488a1422e` |
-| Two-node 1P1D logits, serving and components on Trn2, BF16 | 6/6 passed, 0 failed | 2 | `60e32deb879ef75b67b33628e465f86488a1422e` |
-| Native-comparison serving performance at TP 1, batch 1 and batch 4 | 2/2 passed, 0 failed | 1 | `0c5752284168a59a0ef65db7e84da3396ebe7da6` |
-| Native-comparison GSM8K accuracy at batch 1 and batch 4 | 2/2 passed, 0 failed | 1 | `0c5752284168a59a0ef65db7e84da3396ebe7da6` |
+- Instance: one `trn2.48xlarge` (logical NeuronCore config 2), TP 1.
+- Container: the Neuron DLC
+  `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04`
+  (Neuron SDK 2.33), Python 3.14.6.
+- Versions: vLLM `0.29.0`, vllm-neuron `0.29.0.1.2.0`, torch `2.13.0`,
+  transformers `5.17.0`, neuronx-cc `2.28.7631.0+8f7b0cf5`, nki
+  `0.7.0+37713544100.gfede04bb`, libtorch-neuronx-lite
+  `2.13.0.1.0.3112+653bc48f`.
+- Checkpoint: `baidu/ERNIE-4.5-0.3B-PT` at revision
+  `b565cf6caebdb7a1eadf00100857b1ed5e044f12`, bfloat16.
+- Order: CPU unit tests, then the integration test (which registers the
+  factory in-process), then `pip install -e contrib/models/ernie4_5`, then the
+  serve smoke. After the install, the `vllm.general_plugins` group listed
+  `ernie4_5_neuron.plugin:register`, and the serve smoke ran through that entry
+  point with the flags under "Usage".
 
-Every run used `trn2.48xlarge`, plugin version `0.31.0.1.2.0` with vLLM
-`0.31.0`, and the `neuron_native` runtime backend. The checkpoint is
+#### Results
+
+| Test | Result |
+| --- | --- |
+| CPU unit tests (`VLLM_NEURON_CPU_MODE=1 pytest contrib/models/ernie4_5/test/unit`) | 5 passed, 0 failed |
+| Integration logit test, `test_model_accuracy[1-2048]` (batch 1, `max_model_len` 2,048) | PASSED. Both prompts: Overall Status PASSED. Two-way validation: 2/2 prompts passed. |
+| Integration logit test, `test_model_accuracy[4-2048]` (batch 4, `max_model_len` 2,048) | PASSED. Both prompts: Overall Status PASSED. Two-way validation: 2/2 prompts passed. |
+| `vllm serve` smoke (3 completions at `max_tokens` 32 and one batched request of the 3 prompts at `max_tokens` 16, `temperature` 0) | Passed. Every completion returned non-empty text. |
+
+The integration test decodes 16 tokens for each of 2 prompts and compares the
+Neuron logits against HuggingFace FP32 and BF16 references. Max errors per
+prompt, with the thresholds the test applies:
+
+| Prompt | Overall Status | Divergence | K5 | K50 | K1000 | All |
+| --- | --- | --- | --- | --- | --- | --- |
+| Threshold | | 1 ULP | 0.04 | 0.04 | 0.06 | 0.065 |
+| 1/2 | PASSED | 0.0000 | 0.0350 | 0.0388 | 0.0388 | 0.0601 |
+| 2/2 | PASSED | 0.0000 | 0.0165 | 0.0165 | 0.0165 | 0.0165 |
+
+Both parametrizations measured these values. At batch 4, each of the 4 batch
+rows reported the same max errors as batch 1. The K5 to All maxima are at
+token 1 for prompt 1 and at token 4 for prompt 2. At prompt 2, token 2, the
+argmax diverged ("Acceptable divergence Δ = 0.0000"), and the test continued
+with teacher forcing.
+
+The K5 bound is 0.04. The template uses 0.03, and the port used 0.015. The
+comment at `TOL_MAP` in `test/integration/test_model.py` gives the reason: one
+early token per prompt is numerically sensitive. At generation token 1 the
+BF16 CPU baseline is itself 0.2153 (prompt 1) and 0.2391 (prompt 2) L-inf from
+FP32, against 0.2598 and 0.2358 for Neuron, and the measured K5 error is
+0.0350. The K50, K1000 and All bounds are the port's, tighter than the
+template's 0.05, 0.08 and 0.09.
+
+The test log also prints aggregate thresholds that it labels informational and
+that do not decide the verdict. At both batch sizes they reported
+`agg_bc: FAIL`, `agg_linf_1.2x: FAIL`, `pp_static_0.03: 0/2`,
+`pp_static_0.05: 0/2`, `pp_tok_linf_1.5x: 1/2` and
+`agg_sigma_ratio: 1.0885`; the other aggregate and per-prompt checks passed.
+
+Serve smoke outputs (greedy, first 60 characters as JSON strings):
+
+| Prompt | Output |
+| --- | --- |
+| `The capital of France is` | `" the capital of the French Republic.\n\nThe capital of France "` ... |
+| `1, 2, 3, 4, 5,` | `" 6, 7, 8, 9, 10, 11, 12, 13, 14,"` (full output) |
+| `def fibonacci(n):` | `"\n\n    if n == 0:\n        return 0\n    elif n == 1:\n        r"` ... |
+
+Module tests (`test/module/`) were not part of this run.
+
+#### Changes for vLLM Neuron 0.29
+
+Relative to the port, which targeted the repository's vLLM 0.32 pin:
+
+- `pyproject.toml` and `src/plugin.py` (new) install the folder as a vLLM
+  plugin that registers `Ernie4_5ForCausalLM` in every process (see "Usage").
+- `src/compat.py` (new) vendors `hoist_rope_parameters` and
+  `build_per_head_block_table`, which vLLM Neuron 0.29.0.1.2.0 does not ship,
+  copied unchanged from a later release. `src/config.py` and `src/model.py`
+  import them from there.
+- `src/model.py`: decode casts the per-head KV write slots to `uint32`. The
+  decode kernel reads them as `uint32`; with vLLM's `int64` slot mapping the
+  runtime refused to load the decode NEFF ("invalid offset").
+- `test/unit/test_decode_kv_contract.py` (new) captures the arguments of the
+  decode attention call at TP 1 and checks the dtype, shape and values of the
+  write slots and the per-head block table. It runs no kernel.
+- `test/conftest.py` adds a session fixture that shuts down the plugin's
+  `MPExecutor` worker pool, so pytest exits after the last test.
+- `test/integration/test_model.py` uses its own full-vocabulary
+  `generate_fn` in place of the plugin's `create_offline_vllm_generate_fn`.
+  That helper requests `tokenizer.vocab_size` logprobs (100,295 base tokens
+  for this tokenizer) while the model scores 103,424 ids, so its rows got
+  different lengths and it stopped in `torch.stack` before validation. The new
+  function requests and packs all `config.vocab_size` ids.
+  `multi_prompt_logit_validation` is unchanged.
+- `test/integration/test_model.py`: the K5 tolerance is 0.04 instead of 0.015
+  (see above).
+
+### Earlier runs: vLLM Neuron 0.31.0.1.2.0 (implementation in-tree)
+
+These runs tested this implementation in-tree, at
+`vllm_neuron/model/ernie4_5/`, registered through `get_models()`, before it
+became this folder. Every run used `trn2.48xlarge`, plugin version
+`0.31.0.1.2.0` with vLLM `0.31.0`, the `neuron_native` runtime backend, and
 `baidu/ERNIE-4.5-0.3B-PT` at revision
-`b565cf6caebdb7a1eadf00100857b1ed5e044f12`.
+`b565cf6caebdb7a1eadf00100857b1ed5e044f12`. Every result in this subsection is
+a test verdict or a case count. No accuracy score, tolerance measurement,
+latency or throughput figure was read out of these runs, so none is quoted.
 
-The CI record does not link each result to one image or plugin commit.
+| Test | Cases | Nodes |
+| --- | --- | --- |
+| Loading and components on CPU, BF16 | 6/6 passed, 0 failed | 1 |
+| Two-node 1P1D logits, serving and components on Trn2, BF16 | 6/6 passed, 0 failed | 2 |
+| Native-comparison serving performance at TP 1, batch 1 and batch 4 | 2/2 passed, 0 failed | 1 |
+| Native-comparison GSM8K accuracy at batch 1 and batch 4 | 2/2 passed, 0 failed | 1 |
 
-### Model configuration
+#### Model configuration
 
 The architecture class is `Ernie4_5ForCausalLM`, served in bfloat16; the
 factory rejects any other dtype. The performance run used TP 1, and the
@@ -273,13 +345,11 @@ disaggregated-inference and component test files each parametrize TP 8 and TP
 this is a dense model. The logit, serving and native-comparison runs set
 `max_model_len` and `max_num_batched_tokens` to 2,048 with `max_num_seqs` 4.
 
-Registration is the user's job, as described under "Usage" above and in
-`contrib/README.md`; nothing outside this folder needs to change. Beyond the
-standard arguments, the model needs `VLLM_NEURON_BACKEND=neuron_native`, a
-bfloat16 dtype, and prompts whose length is a multiple of the
-tensor-parallel size (sequence-parallel prefill).
+Beyond the standard arguments, the model needs
+`VLLM_NEURON_BACKEND=neuron_native`, a bfloat16 dtype, and prompts whose length
+is a multiple of the tensor-parallel size (sequence-parallel prefill).
 
-### Component validation
+#### Component validation
 
 The CPU run for loading and components passed all 6 of its cases with no
 failures, on one node. Those cases are the tests this folder ships as
@@ -298,23 +368,24 @@ other, and asserts NKI-kernel dispatch for each component. The remaining two
 cases are the 1P1D logit and serving cases described below, which this folder
 does not ship.
 
-### Numerical correctness
+#### Numerical correctness
 
 Logit validation ran, inside the two-node 1P1D run: the port's
 `test_di_logits_serving.py` teacher-forced two prompts for 16 tokens at batch
 4 and compared raw per-token logits against FP32 and BF16 HuggingFace
 references. The run passed, 6 of 6 cases, with no failures.
 
-The shipped `test/integration/test_model.py` uses the tolerance map of that
-run — `(1e-5, 0.015)` at top-5, `(1e-5, 0.04)` at top-50, `(1e-5, 0.06)` at
-top-1000 and `(1e-5, 0.065)` over the full vocabulary — and keeps the strict
-`1e-5` argmax-divergence bound. It is an offline, single-node adaptation of
-that test, not a rerun of it: see Exceptions.
+That run used the tolerance map `(1e-5, 0.015)` at top-5, `(1e-5, 0.04)` at
+top-50, `(1e-5, 0.06)` at top-1000 and `(1e-5, 0.065)` over the full
+vocabulary. The shipped `test/integration/test_model.py` is an offline,
+single-node adaptation of that test, not a rerun of it (see Exceptions). It
+keeps those bounds and the strict `1e-5` argmax-divergence bound, except at
+top-5, which is 0.04 on vLLM Neuron 0.29.0.1.2.0.
 
 The GSM8K accuracy run passed both of its cases, at batch 1 and at batch 4.
 We hold its verdict only. We did not read a GSM8K score.
 
-### Serving validation
+#### Serving validation
 
 Our required serving grid is 1,024 input / 512 output tokens and 8,192 input /
 1,024 output tokens, offline and online:
@@ -331,10 +402,11 @@ throughput figures.
 
 ### Exceptions
 
-- The shipped `test/integration/test_model.py` has never been run. It is an
-  offline single-node adaptation of the two-node 1P1D logit test (same
-  prompts, output length, batch and tolerance map, TP 1), written for this
-  contribution.
+- The shipped `test/integration/test_model.py` is an offline single-node
+  adaptation of the two-node 1P1D logit test of the earlier runs (same
+  prompts, output length and TP 1), written for this contribution. It ran on
+  vLLM Neuron 0.29.0.1.2.0 as recorded above, with a K5 bound of 0.04 where
+  the 1P1D test used 0.015.
 - Dropped: `test_di_logits_serving.py` (the 1P1D logit and serving test). It
   needs a shared multi-node serving harness that does not ship with this
   folder. To keep the test, we would have to copy that harness into the
@@ -352,7 +424,7 @@ throughput figures.
 - `test/unit/test_factory.py` no longer asserts that
   `vllm_neuron.model.registry.get_models()` maps the architecture to the
   factory, because a contrib model is deliberately absent from that registry.
-  It asserts the pair a user has to register instead — the architecture string
+  It asserts the pair that gets registered instead — the architecture string
   in `config.json` and the factory class in `src/`. The config-field and
   config-rejection checks are unchanged.
 - The checkpoint resolver lost its third source, the shared
@@ -370,38 +442,28 @@ throughput figures.
   report an unsupported architecture: it resolves vLLM's class and then fails
   on `from_configs`, the plugin convention that both Neuron model runners call
   and that no vLLM class defines, so the error names nothing about
-  registration. It is a confusing crash, not wrong output. The integration
-  test skips itself unless `VLLM_WORKER_MULTIPROC_METHOD` is `fork`, so a
-  registration problem cannot surface as that crash mid-test, and the README
-  leads its usage section with the hazard.
-- Registering a contrib architecture is process-start-method dependent, and
-  the two things the guide asks for are in tension. The local-src loader keeps
-  the tests runnable from a copied-out folder by loading `src/` from its path
-  under a synthetic module name, which no fresh interpreter can import by
-  name; a registration that survives `spawn` would need the opposite, a module
-  importable by name (the lazy `"module:Class"` form that the plugin uses for
-  its own models, and which vLLM resolves by importing it in a fresh
-  interpreter). So the integration test and the README's offline example both
-  register a class object, and both rely on `fork`.
-- Sourcing for the statements above: `fork` being the default of
-  `VLLM_WORKER_MULTIPROC_METHOD`, the built-in `Ernie4_5ForCausalLM` entry,
-  and class-object registration being inspected in-process were read from
-  vLLM 0.31.0 source, in which `from_configs` does not appear at all. This
-  repo's `requirements/core.txt` now pins vLLM 0.32.0, which we did not read.
-  That the vLLM CLI uses `spawn` rests on two
-  comments in the plugin, with a third describing a forked engine core, so it
-  is reported as commentary, not as verified. One vLLM path that could force
-  `spawn` by itself (`_maybe_force_spawn`) was not read; it is not expected to
-  fire on Neuron, where there is no CUDA. None of this came from a run of this
-  contribution.
-- All evidence was produced with this implementation in-tree, at
-  `vllm_neuron/model/ernie4_5/`, registered through `get_models()`. The contrib
-  layout — code in `contrib/models/ernie4_5/src/`, registered by the user — was
-  not itself re-run in CI.
-- Untested in our evidence: Trn3; any Neuron SDK release number (none was
-  recorded); prefix caching and chunked prefill (the segmented-attention path
-  exists in `src/model.py`, and the logit and serving runs set
-  `--no-enable-prefix-caching`); speculative decoding (the forward pass has a
+  registration. It is a confusing crash, not wrong output. The installed
+  entry point registers the factory in every process.
+- The integration test does not use the entry point. The tests load `src/` by
+  file location under a synthetic module name, so they run from a copied-out
+  folder, and vLLM inspects a `"module:Class"` registration by importing it in
+  a fresh interpreter, which cannot import that name. The test therefore
+  registers the class object in its own process, which reaches the engine core
+  and the workers only when they are forks of it. It skips itself unless
+  `VLLM_WORKER_MULTIPROC_METHOD` is unset or `fork`, so a registration problem
+  cannot surface as the crash above mid-test.
+- The statements about vLLM's built-in `Ernie4_5ForCausalLM`, the
+  `from_configs` failure and the fresh-interpreter inspection of string
+  registrations were read from vLLM 0.31.0 source, not reproduced in a run.
+- The earlier runs used this implementation in-tree. The vLLM Neuron
+  0.29.0.1.2.0 run used this folder: the tests loaded `src/` from it, and the
+  serve smoke ran through its installed entry point.
+- Untested in our evidence: Trn3; TP > 1 on vLLM Neuron 0.29.0.1.2.0 (TP 8
+  ran only in the earlier in-tree runs); the module tests on vLLM Neuron
+  0.29.0.1.2.0; the offline `LLM(...)` example with the installed package (the
+  integration test registers in-process); prefix caching and chunked prefill
+  (the segmented-attention path exists in `src/model.py`, and every run
+  disabled prefix caching); speculative decoding (the forward pass has a
   rejection-sampler branch, never exercised); any quantized or FP8-KV
   configuration (none is implemented); LoRA and multimodal input (neither is
   implemented; `inputs_embeds` is rejected); the 8,192/1,024 serving row; the
@@ -409,5 +471,6 @@ throughput figures.
 - `src/model.py` names data parallelism among its supported parallelism modes,
   but the folder contains no data-parallel wiring and our evidence covers
   none. Treat DP as unverified.
-- No GSM8K score, measured tolerance, latency or throughput figure appears in
-  this README. We hold test verdicts and case counts only.
+- No GSM8K score, latency or throughput figure appears in this README. The
+  measured logit errors come from the vLLM Neuron 0.29.0.1.2.0 run; the
+  earlier runs are reported as test verdicts and case counts only.

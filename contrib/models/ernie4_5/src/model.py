@@ -33,12 +33,7 @@ from torch import nn
 from vllm.distributed.parallel_state import get_tp_group
 
 import vllm_neuron.functional as NF
-from vllm_neuron.model.kv_cache import (
-    KVSpec,
-    LayerSpec,
-    build_per_head_block_table,
-    build_per_head_slot_mapping,
-)
+from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, build_per_head_slot_mapping
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.weight_loader import (
     SafetensorsWeightLoader,
@@ -54,6 +49,7 @@ from vllm_neuron.nn.sampler import Sampler
 import vllm_neuron.nn as neuron_nn
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 
+from .compat import build_per_head_block_table
 from .config import Ernie4_5Config
 
 logger = logging.getLogger(__name__)
@@ -627,9 +623,15 @@ class Ernie4_5Attention(nn.Module):
             )
         else:
             active_blocks_table = block_table
+        # The kernel reads the write slots as uint32 (uint32 max = skip), as
+        # the plugin's own decoders pass them. vLLM's slot mapping is int64.
+        # The kernel sizes its slot DMA from the dtype it is given, but the
+        # compiler stores an int64 graph tensor in 32 bits. An int64 slot
+        # tensor thus makes the kernel read twice the bytes of its buffer, and
+        # the runtime refuses to load the decode NEFF ("invalid offset").
         kv_cache_update_idx = build_per_head_slot_mapping(
             slot_mapping, block_size, nkh, B
-        )
+        ).to(torch.uint32)
 
         # <-- MODEL-SPECIFIC: rope_contiguous_layout=True (rotate half). The
         # reordered Q/K weights make this equal to the HF interleaved RoPE.

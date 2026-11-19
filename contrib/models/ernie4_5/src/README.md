@@ -1,7 +1,7 @@
 # ERNIE 4.5 (dense) — architecture and feature status
 
 This card describes the implementation in this folder. Everything in it was
-read out of `config.py`, `factory.py` and `model.py`, or out of the verified CI
+read out of `config.py`, `factory.py` and `model.py`, or out of the validation
 evidence summarized in the model folder's `README.md`. Nothing here is a plan
 or an expectation.
 
@@ -40,7 +40,7 @@ TP size and divide by it. The MLP shards the intermediate dimension.
 
 ## Feature status
 
-"Verified" means the model folder's `README.md` cites CI evidence for it.
+"Verified" means the model folder's `README.md` cites test evidence for it.
 "Implemented, unverified" means the code path exists in this folder but no
 evidence covers it. "Not implemented" means the code has no such path.
 
