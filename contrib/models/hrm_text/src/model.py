@@ -42,13 +42,7 @@ from vllm.distributed.parallel_state import get_tp_group
 import vllm_neuron.functional as NF
 import vllm_neuron.nn as neuron_nn
 from transformers import PretrainedConfig
-from vllm_neuron.model.kv_cache import (
-    KVSpec,
-    LayerSpec,
-    build_per_head_block_table,
-    paged_slot_indices,
-    scatter_new_kv,
-)
+from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, paged_slot_indices
 from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.nn.sampler import Sampler
@@ -60,6 +54,7 @@ from vllm_neuron.utils.weight_loader import (
     sharding_weight_loader,
 )
 
+from .compat import build_per_head_block_table, scatter_new_kv
 from .config import HrmTextConfig
 
 logger = logging.getLogger(__name__)
