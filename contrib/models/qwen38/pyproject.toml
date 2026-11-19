@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=77.0.3,<80.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen38-neuron"
+version = "0.1.0"
+description = "Qwen3.8 27B (text) for vLLM Neuron (contrib model)"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = []  # runs inside a vllm-neuron environment
+
+# vLLM calls register() in every process (API server, engine, workers).
+[project.entry-points."vllm.general_plugins"]
+qwen38 = "qwen38_neuron:register"
+
+[tool.setuptools]
+package-dir = {"qwen38_neuron" = "src"}
+packages = ["qwen38_neuron", "qwen38_neuron.kernels", "qwen38_neuron.kernels.core", "qwen38_neuron.kernels.core.attention", "qwen38_neuron.kernels.core.utils"]
