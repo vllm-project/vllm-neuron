@@ -9,31 +9,35 @@ feature-status card.
 
 > **Note:** Contrib models are community contributions and may have limited
 > testing or performance optimization compared to the officially-supported
-> models under `vllm_neuron/model/`. The compatibility matrix and the
-> validation report below record exactly what was tested.
+> models under `vllm_neuron/model/`. The compatibility matrix below records
+> exactly what was tested.
 
 ## Usage
 
 Install `vllm-neuron` in your Neuron environment (see the top-level
-`README.md` for installation). A contrib model is not in the plugin's model
-registry, so register the architecture `NanbeigeForCausalLM` yourself, as
-described in [contrib/README.md](../../README.md) ("How do I register a custom
-model with vLLM?"). The checkpoint ships its own model code, so every entry
-point needs `trust_remote_code`.
+`README.md` for installation), then install this folder:
+
+```bash
+pip install -e contrib/models/nanbeige
+```
+
+The install adds a `vllm.general_plugins` entry point (`src/plugin.py`) that
+registers the architecture `NanbeigeForCausalLM` in every vLLM process: the
+front end, the engine core and each tensor-parallel worker. So `vllm serve`
+and `LLM(...)` find the model with no other setup. The package is installed
+from `src/` under the name `nanbeige_neuron`, and
+`pip uninstall vllm-neuron-contrib-nanbeige` removes the registration. The
+checkpoint ships its own model code, so every entry point needs
+`trust_remote_code`.
 
 ### Serve with the OpenAI-compatible server
 
-`vllm serve` starts the engine directly, so there is no script of yours in
-which to call `ModelRegistry.register_model`, and the CLI's engine-core
-process does not inherit a registration made elsewhere (see "Registering this
-model" below). Use option 2 of [contrib/README.md](../../README.md): move
-`src/` to `vllm_neuron/model/nanbeige/` and add
-`("NanbeigeForCausalLM", "vllm_neuron.model.nanbeige:NanbeigeForCausalLM")`
-to `_MODELS` in `vllm_neuron/model/registry.py`. That edit is yours to make in
-your own checkout; this contrib folder does not make it. Then:
+These are the flags of the tested serve run (see the validation report):
 
 ```bash
 vllm serve Nanbeige/Nanbeige4.2-3B \
+    --host 127.0.0.1 \
+    --port 8000 \
     --trust-remote-code \
     --dtype bfloat16 \
     --tensor-parallel-size 8 \
@@ -46,7 +50,7 @@ vllm serve Nanbeige/Nanbeige4.2-3B \
 Then send a request:
 
 ```bash
-curl http://localhost:8000/v1/completions \
+curl http://127.0.0.1:8000/v1/completions \
     -H "Content-Type: application/json" \
     -d '{
         "model": "Nanbeige/Nanbeige4.2-3B",
@@ -57,18 +61,10 @@ curl http://localhost:8000/v1/completions \
 
 ### Offline inference with the Python API
 
-Copy `src/` into your own application package first, then register the factory
-class before you construct the engine (option 1 of
-[contrib/README.md](../../README.md)):
+With the folder installed, build the engine directly:
 
 ```python
-from vllm import LLM, ModelRegistry, SamplingParams
-
-# Adjust this import to the package you copied contrib/models/nanbeige/src/
-# into.
-from your_package.nanbeige.factory import NanbeigeForCausalLM
-
-ModelRegistry.register_model("NanbeigeForCausalLM", NanbeigeForCausalLM)
+from vllm import LLM, SamplingParams
 
 llm = LLM(
     model="Nanbeige/Nanbeige4.2-3B",
@@ -76,7 +72,9 @@ llm = LLM(
     dtype="bfloat16",
     tensor_parallel_size=8,
     max_model_len=2048,
+    max_num_batched_tokens=2048,
     max_num_seqs=1,
+    enable_prefix_caching=False,
 )
 
 sampling_params = SamplingParams(temperature=0.0, max_tokens=32)
@@ -85,30 +83,10 @@ for output in outputs:
     print(output.outputs[0].text)
 ```
 
-Prefill runs sequence-parallel, so a prompt length must be greater than the
-tensor-parallel size and a multiple of it.
-
-### Registering this model
-
-Option 1 above (register, then build `LLM(...)`) works on the offline path,
-but only because that path forks. The plugin pins
-`distributed_executor_backend="mp"`, so the topology is your process, then an
-engine-core process, then one `MultiprocExecutor` worker per rank. The start
-method comes from `VLLM_WORKER_MULTIPROC_METHOD`, and the plugin leaves it at
-vLLM's `fork` default for every architecture except Qwen3-ASR. A forked child
-inherits this process's populated `ModelRegistry`, so the architecture is
-already there; `NeuronWorker.__init__` then registers the plugin's own
-`get_models()` entries, which overwrite only their own architecture keys, and
-the model runner resolves the final class with
-`ModelRegistry.resolve_model_cls(...)`.
-
-Under `spawn` the registration is lost: a spawned engine-core re-executes from
-scratch and never runs your call, and a class object cannot be carried across
-`spawn` at all. vLLM's spawn-safe form is the lazy `"module:Class"` string,
-which needs a module importable by name in a fresh interpreter. If you set
-`VLLM_WORKER_MULTIPROC_METHOD=spawn`, or you serve with the CLI, use option 2
-instead. This paragraph is read from the plugin and vLLM code, not measured by
-a run of this model.
+Prefill runs sequence-parallel over the padded prefill length, so each
+prefill token bucket must be greater than the tensor-parallel size and a
+multiple of it. The prompt itself can be any length: the serve smoke test
+below sent prompts of 6, 7 and 16 tokens at TP8.
 
 To iterate without Neuron hardware, run in CPU mode by setting
 `VLLM_NEURON_CPU_MODE=1` in the environment. The fused decode megakernel does
@@ -118,22 +96,27 @@ variables.
 
 ## Compatibility Matrix
 
-| Instance | Status | Software |
-| --- | --- | --- |
-| Trn2 (trn2.48xlarge) | Working — see the validation report | `vllm-neuron` 0.31.0.1.2.0, vLLM 0.31.0, `VLLM_NEURON_BACKEND=neuron_native` |
-| Trn3 | Not tested | — |
+| Instance / SDK version | 2.33 (vLLM Neuron 0.29.0.1.2.0) | 2.32 and earlier |
+| ---------------------- | ------------------------------- | ---------------- |
+| Trn3 | Not tested | Not tested |
+| Trn2 | Working (TP 8) | Not tested |
 
-This README states no Neuron SDK release. The recorded runs used a pinned
-toolchain, but their results do not name the Neuron SDK release.
+Tested in the Neuron Deep Learning Container
+`public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04`
+with vLLM 0.29.0, transformers 5.17.0 and neuronx-cc 2.28.7631.0. The earlier
+runs in the validation report used `vllm-neuron` 0.31.0.1.2.0 and name no
+Neuron SDK release, so the matrix does not count them.
 
 ## Example Checkpoints
 
-- <https://huggingface.co/Nanbeige/Nanbeige4.2-3B>
+- <https://huggingface.co/Nanbeige/Nanbeige4.2-3B> (tested at the pinned revision
+  `b82e54bd609793562a75cbf9337970a93369eab5`)
 
 ## Testing
 
-The integration test serves the model through vLLM on Neuron and validates
-its per-token logits against a HuggingFace reference:
+The integration test runs the model through vLLM's offline `LLM` API on
+Neuron at TP8 and validates its per-token logits against a HuggingFace
+reference, for one sequence and for four sequences at a 2,048-token context:
 
 ```bash
 pytest contrib/models/nanbeige/test/integration/test_model.py \
@@ -141,14 +124,19 @@ pytest contrib/models/nanbeige/test/integration/test_model.py \
 ```
 
 Set `NANBEIGE4_CHECKPOINT_PATH` to a local checkpoint directory to avoid a
-Hub download.
+Hub download. The test registers the factory from this folder's `src/` itself,
+so it does not need the `pip install` above. Its goldens come from the
+independent upstream-Llama loop reference in `test/nanbeige_utils.py`
+(transformers' `LlamaForCausalLM`, with the physical layers run once per loop
+and a KV cache per loop), not from the checkpoint's own model code; see
+Exceptions.
 
 Every test here loads this folder's `src/` by file location through
 `test/_local_src.py`, so the tests work from any working directory and after
 the folder is copied out of the repository. They need the `vllm-neuron` plugin
-importable (installed, or the repository root on `sys.path`, which
-`pytest.ini` does for a run from the repository root), but nothing else from
-the repository.
+installed, but nothing else from the repository. `test/conftest.py` shuts down
+the plugin's worker pool at the end of the session, so pytest exits after it
+prints its summary.
 
 Run one model's tests per pytest invocation, or pass
 `--import-mode=importlib`. The reason is pytest's default import mode, not
@@ -196,165 +184,121 @@ not run on CPU, so the module test covers prefill only.
 
 ## Validation report
 
-### Source and environment
+### vLLM Neuron 0.29.0.1.2.0 (2026-11-19)
 
-Both recorded test runs passed at plugin commit
-`cbdb21f13cf51702182309bb6f3a329370ac76fd`, so one commit covers all the
-results below. The runs used `vllm-neuron` 0.31.0.1.2.0 and vLLM 0.31.0 with
-the native runtime backend (`neuron_native`) on `trn2.48xlarge`.
+#### Environment
 
-The checkpoint is `Nanbeige/Nanbeige4.2-3B` at revision
-`b82e54bd609793562a75cbf9337970a93369eab5`, which the tests pin and verify
-against the published `config.json`.
+| Image | Instance | TP | vLLM | vllm-neuron | torch | transformers | neuronx-cc |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04` | `trn2.48xlarge` (LNC=2) | 8 | 0.29.0 | 0.29.0.1.2.0 | 2.13.0 | 5.17.0 | 2.28.7631.0+8f7b0cf5 |
 
-### Model configuration
+#### Results
 
-The architecture class is `NanbeigeForCausalLM` (factory in `src/factory.py`,
-implementation in `src/model.py`), BF16 weights, no quantization and no
-expert parallelism. The model is dense, so there is no EP degree.
-The device run sharded the model over TP8, with 4 ranks on each of two
-`trn2.48xlarge` nodes; the CPU tests build it at TP2. The device test
-constants set `--max-model-len 2048` for both the logit and the serving
-case, with `--max-num-batched-tokens 512 --max-num-seqs 1` for the logit case
-and `--max-num-batched-tokens 1024 --max-num-seqs 4` for the serving case.
-Model-specific serving arguments: `--trust-remote-code` (the checkpoint ships
-its model code), `--dtype bfloat16`, `--no-enable-prefix-caching`, and
-on-device greedy sampling for the logit case. Registration is the user's
-step; see Usage above.
-
-### Component validation
-
-A CPU-mode run of the model loading and component tests passed 6 of 6 cases
-at commit `cbdb21f1`. The 6 cases check these items:
-
-- the factory wiring and the config parse;
-- the refusal of each unsupported option;
-- a TP2 full-model load that reads all 201 checkpoint tensors, and a
-  prefill-logit comparison against an independent upstream-Llama loop
-  reference;
-- a per-loop decoder-layer and KV-cache comparison for the first and the last
-  physical layer (2 cases);
-- a cross-check of that reference against the checkpoint's own model code.
-
-The same 6 cases are in this folder, split by kind into the folder structure
-that contrib/README.md defines. The 4 loading and configuration cases are in
-`test/unit/test_nanbeige_cpu.py`. The 2 per-loop decoder-layer cases are in
-`test/module/test_decoder_layer.py`. The split changed no assertion.
-
-A two-node device test on Trn2, sharded at TP8, passed 8 of 8 cases at commit
-`cbdb21f1`. This test is not in this folder (see Exceptions). Its test file
-has 4 cases, and each of the 2 nodes ran them, which gives 8 cases. The 4
-cases are a decoder-layer prefill-and-decode comparison for the first and the
-last physical layer, a server logit validation, and a serving run. This
-case-to-node mapping comes from the case count and the test file. The run
-results give the test verdict and the case counts, but not the result of each
-case.
-
-### Numerical correctness
-
-This model has no dataset-level accuracy result of any kind. There is no
-GSM8K or other dataset accuracy run, and neither recorded test is a dedicated
-logit test. See Exceptions.
-
-The logit result is indirect. The two-node device test that passed 8 of 8 has
-a case that starts a TP8 server across both nodes. That case compares the
-full-vocabulary logits of each of 32 generated tokens against an independent
-HuggingFace reference. The reference is an FP32 baseline plus a same-dtype
-teacher-forced pass. The case uses `multi_prompt_logit_validation` with the
-default tolerance map of `vllm_neuron.accuracy`. All cases in that test
-passed, so this comparison passed. The run results do not include a per-case
-metric.
-
-`test/integration/test_model.py` in this folder uses the same default bounds:
-`(1e-5, 0.011)` at top-5, `(1e-5, 0.02)` at top-50, `(1e-5, 0.03)` at
-top-1000 and `(1e-5, 0.05)` over the full vocabulary. It also keeps the strict
-`1e-5` argmax bound. This test has no CI run. Its configuration is
-single-node TP8, offline `LLM`, and reference logits from the checkpoint's own
-model code. The recorded run used a two-node server instead.
-
-### Serving validation
-
-| Workload | Offline | Online |
+| Test | Configuration | Result |
 | --- | --- | --- |
-| 1,024 in / 512 out | No evidence | Passed: 4 concurrent requests, exactly 512 generated tokens each, in the two-node device test (8/8 passed, commit `cbdb21f1`) |
-| 8,192 in / 1,024 out | No evidence | No evidence |
+| CPU unit tests, `test/unit/` | CPU mode, `neuron_native` backend, TP2 full-model load | 4 passed (127.97 s) |
+| `test_model_accuracy[1-2048]` | TP8, 1 sequence, `max_model_len` 2048, 2 prompts x 32 tokens | PASSED |
+| `test_model_accuracy[4-2048]` | TP8, 4 sequences, `max_model_len` 2048, 2 prompts x 32 tokens | PASSED |
+| `vllm serve` smoke | The flags under Usage, 3 prompts | passed (3/3 prompts) |
 
-In the online 1,024 / 512 case, the device test sent 4 concurrent OpenAI-API
-completion requests. Each request had exactly 1,024 prompt tokens.
-`min_tokens` and `ignore_eos` forced 512 output tokens. The test asserted the
-token counts and a non-empty completion. There is no offline
-(`LLM.generate`) measurement at that shape. There is no run at 8,192 / 1,024
-in either mode.
+Not run on 0.29: module tests (`test/module/`, 2 cases), not in the 0.29 run script; last pass on 0.31.0.1.2.0 (CPU).
+
+#### Logit validation
+
+| Case | Prompt | Overall Status | K5 (<= 0.011) | K50 (<= 0.02) | K1000 (<= 0.03) | All (<= 0.05) |
+| --- | --- | --- | --- | --- | --- | --- |
+| `[1-2048]` | 1 | PASSED | 0.0100 | 0.0161 | 0.0161 | 0.0200 |
+| `[1-2048]` | 2 | FAILED | 0.0168 (> 0.011) | 0.0168 | 0.0168 | 0.0186 |
+| `[4-2048]` | 1 | PASSED | 0.0100 | 0.0161 | 0.0161 | 0.0200 |
+| `[4-2048]` | 2 | FAILED | 0.0168 (> 0.011) | 0.0168 | 0.0168 | 0.0186 |
+
+Two-way check, Neuron vs CPU BF16 reference; max over all validated tokens, the same in each of the 4 sequences of `[4-2048]`. No argmax divergence (0.0000, threshold 1 ULP).
+Prompt 2 over K5 at generated token 24 (L-inf vs FP32: Neuron 0.0175, CPU BF16 0.0111). Both cases passed on aggregate σ-ratio 0.9350 ≤ 1.0 (`multi_prompt_logit_validation`).
+
+#### Serve smoke
+
+`/v1/completions`, `max_tokens` 32, `temperature` 0; a 4th request with the 3 prompts batched (`max_tokens` 16) returned a prefix of each completion.
+
+| Prompt | Prompt tokens | Completion tokens | Completion (first 60 characters, JSON-quoted) |
+| --- | --- | --- | --- |
+| `The capital of France is` | 6 | 32 | `" Paris.\n</think>\n\nHere are a few ways to respond to your sta"` |
+| `1, 2, 3, 4, 5,` | 16 | 32 | `" 6, 7, 8, 9, 10, 11, 12, 13, 14,"` (whole completion) |
+| `def fibonacci(n):` | 7 | 32 | `"\n 不仅如此，斐波那契数列还有多种变体，例如卢卡斯数列、斐波那契编码、斐波那契堆等数据结构。\n\n卢卡斯"` (whole completion) |
+
+#### Changes for 0.29
+
+- `pyproject.toml`, `src/plugin.py` (new): install the folder as `nanbeige_neuron` with a `vllm.general_plugins` entry point, replacing the manual registration steps.
+- `src/compat.py` (new): vendored `hoist_rope_parameters` (not in 0.29.0.1.2.0), copied unchanged from a later plugin release; `src/config.py` imports it. No other `src/` file changed.
+- `test/conftest.py` (new): shuts down the plugin's `MPExecutor` worker pool at session end, so pytest exits.
+- `test/integration/test_model.py`: goldens from `load_loop_reference` in `test/nanbeige_utils.py` (variant `transformers_llama_loop_v1`), not the remote code, which calls `DynamicCache.from_legacy_cache` (removed in transformers 5.17).
+- `test/integration/test_model.py`: maps the padding ids past the tokenizer vocabulary to `""` in the engine's tokenizer (vLLM 0.29.0's detokenizer crashed on their `None` token strings).
+
+### Earlier runs (vLLM Neuron 0.31.0.1.2.0)
+
+Before the changes above, the port was validated with `vllm-neuron`
+0.31.0.1.2.0 and vLLM 0.31.0, with the native runtime backend
+(`neuron_native`) on `trn2.48xlarge`. Those runs imported `src/` through the
+repository-rooted `contrib.models.nanbeige.src` path, not through
+`test/_local_src.py`.
+
+| Test | Result |
+| --- | --- |
+| CPU-mode loading, configuration and decoder-layer cases (then one file; now the 4 cases of `test/unit/` and the 2 of `test/module/`, with no case added or dropped) | 6 of 6 passed |
+| Two-node device test at TP8, 4 ranks on each of two nodes: a decoder-layer prefill-and-decode comparison for the first and the last physical layer, a server logit validation and a serving run | 8 of 8 passed (the 4 cases on each node) |
+
+The run results give the verdict and the case counts of the device test, not
+the result of each case. Its server logit case compared the full-vocabulary
+logits of each of 32 generated tokens against an FP32 baseline plus a
+same-dtype teacher-forced HuggingFace reference, with the default tolerance
+map of `vllm_neuron.accuracy`. Its serving case sent 4 concurrent OpenAI-API
+completion requests of exactly 1,024 prompt tokens each, forced 512 output
+tokens with `min_tokens` and `ignore_eos`, and asserted the token counts and
+a non-empty completion. There was no run at 8,192 in / 1,024 out and no
+offline (`LLM.generate`) run at either shape. The device test depends on
+shared server and multi-node test helpers that are not in this repository, so
+it is not in this folder and cannot be run again from it.
 
 ### Exceptions
 
-- **No logit-validation test and no accuracy test.** This model has two
-  recorded passing tests. Neither is a dedicated logit test, and neither is a
-  GSM8K or other dataset accuracy run. So this README states no accuracy
-  score. The only logit comparison is the server-logit case in the two-node
-  device test, as described under Numerical correctness.
-- **The two-node device test is not in this folder.** It needs shared test
-  helpers outside the model folder: `test/utils/simple_server`,
-  `test/utils/network`, `test/vllm_neuron/utils/server_utils` and
-  `test/vllm_neuron/utils/longbench_prompts`. It also needs a two-node harness
-  that discovers peer IPs and runs a headless follower server. A copy of that
-  orchestration would add several hundred lines of infrastructure to the
-  model folder. That code no longer matches its original harness.
-  So this folder does not include the test. The device result above comes
-  from it, but you cannot run it again from this folder. For the same
-  reason, `test/nanbeige_utils.py` omits the helper code that only that test
-  used: the online generate function and the multi-node server orchestration.
-  That code was the only code that imported
-  `test.vllm_neuron.utils.server_utils` and `test.utils.network`.
-- **`PROMPTS_2` is vendored.** The two validation prompts come from
-  `test/vllm_neuron/utils/test_prompts.py`, and they are byte-identical to
-  it. This folder copies them verbatim into `test/nanbeige_utils.py` and into
-  the integration test, as contrib/README.md permits.
-- **The registry assertion has a different meaning.** The recorded CPU test
-  asserted that `vllm_neuron.model.registry.get_models()` maps the
-  architecture to the factory. A contrib model is not in `get_models()`. So
-  the test in this folder registers the local factory with vLLM's
-  `ModelRegistry`. It then asserts that the architecture resolves to the
-  factory. The case count is the same.
-- **The recorded CPU suite is split across two directories.** The run that
-  passed 6 of 6 used one file. Here its 4 loading and configuration cases are
-  in `test/unit/` and its 2 per-loop decoder-layer cases are in
-  `test/module/`, to match the folder structure contrib/README.md defines.
-  The split adds, drops or rewrites no case. No run covers the split layout.
-- **Option 1 registration depends on the `fork` start method.** The
-  integration test, and the offline example in Usage, register the factory
-  class in the user's process and rely on the engine-core and worker
-  processes inheriting that registration through `fork`. Under `spawn`, and
-  therefore under `vllm serve`, it does not reach them; vLLM's spawn-safe
-  lazy `"module:Class"` form needs a module importable by name in a fresh
-  interpreter, which the file-location loader this folder uses deliberately
-  avoids. Serving needs option 2 (see "Registering this model"). This is
-  read from the plugin and vLLM source, not observed in a run of this model.
-- **The tests resolve `src/` by file location.** The recorded runs imported
-  the model code through the repository-rooted `contrib.models.nanbeige.src`
-  path. The tests in this folder load `src/` through `test/_local_src.py`
-  instead, under the module name `contrib_nanbeige_src`. Thus the folder
-  works after you copy it out of the repository. The recorded runs used the
-  old import scheme. A static check verified test collection of the new
-  layout outside the repository, with the plugin stubbed. No run on hardware
-  or in CI covers the 4 unit cases and the 2 module cases after the move to
-  `test/_local_src.py`.
-- **The integration test configuration is untested as such.** It is adapted
-  from the template and has never been run in CI. Its `(1, 2048)` and
-  `(4, 2048)` cases mirror the shapes of the recorded logit and serving runs,
-  but those ran on a two-node server, not single-node offline.
-- **The integration test's reference depends on the checkpoint's model
-  code.** `get_cached_reference_goldens` loads the HuggingFace reference with
-  `trust_remote_code=True`. The CPU test in `test/unit/test_nanbeige_cpu.py`
-  documents that this remote code does not load on every `transformers`
-  version. When it cannot load, that test skips and gives the reason. On such
-  a version, the integration test cannot build its goldens. The recorded
-  device run used an independent upstream-Llama loop reference instead.
-- **Untested configurations.** Only TP8 (device, 2 nodes) and TP2 (CPU) have
-  results; no other tensor-parallel degree, no Trn3, no quantized weights, no
-  speculative decoding (the code has a rejection-sampling branch with no
-  evidence behind it), no data-parallel or disaggregated (prefill/decode)
-  deployment, no prefix caching (the runs disabled it), and no context length
-  beyond 2,048 tokens, even though the checkpoint config allows far more.
+- **No dataset accuracy result.** There is no GSM8K or other dataset
+  accuracy run, so this README states no accuracy score. The accuracy
+  evidence is the logit validation above.
+- **One two-way bound is exceeded.** On vLLM Neuron 0.29.0.1.2.0, prompt 2
+  exceeds the top-5 two-way bound (0.0168 against 0.011) at one token. The
+  integration cases pass on the aggregate σ-ratio, as described above.
+- **The integration goldens do not come from the checkpoint's model code.**
+  The remote code cannot generate on transformers 5.17 (see the changes
+  above), so the goldens come from the folder's independent upstream-Llama
+  loop reference. `test_nanbeige_reference_matches_remote_code` compares that
+  reference with the remote code in FP32, without a KV cache, on the
+  last-position logits of one prompt (`atol=2e-3`, `rtol=1e-3`, same argmax),
+  and passed in the 0.29.0.1.2.0 run.
+- **Logprob strings for padding ids.** The mapping of the padding ids to `""`
+  is in the integration test only. A request outside the test that returns
+  logprobs for those ids is not covered by it.
+- **Offline path with the installed package.** The `vllm serve` smoke test
+  ran with this folder installed. The offline `LLM(...)` path ran in the
+  integration test, which registers the factory itself and ran before the
+  install. The offline example under Usage, which relies on the installed
+  entry point alone, has no separate run.
+- **Module tests not run since the move to `test/_local_src.py`.** The 2
+  cases of `test/module/` were not part of the 0.29.0.1.2.0 run. Their last
+  recorded pass is the 0.31.0.1.2.0 CPU run, which used the old import path.
+- **`PROMPTS_2` is vendored.** The two validation prompts are the
+  `PROMPTS_2` set that the port's original tests used, copied verbatim into
+  `test/nanbeige_utils.py` and into the integration test, as
+  contrib/README.md permits.
+- **The registry assertion has a different meaning.** The original CPU test
+  asserted that the plugin's own `get_models()` maps the architecture to the
+  factory. A contrib model is not in `get_models()`. So the test in this
+  folder registers the local factory with vLLM's `ModelRegistry` and asserts
+  that the architecture resolves to the factory. The case count is the same.
+- **Untested configurations.** Only TP8 (device: one node on 0.29.0.1.2.0,
+  two nodes on 0.31.0.1.2.0) and TP2 (CPU) have results; no other
+  tensor-parallel degree, no Trn3, no quantized weights, no speculative
+  decoding (the code has a rejection-sampling branch with no evidence behind
+  it), no data-parallel or disaggregated (prefill/decode) deployment, no
+  prefix caching (the runs disabled it), and no context length beyond 2,048
+  tokens, even though the checkpoint config allows far more.
 - **No performance data.** No benchmark or latency test ran for this model,
   so this README states no throughput, latency or time-to-first-token figure.

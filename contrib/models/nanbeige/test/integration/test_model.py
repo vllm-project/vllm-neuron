@@ -70,6 +70,7 @@ _LOADER_SPEC = importlib.util.spec_from_file_location(
 )
 _local_src = importlib.util.module_from_spec(_LOADER_SPEC)
 _LOADER_SPEC.loader.exec_module(_local_src)
+nb = _local_src.load_test_helper("nanbeige_utils")
 
 # The architecture string in the checkpoint's ``config.json``.
 ARCHITECTURE = "NanbeigeForCausalLM"
@@ -156,6 +157,15 @@ def test_model_accuracy(batch_size: int, seq_len: int) -> None:
         tokenizer=tokenizer,
         prompts=PROMPTS,
         output_length=OUTPUT_LENGTH,
+        # The checkpoint's remote code builds its KV cache with
+        # ``DynamicCache.from_legacy_cache``, which transformers 5.17 (the
+        # version vLLM Neuron 0.29.0.1.2.0 ships with) no longer has, so it
+        # cannot generate. The independent upstream-Llama reference in
+        # ``nanbeige_utils`` computes the goldens instead;
+        # ``test_nanbeige_reference_matches_remote_code`` checks it against
+        # the remote code.
+        model_loader=nb.load_loop_reference,
+        golden_variant=nb.REFERENCE_IMPL,
     )
 
     # Four of these arguments are required by logit validation, not optional
@@ -187,6 +197,22 @@ def test_model_accuracy(batch_size: int, seq_len: int) -> None:
             }
         },
     )
+
+    # vLLM 0.29.0 decodes every logprob id to a token string. The Nanbeige
+    # tokenizer has no string for the padding ids past its vocabulary
+    # (``convert_ids_to_tokens`` returns None for them), which crashes the
+    # detokenizer. Map those ids to "" in this test's tokenizer: the logit
+    # comparison reads the logits, never the strings.
+    tokenizer_in_engine = llm.get_tokenizer()
+    convert_ids_to_tokens = tokenizer_in_engine.convert_ids_to_tokens
+
+    def _convert_ids_to_tokens(ids, *args, **kwargs):
+        tokens = convert_ids_to_tokens(ids, *args, **kwargs)
+        if isinstance(tokens, list):
+            return ["" if token is None else token for token in tokens]
+        return "" if tokens is None else tokens
+
+    tokenizer_in_engine.convert_ids_to_tokens = _convert_ids_to_tokens
     try:
         generate_fn = create_offline_vllm_generate_fn(llm, OUTPUT_LENGTH)
         prompts_input_ids = [
