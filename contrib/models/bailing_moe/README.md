@@ -10,34 +10,56 @@ architecture and the kernel paths in detail.
 
 > **Note:** Contrib models are community contributions and may have limited
 > testing or performance optimization compared to the officially-supported
-> models under `vllm_neuron/model/`. The compatibility matrix and the
-> validation report below record exactly what was tested.
+> models under `vllm_neuron/model/`. The compatibility matrix below records
+> exactly what was tested.
 
 ## Usage
 
 Install `vllm-neuron` in your Neuron environment (see the top-level
-`README.md`). The plugin auto-registers with vLLM, but a contrib model is not in
-the plugin's model registry, so you register the architecture
-`BailingMoeV2ForCausalLM` yourself. See
-[contrib/README.md](../../README.md) — "How do I register a custom model with
-vLLM?".
+`README.md`), then install this folder:
 
-The recorded runs served this model with 8 ranks (tensor parallelism 8 with
-expert parallelism 8) spread over 2 `trn2.48xlarge` nodes, 4 ranks on each node.
+```bash
+pip install -e contrib/models/bailing_moe
+```
+
+The install adds a `vllm.general_plugins` entry point (`src/plugin.py`) that
+registers `BailingMoeV2ForCausalLM` in every vLLM process: the front end, the
+engine core and each Neuron worker. `vllm serve` and `LLM(...)` then find the
+architecture with no other setup. vLLM also has its own
+`BailingMoeV2ForCausalLM`; this registration replaces it while the package is
+installed.
+
+The tested configuration is tensor parallelism 8 with expert parallelism 8 on
+one `trn2.48xlarge` (see the validation report).
+
+### Serve with the OpenAI-compatible server
+
+```bash
+vllm serve inclusionAI/Ling-mini-2.0 \
+    --host 127.0.0.1 --port 8000 \
+    --tensor-parallel-size 8 --enable-expert-parallel \
+    --max-model-len 2048 --max-num-seqs 4 --max-num-batched-tokens 1024 \
+    --block-size 32 \
+    --trust-remote-code --no-enable-prefix-caching --no-async-scheduling \
+    --additional-config '{"neuron_config": {"quantization": "bf16"}}'
+```
+
+Then send a request:
+
+```bash
+curl http://127.0.0.1:8000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "inclusionAI/Ling-mini-2.0",
+        "prompt": "The color of the sky is",
+        "max_tokens": 32
+    }'
+```
 
 ### Offline inference with the Python API
 
-Copy `src/` into your own package, then register the factory before you
-construct the engine (option 1 in contrib/README.md).
-
 ```python
-from vllm import LLM, ModelRegistry, SamplingParams
-
-# Your own copy of this folder's src/. The lazy
-# "your_package.factory:BailingMoeV2ForCausalLM" string works the same way.
-from your_package.factory import BailingMoeV2ForCausalLM
-
-ModelRegistry.register_model("BailingMoeV2ForCausalLM", BailingMoeV2ForCausalLM)
+from vllm import LLM, SamplingParams
 
 llm = LLM(
     model="inclusionAI/Ling-mini-2.0",
@@ -47,7 +69,9 @@ llm = LLM(
     block_size=32,
     max_model_len=2048,
     max_num_seqs=4,
+    max_num_batched_tokens=1024,
     enable_prefix_caching=False,
+    async_scheduling=False,
     additional_config={"neuron_config": {"quantization": "bf16"}},
 )
 
@@ -56,81 +80,20 @@ for output in llm.generate(["The color of the sky is"], sampling_params):
     print(output.outputs[0].text)
 ```
 
-This registration reaches the processes that actually build the model by
-`fork` inheritance, and by nothing else. `LLM(...)` runs the engine core in a
-child process and the 8 workers in children of that one, because the plugin
-pins `distributed_executor_backend="mp"`
-(`vllm_neuron/vllm/platform.py`). Those children come from
-`VLLM_WORKER_MULTIPROC_METHOD`, whose default is `fork`, and a forked child
-inherits the registry of this process, so the architecture is already there
-when the worker adds the plugin's own models and when the runner calls
-`ModelRegistry.resolve_model_cls`. Leave that variable at its default for
-this path.
-
-What goes wrong without that inheritance is worth knowing, because
-`BailingMoeV2ForCausalLM` is also a built-in architecture of upstream vLLM: its
-registry maps the same string to vLLM's own `bailing_moe` implementation. Your
-registration replaces that entry in your process, and the forked children
-inherit the replacement. A process that never ran your registration still
-holds vLLM's entry, so it does not report an unknown architecture — it resolves
-vLLM's implementation and then fails when the Neuron runner calls
-`from_configs` on a class that does not define it. The Exceptions section
-records all of this as read from the code, not from a run.
-
-### Serve with the OpenAI-compatible server
-
-`vllm serve` starts the engine itself, so there is no script of yours in which
-to call `register_model` at all. That alone rules out option 1 for serving,
-whatever the process start method is. (The plugin's own comments in
-`vllm_neuron/vllm/platform.py` and `vllm_neuron/vllm/model_runner_v2_policy.py`
-say the CLI starts its engine core with `spawn`, which would also defeat a
-registration made in another process. We did not read that from vLLM's CLI
-code.) Serving therefore needs option 2 of contrib/README.md (move `src/` into `vllm_neuron/model/` and add
-the architecture to `_MODELS` in `vllm_neuron/model/registry.py`), or the same
-registration from a vLLM plugin of your own. This PR does not make that edit:
-it changes plugin core code, which the guide keeps outside a contrib
-contribution. Once the architecture is registered that way, serve it with the
-flags of the port's own two-node serving test, with the node-0 half shown:
-
-```bash
-vllm serve inclusionAI/Ling-mini-2.0 \
-    --tensor-parallel-size 8 --enable-expert-parallel \
-    --nnodes 2 --node-rank 0 --master-addr $NODE0_IP --master-port 29550 \
-    --max-model-len 2048 --max-num-seqs 4 --max-num-batched-tokens 1024 \
-    --block-size 32 \
-    --trust-remote-code --no-enable-prefix-caching --no-async-scheduling \
-    --additional-config '{"neuron_config": {"quantization": "bf16"}}' \
-    --port 8000
-```
-
-Node 1 runs the same command with `--node-rank 1 --headless` and no `--port`.
-Then send a request:
-
-```bash
-curl http://localhost:8000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{
-        "model": "inclusionAI/Ling-mini-2.0",
-        "prompt": "The color of the sky is",
-        "max_tokens": 32
-    }'
-```
-
 To iterate without Neuron hardware, run in CPU mode by setting
 `VLLM_NEURON_CPU_MODE=1` in the environment. See the top-level `README.md` and
 `AGENTS.md` for the full list of `VLLM_NEURON_*` environment variables.
 
 ## Compatibility Matrix
 
-The verified evidence for this model records the plugin and vLLM versions and
-the container images, not a Neuron SDK release number, so the matrix is keyed
-by plugin version. Everything outside the one tested cell is untested, not
-known-broken.
+| Instance / SDK version | 2.33 (vLLM Neuron 0.29.0.1.2.0) | 2.32 and earlier |
+| ---------------------- | ------------------------------- | ---------------- |
+| Trn3                   | Not tested                      | Not tested       |
+| Trn2                   | Working (TP 8)                  | Not tested       |
 
-| Instance / plugin version | 0.31.0.1.2.0 (vLLM 0.31.0) | Other |
-| ------------------------- | -------------------------- | ----- |
-| Trn2                      | Working at TP 8 / EP 8     | Not tested |
-| Trn3                      | Not tested                 | Not tested |
+Before the 0.29 changes listed in the validation report, the port's component
+tests also passed on plugin 0.31.0.1.2.0 (see "Earlier runs"). The code in this
+folder has run on 0.29.0.1.2.0 only.
 
 ## Example Checkpoints
 
@@ -156,8 +119,11 @@ default `prepend` import mode keys a test module on its basename, so a single
 invocation that collects two contrib folders errors on the duplicate names.
 Collect one model per invocation, or pass `--import-mode=importlib`.
 
-`test/integration/test_model.py` serves the model through vLLM and validates
-its logits. It needs 8 Neuron cores reachable from the test process:
+`test/integration/test_model.py` builds a vLLM engine with `LLM(...)` at TP 8 /
+EP 8 and validates its logits. It needs 8 Neuron cores reachable from the test
+process, which one `trn2.48xlarge` provides. The test registers the
+architecture in its own process and fails early unless
+`VLLM_WORKER_MULTIPROC_METHOD` is unset or `fork`:
 
 ```bash
 pytest contrib/models/bailing_moe/test/integration/test_model.py \
@@ -166,8 +132,8 @@ pytest contrib/models/bailing_moe/test/integration/test_model.py \
 
 `test/integration/test_full_model_prefill.py` is the other full-model test: it
 runs a real 20-layer prefill of both logit prompts on 8 ranks and asserts that
-every stage is finite. It drives the model directly, not through vLLM, so it
-runs through the launcher like the module tests below.
+every stage is finite. It drives the model directly, not through vLLM, so on a
+device it runs across 2 nodes like the module tests below.
 
 ### Unit tests (CPU mode)
 
@@ -201,44 +167,65 @@ VLLM_NEURON_CPU_MODE=1 VLLM_NEURON_BACKEND=neuron_native \
     pytest contrib/models/bailing_moe/test/module/test_components.py -v
 ```
 
-On a device the 8 ranks span 2 `trn2.48xlarge` nodes with 4 ranks on each node.
-Start them on each node through the repository's inter-node launcher, which
-sets `NODE_RANK`, `MASTER_ADDR` and `NEURON_RT_ROOT_COMM_ID`:
-
-```bash
-python3 test/vllm_neuron/functional/collectives/launch_inter_node_a2av.py \
-    -m pytest -v contrib/models/bailing_moe/test/module/ \
-    contrib/models/bailing_moe/test/integration/test_full_model_prefill.py
-```
+On a device, the module tests and `test_full_model_prefill.py` place the 8
+ranks on 2 `trn2.48xlarge` nodes with 4 ranks on each node
+(`DEVICE_NNODES = 2` in `test/module/utils.py`). Each node needs its node rank,
+the rendezvous address and the Neuron runtime communication id in the
+environment; the module docstring of `test/module/utils.py` names the
+variables. The recorded runs set them with an inter-node launcher that the tests
+name (`test/vllm_neuron/functional/collectives/launch_inter_node_a2av.py`) and
+that is not part of this repository, so you need your own way to start one
+pytest process per node with those variables.
 
 See the [module test guidelines](../../../docs/design/accuracy/module_test_guidelines.md)
 for the three-way accuracy pattern these tests follow.
 
 ## Validation report
 
-### Source and environment
+### vLLM Neuron 0.29.0.1.2.0 (2026-11-18)
 
-Both passing tests ran at one plugin commit, `ecb3dfc394f00def7c090a825ba6bffbda322f2b`,
-so a single commit covers the whole table below. The runs used plugin version
-`0.31.0.1.2.0` with vLLM `0.31.0` and the `neuron_native` runtime backend. The
-base image was the `vllm-neuron` dependencies image for that plugin version.
-The instance type was `trn2.48xlarge` throughout: one node for the CPU test and
-two nodes for the device test.
+#### Environment
 
-The checkpoint is `inclusionAI/Ling-mini-2.0`. The revision
-`a810f6416bc4e1e29c9d7f271dd2fa7e56e71eab` comes from the tests themselves
-(`test/module/utils.py`), which resolve that snapshot. The evidence we hold
-records the test ids, verdicts, case counts, node counts, instance type and
-images. It does not name the checkpoint revision separately.
+| Image | Instance | TP | vLLM | vllm-neuron | torch | transformers | neuronx-cc |
+|---|---|---|---|---|---|---|---|
+| `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04` | 1 × `trn2.48xlarge`, LNC 2 | 8 (EP 8) | 0.29.0 | 0.29.0.1.2.0 | 2.13.0 | 5.17.0 | 2.28.7631.0+8f7b0cf5 |
 
-The code in `src/` is the implementation from the snapshot where those tests
-passed, with two changes. Neither change alters its behaviour. The in-tree
-relative import `from ..kv_cache import ...` is now the absolute
-`from vllm_neuron.model.kv_cache import ...`, because the contrib folder is not
-inside `vllm_neuron/model/`. Also, `ruff format` rewrapped six expressions in
-three places in `src/model.py`. This lets the folder pass the repository's own
-`ruff format --check` hook. The test code has more changes. The Exceptions
-section lists every change.
+#### Results
+
+| Test | Configuration | Result |
+|---|---|---|
+| CPU unit tests, `test/unit/` | `VLLM_NEURON_CPU_MODE=1`, `neuron_native`, 8 ranks on the host | 7 passed, 0 failed |
+| `test_model_accuracy[1-256]` | TP 8 / EP 8, `neuron_native`, BF16, batch 1, 256-token context, 2 prompts × 16 greedy tokens, on-device greedy sampling | PASSED on aggregate σ-ratio 0.8723 ≤ 1.0; per-prompt 0/2 within bounds (below) |
+| `vllm serve` smoke | The Usage command, installed with `pip install -e contrib/models/bailing_moe` | Passed: 3/3 prompts, 32 completion tokens each; a batched request of all 3 at `max_tokens` 16 returned a prefix of each |
+
+Not run on 0.29: `test/module/` and `test/integration/test_full_model_prefill.py`, CPU or device (not in the one-node 0.29 run; on a device they need 2 nodes).
+
+#### Logit validation
+
+| Prompt | Overall Status | Max K5 (0.011) | Max K50 (0.02) | Max K1000 (0.03) | Max All (0.05) | Argmax divergence (1 ULP) |
+|---|---|---|---|---|---|---|
+| 1 of 2 | FAILED | 0.0697 (> 0.011) at token 0 | 0.0811 (> 0.02) at token 0 | 0.0896 (> 0.03) at token 0 | 0.1102 (> 0.05) at token 0 | 0.2500 (> 1 ULP) at token 13 |
+| 2 of 2 | FAILED | 0.0187 (> 0.011) at token 4 | 0.0580 (> 0.02) at token 4 | 0.0580 (> 0.03) at token 4 | 0.0580 (> 0.05) at token 4 | 0.0000 |
+
+Neuron vs CPU BF16 reference; token = generated token. Prompt 1 over K5, K50, K1000 and All at generated token 0, argmax divergence at generated token 13; prompt 2 over K5, K50, K1000 and All at generated token 4.
+Test passed on aggregate σ-ratio 0.8723 ≤ 1.0 (`multi_prompt_logit_validation`); `pp_max_linf_1.5x` and `pp_max_l2_1.5x` 2/2; `agg_bc` FAIL.
+
+#### Serve smoke
+
+`/v1/completions`, `temperature` 0, `max_tokens` 32; first 60 characters of each output as a Python string literal.
+
+| Prompt | Output |
+|---|---|
+| `The capital of France is` | `' _.\nA.Paris\nB.London\nC.Berlin\nD.Madrid\nA\nThe problem is a si'` |
+| `1, 2, 3, 4, 5,` | `' 6, 7, 8, 9, 10, 11, 12, 13, 14,'` (the whole output) |
+| `def fibonacci(n):` | `'\n    """\n    Calculate the nth Fibonacci number using dynami'` |
+
+#### Changes for 0.29
+
+- `src/compat.py` (new): vendors `hoist_rope_parameters`, `build_per_head_block_table` and `scatter_new_kv`, absent from 0.29.0.1.2.0, unchanged from a later plugin release; `src/config.py` and `src/model.py` import them from it.
+- `src/factory.py`: vLLM model interface for the front end (keyword-only `vllm_config` and `prefix`, `forward` with explicit `input_ids` and `positions`, `embed_input_ids` and `compute_logits` stubs that raise `NotImplementedError`, not called on the tested paths).
+- `pyproject.toml`, `src/plugin.py` (new): install `src/` as the `bailing_moe_neuron` package with a `vllm.general_plugins` entry point that registers `BailingMoeV2ForCausalLM`.
+- `test/conftest.py`: session-scoped autouse fixture that shuts down the plugin's `MPExecutor` worker pool (`vllm_neuron.utils.executor._worker_pool`) at session end, so pytest exits after its summary.
 
 ### Model configuration
 
@@ -246,18 +233,29 @@ section lists every change.
 |---|---|
 | Architecture class | `BailingMoeV2ForCausalLM` (the `architectures` field of the checkpoint) |
 | Implementation | BF16; the factory rejects any other dtype and any `quantization_config` |
-| Parallelism | TP 8 with EP 8, named by both passing test ids, as 4 ranks on each of 2 nodes for the device run |
+| Parallelism | TP 8 with EP 8: on one `trn2.48xlarge` on 0.29.0.1.2.0, and as 4 ranks on each of 2 nodes for the 0.31.0.1.2.0 device run |
 | KV block size | 32 (`--block-size 32`); the component tests allocate 64 blocks, so 2048 tokens of KV |
-| Context length | The test constants state a 256-token context for the full-model prefill and logit geometry, and a 2048-token context with a 1024-token prefill bucket for the serving geometry |
-| Registration | Not in `vllm_neuron/model/registry.py`. Register `BailingMoeV2ForCausalLM` with vLLM yourself (see Usage) |
+| Context length | 256 tokens for the integration test and the full-model prefill; `--max-model-len 2048` with `--max-num-batched-tokens 1024` for `vllm serve` |
+| Registration | `pip install -e contrib/models/bailing_moe` (a `vllm.general_plugins` entry point); not in `vllm_neuron/model/registry.py` |
 | Model-specific serving args | `--enable-expert-parallel`, `--block-size 32`, `--trust-remote-code`, `--no-enable-prefix-caching`, `--no-async-scheduling`, and `neuron_config.quantization = "bf16"` |
 
-### Component validation
+### Earlier runs: plugin 0.31.0.1.2.0 (vLLM 0.31.0)
 
-| Test id | Verdict | Cases | Nodes | Plugin commit |
-|---|---|---|---|---|
-| `[vLLM Neuron Model] BailingMoeV2 Ling-mini-2.0 BF16 CPU Loading and Components TP8 EP8` | PASS | 17 / 17 | 1 | `ecb3dfc` |
-| `[vLLM Neuron Model] BailingMoeV2 Ling-mini-2.0 BF16 Device Functional TP8 EP8 2-Node TRN2` | PASS | 32 / 32 | 2 | `ecb3dfc` |
+These runs tested the port before the 0.29 changes above, with the
+`neuron_native` route on `trn2.48xlarge`: one node for the CPU run and two
+nodes for the device run. Apart from those changes, this folder's `src/`
+differs from the code that ran in two ways that do not alter its behaviour: the
+in-tree relative import `from ..kv_cache import ...` became
+`from vllm_neuron.model.kv_cache import ...`, and `ruff format` rewrapped six
+expressions in three places in `src/model.py`. The test changes are listed
+under Exceptions. The tests pin the checkpoint revision
+(`test/module/utils.py`); the evidence of these runs does not name it
+separately.
+
+| Test id | Verdict | Cases | Nodes |
+|---|---|---|---|
+| `[vLLM Neuron Model] BailingMoeV2 Ling-mini-2.0 BF16 CPU Loading and Components TP8 EP8` | PASS | 17 / 17 | 1 |
+| `[vLLM Neuron Model] BailingMoeV2 Ling-mini-2.0 BF16 Device Functional TP8 EP8 2-Node TRN2` | PASS | 32 / 32 | 2 |
 
 The first id is the CPU-mode run of the port's loading and component tests,
 which ship here as `test/unit/test_cpu_loading.py` and
@@ -281,29 +279,10 @@ reference, Neuron) against the independent torch transcription in
 `test/module/reference_model.py`. On a device, they also assert that the
 compiled prefill and decode graphs of every rank call the required NKI kernels.
 Thus a torch fallback of a required operation fails the test. We did not read
-error magnitudes out of the measurement artifacts.
-
-### Numerical correctness
-
-No recorded test id for this model names logit validation. The evidence
-records the device run as "Device Functional". It holds no accuracy numbers of
-any kind, only the verdicts and case counts above.
-
-The shipped `test/integration/test_model.py` does perform logit validation
-against the independent torch reference. It uses 2 prompts, 16 greedy tokens
-and a 256-token context at TP 8 / EP 8. It asserts
-`TOL_MAP = {"5": (1e-5, 0.011), "50": (1e-5, 0.02), "1000": (1e-5, 0.03), "all": (1e-5, 0.05)}`.
-That is the `DEFAULT_TOLERANCE_MAP` of `vllm_neuron.accuracy`. The port's own
-logit test selected this map by passing `tol_map=None`. The argmax bound stays
-at the strict `1e-5` of the template. These are the bounds that the shipped
-test asserts, not a measured result. No verdict for this test exists in our
-evidence. Nobody ran it in the offline single-process shape that it ships in.
-
-The passing runs give two checks, but neither is logit validation. The first is
-the three-way component comparison above. The second is the full-model prefill
-probe. It asserts that every stage of a real 20-layer prefill is finite on
-every rank. The prefill covers both logit prompts, each pad-position mode of
-the runner, and the server forward with the on-device sampler.
+error magnitudes out of the measurement artifacts. The full-model prefill probe
+asserts that every stage of a real 20-layer prefill is finite on every rank. The
+prefill covers both logit prompts, each pad-position mode of the runner, and
+the server forward with the on-device sampler.
 
 ### Serving validation
 
@@ -315,10 +294,12 @@ online. We have no evidence for any cell:
 | 1,024 in / 512 out | No evidence | No evidence |
 | 8,192 in / 1,024 out | No evidence | No evidence |
 
-The port does ship a serving test for the first row: 4 concurrent requests of
-1,024 input and 512 output tokens, online, over 2 nodes. But no passing test id
-names serving for this model. That test is also not in this folder (see
-Exceptions). The 8,192 / 1,024 row never ran for this model at all.
+The 0.29.0.1.2.0 `vllm serve` smoke above is a functional check with prompts
+of 5 to 14 tokens and 32 output tokens, not a cell of this grid. The port
+ships a serving test for the first row (4 concurrent requests of 1,024 input
+and 512 output tokens, online, over 2 nodes), but no recorded run names serving
+for this model, and that test is not in this folder (see Exceptions). The
+8,192 / 1,024 row never ran for this model at all.
 
 ### Exceptions
 
@@ -337,59 +318,20 @@ Dropped tests:
 
 Untested configurations and missing coverage:
 
-- No logit validation and no dataset accuracy run (no GSM8K or similar) appears
-  in the evidence for this model.
+- No dataset accuracy run (no GSM8K or similar) appears in the evidence for
+  this model.
 - Neither serving row of the required grid has evidence, offline or online.
-- The shipped integration test has never been run as shipped. It also differs
-  in geometry from the recorded runs: it builds one offline engine in one
-  process, while the recorded device run drove TP 8 / EP 8 as 4 ranks on each of
-  2 nodes.
-- Only TP 8 with EP 8 was run. Other TP degrees, the TP (non-EP) path for the
-  routed experts, and single-node 8-rank topologies are untested.
-- No evidence for Trn3, for any plugin or vLLM version other than
-  `0.31.0.1.2.0` / `0.31.0`, or for any Neuron SDK release: the evidence does
-  not record an SDK version.
-- No recorded test id covers quantization, the FP8 KV-cache path that exists in
-  the code, on-device sampling, prefix caching, chunked prefill, LoRA or
-  speculative decoding.
-- Case counts are complete for what ran (17 / 17 and 32 / 32, zero failures),
-  so there is no case-count shortfall to report.
-
-Registration, read from the code and not from a run. No test id in our
-evidence exercises any registration path for this model, so every statement
-here is a reading of `vllm_neuron/vllm/platform.py`,
-`vllm_neuron/vllm/worker/neuron_worker.py`, the two
-`ModelRegistry.resolve_model_cls` call sites in the runners, and a copy of the
-vLLM 0.31.0 sources. The plugin now pins `vllm==0.32.0`
-(`requirements/core.txt`), which we did not read:
-
-- `ModelRegistry.register_model(...)` in a user script reaches the engine core
-  and the workers only because they are forked from it, as the Usage section
-  describes. The guide's option 1 never says so. The `fork` default is
-  vLLM's own (`VLLM_WORKER_MULTIPROC_METHOD` in its `envs.py`), and the only
-  place the plugin sets that variable forces `spawn` for Qwen3-ASR alone.
-- `vllm serve` cannot use option 1, first because the CLI gives the user no
-  script in which to register anything. The plugin's comments also say the CLI
-  starts its engine core with `spawn`, which would defeat a registration made
-  elsewhere; that part is their claim, not something we read from vLLM's CLI.
-  Either way serving needs option 2, which this PR does not perform.
-- Upstream vLLM ships `BailingMoeV2ForCausalLM` as a built-in architecture
-  (its registry maps the string to vLLM's own `bailing_moe` module), so a
-  process without the user's registration resolves that class instead of
-  reporting an unknown architecture. It then fails on `from_configs`, which
-  the Neuron runners call and vLLM's class does not define. So the exposure is
-  a confusing failure rather than wrong numbers — but only because the Neuron
-  runner happens to require `from_configs`.
-- The only `spawn`-safe form of registration is the lazy `"module:Class"`
-  string, which vLLM resolves by importing that name in a fresh interpreter
-  (`_LazyRegisteredModel.inspect_model_cls` runs `_run_in_subprocess`). The
-  local-src loader deliberately gives this folder's code a module name
-  (`contrib_bailing_moe_src.*`) that exists only in the process that loaded it,
-  so the string form is unusable here and the tests register the class object,
-  which `_RegisteredModel.from_model_cls` inspects in-process. The two
-  requirements are in genuine tension: a copy of `src/` installed as a real
-  package in the user's own application satisfies both, which is what the Usage
-  section tells the user to do.
+- The offline `LLM(...)` example in Usage was not run as written. The
+  integration test builds its engine the same way at TP 8 / EP 8, with a
+  256-token context and its own registration.
+- Only TP 8 with EP 8 was run: on one node on 0.29.0.1.2.0, on 2 nodes on
+  0.31.0.1.2.0. Other TP degrees and the TP (non-EP) path for the routed
+  experts are untested.
+- No evidence for Trn3, or for this folder's code on any version other than
+  vLLM Neuron 0.29.0.1.2.0.
+- Nothing recorded covers quantization, the FP8 KV-cache path that exists in
+  the code, non-greedy on-device sampling, prefix caching, chunked prefill,
+  LoRA or speculative decoding.
 
 Changes to the port's tests, beyond moving them into this folder:
 
@@ -413,16 +355,16 @@ Changes to the port's tests, beyond moving them into this folder:
   `test/vllm_neuron/conftest.py`) into the new `test/conftest.py`. The last one
   is also a fix: that conftest applies only under `test/vllm_neuron/`, so every
   test here that asks for `dist_cleanup` by name would have errored with
-  "fixture not found". The recorded runs used the fixture from its original
+  "fixture not found". The 0.31.0.1.2.0 runs used the fixture from its original
   location, where the tests then lived.
 - `test_cpu_loading.py` asserted that `vllm_neuron.model.registry.get_models()`
   maps the architecture to the factory. A contrib model is not in that
   registry, so the test now registers the architecture with vLLM's
-  `ModelRegistry` and asserts that vLLM holds it. The recorded 17-case run
-  asserted the in-tree registry, so this one assertion differs from what ran.
+  `ModelRegistry` and asserts that vLLM holds it. The 0.31.0.1.2.0 run asserted
+  the in-tree registry; the 0.29.0.1.2.0 run asserted the new form.
 - `test/integration/test_model.py` registered the factory as the string
   `"contrib.models.bailing_moe.src.factory:BailingMoeV2ForCausalLM"` and put
   the repository root on `PYTHONPATH` for the engine's children. It now
   registers the class object that the loader returns, and fails early with an
-  explanation if `VLLM_WORKER_MULTIPROC_METHOD` is not `fork`. This test has
-  never been run in either shape.
+  explanation if `VLLM_WORKER_MULTIPROC_METHOD` is not `fork`. The 0.29.0.1.2.0
+  run ran it in this form.

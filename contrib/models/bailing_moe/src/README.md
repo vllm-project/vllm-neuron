@@ -42,8 +42,8 @@ covers the BF16 checkpoint.
 | Tensor parallelism | TP 8 is the degree that the recorded tests ran. The code shards attention heads, the dense MLP and the shared expert over the TP group; other degrees are untested. |
 | Expert parallelism | EP 8 is the degree that the recorded tests ran (32 experts on each rank, full intermediate size, so the prefill MoE kernel applies). The code also has a TP path for the routed experts, which is untested. |
 | Sequence parallelism (prefill) | Supported by the code (the attention and MLP blocks exchange SP shards). Exercised by the component and full-model prefill tests. |
-| Multi-node TP | TP 8 / EP 8 as 4 ranks on each of 2 nodes is the topology the recorded tests ran. |
-| On-device sampling | Supported by the code: with an `on_device_sampling_config` the model runs `vllm_neuron.nn.sampler.Sampler` and skips the logit all-gather. Not covered by a recorded test id. |
+| Multi-node TP | TP 8 / EP 8 ran as 4 ranks on each of 2 nodes on plugin 0.31.0.1.2.0 (component and full-model prefill tests). On vLLM Neuron 0.29.0.1.2.0 it ran on one `trn2.48xlarge` (integration test and `vllm serve`). |
+| On-device sampling | Supported by the code: with an `on_device_sampling_config` the model runs `vllm_neuron.nn.sampler.Sampler` and skips the logit all-gather. The 0.29.0.1.2.0 integration test runs with greedy on-device sampling (`all_greedy`); other sampling settings are untested. |
 | Quantization | Not supported. The factory accepts `None` or `"bf16"` and rejects a checkpoint with a `quantization_config`. |
 | FP8 KV cache | Present in the code (quantize-on-write under `kv_cache_dtype=fp8`), untested. No recorded test id names an FP8 KV cache run. |
 | Tied embeddings | Not supported. The factory requires a separate `lm_head.weight`. |

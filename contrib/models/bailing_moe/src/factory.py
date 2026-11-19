@@ -23,14 +23,31 @@ class BailingMoeV2ForCausalLM(nn.Module):
     """
 
     def __init__(
-        self, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None
+        self,
+        hf_config: PretrainedConfig,
+        neuron_config: NeuronConfig | None,
+        *,
+        vllm_config=None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self._model = self._select_implementation(hf_config, neuron_config)
 
-    def forward(self, *args, **kwargs):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        *args,
+        **kwargs,
+    ):
         """Delegate forward pass to the selected implementation."""
-        return self._model(*args, **kwargs)
+        return self._model(*args, input_ids=input_ids, positions=positions, **kwargs)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
 
     @classmethod
     def from_configs(

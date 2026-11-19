@@ -11,6 +11,8 @@ Several of the plugin's own model tests define the same fixture locally, for
 example ``test/vllm_neuron/model/qwen3_embedding/modules/test_attention.py``.
 """
 
+import os
+
 import pytest
 import torch
 
@@ -26,3 +28,20 @@ def dist_cleanup():
         except Exception as e:
             print(f"Warning: Runtime close failed: {e}")
     yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _worker_pool_cleanup():
+    """Shut down the plugin's ``MPExecutor`` worker pool when the session ends.
+
+    ``MPExecutor`` keeps its worker processes in a module-level pool so later
+    tests can reuse them. Those workers outlive the last test, so without this
+    shutdown pytest prints its summary and then never exits. The plugin's own
+    test suite shuts the pool down the same way.
+    """
+    pid = os.getpid()
+    yield
+    if os.getpid() == pid:
+        from vllm_neuron.utils.executor import _worker_pool
+
+        _worker_pool.shutdown_all()
