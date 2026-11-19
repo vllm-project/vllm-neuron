@@ -6,8 +6,8 @@ and `src/README.md` describes the architecture and the per-feature status.
 
 > **Note:** Contrib models are community contributions and may have limited
 > testing or performance optimization compared to the officially-supported
-> models under `vllm_neuron/model/`. The compatibility matrix and the
-> validation report below record exactly what was tested.
+> models under `vllm_neuron/model/`. The compatibility matrix below records
+> exactly what was tested.
 
 ## Usage
 
@@ -91,10 +91,10 @@ full list of `VLLM_NEURON_*` environment variables.
 
 ## Compatibility Matrix
 
-| Instance / version   | vLLM Neuron 0.29.0.1.2.0 (Neuron SDK 2.33) | Other versions |
-| -------------------- | ------------------------------------------ | -------------- |
-| Trn2 (trn2.48xlarge) | Working, TP 8                              | Not tested     |
-| Trn3                 | Not tested                                 | Not tested     |
+| Instance / SDK version | 2.33 (vLLM Neuron 0.29.0.1.2.0) | 2.32 and earlier |
+| ---------------------- | ------------------------------- | ---------------- |
+| Trn3 | Not tested | Not tested |
+| Trn2 | Working (TP 8) | Not tested |
 
 The earlier runs on `vllm-neuron` 0.31.0.1.2.0 in the validation report used
 the port before the 0.29 changes, so that version is not listed as tested for
@@ -127,7 +127,7 @@ itself, from the test process, before it builds the engine. vLLM's engine-core
 and worker processes inherit that registration through the default `fork`
 start method, so do not set `VLLM_WORKER_MULTIPROC_METHOD=spawn` for this test.
 
-### Unit tests
+### Optional: unit tests
 
 `test/unit/test_loading.py` runs the registration contract, the config parse,
 the checkpoint mapping coverage, the weight-loader transforms and a full
@@ -138,7 +138,7 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/olmo2/test/unit/ \
     -v -s --timeout=3600
 ```
 
-### Module tests
+### Optional: module tests
 
 `test/module/test_components.py` compares layer-0 attention and MLP with a
 HuggingFace reference (the three-way pattern in the
@@ -171,27 +171,9 @@ pytest prints its summary and then does not exit.
 
 #### Environment
 
-One `trn2.48xlarge` (logical NeuronCore config 2), in the Neuron Deep Learning
-Container
-`public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04`
-(Neuron SDK 2.33, Python 3.14.6), with the code in this folder at TP 8 on one
-node:
-
-| Package | Version |
-|---|---|
-| vLLM | 0.29.0 |
-| `vllm-neuron` | 0.29.0.1.2.0 |
-| torch | 2.13.0 |
-| transformers | 5.17.0 |
-| neuronx-cc | 2.28.7631.0+8f7b0cf5 |
-| nki | 0.7.0+37713544100.gfede04bb |
-| libtorch-neuronx-lite | 2.13.0.1.0.3112+653bc48f |
-
-The run downloaded `allenai/OLMo-2-0425-1B` at the pinned revision
-`a1847dff35000b4271fa70afc5db10fd29fedbdf` before the tests; the integration
-test and the serve smoke test load the model by its hub name. The unit and
-integration tests ran first, and the folder was then installed with
-`pip install -e` for the serve smoke test.
+| Image | Instance | TP | vLLM | vllm-neuron | torch | transformers | neuronx-cc |
+|---|---|---|---|---|---|---|---|
+| `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04` | `trn2.48xlarge` (LNC 2), 1 node | 8 | 0.29.0 | 0.29.0.1.2.0 | 2.13.0 | 5.17.0 | 2.28.7631.0+8f7b0cf5 |
 
 #### Results
 
@@ -202,36 +184,23 @@ integration tests ran first, and the folder was then installed with
 | Integration logit test, `test_model_accuracy[4-2048]` | batch 4, max model length 2,048, TP 8 | PASSED |
 | `vllm serve` smoke | the serve command under Usage | Passed, 3 of 3 prompts |
 
-The four unit tests are `test_registry_and_config`,
-`test_checkpoint_mapping_coverage`, `test_weight_loader_transforms` and
-`test_full_model_tp8_load[8]`. The module tests (`test/module/`) were not run
-on this version.
+Not run on 0.29: module tests (`test/module/`), not part of the 0.29 run; last passed on 0.31.0.1.2.0 (see Earlier runs).
 
-The integration test validates 16 generated tokens for each of its two prompts
-against the HuggingFace BF16 reference, with the FP32 reference as the
-baseline. The logged thresholds are a divergence bound of 1 ULP (dynamic, 7
-mantissa bits) and top-K tolerances (rtol) of 0.03 (K5), 0.05 (K50), 0.08
-(K1000) and 0.09 (All). Per prompt, as logged:
+#### Logit validation
 
 | Case | Prompt | Overall Status | Max divergence (1 ULP) | Max K5 (0.03) | Max K50 (0.05) | Max K1000 (0.08) | Max All (0.09) |
 |---|---|---|---|---|---|---|---|
-| `[1-2048]` | 1/2, `The color of the sky is` | FAILED | 0.0000 | 0.0318 (over) | 0.0263 | 0.0198 | 0.0127 |
+| `[1-2048]` | 1/2, `The color of the sky is` | FAILED | 0.0000 | 0.0318 (> 0.03) | 0.0263 | 0.0198 | 0.0127 |
 | `[1-2048]` | 2/2, `A short summary of the history of the printing press:` | PASSED | 0.0000 | 0.0253 | 0.0190 | 0.0187 | 0.0177 |
-| `[4-2048]` | 1/2, `The color of the sky is` | FAILED | 0.0000 | 0.0318 (over) | 0.0263 | 0.0198 | 0.0126 |
+| `[4-2048]` | 1/2, `The color of the sky is` | FAILED | 0.0000 | 0.0318 (> 0.03) | 0.0263 | 0.0198 | 0.0126 |
 | `[4-2048]` | 2/2, `A short summary of the history of the printing press:` | PASSED | 0.0000 | 0.0253 | 0.0190 | 0.0187 | 0.0177 |
 
-Prompt 1 exceeds the K5 tolerance at one generated token (token 10, K5 0.0318
-against 0.03; at batch 4 the same value on all four rows), with no argmax
-divergence, so both cases log `Two-way validation: 1/2 prompts passed`. The
-test asserts `result.passed` from `multi_prompt_logit_validation`. With an
-FP32 baseline (three-way mode), that result also passes when the cross-prompt
-σ-ratio is at most 1.0. The log reports `agg_sigma_ratio: 0.9808 (≤1.0 =
-pass)` at batch 1 and `agg_sigma_ratio: 0.9744 (≤1.0 = pass)` at batch 4, and
-pytest reports `2 passed`.
+Prompt 1: K5 0.0318 > 0.03 at generated token 10 (batch 4: all four rows); test passed on aggregate σ-ratio 0.9808 (`[1-2048]`) and 0.9744 (`[4-2048]`) ≤ 1.0 (`multi_prompt_logit_validation`).
+16 generated tokens per prompt vs the HF BF16 reference (FP32 baseline); no argmax divergence.
 
-The serve smoke test started `vllm serve` with the command under Usage and
-sent each prompt to `/v1/completions` with `max_tokens` 32 and `temperature`
-0. The check is that every completion is non-empty. Each returned 32 tokens:
+#### Serve smoke
+
+`/v1/completions`, max_tokens 32, temperature 0; 32 tokens returned per prompt. Batched request (all three, max_tokens 16): a prefix of the same text.
 
 | Prompt | Start of the completion (first 60 characters) |
 |---|---|
@@ -239,29 +208,13 @@ sent each prompt to `/v1/completions` with `max_tokens` 32 and `temperature`
 | `1, 2, 3, 4, 5,` | ` 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16` |
 | `def fibonacci(n):` | ` \n    if n < 0: \n        return 0 \n    elif n == 0: \n       ` |
 
-(`\n` is a newline.) One batched request with all three prompts and
-`max_tokens` 16 returned a prefix of the same text for each prompt.
+#### Changes for 0.29
 
-#### Changes for vLLM Neuron 0.29
-
-From the earlier port of this folder, which was written against a later
-plugin release:
-
-- `src/compat.py` (new) vendors three plugin helpers that 0.29.0.1.2.0 does
-  not ship: `hoist_rope_parameters` (0.29 has no
-  `vllm_neuron.model.config_utils`) and `build_per_head_block_table` and
-  `scatter_new_kv` (not in 0.29's `vllm_neuron.model.kv_cache`).
-  `src/config.py` and `src/model.py` import them from `.compat` instead of
-  from the plugin.
-- `pyproject.toml` and `src/plugin.py` (new) install `src/` as the
-  `olmo2_neuron` package with a `vllm.general_plugins` entry point that
-  registers `Olmo2ForCausalLM`.
-- `test/conftest.py` adds a session fixture that shuts down the plugin's
-  `MPExecutor` worker pool (`vllm_neuron.utils.executor._worker_pool`) at the
-  end of the session, so pytest exits after its summary.
-
-The model code, the weight loaders and the test assertions are otherwise
-unchanged.
+- `src/compat.py` (new): vendors `hoist_rope_parameters` (0.29 has no `vllm_neuron.model.config_utils`), `build_per_head_block_table` and `scatter_new_kv` (not in 0.29's `vllm_neuron.model.kv_cache`).
+- `src/config.py`, `src/model.py`: import those helpers from `.compat` instead of from the plugin.
+- `pyproject.toml`, `src/plugin.py` (new): install `src/` as the `olmo2_neuron` package with a `vllm.general_plugins` entry point that registers `Olmo2ForCausalLM`.
+- `test/conftest.py`: session fixture that shuts down the plugin's `MPExecutor` worker pool (`vllm_neuron.utils.executor._worker_pool`) at session end.
+- Model code, weight loaders and test assertions: otherwise unchanged.
 
 ### Model configuration
 
@@ -296,9 +249,7 @@ a per-case record.
 
 ### Exceptions
 
-- **Prompt 1 is over the two-way K5 tolerance.** On 0.29 its max K5 error is
-  0.0318 against 0.03 at one token, at batch 1 and batch 4. The integration
-  test passes on the three-way σ-ratio, as described above.
+- **Prompt 1 is over the two-way K5 tolerance.**
 - **Module tests not run on 0.29.** `test/module/test_components.py` last
   passed in the 0.31.0.1.2.0 device run above.
 - **No accuracy-benchmark score and no performance figures.** The serve smoke
