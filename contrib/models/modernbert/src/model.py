@@ -41,7 +41,6 @@ from transformers import PretrainedConfig
 from vllm.distributed.parallel_state import get_tp_group
 
 import vllm_neuron.functional as NF
-from nkilib.core.utils.common_types import ActFnType, NormType
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
@@ -411,15 +410,13 @@ class ModernBertMLP(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # <-- MODEL-SPECIFIC: exact (erf) GELU gated MLP, no bias
-        output = NF.mlp(
-            hidden_states,
-            self.gate_proj_weight,
-            self.up_proj_weight,
-            self.down_proj_weight,
-            act_fn=ActFnType.GELU,
-            norm_type=NormType.NO_NORM,
-        )
+        # <-- MODEL-SPECIFIC: exact (erf) GELU gated MLP, no bias.
+        # vLLM Neuron 0.29's torch path for NF.mlp applies torch.nn.functional.gelu,
+        # a C builtin its graph tracer refuses ("function marked as skipped"), so
+        # the GeGLU runs here with the ATen GELU op instead.
+        gate = hidden_states @ self.gate_proj_weight
+        up = hidden_states @ self.up_proj_weight
+        output = (torch.ops.aten.gelu.default(gate) * up) @ self.down_proj_weight
         if self.world_size > 1:
             output = self.tp_group.all_reduce(output)
         return output

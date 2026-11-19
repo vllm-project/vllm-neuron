@@ -42,7 +42,7 @@ returns CLS-pooled embeddings through vLLM's pooling runner.
 | Feature | Status |
 |---|---|
 | Tensor parallelism | TP 2 is the degree that the recorded tests ran (6 heads and 768 MLP channels per rank). The code shards attention heads and MLP channels and all-reduces after `o_proj` and the MLP; it rejects a TP degree that does not divide the head count. Other degrees are untested. |
-| Multi-node TP | TP 2 as one rank on each of 2 nodes is the topology the recorded tests ran. |
+| Multi-node TP | The vLLM Neuron 0.31.0.1.2.0 device tests ran TP 2 as one rank on each of 2 nodes. The vLLM Neuron 0.29.0.1.2.0 run used TP 2 on one node. |
 | Sequence packing | Supported. More than one sequence in one flat batch, with a padding tail, is covered by the CPU and device tests. |
 | Pooling tasks | Embedding only. `default_seq_pooling_type` is CLS. The plugin's classify assertion is not implemented, and this checkpoint has no classifier head. |
 | Runner | Pooling only. The model raises if `runner_type` is not `pooling`. |
@@ -57,10 +57,10 @@ returns CLS-pooled embeddings through vLLM's pooling runner.
 
 ## Kernel Paths
 
-Each main path goes through an `NF` API, which uses its NKI kernel when its
-eligibility check passes and its torch fallback otherwise. In CPU mode
-(`VLLM_NEURON_CPU_MODE=1`) `can_run_kernel` is false, so every API takes the
-torch fallback.
+Each main path except the MLP goes through an `NF` API, which uses its NKI
+kernel when its eligibility check passes and its torch fallback otherwise. In
+CPU mode (`VLLM_NEURON_CPU_MODE=1`) `can_run_kernel` is false, so every API
+takes the torch fallback.
 
 | Operation | NF API |
 |---|---|
@@ -68,7 +68,10 @@ torch fallback.
 | QKV projection with RoPE | `NF.qkv_proj` |
 | Bidirectional attention with per-row KV bounds | `NF.flash_attention` |
 | Output projection | `NF.o_proj` |
-| GeGLU MLP | `NF.mlp` |
 
 These parts stay in torch: the LayerNorm, the residual adds, the row-tile
-padding and the per-row attention bounds.
+padding, the per-row attention bounds and the GeGLU MLP. The MLP runs its
+projections as torch matmuls and applies the ATen GELU op
+(`torch.ops.aten.gelu.default`), because the torch path of `NF.mlp` in vLLM
+Neuron 0.29 calls `torch.nn.functional.gelu`, which the 0.29 graph tracer
+refuses.
