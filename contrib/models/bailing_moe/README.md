@@ -220,7 +220,7 @@ Test passed on aggregate σ-ratio 0.8723 ≤ 1.0 (`multi_prompt_logit_validation
 
 #### Changes for 0.29
 
-- `src/compat.py` (new): vendors `hoist_rope_parameters`, `build_per_head_block_table` and `scatter_new_kv`, absent from 0.29.0.1.2.0, unchanged from a later plugin release; `src/config.py` and `src/model.py` import them from it.
+- `src/compat.py` (new): vendors `hoist_rope_parameters`, `build_per_head_block_table` and `scatter_new_kv`, absent from 0.29.0.1.2.0; `src/config.py` and `src/model.py` import them from it.
 - `src/factory.py`: vLLM model interface for the front end (keyword-only `vllm_config` and `prefix`, `forward` with explicit `input_ids` and `positions`, `embed_input_ids` and `compute_logits` stubs that raise `NotImplementedError`, not called on the tested paths).
 - `pyproject.toml`, `src/plugin.py` (new): install `src/` as the `bailing_moe_neuron` package with a `vllm.general_plugins` entry point that registers `BailingMoeV2ForCausalLM`.
 - `test/conftest.py`: session-scoped autouse fixture that shuts down the plugin's `MPExecutor` worker pool (`vllm_neuron.utils.executor._worker_pool`) at session end, so pytest exits after its summary.
