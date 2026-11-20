@@ -103,9 +103,6 @@ Everything outside the tested cell is untested, not known-broken.
 | Trn3 | Not tested | Not tested |
 | Trn2 | Working (TP 2) | Not tested |
 
-The earlier 0.31.0.1.2.0 runs in the validation report tested the port while it
-lived in the plugin tree, not this folder, so the matrix does not count them.
-
 ## Example Checkpoints
 
 - <https://huggingface.co/sapientinc/HRM-Text-1B> — the only checkpoint tested,
@@ -215,56 +212,13 @@ No argmax divergence. Test passed on aggregate σ-ratio 0.7432 ≤ 1.0 (`multi_p
 - `pyproject.toml`, `src/plugin.py` (new): `vllm.general_plugins` entry point `hrm_text_neuron.plugin:register`.
 - `test/conftest.py` (new): session fixture that shuts down the `MPExecutor` worker pool; no test logic changed.
 
-### vLLM Neuron 0.31.0.1.2.0 (earlier runs)
-
-These runs used plugin version `0.31.0.1.2.0` with vLLM `0.31.0` and the
-`neuron_native` runtime backend, on `trn2.48xlarge`: one node for the CPU run
-and two nodes for the device run. The port then lived in the plugin tree, was
-registered through the plugin's own model registry, and imported the three
-helpers that `src/compat.py` now carries.
-
-| Run | Verdict | Cases | Nodes |
-|---|---|---|---|
-| CPU-mode loading and components | PASS | 3 / 3 | 1 |
-| Device components, logits and serving, TP 2 with one rank on each node | PASS | 14 / 14 | 2 |
-
-The CPU run is the file that ships here as `test/unit/test_hrm_text_cpu.py`.
-The device run covered the components in
-`test/module/test_hrm_text_modules_multinode.py` (gated attention prefill,
-attention decode on a paged cache, attention decode with the runner's partial
-block table, and the SwiGLU MLP in prefill and decode), plus a logit case and a
-serving case. Only the aggregate verdict and case count of each run were kept,
-not a per-case breakdown or error values.
-
-- Components: each component is compared three-way (FP32 reference, BF16
-  reference, Neuron) against reference math written from the raw checkpoint
-  tensors, and each compiled graph must call the expected NKI kernels, so a
-  torch fallback of a required operation fails the test.
-- Logits: 16 greedy tokens for the same 2 prompts in a 256-token context,
-  through an online `vllm serve` pair across the 2 nodes, against the same
-  tolerance map as `test/integration/test_model.py`.
-- Serving: one request of exactly 1,024 prompt tokens and 512 output tokens
-  through the production sampling path (no `all_greedy`), asserting the token
-  counts, the `length` finish reason and a non-empty completion. It is one
-  request at concurrency 1, not a throughput or latency measurement.
-
-The logit and serving cases came from an end-to-end test file that depends on
-the plugin's shared online-serving test harness, which is not part of this
-folder, so that file is not shipped. `test/integration/test_model.py`
-re-expresses its logit case with one offline engine. The tests here also differ
-from what ran in three ways: they load `src/` by file location instead of
-importing the in-tree package, they download the pinned checkpoint revision
-with `huggingface_hub.snapshot_download` instead of through the plugin's shared
-checkpoint resolver, and `test_registry_and_config` asserts vLLM's
-`ModelRegistry` instead of the plugin's `get_models()`.
-
 ### Model configuration
 
 | Item | Value |
 |---|---|
 | Architecture class | `HrmTextForCausalLM` (the `architectures` field of the checkpoint) |
 | Implementation | BF16; the factory accepts bfloat16 only |
-| Parallelism | TP 2: on one node for the 0.29.0.1.2.0 run, one rank on each of 2 nodes for the 0.31.0.1.2.0 device run. The port supports TP 1 and TP 2 only (12 heads; the decode kernel needs an even head count per rank) |
+| Parallelism | TP 2 on one node for the 0.29.0.1.2.0 run. The port supports TP 1 and TP 2 only (12 heads; the decode kernel needs an even head count per rank) |
 | KV cache | 128 slots (`16 x H_cycles x (L_cycles + 1)`), because each pass of a layer writes its own slot. The component tests use a block size of 32 |
 | Context length | 256 tokens for the logit tests; 2,048 with a 1,024-token prefill bucket for serving |
 | Registration | `pip install -e contrib/models/hrm_text` (entry point `hrm_text_neuron.plugin:register`). Not in `vllm_neuron/model/registry.py` |
