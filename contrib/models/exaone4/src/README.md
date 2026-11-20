@@ -37,9 +37,7 @@ MLP), with four EXAONE-specific differences:
 
 Each layer writes one `[exaone4_dispatch]` log line per main component at
 trace time, carrying the result of the same eligibility predicate the
-`vllm_neuron.functional` wrappers use. The port's device test reads those
-lines from each server log to prove that the NKI kernel path ran on every rank
-and layer.
+`vllm_neuron.functional` wrappers use.
 
 ## Parallelism
 
@@ -50,11 +48,10 @@ and layer.
   count per rank.
 - The embedding and the LM head are sharded on the vocabulary dimension.
 
-TP8 is the only degree with recorded results: one TP8 engine per node in the
-two-node disaggregated run, TP8 single-node in the performance and GSM8K
-runs, and TP8 single-node in the vLLM Neuron 0.29.0.1.2.0 logit test and
-`vllm serve` run. The unit tests check the loader transforms at TP8 (ranks 0,
-3 and 7) and run the tiny end-to-end cases at TP1 and TP2.
+TP8 is the only degree with recorded results: TP8 single-node in the vLLM
+Neuron 0.29.0.1.2.0 logit test and `vllm serve` run. The unit tests check the
+loader transforms at TP8 (ranks 0, 3 and 7) and run the tiny end-to-end cases
+at TP1 and TP2.
 
 ## Dependencies
 
@@ -117,9 +114,7 @@ Other limits:
 | Padded per-rank MLP | Supported; checked against the unpadded checkpoint MLP in FP32 |
 | Llama3-scaled RoPE | Supported; checked against the HF `Exaone4RotaryEmbedding` |
 | TP with prefill sequence parallelism | Supported at TP8 (recorded); TP1 and TP2 in the tiny CPU cases |
-| NKI kernel dispatch on the main path | Supported; asserted per rank and layer by the port's device test |
 | On-device greedy sampling | Supported; used by the recorded logit run |
-| Disaggregated serving (1P1D, NIXL KV transfer) | Supported; the vllm-neuron 0.31.0.1.2.0 logit and serving run was a two-node 1P1D deployment |
 | Weight quantization (FP8, MXFP4, ...) | Not supported (no quantized weight path) |
 | FP8 KV cache | Unknown (code path present, no evidence) |
 | Speculative decoding | Unknown (code path present, no evidence) |

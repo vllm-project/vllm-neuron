@@ -95,9 +95,7 @@ list of `VLLM_NEURON_*` environment variables.
 
 Tested in the Neuron Deep Learning Container
 `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04`;
-the validation report lists the versions. It also records earlier runs of the
-port on `vllm-neuron` 0.31.0.1.2.0, with test suites this folder does not
-ship; the folder as shipped has not been run on that version.
+the validation report lists the versions.
 
 ## Example Checkpoints
 
@@ -204,116 +202,6 @@ Test passed on 2/2 prompts (`multi_prompt_logit_validation`); the aggregate bloc
 - `pyproject.toml`, `src/plugin.py` (new): install the `exaone4_neuron` package and register `exaone4_neuron.factory:Exaone4ForCausalLM` via a `vllm.general_plugins` entry point.
 - Nothing else in `src/` or `test/` changed.
 
-### vllm-neuron 0.31.0.1.2.0 (earlier recorded runs)
-
-These runs used the port before the 0.29 changes above, with test suites that
-are not shipped here (see Exceptions).
-
-#### Source and environment
-
-Four tests passed for this model, across two plugin commits, so no single
-commit covers the whole table:
-
-| Test | Verdict | Cases | Nodes | Plugin commit |
-| --- | --- | --- | --- | --- |
-| `[vLLM Neuron Functional] EXAONE 4.0 32B BF16 Loading CPU` | PASS | 10 / 10 | 1 | `9bac9de66e9326a800658d109997ba89c697b748` |
-| `[vLLM Neuron E2E] EXAONE 4.0 32B BF16 DI 1P1D Logits Serving TRN2` | PASS | 2 / 2 | 2 | `9bac9de66e9326a800658d109997ba89c697b748` |
-| `[Performance] EXAONE-4.0-32B TP8 Native comparison b1/b4` | PASS | 2 / 2 | 1 | `f11b15f210826655986794298e77f8730c1f342b` |
-| `[Accuracy] LGAI-EXAONE/EXAONE-4.0-32B Native GSM8K b1/b4` | PASS | 2 / 2 | 1 | `f11b15f210826655986794298e77f8730c1f342b` |
-
-Every run used `vllm-neuron` 0.31.0.1.2.0 with vLLM 0.31.0 on the native
-runtime backend (`neuron_native`), on `trn2.48xlarge`. The runs used more than
-one container image. Our evidence does not record which test used which image.
-
-The checkpoint is `LGAI-EXAONE/EXAONE-4.0-32B`. None of the tests pins a
-revision: they resolve the checkpoint by path or Hub id, so the revision the
-runs used is not part of our evidence.
-
-#### Model configuration
-
-The architecture class is `Exaone4ForCausalLM` (factory in `src/factory.py`,
-implementation in `src/model.py`), BF16 weights, no quantization. The model is
-dense, so no run names an expert-parallel degree. TP8 is the only degree with
-results: one TP8 engine on each node of the two-node disaggregated run (5 Q
-heads and 1 KV head per rank), and TP8 single-node for the performance and
-GSM8K runs. The disaggregated test constants set `--max-model-len 2048` with
-`--max-num-batched-tokens 2048 --max-num-seqs 4`, which keeps the whole
-context below the 4,096-token sliding window, so the runner never trims the
-sliding-window block table. The performance run used `--max-model-len 4096`
-with token buckets up to 4096 and sequence buckets `[1]` or `[1, 4]`.
-Model-specific serving arguments are limited to `--dtype bfloat16` and
-disabled prefix caching; the logit run also enables on-device greedy sampling
-and raw-logit logprobs.
-
-#### Component validation
-
-The CPU loading test passed with 10 of 10 cases (commit `9bac9de6`). Eight of
-those cases are the loading suite: registration and resolution, the config
-mapping against the HF config (hybrid layer types, the NoPE full layers,
-Llama3 RoPE scaling, the untied head), weight-mapping coverage of all 707
-checkpoint tensors with shape and dtype checks, the TP8 fused-QKV and o_proj
-loader transforms for ranks 0, 3 and 7 on a sliding and a full layer, the
-padded-MLP shards (3424 values padded to 3456) checked both element-wise and
-numerically against the unpadded checkpoint MLP, and RoPE against the HF
-implementation. The remaining two cases are the tiny end-to-end suite: a TP2
-run whose logits are compared three-way against an HF reference built from the
-same random weights, and a TP1 run that asserts an `[exaone4_dispatch]` line
-for every component of every layer in both phases. (That 8 + 2 split is
-inferred from the case count and the two test files; our evidence records the
-suite verdict and counts, not per-case identities.)
-
-All ten cases ship here, now split across two folders: the RoPE case moved to
-`test/module/test_exaone4_rope.py`, and the other seven loading cases plus the
-two tiny end-to-end cases stay in `test/unit/`. The split changes where the
-cases live, not what they assert.
-
-The two-node run also asserted kernel dispatch: the prefill node must show
-prefill lines and the decode node decode lines, for all 8 ranks and all 64
-layers, with `kernel=True`. It passed as part of that suite's 2 of 2 cases.
-
-#### Numerical correctness
-
-The disaggregated run is the logit evidence for this version: a 1P1D
-deployment on two `trn2.48xlarge` nodes, one TP8 engine per node with NIXL
-moving the KV cache from prefill to decode, which compares the served logits
-of 16 generated tokens per prompt against a HuggingFace reference (FP32
-baseline plus a same-dtype teacher-forced pass) with
-`multi_prompt_logit_validation`, replicated to the 4-sequence batch. It
-reports the aggregate and the stricter per-prompt result separately and
-asserts both. The observed verdict is PASS, 2 of 2 cases (one per node), at
-commit `9bac9de6`. We hold that verdict and those counts only — no logit
-metric was read out.
-
-The shipped `test/integration/test_model.py` uses the same tolerance map as
-that run — `(1e-5, 0.025)` at top-5, `(1e-5, 0.04)` at top-50, `(1e-5, 0.06)`
-at top-1000 and `(1e-5, 0.065)` over the full vocabulary — and keeps the
-strict `1e-5` argmax bound. Its vLLM Neuron 0.29.0.1.2.0 result is reported
-above; it runs single-node and offline, whereas this run was a two-node
-disaggregated server.
-
-A GSM8K run also passed (2 of 2 cases, b1 and b4, 100 documents at
-`max_tokens=1024`, commit `f11b15f2`), which means dataset-level accuracy was
-exercised end to end. Read that verdict narrowly: the test's only score gate
-is a 0.0 threshold on the flexible-extract exact match, so a PASS says the run
-completed and produced a score, not that the score reached any particular
-level. We never read the score itself, so this README states none.
-
-#### Serving validation
-
-| Workload | Offline | Online |
-| --- | --- | --- |
-| 1,024 in / 512 out | No evidence | Evidence: 4 concurrent requests, asserted at 1,024 prompt and 512 completion tokens each, inside the disaggregated run (2/2 PASS, commit `9bac9de6`) |
-| 8,192 in / 1,024 out | No evidence | No evidence |
-
-The online 1,024 / 512 row is the required grid's first row. We have no
-offline (`LLM.generate`) measurement at that shape, and no run at
-8,192 / 1,024 in either mode — the latter would also exceed the context that
-any recorded run configured. The performance test is a separate, narrower
-workload: `vllm bench serve` with random data at 1,024 input and 100 output
-tokens, 20 measured requests after 5 warmups, at TP8 and concurrency 1 and 4.
-It passed (2 of 2 cases, commit `f11b15f2`); we hold no latency or throughput
-figure from it, so none is stated here.
-
 ### Exceptions
 
 - **Three of the port's test files are dropped.** The disaggregated
@@ -329,21 +217,15 @@ figure from it, so none is stated here.
   `WORKLOAD_OUTPUT_RW` result-publishing contract. Vendoring that
   infrastructure would have meant copying a server launcher, a proxy, an MPI
   harness and a metric-publishing layer into the model folder, so the suites
-  were dropped. Their results are still the evidence cited above, but a user
-  cannot re-run them from this folder.
-- **No test in this folder reproduces the two-node deployment.** The
-  0.31.0.1.2.0 logit and serving evidence is 1P1D across two nodes. The
-  shipped integration test, run on 0.29.0.1.2.0, is single-node and offline.
-- **The GSM8K gate is 0.0.** As described under Numerical correctness, the
-  accuracy PASS is not a quality bar. No GSM8K score appears in this README,
-  for this reason and because we never read one.
+  were dropped.
+- **No test in this folder reproduces the two-node deployment.** The shipped
+  integration test, run on 0.29.0.1.2.0, is single-node and offline.
 - **The checkpoint resolver changed.** The port's loading test resolved the
   checkpoint through a shared test helper
   (`test/vllm_neuron/utils/logit_test_utils.get_model_checkpoint`) that does
   not ship here. The test now reads `EXAONE4_CHECKPOINT_PATH` and skips when
   it is unset or does not hold a checkpoint. The case count is unchanged, but
-  the suite can now skip instead of running, which the 0.31.0.1.2.0 run did
-  not do.
+  the suite can now skip instead of running.
 - **`PROMPTS_2` is vendored.** The two validation prompts came from
   `test/vllm_neuron/utils/test_prompts.py` and are copied verbatim into the
   integration test, as contrib/README.md sanctions.
@@ -377,7 +259,7 @@ figure from it, so none is stated here.
   component against a reference implementation. There is no module test that
   runs attention or the MLP forward pass against a HuggingFace module in the
   sense of `docs/design/accuracy/module_test_guidelines.md`; the full-model
-  evidence (the tiny end-to-end suite and the recorded logit runs) is what
+  evidence (the tiny end-to-end suite and the recorded logit run) is what
   covers those components here.
 - **Registration must replace vLLM's own class.** vLLM ships an
   `Exaone4ForCausalLM`, so a process in which this folder's registration has
@@ -402,6 +284,3 @@ figure from it, so none is stated here.
   evidence), no speculative decoding (likewise), no prefix caching (every run
   disabled it), and no context at or beyond the 4,096-token sliding window, so
   the window boundary and the block-table trimming above it are unexercised.
-- **No performance figures.** A performance test passed, but we hold only its
-  verdict and case counts, so this README states no throughput, latency or
-  time-to-first-token number.
