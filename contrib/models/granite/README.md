@@ -104,9 +104,7 @@ To iterate without Neuron hardware, run in CPU mode by setting
 ## Compatibility Matrix
 
 The matrix is keyed on the Neuron SDK of the container and the vLLM Neuron
-plugin version it ran. Trn2 was tested on `trn2.48xlarge` at TP 4. The
-earlier 0.31.0.1.2.0 runs in the validation report used the implementation
-in-tree, not this folder, so they do not count here.
+plugin version it ran. Trn2 was tested on `trn2.48xlarge` at TP 4.
 
 | Instance / SDK version | 2.33 (vLLM Neuron 0.29.0.1.2.0) | 2.32 and earlier |
 | ---------------------- | ------------------------------- | ---------------- |
@@ -190,8 +188,7 @@ with the first folder's.
 
 This section records what was validated for this contribution, and on which
 configuration. The 0.29.0.1.2.0 run below quotes the logit errors from its test
-log. The earlier runs record test verdicts and case counts only. No GSM8K
-score, latency or throughput figure appears in this README.
+log. No GSM8K score, latency or throughput figure appears in this README.
 
 ### vLLM Neuron 0.29.0.1.2.0 (2026-11-18)
 
@@ -238,107 +235,8 @@ No argmax divergence. Test passed on aggregate σ-ratio 0.9358 ≤ 1.0 (`multi_p
 - `pyproject.toml`, `src/plugin.py` (new): `vllm.general_plugins` entry point (see "Usage").
 - `test/conftest.py` (new): session fixture that shuts down the plugin's `MPExecutor` worker pool; no test changed.
 
-### Earlier runs: vLLM Neuron 0.31.0.1.2.0 (in-tree)
+### Exceptions
 
-These runs used this implementation in-tree, at `vllm_neuron/model/granite/`,
-registered through `get_models()`, not the contrib layout of this folder.
-
-| Validation | Cases | Nodes |
-| --- | --- | --- |
-| CPU loading and CPU decoder-layer tests (`test/unit/`) | 5/5 passed, 0 failed | 1 |
-| Device functional test, TP 4 across two nodes | 12/18 passed, 0 failed | 2 |
-| Online serving performance, TP 4, batch 1 and batch 4 | 2/2 passed, 0 failed | 1 |
-| GSM8K accuracy, batch 1 and batch 4 | 2/2 passed, 0 failed | 1 |
-
-Every run used `trn2.48xlarge`, plugin version `0.31.0.1.2.0` with vLLM
-`0.31.0`, and the `neuron_native` runtime backend. The runs did not all use
-the same plugin source commit. The checkpoint is `ibm/PowerLM-3b` at revision
-`38a624db4c8c9dd15d8bfb51845b7b177348e104`. The tests fingerprint its
-`config.json` and safetensors index by SHA-256.
-
-#### Model configuration
-
-The architecture class is `GraniteForCausalLM`, served in bfloat16; the
-FP32 checkpoint is cast at load time. Every passing device and performance run
-names TP 4. No expert parallelism applies: this is a dense model. The
-multi-node full-model server specifications set `max_model_len` 2,048 with
-`max_num_seqs` 4, while the native-comparison constants (the performance and
-GSM8K runs) set `max_model_len` and `max_num_batched_tokens` to 4,096 with
-token buckets up to 4,096. The CPU loading test loads the checkpoint on 4
-ranks; the CPU decoder-layer test runs at TP 2.
-
-#### Component validation
-
-The CPU run passed all 5 of its cases with no failures. Those cases are the
-tests that this folder ships in two files:
-
-- `test/unit/test_loading.py`:
-  - the architecture string and the factory's config rejection
-  - the four Granite scalars and the geometry of the real config
-  - the pinned revision and the 642-tensor index
-  - a full-checkpoint load on 4 CPU ranks. It checks mapping coverage against
-    every checkpoint tensor. It also compares the shards of two layers with
-    the raw tensors.
-- `test/unit/test_cpu_decoder_layer.py`: a decoder layer at TP 2 on CPU,
-  prefill and one decode step, against FP32 and BF16 HuggingFace references.
-
-The two-node device functional run at TP 4 reported 12 of 18 cases passed and
-0 failed. So 6 cases neither passed nor failed. The port's multi-node launcher
-runs two stages per node, so that run spans both device files:
-
-- `test/module/test_device_modules.py`, which this folder ships. It holds
-  three component cases: attention, MLP and a full decoder layer at TP 4
-  across two nodes.
-- The online full-model test, which this folder drops. It holds the
-  reference-logit, prefix-reuse and 1,024/512 serving cases.
-
-We never opened the per-case list. So we cannot say which cases those 6 were,
-or which file each of the 12 passing cases came from. See Exceptions.
-
-#### Numerical correctness
-
-A logit-validation case ran in that two-node run: the port's
-`test_device_full_model.py` teacher-forced two prompts for 16 tokens at batch
-4 against FP32 and BF16 HuggingFace references, through a served endpoint with
-full-vocabulary raw logits and greedy on-device sampling. The run as a whole
-passed with no failures, but because 6 of its 18 cases neither passed nor
-failed and we never read the per-case list, we cannot confirm that the logit
-case was among the 12 that passed.
-
-That test passed no tolerance map, so it used the plugin default, and the
-shipped `test/integration/test_model.py` uses the same values — `(1e-5, 0.011)`
-at top-5, `(1e-5, 0.02)` at top-50, `(1e-5, 0.03)` at top-1000 and
-`(1e-5, 0.05)` over the full vocabulary — keeping the strict `1e-5`
-argmax-divergence bound. The shipped test is an offline, single-node
-adaptation of that case (same prompts, output length, batch, TP and
-tolerances), not a rerun of it. It ran on 0.29.0.1.2.0, above.
-
-The GSM8K accuracy run passed both its cases, at batch 1 and batch 4. We hold
-its verdict only. We did not read its GSM8K score.
-
-#### Serving validation
-
-The serving grid covers 1,024 input / 512 output tokens and 8,192 input /
-1,024 output tokens, offline and online:
-
-| Workload | Offline | Online |
-| --- | --- | --- |
-| 1,024 in / 512 out | No evidence | Partial: a 4-concurrent-request case with exact prompt and completion token counts asserted ran inside the two-node device functional run, whose 12-of-18 case count leaves the per-case outcome unconfirmed. |
-| 8,192 in / 1,024 out | No evidence | No evidence |
-
-A separate online `vllm bench serve` performance run at TP 4 passed both of
-its cases. It requested 1,024 input and 100 output tokens, with 20 measured
-requests at batch 1 and batch 4. This README states the verdict only. It
-quotes no latency or throughput figure.
-
-#### Exceptions
-
-- The multi-node device functional run reported 12 of 18 cases passed with 0
-  failed, which leaves 6 cases that neither passed nor failed. We never opened
-  the per-case list, so the cause of that gap is unknown and this contribution
-  does not claim 18 of 18. Everything the run covers — the device component
-  cases, the online logit case, prefix reuse and the 1,024/512 serving case —
-  inherits that uncertainty.
 - Dropped: `test_device_full_model.py`, which held the online reference-logit,
   prefix-reuse and 1,024/512 serving cases and their node-1 follower
   counterparts. It needs shared harness modules outside the model folder
@@ -346,8 +244,7 @@ quotes no latency or throughput figure.
   `…server_utils`, `…test_prompts`), which would mean vendoring a two-node
   serving harness into the folder. The integration test replaces its logit
   half in offline form. Its prefix-reuse and serving halves have no
-  replacement here. So you cannot reproduce those parts of the 12-of-18 run
-  from this folder.
+  replacement here.
 - Dropped: `test_native_comparison_accuracy.py` (GSM8K), the
   `test_native_comparison_benchmark.py` performance gate, and their shared
   `native_comparison_support.py`. They need `test.utils.simple_server`,
@@ -381,14 +278,13 @@ quotes no latency or throughput figure.
 - This folder on any plugin version other than 0.29.0.1.2.0.
 - Any tensor-parallel degree other than 4 on device.
 - The module tests (`test/module/`) on 0.29.0.1.2.0.
-- Prefix caching and chunked prefill, beyond the unconfirmed 0.31.0.1.2.0 case
-  above. Every 0.29.0.1.2.0 configuration disables prefix caching and sets
-  `max_num_batched_tokens` equal to `max_model_len`. The segmented-attention
-  path exists in `src/model.py`.
+- Prefix caching and chunked prefill. Every 0.29.0.1.2.0 configuration
+  disables prefix caching and sets `max_num_batched_tokens` equal to
+  `max_model_len`. The segmented-attention path exists in `src/model.py`.
 - Speculative decoding (the forward pass has a rejection-sampler branch,
   never exercised).
 - Any quantized or FP8-KV configuration (none is implemented).
 - LoRA and multimodal input (neither is implemented; `inputs_embeds` is
   rejected).
 - Data parallelism (the decode path pins `attention_dp=1`).
-- The 8,192/1,024 serving row and the offline 1,024/512 serving row.
+- The 1,024/512 and 8,192/1,024 serving workloads.

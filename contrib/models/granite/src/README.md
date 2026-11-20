@@ -51,22 +51,20 @@ change there can change this model's decode path.
 ## Feature status
 
 "Verified" means the model folder's `README.md` cites test evidence for it.
-"Unconfirmed" means a case for it ran inside the two-node device run whose
-12-of-18 case count leaves per-case outcomes unknown. "Implemented,
-unverified" means the code path exists in this folder but no evidence covers
-it. "Not implemented" means the code has no such path.
+"Implemented, unverified" means the code path exists in this folder but no
+evidence covers it. "Not implemented" means the code has no such path.
 
 | Feature | Status |
 | --- | --- |
 | bfloat16 execution of an FP32 checkpoint | Verified by the CPU loading run, which checks that every checkpoint tensor has a mapping and compares selected shards of two layers, the embedding, the tied head and the final norm against the raw FP32 tensors. |
 | Projection biases, including the divided row-parallel biases | Verified by the same shard comparison. |
 | The four Granite scalars | Verified against the real config by the CPU loading run, and exercised by every component and end-to-end run. |
-| Tensor parallelism | Verified at TP 4 on device (2 nodes) and on 4 CPU ranks; TP 2 on CPU for the decoder-layer test. No other degree was tested. |
+| Tensor parallelism | Verified at TP 4 on device and on 4 CPU ranks; TP 2 on CPU for the decoder-layer test. No other degree was tested. |
 | Sequence-parallel prefill | Verified (the component runs slice the prompt per rank). |
 | Paged KV cache, BF16 | Verified. |
 | Multi-head attention (36 KV heads) with the per-head block table on decode | Verified at TP 4, where each rank holds 9 key/value heads. |
 | Full-vocabulary logprobs (`max_logprobs=-1`, `raw_logits`) and on-device greedy sampling | Verified by the integration test on vLLM Neuron 0.29.0.1.2.0 (TP 4, batch 4), which uses both. |
-| Prefix caching (`NF.segmented_attention` path) | Unconfirmed — a prefix-reuse case ran inside the 12-of-18 run. |
+| Prefix caching (`NF.segmented_attention` path) | Implemented, unverified. |
 | Chunked prefill | Implemented, unverified. It shares the segmented-attention path with prefix caching; no case names it. |
 | Speculative decoding | Implemented, unverified. `forward` returns `rejection_sampler(...)` when it gets `spec_decode_metadata`; no evidence exercises it. |
 | Data parallelism | Not implemented. The decode path pins `attention_dp=1` with no DP group. |
