@@ -291,7 +291,7 @@ phase, so output-token workloads do not apply to this model.
 
 Dropped tests:
 
-- `test_serving.py` of the earlier port (online `/v1/embeddings`, 4 inputs of
+- `test_serving.py` of the port (online `/v1/embeddings`, 4 inputs of
   1,024 tokens, TP 2 over 2 nodes). It imports a 767-line shared server
   harness outside this folder, and the contrib layout has no slot for a
   serving test. No recorded run covered it, so dropping it loses no evidence.
@@ -316,7 +316,7 @@ Untested configurations and missing coverage:
   FP8 KV cache, prefix caching or chunked prefill. The last four are rejected
   by the code rather than untested.
 
-Changes to the earlier port's tests, beyond moving them into this folder:
+Changes to the port's tests, beyond moving them into this folder:
 
 - Intra-model imports became file-location loads of this folder:
   `test/_local_src.py` loads `test/module/common.py` and `src/{config,model}.py`
