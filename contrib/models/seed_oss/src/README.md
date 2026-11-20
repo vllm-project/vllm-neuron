@@ -45,10 +45,8 @@ wrappers use, so a test can assert that the kernel path was taken.
 
 TP8 and TP16 both have recorded results on `trn2.48xlarge`. With vLLM Neuron
 0.29.0.1.2.0, the single-node integration logit test ran at TP8 and the
-`vllm serve` smoke at TP16. With 0.31.0.1.2.0, TP8 was the degree of each
-engine of the two-node disaggregated logit and serving run, and TP16 that of
-the single-node performance comparison. The CPU tests construct the model at
-TP8 on the meta device and run the numerics at TP1.
+`vllm serve` smoke at TP16. The CPU tests construct the model at TP8 on the
+meta device and run the numerics at TP1.
 
 ## Limits
 
@@ -74,9 +72,7 @@ Other limits:
 | BF16 dense inference, text only | Supported; validated (see the folder README's validation report) |
 | Fused QKV with bias | Supported; the loader layout is checked against the fused weight loader for every TP8 rank |
 | TP with prefill sequence parallelism | Supported; TP8 and TP16 have recorded runs |
-| NKI kernel dispatch on the main path | Supported; asserted per rank and layer by the port's device test |
 | On-device greedy sampling | Supported; used by the recorded logit run |
-| Disaggregated serving (1P1D, NIXL KV transfer) | Supported; the recorded logit and serving run was a two-node 1P1D deployment |
 | Quantization (FP8, MXFP4, ...) | Not supported (no quantized path in the code) |
 | Sliding-window / chunked attention | Not applicable |
 | Multimodal input | Not applicable (text-only checkpoint) |

@@ -95,10 +95,6 @@ To iterate without Neuron hardware, run in CPU mode by setting
 | Trn3 | Not tested | Not tested |
 | Trn2 | Working (TP 8 and TP 16) | Not tested |
 
-The earlier runs in the validation report used `vllm-neuron` 0.31.0.1.2.0
-with the code as first ported, before the 0.29 changes listed there, so the
-matrix does not count them.
-
 ## Example Checkpoints
 
 - <https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct> at revision
@@ -198,100 +194,6 @@ Informational aggregates in the log: `agg_l2_1.5x` PASS; `agg_bc`, `agg_l2_1.2x`
 - `pyproject.toml`, `src/plugin.py` (new): install `src/` as package `seed_oss_neuron`; register `SeedOssForCausalLM` via `vllm.general_plugins` entry point `seed_oss_neuron`.
 - `src/model.py`, `src/factory.py`, `src/__init__.py`, `test/`: unchanged.
 
-### Earlier recorded runs (vLLM Neuron 0.31.0.1.2.0)
-
-#### Source and environment
-
-These runs used the code as first ported, before the changes above. Four
-tests passed, at two plugin commits of that version:
-
-| Test | Verdict | Cases | Nodes |
-| --- | --- | --- | --- |
-| CPU loading and component tests | PASS | 19 / 19 | 1 |
-| Two-node 1P1D disaggregated TP8 logits, serving and kernel dispatch | PASS | 2 / 2 | 2 |
-| TP16 performance comparison, b1 and b4 | PASS | 2 / 2 | 1 |
-| GSM8K accuracy, b1 and b4 | PASS | 2 / 2 | 1 |
-
-Every run used `vllm-neuron` 0.31.0.1.2.0 with vLLM 0.31.0 on the native
-runtime backend (`neuron_native`), on `trn2.48xlarge`.
-
-The checkpoint is `ByteDance-Seed/Seed-OSS-36B-Instruct`. The loading test
-pins its published `config.json` at revision
-`497f1dca95ebdec98e41d517b9f060ee753c902f`; the device tests resolve the
-checkpoint by path or Hub id and do not pin a revision.
-
-#### Model configuration
-
-The architecture class is `SeedOssForCausalLM` (factory in `src/factory.py`,
-implementation in `src/model.py`), BF16 weights, no quantization. The model is
-dense, so no run names an expert-parallel degree. Two tensor-parallel degrees
-have results: TP8 for each of the two engines in the disaggregated run (10 Q
-heads and 1 KV head per rank), and TP16 for the single-node performance and
-GSM8K runs. The test constants set `--max-model-len 2048` everywhere: the
-disaggregated run adds `--max-num-batched-tokens 1024 --max-num-seqs 1`, and
-the TP16 runs add `--max-num-batched-tokens 2048` with sequence buckets `[1]`
-or `[1, 4]`. Model-specific serving arguments are limited to `--dtype
-bfloat16` and disabled prefix caching; the logit run also enables on-device
-greedy sampling and raw-logit logprobs.
-
-#### Component validation
-
-The CPU loading-and-component test passed with 19 of 19 cases. It covers
-factory resolution and config mapping from the published `config.json`,
-construction of all 64 layers on the meta device at TP8 for the first and last
-rank with parameter-shape checks and full coverage of the 771 published
-checkpoint keys, the fused QKV bias loader against the fused QKV weight loader
-for every TP8 rank, and five numerics cases on a tiny random Seed-OSS
-checkpoint (prefill attention, decode attention, MLP in both phases, and
-full-model prefill logits) against an independent HuggingFace reference, plus
-the kernel-dispatch log lines. That suite ships here split by shape: the 14
-registration, config, construction and loader cases in
-`test/unit/test_seed_oss_loading.py`, and the 5 component and full-model
-numerics cases in `test/module/test_seed_oss_components.py` — 19 in total, the
-same cases the recorded run ran.
-
-The two-node run also asserted kernel dispatch: each of the 8 ranks on the
-prefill node and each of the 8 ranks on the decode node must have selected the
-NKI kernel for every main-path operation. It passed as part of that suite's 2
-of 2 cases.
-
-#### Numerical correctness
-
-The disaggregated run is the logit evidence for this version: a 1P1D
-deployment on two `trn2.48xlarge` nodes, one TP8 engine per node, which
-compares the served logits of 16 generated tokens per prompt against a
-HuggingFace reference (FP32 baseline plus a same-dtype teacher-forced pass)
-with `multi_prompt_logit_validation` at a single sequence (`max_num_seqs` is 1
-in that test). It reports both the aggregate and the per-prompt result and
-asserts both. The observed verdict is PASS, 2 of 2 cases (one per node). We
-hold that verdict and those counts only — no logit metric was read out.
-
-The shipped `test/integration/test_model.py` uses the same tolerance map as
-that run — `(1e-5, 0.03)` at top-5, `(1e-5, 0.05)` at top-50, `(1e-5, 0.08)`
-at top-1000 and `(1e-5, 0.09)` over the full vocabulary — and keeps the strict
-`1e-5` argmax bound. Its own device result is the 0.29.0.1.2.0 run above.
-
-A GSM8K run also passed (2 of 2 cases, b1 and b4), which means dataset-level
-accuracy was exercised end to end. Read that verdict narrowly: the test's only
-score gate is a 0.0 threshold on the flexible-extract exact match, so a PASS
-says the run completed and produced a score, not that the score reached any
-particular level. We never read the score itself, so this README states none.
-
-#### Serving validation
-
-| Workload | Offline | Online |
-| --- | --- | --- |
-| 1,024 in / 512 out | No evidence | Evidence: one request through the 1P1D proxy, asserted at 1,024 prompt and 512 completion tokens, inside the disaggregated run (2/2 PASS) |
-| 8,192 in / 1,024 out | No evidence | No evidence |
-
-The online 1,024 / 512 row is the required grid's first row. We have no
-offline (`LLM.generate`) measurement at that shape, and no run at
-8,192 / 1,024 in either mode. The performance test is a separate, narrower
-workload: `vllm bench serve` with random data at 1,024 input and 100 output
-tokens, 20 measured requests after 5 warmups, at TP16 and concurrency 1 and 4.
-It passed (2 of 2 cases); we hold no latency or throughput figure from it, so
-none is stated here.
-
 ### Exceptions
 
 - **Three of the port's four test suites are dropped.** The disaggregated
@@ -306,15 +208,10 @@ none is stated here.
   the `WORKLOAD_OUTPUT_RW` result-publishing contract. Vendoring that
   infrastructure would have meant copying a server launcher, a proxy, an MPI
   harness and a metric-publishing layer into the model folder, so the suites
-  were dropped. Their results are still the 0.31.0.1.2.0 evidence cited above,
-  but a user cannot re-run them from this folder.
+  were dropped.
 - **No logit or serving test in this folder reproduces the disaggregated
-  deployment.** The 0.31.0.1.2.0 logit and serving evidence is 1P1D across two
-  nodes. The shipped integration test is single-node and offline, and the
-  0.29.0.1.2.0 serve smoke is a single-node server.
-- **The GSM8K gate is 0.0.** As described under Numerical correctness, the
-  accuracy PASS is not a quality bar. No GSM8K score appears in this README,
-  for this reason and because we never read one.
+  deployment.** The shipped integration test is single-node and offline, and
+  the 0.29.0.1.2.0 serve smoke is a single-node server.
 - **`PROMPTS_2` is vendored.** The two validation prompts came from
   `test/vllm_neuron/utils/test_prompts.py` and are copied verbatim into the
   integration test, as contrib/README.md sanctions.
@@ -331,24 +228,17 @@ none is stated here.
   input per case, on a tiny random checkpoint. The
   [module test guidelines](../../../docs/design/accuracy/module_test_guidelines.md)
   ask instead for `assert_close_three_way` (Bhattacharyya coefficient and
-  sigma-ratio) aggregated over about ten inputs on a real checkpoint.
-  Rewriting the gate would change what the recorded 19-case run validated, so
-  the cases ship as they ran. The same file also carries the full-model
-  prefill-logits case, which is a full-model stage rather than a single
-  component, because it shares the tiny-checkpoint fixtures with the component
-  cases.
+  sigma-ratio) aggregated over about ten inputs on a real checkpoint. The same
+  file also carries the full-model prefill-logits case, which is a full-model
+  stage rather than a single component, because it shares the tiny-checkpoint
+  fixtures with the component cases.
 - **Untested configurations.** Only TP8 and TP16 have results (0.29.0.1.2.0:
-  the TP8 integration test and the TP16 serve smoke; 0.31.0.1.2.0: TP8 per
-  engine in the two-node run and TP16 on a single node); no other
-  tensor-parallel degree, no Trn3, no quantized weights, no speculative
-  decoding (the code has a rejection-sampling branch with no evidence behind
-  it), no context length beyond 2,048 tokens even though the checkpoint allows
-  524,288, and no prefix caching (every run disabled it). Batches of more than
-  one sequence appear only in the b4 arms of the 0.31.0.1.2.0 performance and
-  GSM8K runs and in the 0.29.0.1.2.0 serve smoke (`--max-num-seqs 4`, one
-  three-prompt request), never in a logit run, so the shipped integration test
-  keeps the single sequence of the logit run — each `(batch_size, seq_len)`
-  pair also costs a separate 36B graph compile.
-- **No performance figures.** A performance test passed, but we hold only its
-  verdict and case counts, so this README states no throughput, latency or
-  time-to-first-token number.
+  the TP8 integration test and the TP16 serve smoke); no other tensor-parallel
+  degree, no Trn3, no quantized weights, no speculative decoding (the code has
+  a rejection-sampling branch with no evidence behind it), no context length
+  beyond 2,048 tokens even though the checkpoint allows 524,288, and no prefix
+  caching (every run disabled it). Batches of more than one sequence appear
+  only in the 0.29.0.1.2.0 serve smoke (`--max-num-seqs 4`, one three-prompt
+  request), never in a logit run, so the shipped integration test keeps a
+  single sequence — each `(batch_size, seq_len)` pair also costs a separate
+  36B graph compile.
