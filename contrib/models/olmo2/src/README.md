@@ -57,7 +57,6 @@ it.
 |---|---|
 | BF16 weights (FP32 checkpoint, BF16 compute) | Exercised |
 | TP 8, single node | Exercised |
-| TP 8 across 2 nodes | Exercised |
 | TP 1, 2, 4 | Implemented, not covered |
 | Flash attention prefill (NKI) | Exercised |
 | Fused decode attention kernel | Exercised |

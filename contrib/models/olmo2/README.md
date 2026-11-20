@@ -96,10 +96,6 @@ full list of `VLLM_NEURON_*` environment variables.
 | Trn3 | Not tested | Not tested |
 | Trn2 | Working (TP 8) | Not tested |
 
-The earlier runs on `vllm-neuron` 0.31.0.1.2.0 in the validation report used
-the port before the 0.29 changes, so that version is not listed as tested for
-the code in this folder.
-
 ## Example Checkpoints
 
 - <https://huggingface.co/allenai/OLMo-2-0425-1B> — the only checkpoint with
@@ -184,7 +180,7 @@ pytest prints its summary and then does not exit.
 | Integration logit test, `test_model_accuracy[4-2048]` | batch 4, max model length 2,048, TP 8 | PASSED |
 | `vllm serve` smoke | the serve command under Usage | Passed, 3 of 3 prompts |
 
-Not run on 0.29: module tests (`test/module/`), not part of the 0.29 run; last passed on 0.31.0.1.2.0 (see Earlier runs).
+Not run on 0.29: module tests (`test/module/`), not part of the 0.29 run.
 
 #### Logit validation
 
@@ -228,30 +224,10 @@ The tested serving configuration is a maximum model length of 2048 with a
 matching 2048-token batched-token limit, `--max-num-seqs` 1 or 4, block size
 32, prefix caching off and async scheduling off.
 
-### Earlier runs: `vllm-neuron` 0.31.0.1.2.0 (vLLM 0.31.0)
-
-These runs used the port before the 0.29 changes above, on `trn2.48xlarge` at
-TP 8 with the `neuron_native` runtime backend. Only the verdicts and case
-counts were recorded, and the runs used more than one container image without
-a record of which image served which row.
-
-| Run | Nodes | Result |
-|---|---|---|
-| CPU loading and components | 1 | PASS, 5 of 5 |
-| Device functional | 2 (4 ranks each) | PASS, 12 of 12 |
-
-The CPU run covers the loading path (now `test/unit/test_loading.py`) and the
-one component case with a CPU path. The device run covers the four layer-0
-attention and MLP cases of `test/module/test_components.py` on each node, plus
-the port's serving cases, which include a 1,024-token prompt with 512
-generated tokens. Those compositions are read from the test sources, not from
-a per-case record.
-
 ### Exceptions
 
 - **Prompt 1 is over the two-way K5 tolerance.**
-- **Module tests not run on 0.29.** `test/module/test_components.py` last
-  passed in the 0.31.0.1.2.0 device run above.
+- **Module tests not run on 0.29.**
 - **No accuracy-benchmark score and no performance figures.** The serve smoke
   test checks only that each completion is non-empty.
 - **No 8,192 / 1,024 serving run.** Every run used a 2,048-token maximum
@@ -261,7 +237,7 @@ a per-case record.
   test helpers outside this folder. The serving test's logit-validation shape
   is what `test/integration/test_model.py` carries now, with locally defined
   prompts. The module tests default to one node with all 8 ranks, so the
-  2-node topology above cannot be reproduced from this folder alone.
+  2-node topology cannot be reproduced from this folder alone.
 - **Rewritten assertion.** The port's CPU test asserted that
   `vllm_neuron.model.registry.get_models()` maps `Olmo2ForCausalLM` to the
   factory. A contrib model is deliberately absent from that registry, so the
