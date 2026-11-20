@@ -15,6 +15,8 @@ class OnDeviceSamplingConfig:
             self.all_greedy = bool(all_greedy_val)
 
         self.max_top_k = int(kwargs.pop("max_top_k", 256))
+        self.sampling_vocab_size = kwargs.pop("sampling_vocab_size", None)
+        self.suppressed_token_ids = tuple(kwargs.pop("suppressed_token_ids", ()))
 
         deterministic_val = kwargs.pop("deterministic", False)
         if isinstance(deterministic_val, str):

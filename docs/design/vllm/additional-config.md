@@ -319,3 +319,19 @@ If you see compilation messages after warmup, you may have inputs that don't mat
 **"Only support greedy sampling" Error:**
 
 Currently, on-device sampling only supports `temperature=0`. For non-greedy sampling, remove `on_device_sampling_config` to use CPU sampling.
+
+### Static vocabulary limits for on-device sampling
+
+A tokenizer can have fewer entries than the model's output head. For
+text-only rollout, set the vocabulary limit to the tokenizer length and
+list any placeholder IDs that the model must never generate:
+
+```json
+{"neuron_config": {"on_device_sampling_config": {"sampling_vocab_size": 32000, "suppressed_token_ids": [31998]}}}
+```
+
+These are example token IDs; use the values from the tokenizer that serves
+the checkpoint. IDs are global across tensor-parallel ranks. The native
+sampler applies these restrictions together with any request grammar before
+token selection. They do not change raw logits returned to clients or apply
+when on-device sampling is disabled. Both options are disabled by default.

@@ -5,6 +5,7 @@ import torch
 from torch.distributed import ProcessGroup
 
 from vllm_neuron.functional.sampling import sample
+from vllm_neuron.functional.sampling_vocabulary import SamplingVocabulary
 from vllm_neuron.model.neuron_config import OnDeviceSamplingConfig
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,15 @@ class Sampler(torch.nn.Module):
         self.deterministic = sampling_config.deterministic
         self.capture_topk = sampling_config.capture_topk
         self.process_group = process_group
+        self.vocabulary = SamplingVocabulary(
+            sampling_config.sampling_vocab_size, sampling_config.suppressed_token_ids
+        )
+        self.vocab_shards = (
+            process_group.size()
+            if process_group is not None
+            and (self.vocabulary.size is not None or self.vocabulary.suppressed)
+            else 1
+        )
 
         from vllm_neuron.parallel.neuron_parallel_state import (
             get_neuron_sampling_all2all_group,
@@ -133,6 +143,10 @@ class Sampler(torch.nn.Module):
                 logit_mask = torch.index_select(logit_mask, dim=-1, index=shard_indices)
             # Set disallowed tokens to -inf so they can't be sampled
             logits = logits.masked_fill(~logit_mask, float("-inf"))
+
+        logits = self.vocabulary.mask(
+            logits, logits.shape[-1] * self.vocab_shards, tp_rank
+        )
 
         if sampling_params is None:
             return sample(
