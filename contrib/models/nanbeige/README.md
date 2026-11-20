@@ -103,9 +103,7 @@ variables.
 
 Tested in the Neuron Deep Learning Container
 `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04`
-with vLLM 0.29.0, transformers 5.17.0 and neuronx-cc 2.28.7631.0. The earlier
-runs in the validation report used `vllm-neuron` 0.31.0.1.2.0 and name no
-Neuron SDK release, so the matrix does not count them.
+with vLLM 0.29.0, transformers 5.17.0 and neuronx-cc 2.28.7631.0.
 
 ## Example Checkpoints
 
@@ -201,7 +199,7 @@ not run on CPU, so the module test covers prefill only.
 | `test_model_accuracy[4-2048]` | TP8, 4 sequences, `max_model_len` 2048, 2 prompts x 32 tokens | PASSED |
 | `vllm serve` smoke | The flags under Usage, 3 prompts | passed (3/3 prompts) |
 
-Not run on 0.29: module tests (`test/module/`, 2 cases), not in the 0.29 run script; last pass on 0.31.0.1.2.0 (CPU).
+Not run on 0.29: module tests (`test/module/`, 2 cases), not in the 0.29 run script.
 
 #### Logit validation
 
@@ -233,31 +231,6 @@ Prompt 2 over K5 at generated token 24 (L-inf vs FP32: Neuron 0.0175, CPU BF16 0
 - `test/integration/test_model.py`: goldens from `load_loop_reference` in `test/nanbeige_utils.py` (variant `transformers_llama_loop_v1`), not the remote code, which calls `DynamicCache.from_legacy_cache` (removed in transformers 5.17).
 - `test/integration/test_model.py`: maps the padding ids past the tokenizer vocabulary to `""` in the engine's tokenizer (vLLM 0.29.0's detokenizer crashed on their `None` token strings).
 
-### Earlier runs (vLLM Neuron 0.31.0.1.2.0)
-
-Before the changes above, the port was validated with `vllm-neuron`
-0.31.0.1.2.0 and vLLM 0.31.0, with the native runtime backend
-(`neuron_native`) on `trn2.48xlarge`. Those runs imported `src/` through the
-repository-rooted `contrib.models.nanbeige.src` path, not through
-`test/_local_src.py`.
-
-| Test | Result |
-| --- | --- |
-| CPU-mode loading, configuration and decoder-layer cases (then one file; now the 4 cases of `test/unit/` and the 2 of `test/module/`, with no case added or dropped) | 6 of 6 passed |
-| Two-node device test at TP8, 4 ranks on each of two nodes: a decoder-layer prefill-and-decode comparison for the first and the last physical layer, a server logit validation and a serving run | 8 of 8 passed (the 4 cases on each node) |
-
-The run results give the verdict and the case counts of the device test, not
-the result of each case. Its server logit case compared the full-vocabulary
-logits of each of 32 generated tokens against an FP32 baseline plus a
-same-dtype teacher-forced HuggingFace reference, with the default tolerance
-map of `vllm_neuron.accuracy`. Its serving case sent 4 concurrent OpenAI-API
-completion requests of exactly 1,024 prompt tokens each, forced 512 output
-tokens with `min_tokens` and `ignore_eos`, and asserted the token counts and
-a non-empty completion. There was no run at 8,192 in / 1,024 out and no
-offline (`LLM.generate`) run at either shape. The device test depends on
-shared server and multi-node test helpers that are not in this repository, so
-it is not in this folder and cannot be run again from it.
-
 ### Exceptions
 
 - **No dataset accuracy result.** There is no GSM8K or other dataset
@@ -281,9 +254,8 @@ it is not in this folder and cannot be run again from it.
   integration test, which registers the factory itself and ran before the
   install. The offline example under Usage, which relies on the installed
   entry point alone, has no separate run.
-- **Module tests not run since the move to `test/_local_src.py`.** The 2
-  cases of `test/module/` were not part of the 0.29.0.1.2.0 run. Their last
-  recorded pass is the 0.31.0.1.2.0 CPU run, which used the old import path.
+- **Module tests not run.** The 2 cases of `test/module/` were not part of
+  the 0.29.0.1.2.0 run.
 - **`PROMPTS_2` is vendored.** The two validation prompts are the
   `PROMPTS_2` set that the port's original tests used, copied verbatim into
   `test/nanbeige_utils.py` and into the integration test, as
@@ -293,8 +265,8 @@ it is not in this folder and cannot be run again from it.
   factory. A contrib model is not in `get_models()`. So the test in this
   folder registers the local factory with vLLM's `ModelRegistry` and asserts
   that the architecture resolves to the factory. The case count is the same.
-- **Untested configurations.** Only TP8 (device: one node on 0.29.0.1.2.0,
-  two nodes on 0.31.0.1.2.0) and TP2 (CPU) have results; no other
+- **Untested configurations.** Only TP8 (device: one node on 0.29.0.1.2.0)
+  and TP2 (CPU) have results; no other
   tensor-parallel degree, no Trn3, no quantized weights, no speculative
   decoding (the code has a rejection-sampling branch with no evidence behind
   it), no data-parallel or disaggregated (prefill/decode) deployment, no

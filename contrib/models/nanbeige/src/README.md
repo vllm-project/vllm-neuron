@@ -43,8 +43,8 @@ kernels take BF16 inputs.
 - The embedding and the LM head are sharded on the vocabulary dimension.
 
 TP8 is the degree the device runs used: one trn2.48xlarge node with vLLM
-Neuron 0.29.0.1.2.0, and earlier two trn2.48xlarge nodes with 4 ranks each.
-The CPU tests build the model at TP2. No other degree has a recorded result.
+Neuron 0.29.0.1.2.0. The CPU tests build the model at TP2. No other degree has
+a recorded result.
 
 ## Limits
 
