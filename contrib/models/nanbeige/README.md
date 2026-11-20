@@ -226,7 +226,7 @@ Prompt 2 over K5 at generated token 24 (L-inf vs FP32: Neuron 0.0175, CPU BF16 0
 #### Changes for 0.29
 
 - `pyproject.toml`, `src/plugin.py` (new): install the folder as `nanbeige_neuron` with a `vllm.general_plugins` entry point, replacing the manual registration steps.
-- `src/compat.py` (new): vendored `hoist_rope_parameters` (not in 0.29.0.1.2.0), copied unchanged from a later plugin release; `src/config.py` imports it. No other `src/` file changed.
+- `src/compat.py` (new): vendored `hoist_rope_parameters` (not in 0.29.0.1.2.0); `src/config.py` imports it. No other `src/` file changed.
 - `test/conftest.py` (new): shuts down the plugin's `MPExecutor` worker pool at session end, so pytest exits.
 - `test/integration/test_model.py`: goldens from `load_loop_reference` in `test/nanbeige_utils.py` (variant `transformers_llama_loop_v1`), not the remote code, which calls `DynamicCache.from_legacy_cache` (removed in transformers 5.17).
 - `test/integration/test_model.py`: maps the padding ids past the tokenizer vocabulary to `""` in the engine's tokenizer (vLLM 0.29.0's detokenizer crashed on their `None` token strings).
