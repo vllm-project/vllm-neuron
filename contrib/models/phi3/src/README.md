@@ -49,10 +49,8 @@ and TP 8 (integration).
 > does read as "an even number of Q heads per rank" — which is where the
 > original sentence came from. At TP 8 a rank holds 1 KV head, 3 Q heads
 > satisfy it, and nothing in `config.py`, `factory.py` or `model.py` rejects
-> TP 8. The recorded GSM8K and performance runs for
-> `microsoft/Phi-4-mini-instruct` ran at TP 8 and passed. The model folder's
-> `README.md` keeps both the original claim and the evidence, under
-> Exceptions.
+> TP 8. The model folder's `README.md` keeps both the original claim and the
+> evidence, under Exceptions.
 
 - Prefill uses sequence parallelism: each rank holds 1/TP of the tokens.
   Attention and MLP all-gather the tokens and reduce-scatter the result.
@@ -104,5 +102,4 @@ need neither the repository root nor a `sys.path` entry.
 
 The port also had 2-node serving tests (served logits, and 1024-input /
 512-output chat requests on both model runners). They depend on shared test
-helpers outside the model folder and are not part of this contribution; the
-model folder's `README.md` records their results in its validation report.
+helpers outside the model folder and are not part of this contribution.

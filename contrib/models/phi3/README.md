@@ -117,8 +117,7 @@ full list of `VLLM_NEURON_*` environment variables.
 
 Tested in the Neuron Deep Learning Container
 `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04`
-with vLLM 0.29.0. The validation report also lists earlier runs of this port on
-vLLM Neuron 0.31.0.1.2.0; the code in this folder was not run on that version.
+with vLLM 0.29.0.
 
 ## Example Checkpoints
 
@@ -133,9 +132,9 @@ LongRoPE scaling, BF16 weights and a sliding window no smaller than
 ## Testing
 
 The integration test runs TP 8 on one node, the topology of every single-node
-run in the validation report. The unit and module tests keep the port's TP 4,
-the topology of its CPU and multi-node runs. Both sizes are valid for this
-implementation (see `src/README.md`, "Parallelism").
+run in the validation report. The unit and module tests keep the port's TP 4.
+Both sizes are valid for this implementation (see `src/README.md`,
+"Parallelism").
 
 The tests do not need the `pip install -e` step. Each test file loads `src/` by
 file location, and the integration test registers the factory with
@@ -180,7 +179,7 @@ Neuron hardware and 4 ranks.
 pytest contrib/models/phi3/test/module/ -v -s --timeout=14400
 ```
 
-The port's recorded runs put those 4 ranks on 2 nodes, with a multi-node
+The module tests put those 4 ranks on 2 nodes, with a multi-node
 launcher that is not part of this contribution. Set
 `phi3_utils.DEVICE_NNODES = 1` to run all 4 ranks on one node, or set
 `NODE_RANK` and the Neuron multi-node environment yourself on each node.
@@ -258,37 +257,12 @@ Informational aggregate checks, both parametrizations: `agg_bc`, `agg_l2_1.2x`, 
 
 #### Changes for 0.29
 
-- `src/compat.py` (new): `build_per_head_block_table`, copied unchanged from a later `vllm-neuron` release (absent from `vllm_neuron.model.kv_cache` in 0.29.0.1.2.0); `src/model.py` imports it from here.
+- `src/compat.py` (new): `build_per_head_block_table` (absent from `vllm_neuron.model.kv_cache` in 0.29.0.1.2.0); `src/model.py` imports it from here.
 - `src/model.py`: decode attention casts the KV-cache write slots passed to `NF.attention_decode` (per-head slot mapping and `slot_mapping`) to `torch.uint32`.
 - `pyproject.toml`, `src/plugin.py` (new): the `vllm.general_plugins` entry point described under Usage.
 - `test/conftest.py` (new): session fixture that shuts down the plugin's `MPExecutor` worker pool.
 - `test/integration/test_model.py`: HuggingFace reference loads transformers' built-in `Phi3ForCausalLM` (SDPA) instead of the checkpoint's remote code; golden cache variant `transformers_builtin_phi3`.
-- Unchanged from the 0.32 version of this port: `src/config.py`, `src/factory.py`, the unit and module tests.
-
-### Earlier runs: vLLM Neuron 0.31.0.1.2.0
-
-Before it moved into `contrib/`, the port ran on `trn2.48xlarge` with
-`vllm-neuron` 0.31.0.1.2.0 and vLLM 0.31.0, from a plugin source tree that
-carried the model in `vllm_neuron/model/phi3/` and listed it in the plugin's
-registry. The factory there is identical to `src/factory.py`; the model code
-predates the 0.29 changes above. Only verdicts and case counts were recorded:
-
-| Run | Topology | Result |
-|---|---|---|
-| CPU loading: the 9 cases of `test/unit/test_phi3_cpu.py` | CPU mode, TP 4 | PASS, 9 of 9 |
-| Multi-node functional: the 4 module cases and 3 serving cases, per node | TP 4, 2 nodes with 2 ranks each, 2,048-token model length | PASS, 14 of 14 |
-| GSM8K accuracy, batch 1 and batch 4 | TP 8, one node, 4,096-token model length | PASS, 2 of 2; no score recorded |
-| Performance comparison, batch 1 and batch 4 | TP 8, one node, 4,096-token model length | PASS, 2 of 2; no figures published |
-
-The serving cases checked the served logits and ran four concurrent
-1,024-input / 512-output chat requests on both model runners. The mapping of
-the counts 9 and 14 to test functions is read from the test sources. The
-serving, GSM8K and performance tests and the multi-node launcher depend on test
-helpers outside this folder and are not shipped here. The shipped unit tests
-also differ from the ones that ran: the registry assertion checks the
-registration contract instead (a contrib model is not in the plugin's
-registry), the prompts come from a local paragraph instead of the plugin's
-shared prompt corpus, and `PHI3_CHECKPOINT_PATH` can supply the checkpoint.
+- Unchanged: `src/config.py`, `src/factory.py`, the unit and module tests.
 
 ### Exceptions
 
