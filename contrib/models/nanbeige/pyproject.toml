@@ -1,0 +1,22 @@
+# Installs this folder's src/ as the ``nanbeige_neuron`` package and registers
+# NanbeigeForCausalLM with vLLM in every process (front end, engine core, Neuron
+# workers) through a general-plugin entry point:
+#     pip install -e contrib/models/nanbeige
+[build-system]
+requires = ["setuptools>=77.0.3,<80.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-neuron-contrib-nanbeige"
+version = "0.1.0"
+description = "NanbeigeForCausalLM contrib model for vllm-neuron"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = []  # runs inside an environment that already has vllm-neuron
+
+[project.entry-points."vllm.general_plugins"]
+nanbeige_neuron = "nanbeige_neuron.plugin:register"
+
+[tool.setuptools]
+package-dir = {"nanbeige_neuron" = "src"}
+packages = ["nanbeige_neuron"]
