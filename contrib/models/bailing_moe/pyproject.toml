@@ -1,0 +1,22 @@
+# Installs this folder's src/ as the ``bailing_moe_neuron`` package and registers
+# BailingMoeV2ForCausalLM with vLLM in every process (front end, engine core, Neuron
+# workers) through a general-plugin entry point:
+#     pip install -e contrib/models/bailing_moe
+[build-system]
+requires = ["setuptools>=77.0.3,<80.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-neuron-contrib-bailing-moe"
+version = "0.1.0"
+description = "BailingMoeV2ForCausalLM contrib model for vllm-neuron"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = []  # runs inside an environment that already has vllm-neuron
+
+[project.entry-points."vllm.general_plugins"]
+bailing_moe_neuron = "bailing_moe_neuron.plugin:register"
+
+[tool.setuptools]
+package-dir = {"bailing_moe_neuron" = "src"}
+packages = ["bailing_moe_neuron"]
