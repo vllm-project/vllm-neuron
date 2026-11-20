@@ -52,7 +52,7 @@ logits = lm_head(z_H)
 |---|---|
 | Tensor parallelism | TP 1 and TP 2. A larger TP gives an odd number of heads on each rank, and the decode kernel needs an even number. |
 | Sequence parallelism (prefill) | Supported |
-| Multi-node TP | TP 2 with one rank on each of 2 nodes |
+| Multi-node TP | The vLLM Neuron 0.29.0.1.2.0 run used TP 2 on one node. |
 | On-device sampling | Supported |
 | PrefixLM attention (`token_type_ids`) | Not supported. The model uses causal attention for all tokens. |
 | Quantization | Not supported. The checkpoint is BF16. |
