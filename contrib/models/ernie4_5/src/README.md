@@ -47,15 +47,14 @@ evidence covers it. "Not implemented" means the code has no such path.
 | Feature | Status |
 | --- | --- |
 | bfloat16 weights | Verified. The factory rejects every other dtype. |
-| Tensor parallelism | Verified at TP 1 and TP 8. |
-| Sequence-parallel prefill | Verified (the component and end-to-end runs exercise it). |
+| Tensor parallelism | Verified at TP 1. |
+| Sequence-parallel prefill | Verified (the end-to-end runs exercise it). |
 | Paged KV cache, BF16 | Verified. |
-| Grouped-query attention with replicated KV heads | Verified at TP 8, where 2 key/value heads span 8 ranks. |
-| NKI kernels for QKV, flash attention, O projection, decode attention and MLP | Verified. The multi-node component test asserts each of these dispatched its kernel rather than a torch fallback. |
-| Torch fallback paths (CPU mode) | Verified by the CPU component tests. |
+| Grouped-query attention with replicated KV heads | Implemented, unverified. |
+| NKI kernels for QKV, flash attention, O projection, decode attention and MLP | Implemented, unverified. |
+| Torch fallback paths (CPU mode) | Implemented, unverified. |
 | On-device greedy sampling | Verified (the logit runs set `all_greedy`). |
 | Full-vocabulary logprobs (`max_logprobs=-1`, `raw_logits`) | Verified by the logit run. |
-| Disaggregated inference (1P1D, two nodes) | Verified. |
 | Prefix caching / chunked prefill | Implemented, unverified. `model.py` routes a nonzero `kv_segment_size` to `NF.segmented_attention`, but the runs we hold disabled prefix caching. |
 | Speculative decoding | Implemented, unverified. `forward` returns `rejection_sampler(...)` when it gets `spec_decode_metadata`; no evidence exercises it. |
 | Data parallelism | Unknown. The `model.py` header names DP as supported, but the folder has no data-parallel wiring and no evidence covers it. |

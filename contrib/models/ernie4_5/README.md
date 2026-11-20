@@ -117,10 +117,6 @@ with. The Trn2 result was produced on `trn2.48xlarge`.
 | Trn3 | Not tested | Not tested |
 | Trn2 | Working (TP 1) | Not tested |
 
-The earlier runs in the validation report used vLLM Neuron 0.31.0.1.2.0 with
-this implementation in-tree, not this folder, so that version is not listed
-as tested.
-
 ## Example Checkpoints
 
 - <https://huggingface.co/baidu/ERNIE-4.5-0.3B-PT> (revision
@@ -218,8 +214,7 @@ model folder per invocation.
 
 ## Validation report
 
-This section records the validation evidence for this contribution, newest
-run first.
+This section records the validation evidence for this contribution.
 
 ### vLLM Neuron 0.29.0.1.2.0 (2026-11-19)
 
@@ -271,95 +266,12 @@ Test passed on two-way validation, 2/2 prompts (`multi_prompt_logit_validation`)
 - `test/integration/test_model.py`: own full-vocabulary `generate_fn` (all `config.vocab_size` ids) replaces the plugin's `create_offline_vllm_generate_fn` (it requested `tokenizer.vocab_size` = 100,295 logprobs of 103,424 ids and stopped in `torch.stack`); `multi_prompt_logit_validation` unchanged.
 - `test/integration/test_model.py`: K5 = 0.04 on 0.29 (template 0.03; the port used 0.015).
 
-### Earlier runs: vLLM Neuron 0.31.0.1.2.0 (implementation in-tree)
-
-These runs tested this implementation in-tree, at
-`vllm_neuron/model/ernie4_5/`, registered through `get_models()`, before it
-became this folder. Every run used `trn2.48xlarge`, plugin version
-`0.31.0.1.2.0` with vLLM `0.31.0`, the `neuron_native` runtime backend, and
-`baidu/ERNIE-4.5-0.3B-PT` at revision
-`b565cf6caebdb7a1eadf00100857b1ed5e044f12`. Every result in this subsection is
-a test verdict or a case count. No accuracy score, tolerance measurement,
-latency or throughput figure was read out of these runs, so none is quoted.
-
-| Test | Cases | Nodes |
-| --- | --- | --- |
-| Loading and components on CPU, BF16 | 6/6 passed, 0 failed | 1 |
-| Two-node 1P1D logits, serving and components on Trn2, BF16 | 6/6 passed, 0 failed | 2 |
-| Native-comparison serving performance at TP 1, batch 1 and batch 4 | 2/2 passed, 0 failed | 1 |
-| Native-comparison GSM8K accuracy at batch 1 and batch 4 | 2/2 passed, 0 failed | 1 |
-
-#### Model configuration
-
-The architecture class is `Ernie4_5ForCausalLM`, served in bfloat16; the
-factory rejects any other dtype. The performance run used TP 1, and the
-disaggregated-inference and component test files each parametrize TP 8 and TP
-1 and passed every case, so both degrees ran. No expert parallelism applies:
-this is a dense model. The logit, serving and native-comparison runs set
-`max_model_len` and `max_num_batched_tokens` to 2,048 with `max_num_seqs` 4.
-
-Beyond the standard arguments, the model needs
-`VLLM_NEURON_BACKEND=neuron_native`, a bfloat16 dtype, and prompts whose length
-is a multiple of the tensor-parallel size (sequence-parallel prefill).
-
-#### Component validation
-
-The CPU run for loading and components passed all 6 of its cases with no
-failures, on one node. Those cases are the tests this folder ships as
-`test/unit/test_factory.py` (architecture, config fields and config
-rejection), `test/unit/test_weight_loaders.py` (the interleaved-to-
-rotate-half reorder against the HuggingFace RoPE, the fused QKV loader at TP 8
-rank 5, and a full-checkpoint load that checks mapping coverage, dtype and
-sampled parameter values) and `test/module/test_components_cpu.py` (attention
-prefill and attention decode against FP32/BF16 HuggingFace references).
-
-The two-node 1P1D run for logits, serving and components passed all 6 of its
-cases with no failures. Four of those cases come from
-`test/module/test_components_multinode.py`, which runs attention and MLP on
-Neuron devices at TP 8 and TP 1 with prefill on one node and decode on the
-other, and asserts NKI-kernel dispatch for each component. The remaining two
-cases are the 1P1D logit and serving cases described below, which this folder
-does not ship.
-
-#### Numerical correctness
-
-Logit validation ran, inside the two-node 1P1D run: the port's
-`test_di_logits_serving.py` teacher-forced two prompts for 16 tokens at batch
-4 and compared raw per-token logits against FP32 and BF16 HuggingFace
-references. The run passed, 6 of 6 cases, with no failures.
-
-That run used the tolerance map `(1e-5, 0.015)` at top-5, `(1e-5, 0.04)` at
-top-50, `(1e-5, 0.06)` at top-1000 and `(1e-5, 0.065)` over the full
-vocabulary. The shipped `test/integration/test_model.py` is an offline,
-single-node adaptation of that test, not a rerun of it (see Exceptions). It
-keeps those bounds and the strict `1e-5` argmax-divergence bound, except at
-top-5, which is 0.04 on vLLM Neuron 0.29.0.1.2.0.
-
-The GSM8K accuracy run passed both of its cases, at batch 1 and at batch 4.
-We hold its verdict only. We did not read a GSM8K score.
-
-#### Serving validation
-
-Our required serving grid is 1,024 input / 512 output tokens and 8,192 input /
-1,024 output tokens, offline and online:
-
-| Workload | Offline | Online |
-| --- | --- | --- |
-| 1,024 in / 512 out | No evidence | Evidence: the serving phase of the two-node 1P1D run (4 concurrent requests through the disaggregated proxy, `ignore_eos`, exact token counts asserted). That run passed 6/6. |
-| 8,192 in / 1,024 out | No evidence | No evidence |
-
-A separate online `vllm bench serve` performance run at TP 1 passed both of
-its cases. It requested 1,024 input and 100 output tokens, with 20 measured
-requests at batch 1 and at batch 4. This README does not quote latency or
-throughput figures.
-
 ### Exceptions
 
 - The shipped `test/integration/test_model.py` is an offline single-node
-  adaptation of the two-node 1P1D logit test of the earlier runs (same
-  prompts, output length and TP 1), written for this contribution. It ran on
-  vLLM Neuron 0.29.0.1.2.0 as recorded above, with a K5 bound of 0.04 where
-  the 1P1D test used 0.015.
+  adaptation of the two-node 1P1D logit test (same prompts, output length and
+  TP 1), written for this contribution. It ran on vLLM Neuron 0.29.0.1.2.0 as
+  recorded above, with a K5 bound of 0.04 where the 1P1D test used 0.015.
 - Dropped: `test_di_logits_serving.py` (the 1P1D logit and serving test). It
   needs a shared multi-node serving harness that does not ship with this
   folder. To keep the test, we would have to copy that harness into the
@@ -407,23 +319,20 @@ throughput figures.
   cannot surface as the crash above mid-test.
 - The statements about vLLM's built-in `Ernie4_5ForCausalLM`, the
   `from_configs` failure and the fresh-interpreter inspection of string
-  registrations were read from vLLM 0.31.0 source, not reproduced in a run.
-- The earlier runs used this implementation in-tree. The vLLM Neuron
-  0.29.0.1.2.0 run used this folder: the tests loaded `src/` from it, and the
-  serve smoke ran through its installed entry point.
-- Untested in our evidence: Trn3; TP > 1 on vLLM Neuron 0.29.0.1.2.0 (TP 8
-  ran only in the earlier in-tree runs); the module tests on vLLM Neuron
-  0.29.0.1.2.0; the offline `LLM(...)` example with the installed package (the
-  integration test registers in-process); prefix caching and chunked prefill
-  (the segmented-attention path exists in `src/model.py`, and every run
-  disabled prefix caching); speculative decoding (the forward pass has a
-  rejection-sampler branch, never exercised); any quantized or FP8-KV
-  configuration (none is implemented); LoRA and multimodal input (neither is
-  implemented; `inputs_embeds` is rejected); the 8,192/1,024 serving row; the
-  offline 1,024/512 serving row.
+  registrations were read from vLLM source, not reproduced in a run.
+- The vLLM Neuron 0.29.0.1.2.0 run used this folder: the tests loaded `src/`
+  from it, and the serve smoke ran through its installed entry point.
+- Untested in our evidence: Trn3; TP > 1 on vLLM Neuron 0.29.0.1.2.0; the
+  module tests on vLLM Neuron 0.29.0.1.2.0; the offline `LLM(...)` example
+  with the installed package (the integration test registers in-process);
+  prefix caching and chunked prefill (the segmented-attention path exists in
+  `src/model.py`, and every run disabled prefix caching); speculative decoding
+  (the forward pass has a rejection-sampler branch, never exercised); any
+  quantized or FP8-KV configuration (none is implemented); LoRA and multimodal
+  input (neither is implemented; `inputs_embeds` is rejected); the 1,024/512
+  and 8,192/1,024 serving workloads.
 - `src/model.py` names data parallelism among its supported parallelism modes,
   but the folder contains no data-parallel wiring and our evidence covers
   none. Treat DP as unverified.
 - No GSM8K score, latency or throughput figure appears in this README. The
-  measured logit errors come from the vLLM Neuron 0.29.0.1.2.0 run; the
-  earlier runs are reported as test verdicts and case counts only.
+  measured logit errors come from the vLLM Neuron 0.29.0.1.2.0 run.
