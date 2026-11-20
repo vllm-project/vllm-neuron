@@ -34,7 +34,7 @@ loader casts each tensor, so the served model is bfloat16.
 | `config.py` | `GraniteConfig` dataclass and `from_configs`, which accepts a `PretrainedConfig`, a `config.json` path or a dict, and resolves the dtype. |
 | `factory.py` | `GraniteForCausalLM` factory registered with vLLM; validates the config and selects the implementation. |
 | `model.py` | The fused QKV bias loader, RMSNorm, rotary embedding, attention (prefill, decode, segmented), MLP, decoder layer, backbone, and the `ForCausalLM` with `forward`, `get_kv_spec`, `bind_kv_cache`, `checkpoint_mappings` and `load_weights`. |
-| `compat.py` | `hoist_rope_parameters`, `build_per_head_block_table` and `scatter_new_kv`, copied from a later plugin release because vLLM Neuron 0.29.0.1.2.0 does not ship them. |
+| `compat.py` | `hoist_rope_parameters`, `build_per_head_block_table` and `scatter_new_kv`, which vLLM Neuron 0.29.0.1.2.0 does not ship. |
 | `plugin.py` | The `vllm.general_plugins` entry point that registers the factory with vLLM in every process. |
 
 Attention shards heads across tensor-parallel ranks and the MLP shards the
