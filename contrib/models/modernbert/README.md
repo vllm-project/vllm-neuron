@@ -107,9 +107,6 @@ Everything outside the one tested cell is untested, not known-broken.
 | Trn3 | Not tested | Not tested |
 | Trn2 | Working (TP 2) | Not tested |
 
-The vLLM Neuron 0.31.0.1.2.0 runs in the validation report tested the code of
-this folder before the 0.29 changes, so they do not cover the current `src/`.
-
 ## Example Checkpoints
 
 - <https://huggingface.co/ibm-granite/granite-embedding-small-english-r2> — the
@@ -229,34 +226,6 @@ Gate: per-vector cosine against FP32 HF, `assert_pooling_close_three_way(task="e
 - `src/model.py`: GeGLU MLP runs torch matmuls and `torch.ops.aten.gelu.default` (exact erf GELU) instead of `NF.mlp`; `nkilib` import removed.
 - `test/conftest.py`: new; session fixture that shuts down the plugin's `MPExecutor` worker pool so pytest exits.
 
-### vLLM Neuron 0.31.0.1.2.0 (earlier port)
-
-These runs tested the code of this folder before the 0.29 changes above, with
-vLLM `0.31.0` and the `neuron_native` runtime backend, on `trn2.48xlarge`: one
-node for the CPU test and two nodes for the device test. The checkpoint
-revision `2ab6fa8ea2d674564defd37171ae19079b864b33` comes from the tests
-(`test/module/common.py`); the evidence of these runs does not record it
-separately.
-
-| Test (as shipped here) | Verdict | Cases | Nodes |
-|---|---|---|---|
-| `test/unit/test_loading.py`, CPU mode | PASS | 9 / 9 | 1 |
-| `test/module/test_device.py`, TP 2 with one rank on each node | PASS | 12 / 12 | 2 |
-
-The CPU run covers config and registration, the attention bounds for four
-packing layouts, the TP 2 weight shards, a full-attention and a
-sliding-attention layer, and the packed full model on CPU. The device run
-covers the attention of a full layer and of a sliding layer, the GeGLU MLP, and
-the full model for one 1,024-token sequence and for two packed sequences with a
-padding tail. We hold the aggregate verdict and case count of each run, not a
-per-file or per-case breakdown, so the attribution of files to runs is by what
-the runs named and what the snapshot contained.
-
-Both sets compare three-way (FP32 HF reference, BF16 HF reference, Neuron)
-against the HuggingFace `ModernBertModel` in eager mode, on the hidden states
-and on the CLS embeddings. No error magnitudes or cosine values were read out of
-the measurement artifacts of these runs.
-
 ### Model configuration
 
 | Item | Value |
@@ -264,7 +233,7 @@ the measurement artifacts of these runs.
 | Architecture class | `ModernBertModel` (the `architectures` field of the checkpoint); the implementation class is `ModernBertForEmbedding` |
 | Model kind | Pooling (embedding) model: `is_pooling_model`, CLS sequence pooling, `attn_type = "encoder_only"`. No LM head, no sampler, no decode phase |
 | Implementation | BF16; the factory rejects a `quantization_config` |
-| Parallelism | TP 2: on one node for the 0.29.0.1.2.0 run, as one rank on each of 2 nodes for the 0.31.0.1.2.0 device run. 12 heads and intermediate 1536 give 6 heads and 768 channels per rank |
+| Parallelism | TP 2 on one node for the 0.29.0.1.2.0 run. 12 heads and intermediate 1536 give 6 heads and 768 channels per rank |
 | Context length | 1,024-token inputs (and 700 + 300 in one batch), with a 2,048-token context and batched-token limit |
 | Registration | Not in `vllm_neuron/model/registry.py`. `pip install -e contrib/models/modernbert` registers `ModernBertModel` through a `vllm.general_plugins` entry point (see Usage) |
 | Model-specific serving args | `--runner pooling` (required), `--no-enable-prefix-caching` (required), `--dtype bfloat16`, and `--pooler-config '{"seq_pooling_type": "CLS", "use_activation": true}'`. The model also rejects an FP8 KV cache and chunked prefill with `max_num_batched_tokens < max_model_len` |
@@ -306,9 +275,6 @@ Cosine ranking uses the embeddings, so the metric should bound their
 direction. There is no second gate: no logit validation (above) and no dataset
 or retrieval-quality evaluation (see Exceptions).
 
-For the 0.31.0.1.2.0 runs we hold the verdicts and case counts only, not a
-cosine.
-
 ### Serving validation
 
 | Mode | Inputs | Evidence |
@@ -340,8 +306,7 @@ Untested configurations and missing coverage:
 - There is no logit validation, and there cannot be. "Numerical correctness"
   gives the reason and describes the cosine floor.
 - `test/module/test_device.py` (one rank on each of 2 nodes) was not run on
-  vLLM Neuron 0.29.0.1.2.0. Its last run was on 0.31.0.1.2.0 with the code
-  before the 0.29 changes.
+  vLLM Neuron 0.29.0.1.2.0.
 - Only TP 2 was run. TP 1 and larger degrees are untested, and a degree that
   does not divide the 12 heads is rejected by the code.
 - No evidence for Trn3, or for the current code on any vLLM Neuron version
@@ -369,5 +334,5 @@ Changes to the earlier port's tests, beyond moving them into this folder:
 - `test_loading.py` asserted that `vllm_neuron.model.registry.get_models()`
   maps the architecture to the factory. A contrib model is not in that
   registry, so the test now registers the architecture with vLLM's
-  `ModelRegistry` and asserts that vLLM holds it. The 0.31.0.1.2.0 run asserted
-  the in-tree registry; the 0.29.0.1.2.0 run asserted the shipped form.
+  `ModelRegistry` and asserts that vLLM holds it. The 0.29.0.1.2.0 run asserted
+  the shipped form.
