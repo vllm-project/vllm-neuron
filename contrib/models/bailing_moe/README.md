@@ -91,9 +91,7 @@ To iterate without Neuron hardware, run in CPU mode by setting
 | Trn3                   | Not tested                      | Not tested       |
 | Trn2                   | Working (TP 8)                  | Not tested       |
 
-Before the 0.29 changes listed in the validation report, the port's component
-tests also passed on plugin 0.31.0.1.2.0 (see "Earlier runs"). The code in this
-folder has run on 0.29.0.1.2.0 only.
+The code in this folder has run on 0.29.0.1.2.0 only.
 
 ## Example Checkpoints
 
@@ -172,9 +170,9 @@ ranks on 2 `trn2.48xlarge` nodes with 4 ranks on each node
 (`DEVICE_NNODES = 2` in `test/module/utils.py`). Each node needs its node rank,
 the rendezvous address and the Neuron runtime communication id in the
 environment; the module docstring of `test/module/utils.py` names the
-variables. The recorded runs set them with an inter-node launcher that the tests
-name (`test/vllm_neuron/functional/collectives/launch_inter_node_a2av.py`) and
-that is not part of this repository, so you need your own way to start one
+variables. The tests name an inter-node launcher
+(`test/vllm_neuron/functional/collectives/launch_inter_node_a2av.py`) that is
+not part of this repository, so you need your own way to start one
 pytest process per node with those variables.
 
 See the [module test guidelines](../../../docs/design/accuracy/module_test_guidelines.md)
@@ -233,56 +231,11 @@ Test passed on aggregate σ-ratio 0.8723 ≤ 1.0 (`multi_prompt_logit_validation
 |---|---|
 | Architecture class | `BailingMoeV2ForCausalLM` (the `architectures` field of the checkpoint) |
 | Implementation | BF16; the factory rejects any other dtype and any `quantization_config` |
-| Parallelism | TP 8 with EP 8: on one `trn2.48xlarge` on 0.29.0.1.2.0, and as 4 ranks on each of 2 nodes for the 0.31.0.1.2.0 device run |
+| Parallelism | TP 8 with EP 8 on one `trn2.48xlarge` on 0.29.0.1.2.0 |
 | KV block size | 32 (`--block-size 32`); the component tests allocate 64 blocks, so 2048 tokens of KV |
 | Context length | 256 tokens for the integration test and the full-model prefill; `--max-model-len 2048` with `--max-num-batched-tokens 1024` for `vllm serve` |
 | Registration | `pip install -e contrib/models/bailing_moe` (a `vllm.general_plugins` entry point); not in `vllm_neuron/model/registry.py` |
 | Model-specific serving args | `--enable-expert-parallel`, `--block-size 32`, `--trust-remote-code`, `--no-enable-prefix-caching`, `--no-async-scheduling`, and `neuron_config.quantization = "bf16"` |
-
-### Earlier runs: plugin 0.31.0.1.2.0 (vLLM 0.31.0)
-
-These runs tested the port before the 0.29 changes above, with the
-`neuron_native` route on `trn2.48xlarge`: one node for the CPU run and two
-nodes for the device run. Apart from those changes, this folder's `src/`
-differs from the code that ran in two ways that do not alter its behaviour: the
-in-tree relative import `from ..kv_cache import ...` became
-`from vllm_neuron.model.kv_cache import ...`, and `ruff format` rewrapped six
-expressions in three places in `src/model.py`. The test changes are listed
-under Exceptions. The tests pin the checkpoint revision
-(`test/module/utils.py`); the evidence of these runs does not name it
-separately.
-
-| Test id | Verdict | Cases | Nodes |
-|---|---|---|---|
-| `[vLLM Neuron Model] BailingMoeV2 Ling-mini-2.0 BF16 CPU Loading and Components TP8 EP8` | PASS | 17 / 17 | 1 |
-| `[vLLM Neuron Model] BailingMoeV2 Ling-mini-2.0 BF16 Device Functional TP8 EP8 2-Node TRN2` | PASS | 32 / 32 | 2 |
-
-The first id is the CPU-mode run of the port's loading and component tests,
-which ship here as `test/unit/test_cpu_loading.py` and
-`test/module/test_components.py`. The second id is the device run of the
-port's device tests. These are the same component tests on 8 ranks across 2
-nodes, plus `test/integration/test_full_model_prefill.py` and
-`test/module/test_kernel_routes.py`. This PR moved the prefill test out of
-`test/module/` (see Exceptions). We hold the aggregate verdict and case count
-of each run, not a per-file or per-case breakdown. Thus we attribute files to
-ids by what the ids name and what the snapshot contained.
-
-For the first id, the case count also supports the attribution. Pytest
-collects 7 cases from `test/unit/test_cpu_loading.py` and 10 from
-`test/module/test_components.py`. Neither file carries a mark that CPU mode
-deselects, and 7 + 10 is exactly the recorded 17. The 32 cases of the second
-id over 2 nodes do not decompose that way from the files in this folder. Thus
-its attribution rests on the id alone.
-
-The component tests compare each component three-way (FP32 reference, BF16
-reference, Neuron) against the independent torch transcription in
-`test/module/reference_model.py`. On a device, they also assert that the
-compiled prefill and decode graphs of every rank call the required NKI kernels.
-Thus a torch fallback of a required operation fails the test. We did not read
-error magnitudes out of the measurement artifacts. The full-model prefill probe
-asserts that every stage of a real 20-layer prefill is finite on every rank. The
-prefill covers both logit prompts, each pad-position mode of the runner, and
-the server forward with the on-device sampler.
 
 ### Serving validation
 
@@ -324,9 +277,8 @@ Untested configurations and missing coverage:
 - The offline `LLM(...)` example in Usage was not run as written. The
   integration test builds its engine the same way at TP 8 / EP 8, with a
   256-token context and its own registration.
-- Only TP 8 with EP 8 was run: on one node on 0.29.0.1.2.0, on 2 nodes on
-  0.31.0.1.2.0. Other TP degrees and the TP (non-EP) path for the routed
-  experts are untested.
+- Only TP 8 with EP 8 was run, on one node on 0.29.0.1.2.0. Other TP degrees
+  and the TP (non-EP) path for the routed experts are untested.
 - No evidence for Trn3, or for this folder's code on any version other than
   vLLM Neuron 0.29.0.1.2.0.
 - Nothing recorded covers quantization, the FP8 KV-cache path that exists in
@@ -355,13 +307,12 @@ Changes to the port's tests, beyond moving them into this folder:
   `test/vllm_neuron/conftest.py`) into the new `test/conftest.py`. The last one
   is also a fix: that conftest applies only under `test/vllm_neuron/`, so every
   test here that asks for `dist_cleanup` by name would have errored with
-  "fixture not found". The 0.31.0.1.2.0 runs used the fixture from its original
-  location, where the tests then lived.
+  "fixture not found".
 - `test_cpu_loading.py` asserted that `vllm_neuron.model.registry.get_models()`
   maps the architecture to the factory. A contrib model is not in that
   registry, so the test now registers the architecture with vLLM's
-  `ModelRegistry` and asserts that vLLM holds it. The 0.31.0.1.2.0 run asserted
-  the in-tree registry; the 0.29.0.1.2.0 run asserted the new form.
+  `ModelRegistry` and asserts that vLLM holds it. The 0.29.0.1.2.0 run asserted
+  the new form.
 - `test/integration/test_model.py` registered the factory as the string
   `"contrib.models.bailing_moe.src.factory:BailingMoeV2ForCausalLM"` and put
   the repository root on `PYTHONPATH` for the engine's children. It now
