@@ -259,7 +259,7 @@ Test passed on two-way validation, 2/2 prompts (`multi_prompt_logit_validation`)
 #### Changes for 0.29
 
 - `pyproject.toml`, `src/plugin.py` (new): `vllm.general_plugins` entry point that registers `Ernie4_5ForCausalLM` in every vLLM process.
-- `src/compat.py` (new): vendors `hoist_rope_parameters` and `build_per_head_block_table` (not in 0.29.0.1.2.0; copied unchanged from a later release), imported by `src/config.py` and `src/model.py`.
+- `src/compat.py` (new): vendors `hoist_rope_parameters` and `build_per_head_block_table` (not in 0.29.0.1.2.0), imported by `src/config.py` and `src/model.py`.
 - `src/model.py`: decode casts the per-head KV write slots to `uint32` (with `int64` slots the runtime refused to load the decode NEFF, "invalid offset").
 - `test/unit/test_decode_kv_contract.py` (new): checks dtype, shape and values of the decode write slots and per-head block table at TP 1; runs no kernel.
 - `test/conftest.py`: session fixture that shuts down the plugin's `MPExecutor` worker pool, so pytest exits.
