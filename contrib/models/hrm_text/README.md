@@ -180,7 +180,7 @@ for the three-way accuracy pattern these tests follow.
 | Test | Configuration | Result |
 |---|---|---|
 | CPU unit tests (`test/unit/`) | `VLLM_NEURON_CPU_MODE=1` | 3 passed |
-| `test_model_accuracy[1-256]` | batch 1, 256-token context, 2 prompts x 16 greedy tokens, TP 2 | PASSED (622.56 s) |
+| `test_model_accuracy[1-256]` | batch 1, 256-token context, 2 prompts x 16 greedy tokens, TP 2 | PASSED (622.56 s). Rerun 2026-11-20 with the per-prompt assertions: PASSED (624.13 s), same values |
 | `vllm serve` smoke | flags in Usage, TP 2 | Passed (3/3 completions non-empty) |
 
 Not run on 0.29: module tests (`test/module/`), which need 2 `trn2.48xlarge` nodes; this run used one.
@@ -193,7 +193,14 @@ Not run on 0.29: module tests (`test/module/`), which need 2 `trn2.48xlarge` nod
 | 2 (human genome) | FAILED | 0.0192 (> 0.011, token 3) | 0.0233 (> 0.02, token 2) | 0.0289 | 0.0717 (> 0.05, token 1) | 0.0000 |
 
 Prompt 1 over K5/K50/K1000 at generated token 1; prompt 2 over K5 at tokens 1-3, K50 at 2, All at 1 (0-based, of 16).
-No argmax divergence. Test passed on aggregate σ-ratio 0.7432 ≤ 1.0 (`multi_prompt_logit_validation`); `agg_bc` FAIL, `pp_static_0.03`/`0.05` 1/2.
+No argmax divergence. Test passed on aggregate σ-ratio 0.7432 ≤ 1.0 (`multi_prompt_logit_validation`) and on the asserted per-prompt checks `pp_max_linf_1.5x` and `pp_max_l2_1.5x` 2/2; `agg_bc` FAIL, `pp_static_0.03`/`0.05` 1/2.
+
+Error against the FP32 reference, per prompt (max over the 16 generated tokens):
+
+| Prompt | CPU BF16 L-inf | Neuron L-inf | Neuron / CPU BF16 | CPU BF16 L2 | Neuron L2 | Neuron / CPU BF16 |
+|---|---|---|---|---|---|---|
+| 1 (Amazon rainforest) | 0.0334 | 0.0106 | 0.32x | 0.0463 | 0.0298 | 0.64x |
+| 2 (human genome) | 0.0601 | 0.0688 | 1.14x | 0.0903 | 0.0739 | 0.82x |
 
 #### Serve smoke
 
