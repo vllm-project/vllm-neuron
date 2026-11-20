@@ -197,7 +197,7 @@ Test passed on 2/2 prompts (`multi_prompt_logit_validation`); the aggregate bloc
 
 #### Changes for 0.29
 
-- `src/compat.py` (new): vendors `hoist_rope_parameters`, `build_per_head_block_table` and `scatter_new_kv`, copied unchanged from a later `vllm-neuron` (not in 0.29.0.1.2.0).
+- `src/compat.py` (new): vendors `hoist_rope_parameters`, `build_per_head_block_table` and `scatter_new_kv` (not in 0.29.0.1.2.0).
 - `src/config.py`, `src/model.py`: import those helpers from `.compat` (`paged_slot_indices` still comes from the plugin).
 - `pyproject.toml`, `src/plugin.py` (new): install the `exaone4_neuron` package and register `exaone4_neuron.factory:Exaone4ForCausalLM` via a `vllm.general_plugins` entry point.
 - Nothing else in `src/` or `test/` changed.

@@ -62,8 +62,8 @@ The implementation imports only shared building blocks, as
 (checkpoint and weight-loader helpers) and vLLM's public APIs. It imports
 nothing from another model's folder.
 
-`compat.py` holds three helpers that vLLM Neuron 0.29.0.1.2.0 does not ship,
-copied unchanged from a later release: `hoist_rope_parameters` (used by
+`compat.py` holds three helpers that vLLM Neuron 0.29.0.1.2.0 does not ship:
+`hoist_rope_parameters` (used by
 `config.py`), and `build_per_head_block_table` and `scatter_new_kv` (used by
 `model.py`). `plugin.py` is the `vllm.general_plugins` entry point that
 `../pyproject.toml` declares.
