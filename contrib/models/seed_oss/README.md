@@ -189,7 +189,7 @@ Informational aggregates in the log: `agg_l2_1.5x` PASS; `agg_bc`, `agg_l2_1.2x`
 
 #### Changes for 0.29
 
-- `src/compat.py` (new): `hoist_rope_parameters`, copied unchanged from a later vLLM Neuron release; 0.29.0.1.2.0 has no `vllm_neuron.model.config_utils`.
+- `src/compat.py` (new): `hoist_rope_parameters`; 0.29.0.1.2.0 has no `vllm_neuron.model.config_utils`.
 - `src/config.py`: imports `hoist_rope_parameters` from `src/compat.py` instead of the plugin.
 - `pyproject.toml`, `src/plugin.py` (new): install `src/` as package `seed_oss_neuron`; register `SeedOssForCausalLM` via `vllm.general_plugins` entry point `seed_oss_neuron`.
 - `src/model.py`, `src/factory.py`, `src/__init__.py`, `test/`: unchanged.
