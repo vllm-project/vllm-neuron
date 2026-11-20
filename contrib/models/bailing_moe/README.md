@@ -193,7 +193,7 @@ for the three-way accuracy pattern these tests follow.
 | Test | Configuration | Result |
 |---|---|---|
 | CPU unit tests, `test/unit/` | `VLLM_NEURON_CPU_MODE=1`, `neuron_native`, 8 ranks on the host | 7 passed, 0 failed |
-| `test_model_accuracy[1-256]` | TP 8 / EP 8, `neuron_native`, BF16, batch 1, 256-token context, 2 prompts × 16 greedy tokens, on-device greedy sampling | PASSED on aggregate σ-ratio 0.8723 ≤ 1.0; per-prompt 0/2 within bounds (below) |
+| `test_model_accuracy[1-256]` | TP 8 / EP 8, `neuron_native`, BF16, batch 1, 256-token context, 2 prompts × 16 greedy tokens, on-device greedy sampling | PASSED on aggregate σ-ratio 0.8723 ≤ 1.0 and per-prompt `pp_max_linf_1.5x` / `pp_max_l2_1.5x` 2/2; static per-prompt bounds 0/2 (below). Rerun 2026-11-20 with the per-prompt assertions: PASSED (258.83 s), same values |
 | `vllm serve` smoke | The Usage command, installed with `pip install -e contrib/models/bailing_moe` | Passed: 3/3 prompts, 32 completion tokens each; a batched request of all 3 at `max_tokens` 16 returned a prefix of each |
 
 Not run on 0.29: `test/module/` and `test/integration/test_full_model_prefill.py`, CPU or device (not in the one-node 0.29 run; on a device they need 2 nodes).
@@ -206,7 +206,24 @@ Not run on 0.29: `test/module/` and `test/integration/test_full_model_prefill.py
 | 2 of 2 | FAILED | 0.0187 (> 0.011) at token 4 | 0.0580 (> 0.02) at token 4 | 0.0580 (> 0.03) at token 4 | 0.0580 (> 0.05) at token 4 | 0.0000 |
 
 Neuron vs CPU BF16 reference; token = generated token. Prompt 1 over K5, K50, K1000 and All at generated token 0, argmax divergence at generated token 13; prompt 2 over K5, K50, K1000 and All at generated token 4.
-Test passed on aggregate σ-ratio 0.8723 ≤ 1.0 (`multi_prompt_logit_validation`); `pp_max_linf_1.5x` and `pp_max_l2_1.5x` 2/2; `agg_bc` FAIL.
+Test passed on aggregate σ-ratio 0.8723 ≤ 1.0 (`multi_prompt_logit_validation`) and on the asserted per-prompt checks `pp_max_linf_1.5x` and `pp_max_l2_1.5x` 2/2; `agg_bc` FAIL.
+
+Error against the FP32 reference, per prompt (max over the 16 generated tokens):
+
+| Prompt | CPU BF16 L-inf | Neuron L-inf | Neuron / CPU BF16 | CPU BF16 L2 | Neuron L2 | Neuron / CPU BF16 |
+|---|---|---|---|---|---|---|
+| 1 of 2 | 0.1116 | 0.0331 | 0.30x | 0.0521 | 0.0392 | 0.75x |
+| 2 of 2 | 0.0455 | 0.0520 | 1.14x | 0.0234 | 0.0295 | 1.26x |
+
+Prompt 1, generated token 13 (the argmax divergence), logits of the two candidate tokens:
+
+| Logits | `","` | `" divided"` | Argmax |
+|---|---|---|---|
+| FP32 reference | 21.4900 | 21.2679 | `","` |
+| CPU BF16 reference | 21.500 | 21.625 | `" divided"` |
+| Neuron | 21.250 | 21.000 | `","` |
+
+BF16 ULP at 21.5: 0.125. Neuron and FP32 agree; the divergence is against the CPU BF16 reference.
 
 #### Serve smoke
 
