@@ -207,7 +207,7 @@ No argmax divergence. Test passed on aggregate σ-ratio 0.7432 ≤ 1.0 (`multi_p
 
 #### Changes for 0.29
 
-- `src/compat.py` (new): vendors `hoist_rope_parameters`, `build_per_head_block_table`, `scatter_new_kv` from a later plugin release.
+- `src/compat.py` (new): vendors `hoist_rope_parameters`, `build_per_head_block_table`, `scatter_new_kv` (not in 0.29.0.1.2.0).
 - `src/config.py`, `src/model.py`: import those helpers from `.compat` instead of the plugin; no other change.
 - `pyproject.toml`, `src/plugin.py` (new): `vllm.general_plugins` entry point `hrm_text_neuron.plugin:register`.
 - `test/conftest.py` (new): session fixture that shuts down the `MPExecutor` worker pool; no test logic changed.
