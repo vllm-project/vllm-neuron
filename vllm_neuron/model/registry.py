@@ -7,6 +7,7 @@ from .llama3 import Eagle3LlamaForCausalLM, PEagleLlamaForCausalLM
 from .qwen3 import DFlashQwen3ForCausalLM, Qwen3ForCausalLM
 from .qwen3_vl import Qwen3VLForConditionalGeneration
 from .qwen3_asr import Qwen3ASRForConditionalGeneration
+from .qwen3_5 import Qwen3_5ForConditionalGeneration
 
 
 def get_models() -> list[tuple[str, type]]:
@@ -27,6 +28,8 @@ def get_models() -> list[tuple[str, type]]:
         ("Qwen3ForCausalLM", Qwen3ForCausalLM),
         ("Qwen3VLForConditionalGeneration", Qwen3VLForConditionalGeneration),
         ("Qwen3ASRForConditionalGeneration", Qwen3ASRForConditionalGeneration),
+        # Qwen3.5-family dense hybrid (Qwen3.6/3.8-27B), language model only.
+        ("Qwen3_5ForConditionalGeneration", Qwen3_5ForConditionalGeneration),
     ]
 
     # SyntheticNeuronModel is a testing-only model that replaces real neural
