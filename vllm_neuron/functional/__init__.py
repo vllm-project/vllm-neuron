@@ -5,6 +5,10 @@ from .spec_decode_correction import (
 )  # noqa: F401
 from .attention.attention_decode_mask import gen_attention_decode_mask
 from .attention.attention_decode import attention_decode
+from .attention.attention_decode_block_kv import (
+    attention_decode_block_kv,
+    can_use_attention_decode_block_kv,
+)
 from .attention.qkv import qkv_proj
 from .attention.o_proj import o_proj
 from .attention.attention_cte import flash_attention
@@ -64,6 +68,8 @@ __all__ = [
     "all_to_all_v",
     "argsort_unstable",
     "attention_decode",
+    "attention_decode_block_kv",
+    "can_use_attention_decode_block_kv",
     "build_all2all_combine_metadata",
     "build_all2all_dispatch_metadata",
     "build_all_gatherv_metadata",
