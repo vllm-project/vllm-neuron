@@ -68,6 +68,10 @@ _hd256_params = [
     # Partial prior segment of 6144 keys: 2 sections.
     pytest.param(512, 8192, 6144, 64, 2, id="hd256-q512-seg8192-prior6144"),
     pytest.param(512, 4096, 4096, 64, 2, id="hd256-q512-seg4096-prior4096"),
+    # The chunk tail of a prompt (the 256 bucket) after a partial prior segment of
+    # 2 sections, and after a full and a partial prior segment.
+    pytest.param(256, 8192, 5888, 64, 6, id="hd256-q256-seg8192-prior5888-q6kv1"),
+    pytest.param(256, 8192, 14848, 64, 6, id="hd256-q256-seg8192-prior14848-q6kv1"),
     # Active Q chunk of 8192 keys: 2 sections.
     pytest.param(8192, 8192, 0, 64, 2, id="hd256-q8192-seg8192-prior0", marks=_slow),
     pytest.param(8192, 4096, 0, 64, 2, id="hd256-q8192-seg4096-prior0", marks=_slow),
