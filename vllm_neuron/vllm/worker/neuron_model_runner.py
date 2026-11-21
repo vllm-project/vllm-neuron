@@ -6039,15 +6039,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             rank=rank_tensor,
             logit_mask=dummy_logit_mask,
         )
-        # DeltaNet state rows. Warmup must give this input too, or the traced
-        # graph differs from the graph of a real step. The model folds the token
-        # block of a prefill into one batch row, so the tensor holds one row.
-        # The value is not important: the trace reads the shape, and the reset in
-        # the model zeros the row of the first real request.
-        if getattr(self, "_deltanet_state_slots", None) is not None:
-            warmup_kwargs["batch_slot_indices"] = torch.zeros(
-                1, dtype=torch.long, device=device
+        # DeltaNet state rows and padding mask. The model folds the token block of
+        # a prefill into one batch row, so the state row input holds one row.
+        warmup_kwargs.update(
+            self._deltanet_warmup_inputs(
+                num_slot_rows=1, num_tokens=num_tokens, device=device
             )
+        )
         # Snapshot rows [restore, save] = [0, 0]: no restore, save to the scratch row.
         if getattr(self, "_deltanet_snapshot_rows_enabled", False):
             warmup_kwargs["deltanet_snapshot_rows"] = torch.zeros(
@@ -6438,16 +6436,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             rank=rank_tensor,
             logit_mask=dummy_logit_mask,
         )
-        # DeltaNet state rows. Warmup must give this input too, or the traced
-        # graph differs from the graph of a real step. A decode step holds one
-        # batch row for each token. The value is not important: the trace reads
-        # the shape, and the reset in the model zeros the row of the first real
-        # request. Row 0 keeps every warmup write in range for a spec-decode
-        # shape, where the token count is larger than the row count of the state.
-        if getattr(self, "_deltanet_state_slots", None) is not None:
-            decode_warmup_kwargs["batch_slot_indices"] = torch.zeros(
-                num_tokens, dtype=torch.long, device=device
+        # DeltaNet state rows and padding mask. A decode step holds one batch row
+        # for each token.
+        decode_warmup_kwargs.update(
+            self._deltanet_warmup_inputs(
+                num_slot_rows=num_tokens, num_tokens=num_tokens, device=device
             )
+        )
         # Always inject prev-step kwargs when the model is decorated. The
         # decorator's prologue calls
         # ``correct_spec_decode_positions_and_slot_mapping`` unconditionally
@@ -9335,6 +9330,64 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         ):
             yield
 
+    def _deltanet_warmup_inputs(
+        self, num_slot_rows: int, num_tokens: int, device: torch.device
+    ) -> dict[str, torch.Tensor]:
+        """The DeltaNet inputs of a warmup step: state rows and padding mask.
+
+        Warmup must give the inputs of a real step, or the traced graph differs
+        from the graph that serves. The values are not important: the trace reads
+        the shapes, and the model reset zeros the row of the first real request.
+        Row 0 keeps every warmup write in range for a spec-decode shape, where
+        the token count is larger than the row count of the state. The mask marks
+        every warmup token as real.
+
+        Args:
+            num_slot_rows: Batch rows of the step (1 for a prefill).
+            num_tokens: Tokens of the step.
+            device: Device of the inputs.
+
+        Returns:
+            ``batch_slot_indices`` and ``deltanet_padding_mask``, or an empty dict
+            for a model without DeltaNet layers, which must not see them.
+        """
+        if getattr(self, "_deltanet_state_slots", None) is None:
+            return {}
+        return {
+            "batch_slot_indices": torch.zeros(
+                num_slot_rows, dtype=torch.long, device=device
+            ),
+            "deltanet_padding_mask": torch.ones(
+                num_tokens, dtype=torch.bfloat16, device=device
+            ),
+        }
+
+    def _deltanet_padding_mask_for(
+        self, positions: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        """The DeltaNet padding mask of a step: 1.0 for a real token, 0.0 for padding.
+
+        Padding positions repeat the last valid position, so real tokens have
+        strictly increasing positions: pos[i] == pos[0] + i. Anchor the expected
+        sequence at pos[0], not 0, or a continuation chunk of a chunked prefill
+        (pos[0] > 0) marks every padding slot as real.
+
+        Args:
+            positions: CPU positions of the step.
+
+        Returns:
+            A bf16 mask of the shape of ``positions``, or None for a model without
+            DeltaNet layers (an extra input would change its traced graph).
+        """
+        if getattr(self, "_deltanet_state_slots", None) is None:
+            return None
+        if positions is None or len(positions) == 0:
+            return None
+        expected_pos = positions[0] + torch.arange(
+            len(positions), dtype=positions.dtype
+        )
+        return (positions >= expected_pos).to(torch.bfloat16)
+
     def _build_deltanet_slot_indices(
         self,
         num_batch_rows: int,
@@ -9453,18 +9506,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 positions,
             )
 
-        # DeltaNet padding mask: 1.0 for real tokens, 0.0 for padding.
-        # Computed on CPU before device transfer to avoid XLA dtype issues.
-        # Padding positions repeat the last valid position, so real tokens
-        # have strictly increasing positions: pos[i] == pos[0] + i. Anchor the
-        # expected sequence at pos[0], not 0, or a continuation chunk of a
-        # chunked prefill (pos[0] > 0) marks every padding slot as real.
-        _deltanet_padding_mask = None
-        if positions is not None and len(positions) > 0:
-            expected_pos = positions[0] + torch.arange(
-                len(positions), dtype=positions.dtype
-            )
-            _deltanet_padding_mask = (positions >= expected_pos).to(torch.bfloat16)
+        # DeltaNet padding mask, computed on CPU before the device transfer to
+        # avoid XLA dtype issues. None for a model without DeltaNet layers.
+        _deltanet_padding_mask = self._deltanet_padding_mask_for(positions)
         # Move inputs to Neuron device
         input_ids = input_ids.to(self.device)
         positions = positions.to(self.device)
