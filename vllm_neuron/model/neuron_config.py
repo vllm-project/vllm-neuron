@@ -197,6 +197,12 @@ class NeuronConfig:
     gpt_oss_tail_hops: tuple[int, ...] = (8, 16)
     # Decode SP: all-reduce -> reduce-scatter + all-gather on token shards; Qwen3-32B MXFP8, tokens % TP == 0 only.
     enable_decode_sequence_parallel: bool = False
+    # Rows of the DeltaNet state snapshot buffers of a hybrid model (Qwen3.5), row 0
+    # included. 0 disables the snapshots, which prefix caching needs. Derived in
+    # platform check_and_update_config, not customer-set: the default is 129 with
+    # prefix caching and 0 without it; VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_ROWS
+    # overrides it.
+    deltanet_snapshot_rows: int = 0
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "NeuronConfig":
@@ -283,6 +289,7 @@ class NeuronConfig:
             enable_decode_sequence_parallel=config_dict.get(
                 "enable_decode_sequence_parallel", False
             ),
+            deltanet_snapshot_rows=config_dict.get("deltanet_snapshot_rows", 0),
         )
 
     def __post_init__(self):

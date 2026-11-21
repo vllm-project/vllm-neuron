@@ -61,6 +61,9 @@ from vllm_neuron.vllm.worker.neuron_profiler import (
 
 logger = logging.getLogger(__name__)
 
+# The KV cap fraction of a model that declares no default_kv_cap_fraction.
+_DEFAULT_KV_CAP_FRACTION = 0.30
+
 # Largest GIL switch interval this accepts, in seconds. CPython's own default is 0.005 s, and the
 # point of the knob is to go shorter, so anything above a second is a typo rather than a setting.
 _MAX_GIL_SWITCH_INTERVAL_S = 1.0
@@ -1202,8 +1205,19 @@ class NeuronWorker(WorkerBase):
         return int(headroom_gib * (1024**3)), source
 
     def _get_kv_cap_fraction(self) -> float:
-        """Return the validated fractional cap for default KV sizing."""
+        """Return the validated fractional cap for default KV sizing.
+
+        VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION wins. Unset, a model can declare its
+        measured cap as the class attribute ``default_kv_cap_fraction``; other models
+        get 0.30.
+        """
         fraction = envs.VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION
+        if fraction is None:
+            model = getattr(getattr(self, "model_runner", None), "model", None)
+            model = getattr(model, "_orig_mod", model)
+            fraction = getattr(model, "default_kv_cap_fraction", None)
+            if not isinstance(fraction, float):
+                fraction = _DEFAULT_KV_CAP_FRACTION
         if not math.isfinite(fraction) or not 0 < fraction <= 1:
             raise RuntimeError(
                 "VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION must be in (0, 1]. "

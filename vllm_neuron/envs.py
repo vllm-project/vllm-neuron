@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     # TODO: Remove VLLM_NEURON_SWITCH_CC and derive topology from instance type.
     VLLM_NEURON_SWITCH_CC: bool = False
     VLLM_NEURON_MIN_KV_BUDGET_GIB: float = 1.0
-    VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION: float = 0.30
+    VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION: float | None = None
     VLLM_NEURON_RESERVED_HEADROOM_GIB: float | None = None
     VLLM_NEURON_WORKER_TERMINATION_TIMEOUT: int = 5
     VLLM_NEURON_NIXL_PROGRESS_THREAD_DELAY_US: int = 0
@@ -108,6 +108,24 @@ if TYPE_CHECKING:
     VLLM_NEURON_MEGA_DMA_ORDER_DERIVE: bool = False
     VLLM_NEURON_MEGA_DMA_ORDER_CONSTRAINTS_FILE: Optional[str] = None
     VLLM_NEURON_MEGA_SBUF_ALLOC: bool = True
+    # Qwen3.5 (hybrid DeltaNet) kernels, state snapshots and async fast paths
+    VLLM_NEURON_BACKEND_DELTANET_PREFILL_KERNEL: str = "v2"
+    VLLM_NEURON_BACKEND_DELTANET_FORMULATION: str = "fused"
+    VLLM_NEURON_BACKEND_DELTANET_GEMM_DTYPE: str = "fp32"
+    VLLM_NEURON_BACKEND_DELTANET_INVERSE_DTYPE: str = "fp32"
+    VLLM_NEURON_BACKEND_DELTANET_LOOKAHEAD: int = 0
+    VLLM_NEURON_BACKEND_DELTANET_KGROUPS_PER_LAUNCH: int = 0
+    VLLM_NEURON_BACKEND_DELTANET_DECODE_KERNEL: str = "inplace"
+    VLLM_NEURON_BACKEND_DELTANET_CONV_STATE_WRITE: str = "select"
+    VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_ROWS: int | None = None
+    VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_ALIGN: int = 128
+    VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_TAIL_MARGIN: int = 64
+    VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_POLICY: str = "both"
+    VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_JUNCTION_MIN: int = 512
+    VLLM_NEURON_BACKEND_QWEN3_5_ATTN_DECODE_KERNEL: str = "tkg"
+    VLLM_NEURON_BACKEND_ASYNC_SKIP_PREFILL_READBACK: bool | None = None
+    VLLM_NEURON_BACKEND_ASYNC_DEVICE_TOKEN_MERGE: bool | None = None
+    VLLM_NEURON_BACKEND_KV_ADMIT_BY_REQUEST_LEN: bool | None = None
 
 
 def maybe_convert_bool(value: str | None) -> bool | None:
@@ -322,10 +340,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         else 1.0
     ),
     # Default KV cap for the memory-utilization budget.
-    "VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION": lambda: (
-        maybe_convert_float(os.getenv("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION"))
-        if os.getenv("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION") is not None
-        else 0.30
+    # Unset: the model's default_kv_cap_fraction, else 0.30 (see
+    # NeuronWorker._get_kv_cap_fraction).
+    "VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION": lambda: maybe_convert_float(
+        os.getenv("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION")
     ),
     # An explicit reserve enables headroom sizing for this worker.
     "VLLM_NEURON_RESERVED_HEADROOM_GIB": lambda: (
@@ -542,6 +560,138 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # file's own ``sbuf_alloc_limit``. ON by default; set the variable to 0 to turn it off.
     "VLLM_NEURON_MEGA_SBUF_ALLOC": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_MEGA_SBUF_ALLOC")) is not False
+    ),
+    # ================== DeltaNet prefill kernel (Qwen3.5) ==================
+    # Select the DeltaNet prefill NKI kernel: "v2" (fused_v2.py, the default) or
+    # "v1" (fused.py, the reference). See vllm_neuron/nki/deltanet/fused_v2.py.
+    "VLLM_NEURON_BACKEND_DELTANET_PREFILL_KERNEL": lambda: os.getenv(
+        "VLLM_NEURON_BACKEND_DELTANET_PREFILL_KERNEL", "v2"
+    ).lower(),
+    # v2 formulation: "fused" (fewer operations, equal to v1 to the rounding
+    # error) or "v1math" (bit-identical to v1). "fused" is the fast one.
+    # "v1math" is a reference that shows the v2 data path matches v1 exactly.
+    "VLLM_NEURON_BACKEND_DELTANET_FORMULATION": lambda: os.getenv(
+        "VLLM_NEURON_BACKEND_DELTANET_FORMULATION", "fused"
+    ).lower(),
+    # v2 "fused" only. Operand dtype of the matmuls outside the intra-chunk
+    # inverse: "fp32" or "bf16". "bf16" changes the numerics.
+    "VLLM_NEURON_BACKEND_DELTANET_GEMM_DTYPE": lambda: os.getenv(
+        "VLLM_NEURON_BACKEND_DELTANET_GEMM_DTYPE", "fp32"
+    ).lower(),
+    # v2 "fused" only. Operand dtype of the intra-chunk inverse matmuls:
+    # "fp32" or "bf16". "bf16" changes the numerics.
+    "VLLM_NEURON_BACKEND_DELTANET_INVERSE_DTYPE": lambda: os.getenv(
+        "VLLM_NEURON_BACKEND_DELTANET_INVERSE_DTYPE", "fp32"
+    ).lower(),
+    # v2 "fused" only. 1 emits the state-independent work of chunk c + 1
+    # before the state chain of chunk c. 0 keeps the chunk order.
+    "VLLM_NEURON_BACKEND_DELTANET_LOOKAHEAD": lambda: (
+        maybe_convert_int(os.getenv("VLLM_NEURON_BACKEND_DELTANET_LOOKAHEAD")) or 0
+    ),
+    # v2 only. Number of k-head groups for each core in one launch. 0 puts all
+    # heads in one launch. A smaller value makes more, smaller launches, which
+    # compile faster.
+    "VLLM_NEURON_BACKEND_DELTANET_KGROUPS_PER_LAUNCH": lambda: (
+        maybe_convert_int(os.getenv("VLLM_NEURON_BACKEND_DELTANET_KGROUPS_PER_LAUNCH"))
+        or 0
+    ),
+    # ================== DeltaNet decode kernel (Qwen3.5) ====================
+    # Select the DeltaNet decode step: "v1" (the NKI kernel in recurrent.py, with
+    # the gates and the gated norm in torch), "tkg" (nkilib gdn_tkg, which also
+    # does the gates, the l2norm and the gated norm) or "batched"
+    # (nki/deltanet/decode_batched.py, which does the same work as "tkg" for all
+    # heads at once). "tkg" uses bf16 matmul operands, so it changes the numerics.
+    # "batched" uses float32 math, but it also changes the rounding of the output.
+    # "inplace" (nki/deltanet/decode_inplace.py) does the work of "batched" for the
+    # whole batch in one call, and reads and writes the state rows in place by slot.
+    # A batch that it cannot take uses the "batched" path. "inplace" is the default.
+    "VLLM_NEURON_BACKEND_DELTANET_DECODE_KERNEL": lambda: os.getenv(
+        "VLLM_NEURON_BACKEND_DELTANET_DECODE_KERNEL", "inplace"
+    ).lower(),
+    # Select how a decode step writes the DeltaNet conv window of each request to
+    # its state row: "select" (one torch.where for each batch row, then a write
+    # of the full buffer) or "scatter" (index_put_). The 2 writes give the same
+    # tokens. At TP=4, the index_put_ of some decode buckets (7, 8, 10, 12 and 20)
+    # compiles to about 415,000 GpSimd instructions, and a decode step then takes
+    # about 580 ms. With "select", these buckets take 48 to 60 ms.
+    "VLLM_NEURON_BACKEND_DELTANET_CONV_STATE_WRITE": lambda: os.getenv(
+        "VLLM_NEURON_BACKEND_DELTANET_CONV_STATE_WRITE", "select"
+    ).lower(),
+    # ============ DeltaNet state snapshots for prefix caching ===============
+    # Rows of the DeltaNet snapshot buffers, row 0 included (row 0 is a scratch
+    # row). 0 disables the snapshots. Prefix caching (--enable-prefix-caching)
+    # on a DeltaNet model needs 2 or more rows: without a snapshot, a cache hit
+    # skips tokens whose recurrent state the layer does not have. Unset: the
+    # platform picks 129 with prefix caching and 0 without it
+    # (NeuronPlatform._apply_qwen3_5_defaults).
+    # See vllm_neuron/vllm/core/deltanet_snapshots.py.
+    "VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_ROWS": lambda: maybe_convert_int(
+        os.getenv("VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_ROWS")
+    ),
+    # Alignment of a snapshot position in tokens. Use a multiple of the KV block
+    # size and of the DeltaNet prefill chunk (128).
+    "VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_ALIGN": lambda: (
+        maybe_convert_int(os.getenv("VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_ALIGN"))
+        or 128
+    ),
+    # Minimum token count between the tail save point and the prompt end. The end
+    # of a chat prompt holds the parts that change between requests.
+    "VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_TAIL_MARGIN": lambda: int(
+        os.getenv("VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_TAIL_MARGIN", "64")
+    ),
+    # Save points: "both" (tail and junction), "tail" or "junction".
+    "VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_POLICY": lambda: os.getenv(
+        "VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_POLICY", "both"
+    ).lower(),
+    # Minimum gain of a junction save in tokens. A smaller junction costs an
+    # extra prefill step for less than one prefill bucket of tokens.
+    "VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_JUNCTION_MIN": lambda: int(
+        os.getenv("VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_JUNCTION_MIN", "512")
+    ),
+    # ============ Full attention decode kernel (Qwen3.5) ===============
+    # Select the decode attention of the Qwen3.5 full attention layers: "tkg"
+    # (nkilib attention_tkg, see
+    # vllm_neuron/functional/attention/attention_decode_block_kv.py; the default)
+    # or "torch" (gather the cache and attend in torch, the reference). With
+    # "tkg", the layer also replaces NaN and Inf by 0 in the keys and values that
+    # it writes to the cache. A layer that tkg cannot take uses "torch".
+    "VLLM_NEURON_BACKEND_QWEN3_5_ATTN_DECODE_KERNEL": lambda: os.getenv(
+        "VLLM_NEURON_BACKEND_QWEN3_5_ATTN_DECODE_KERNEL", "tkg"
+    ).lower(),
+    # ============ Async scheduling: prefill steps ===============
+    # Skip the read of the previous step's sampled tokens before a step that
+    # only prefills new requests. Such a step reads prompt tokens only, so the
+    # worker can submit it while the previous step runs. A later step reads
+    # the skipped outputs. Applies with async scheduling, with no speculative
+    # decoding and no KV transfer. Unset: on for a model that declares
+    # supports_async_readback_skip (Qwen3.5), off otherwise; 0 or 1 forces it.
+    # See NeuronModelRunner._can_skip_prefill_readback.
+    "VLLM_NEURON_BACKEND_ASYNC_SKIP_PREFILL_READBACK": lambda: maybe_convert_bool(
+        os.getenv("VLLM_NEURON_BACKEND_ASYNC_SKIP_PREFILL_READBACK")
+    ),
+    # ============ Async scheduling: decode steps after a batch change ===============
+    # Build the input tokens of a decode step on the device when the batch
+    # changed. A small compiled graph takes the token of each row that was in
+    # the previous step from the previous output, and the token of each other
+    # row from the host. The worker then submits the step while the previous
+    # step runs. Applies with async scheduling, with no speculative decoding and
+    # no KV transfer. Unset: on for a model that declares
+    # supports_async_readback_skip (Qwen3.5), off otherwise; 0 or 1 forces it. A
+    # model with the in-graph async reorder never uses it.
+    # See NeuronModelRunner._can_merge_tokens_on_device.
+    "VLLM_NEURON_BACKEND_ASYNC_DEVICE_TOKEN_MERGE": lambda: maybe_convert_bool(
+        os.getenv("VLLM_NEURON_BACKEND_ASYNC_DEVICE_TOKEN_MERGE")
+    ),
+    # ============ Scheduler: KV admission by request length ===============
+    # Admit a new request when the KV pool can hold the largest length of each
+    # admitted request: its prompt tokens plus its max_tokens. The default
+    # admission assumes max_model_len for each request, so a short request
+    # holds a full max_model_len share of the pool. Both rules prevent the
+    # preemption of a decode request. Applies to a pool of full attention
+    # layers only. Unset: on for a model with linear attention layers (Qwen3.5),
+    # off otherwise; 0 or 1 forces it. See NeuronScheduler._kv_blocks_of.
+    "VLLM_NEURON_BACKEND_KV_ADMIT_BY_REQUEST_LEN": lambda: maybe_convert_bool(
+        os.getenv("VLLM_NEURON_BACKEND_KV_ADMIT_BY_REQUEST_LEN")
     ),
 }
 

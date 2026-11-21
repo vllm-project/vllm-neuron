@@ -106,7 +106,25 @@ def _patch_dcp_config_validation():
 # still carries that information. Mirrors the CLI-side `sys.argv` check in
 # `apply_config_platform_defaults` below for the offline API.
 _llm_init_explicit_optimization_level = False
+# Every kwarg of the current offline `LLM()` call, for the same reason: a model
+# default must not overwrite a value that the caller set.
+_llm_init_explicit_kwargs: frozenset[str] = frozenset()
 _llm_init_patched = False
+
+
+def _explicitly_set(cli_flag: str, kwarg: str) -> bool:
+    """Return True when the caller set an engine argument on the CLI or in `LLM()`.
+
+    Args:
+        cli_flag: The CLI flag, e.g. ``--max-num-seqs``.
+        kwarg: The `LLM()` keyword, e.g. ``max_num_seqs``.
+
+    Example:
+        >>> _explicitly_set("--max-num-seqs", "max_num_seqs")  # doctest: +SKIP
+        False
+    """
+    in_argv = any(a == cli_flag or a.startswith(cli_flag + "=") for a in sys.argv)
+    return in_argv or kwarg in _llm_init_explicit_kwargs
 
 
 def _patch_llm_init_optimization_level():
@@ -164,13 +182,16 @@ def _apply_llm_init_patch(LLM):
     _orig_init = LLM.__init__
 
     def _patched_init(self, *args, **kwargs):
-        global _llm_init_explicit_optimization_level
+        global _llm_init_explicit_optimization_level, _llm_init_explicit_kwargs
         prev = _llm_init_explicit_optimization_level
+        prev_kwargs = _llm_init_explicit_kwargs
         _llm_init_explicit_optimization_level = "optimization_level" in kwargs
+        _llm_init_explicit_kwargs = frozenset(kwargs)
         try:
             _orig_init(self, *args, **kwargs)
         finally:
             _llm_init_explicit_optimization_level = prev
+            _llm_init_explicit_kwargs = prev_kwargs
 
     _patched_init._neuron_optlevel_patched = True
     LLM.__init__ = _patched_init
@@ -305,7 +326,9 @@ class NeuronPlatform(Platform):
         """
         cache_config = vllm_config.cache_config
         if not cache_config.user_specified_block_size:
-            cache_config.block_size = 32
+            # Qwen3.5 is measured at block size 64: its decode attention reads
+            # the cache by block, and the DeltaNet snapshots align to 128.
+            cache_config.block_size = 64 if cls._is_qwen3_5(vllm_config) else 32
 
         parallel_config = vllm_config.parallel_config
         if (
@@ -672,6 +695,9 @@ class NeuronPlatform(Platform):
         neuron_config = vllm_config.additional_config.setdefault("neuron_config", {})
         neuron_config["decode_only_weights"] = decode_only
 
+        if cls._is_qwen3_5(vllm_config):
+            cls._apply_qwen3_5_defaults(vllm_config, neuron_config)
+
         enable_structured_outputs = neuron_config.get(
             "enable_structured_outputs", False
         )
@@ -719,6 +745,7 @@ class NeuronPlatform(Platform):
         cls._maybe_enable_moe_for_component_dp(vllm_config)
 
         cls._validate_dcp_config(vllm_config)
+        cls._validate_hybrid_state_kv_transfer(vllm_config)
         cls._auto_set_neuron_connector_module_path(vllm_config)
         cls._auto_set_neuron_ec_connector_module_path(vllm_config)
         cls._validate_quantization_config(vllm_config)
@@ -1104,6 +1131,148 @@ class NeuronPlatform(Platform):
                 "sequence across more DCP ranks for long-context workloads.",
                 tp_size,
                 num_q_heads,
+            )
+
+    _QWEN3_5_ARCHITECTURES = (
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5ForCausalLM",
+    )
+    # The Qwen3.5 serving defaults, from the TP=4 x 16 and TP=8 x 8 measurements on
+    # trn2.48xlarge (decode batch [32], prefill chunk 8192 in buckets of 256, 2048,
+    # 4096 and 8192, KV segment 8192).
+    _QWEN3_5_MAX_NUM_SEQS = 32
+    _QWEN3_5_MAX_NUM_BATCHED_TOKENS = 8192
+    _QWEN3_5_PREFILL_BUCKETS = (256, 2048, 4096)
+    _QWEN3_5_SNAPSHOT_ROWS = 129
+
+    @classmethod
+    def _is_qwen3_5(cls, vllm_config) -> bool:
+        """Return True when the model is a Qwen3.5-family hybrid (Qwen3.6/3.8-27B)."""
+        model_config = vllm_config.model_config
+        if model_config is None:
+            return False
+        architectures = getattr(model_config.hf_config, "architectures", None) or []
+        return any(a in cls._QWEN3_5_ARCHITECTURES for a in architectures)
+
+    @classmethod
+    def _apply_qwen3_5_defaults(cls, vllm_config, neuron_config: dict) -> None:
+        """Default the Qwen3.5 serving configuration to the measured one.
+
+        A plain ``vllm serve <model> --tensor-parallel-size 4`` then needs no
+        --additional-config. An explicit value always wins: a CLI flag or `LLM()`
+        kwarg for the batch limits, any bucket key for the buckets, and
+        VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_ROWS for the snapshot rows.
+
+        - ``max_num_seqs`` 32 and ``max_num_batched_tokens`` 8192. vLLM's defaults
+          (256 sequences, 2048 tokens) would size a 256-row DeltaNet state and a
+          256-row decode graph.
+        - Buckets, when no bucket key is set: decode batch ``[max_num_seqs]`` (one
+          decode graph, so greedy output does not depend on load); prefill 256,
+          2048, 4096 up to ``max_num_batched_tokens`` (256 takes the chunk tails);
+          one KV segment of ``max_num_batched_tokens``; one decode context bucket,
+          the largest multiple of 128 below ``max_model_len``.
+        - ``deltanet_snapshot_rows``: 129 with prefix caching, which needs 2 or more
+          rows for a correct cache hit, and 0 without it.
+        - Language model only: the port does not load the vision tower, so the
+          multimodal limits are 0 (``--language-model-only``).
+
+        The config passes through this hook more than once, so the first pass
+        marks the neuron_config and later passes keep its result.
+
+        Args:
+            vllm_config: The vLLM config.
+            neuron_config: The shared ``additional_config["neuron_config"]`` dict.
+        """
+        if neuron_config.get("_qwen3_5_defaults_applied"):
+            return
+        neuron_config["_qwen3_5_defaults_applied"] = True
+        scheduler_config = vllm_config.scheduler_config
+        max_model_len = vllm_config.model_config.max_model_len
+
+        if (
+            not _explicitly_set("--max-num-seqs", "max_num_seqs")
+            and scheduler_config.max_num_seqs > cls._QWEN3_5_MAX_NUM_SEQS
+        ):
+            scheduler_config.max_num_seqs = cls._QWEN3_5_MAX_NUM_SEQS
+        if not _explicitly_set("--max-num-batched-tokens", "max_num_batched_tokens"):
+            scheduler_config.max_num_batched_tokens = min(
+                cls._QWEN3_5_MAX_NUM_BATCHED_TOKENS, max_model_len
+            )
+
+        bucket_keys = (
+            "num_seqs_buckets",
+            "num_batched_tokens_buckets",
+            "kv_segment_size_buckets",
+            "decode_context_length_buckets",
+        )
+        if not any(k in neuron_config for k in bucket_keys):
+            from vllm_neuron.utils.bucket_utils import (
+                get_default_kv_segment_size_buckets,
+            )
+
+            max_tokens = scheduler_config.max_num_batched_tokens
+            neuron_config["num_seqs_buckets"] = [scheduler_config.max_num_seqs]
+            neuron_config["num_batched_tokens_buckets"] = [
+                b for b in cls._QWEN3_5_PREFILL_BUCKETS if b < max_tokens
+            ] + [max_tokens]
+            segments = get_default_kv_segment_size_buckets(max_tokens, max_model_len)
+            if segments:
+                neuron_config["kv_segment_size_buckets"] = segments
+            ctx = (max_model_len - 1) // 128 * 128
+            if ctx >= 128:
+                neuron_config["decode_context_length_buckets"] = [ctx]
+
+        rows = envs.VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_ROWS
+        if rows is None:
+            prefix_caching = bool(
+                getattr(vllm_config.cache_config, "enable_prefix_caching", False)
+            )
+            rows = cls._QWEN3_5_SNAPSHOT_ROWS if prefix_caching else 0
+        neuron_config["deltanet_snapshot_rows"] = rows
+
+        mm_config = vllm_config.model_config.multimodal_config
+        if mm_config is not None and not mm_config.language_model_only:
+            mm_config.language_model_only = True
+            logger.info(
+                "Qwen3.5 serves the language model only: multimodal inputs are off."
+            )
+        logger.info(
+            "Qwen3.5 defaults: max_num_seqs=%d max_num_batched_tokens=%d buckets=%s "
+            "deltanet_snapshot_rows=%d",
+            scheduler_config.max_num_seqs,
+            scheduler_config.max_num_batched_tokens,
+            {k: neuron_config.get(k) for k in bucket_keys},
+            rows,
+        )
+
+    @classmethod
+    def _validate_hybrid_state_kv_transfer(cls, vllm_config) -> None:
+        """Reject KV transfer for a model with linear attention layers.
+
+        A linear attention (DeltaNet) layer keeps a recurrent state in model buffers,
+        outside the paged KV cache, and no connector moves that state. A decode engine
+        would then start from an empty state and answer wrongly, with no error.
+
+        Args:
+            vllm_config: The vLLM config of this engine.
+
+        Raises:
+            ValueError: KV transfer is configured and the model has linear attention
+                layers.
+        """
+        if vllm_config.kv_transfer_config is None:
+            return
+        # The helper lives beside the state slot pool, which imports nothing from vLLM.
+        from vllm_neuron.vllm.worker.deltanet_state_slots import (
+            count_linear_attention_layers,
+        )
+
+        num_linear = count_linear_attention_layers(vllm_config.model_config)
+        if num_linear > 0:
+            raise ValueError(
+                f"This model has {num_linear} linear attention layers. KV transfer does "
+                "not move their recurrent state, so disaggregated serving would give "
+                "wrong answers. Serve the model without --kv-transfer-config."
             )
 
     @classmethod

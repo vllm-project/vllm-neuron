@@ -8,6 +8,7 @@ bucket-aware admission control.
 """
 
 import logging
+import time
 from collections import deque
 from enum import Enum, auto
 from typing import TYPE_CHECKING
@@ -33,6 +34,11 @@ from vllm_neuron.utils.bucket_utils import (
     get_max_num_batched_tokens,
     resolve_num_batched_tokens_buckets,
     validate_num_seqs_buckets,
+)
+from vllm_neuron.vllm.core.deltanet_snapshots import DeltaNetSnapshotTable
+from vllm_neuron.vllm.worker.deltanet_state_slots import (
+    count_linear_attention_layers,
+    usable_state_rows,
 )
 from vllm_neuron.vllm.patches.jf_grammar_patch import (
     apply_jf_grammar_rollback_patch,
@@ -210,6 +216,34 @@ class NeuronScheduler(Scheduler):
             "every admissible waiter is an asynchronous KV pull.",
             "enabled" if self._skip_decode_holdback else "disabled",
         )
+
+        # A model with linear attention keeps a recurrent state row for each
+        # request, so the row count limits admission, and `_state_rows_in_use`
+        # counts it. The pool holds max(num_seqs_buckets) rows. See
+        # DeltaNetStateSlots.
+        self._num_state_rows = 0
+        self._usable_state_rows = 0
+        if count_linear_attention_layers(vllm_config.model_config):
+            additional = getattr(vllm_config, "additional_config", None) or {}
+            neuron_config = additional.get("neuron_config") or {}
+            buckets = neuron_config.get("num_seqs_buckets") or []
+            self._num_state_rows = max(buckets) if buckets else 1
+            # A batch that pads needs 1 free row for its padded rows. Admission
+            # keeps that row free.
+            self._usable_state_rows = usable_state_rows(self._num_state_rows, buckets)
+        self._state_exhaustion_warned: bool = False
+
+        # DeltaNet state snapshots for prefix caching. A cache hit must restore
+        # the recurrent state at the hit position, so the hit is cut to the
+        # longest prefix that has a snapshot. See deltanet_snapshots.py.
+        self._dn_snapshots: DeltaNetSnapshotTable | None = None
+        self._dn_restore: dict[str, tuple[int, int]] = {}
+        self._dn_last_log = 0.0
+        if self._num_state_rows and getattr(
+            vllm_config.cache_config, "enable_prefix_caching", False
+        ):
+            self._init_deltanet_snapshots()
+
         # One-shot flag: warn once if a producer ever arrives with max_tokens>1
         # (a P/D-contract breach the send-lane must not park -- see
         # _is_dispatched_producer).
@@ -327,8 +361,19 @@ class NeuronScheduler(Scheduler):
         self._max_kv_concurrent = (
             max_concurrent if max_concurrent > 0 else self.max_num_seqs
         )
+        # The KV admission by request length is on by default for a model with
+        # linear attention layers, and off for others; the env var forces it
+        # either way. See _kv_blocks_of.
+        self._kv_admit_by_len = False
+        self._kv_group_block_sizes: tuple[int, ...] = ()
+        self._kv_budget_blocks = 0
+        admit_by_len = envs.VLLM_NEURON_BACKEND_KV_ADMIT_BY_REQUEST_LEN
+        if admit_by_len is None:
+            admit_by_len = self._num_state_rows > 0
+        if admit_by_len:
+            self._init_kv_admission_by_len(vllm_config, kv_cache_config)
 
-        if 0 < max_concurrent < self.max_num_seqs:
+        if 0 < max_concurrent < self.max_num_seqs and not self._kv_admit_by_len:
             logger.warning(
                 "max_num_seqs (%d) exceeds worst-case KV cache capacity (%d "
                 "concurrent requests at max_model_len=%d, assuming no prefix "
@@ -445,6 +490,211 @@ class NeuronScheduler(Scheduler):
                 )
         super().add_request(request)
 
+    def _init_deltanet_snapshots(self) -> None:
+        """Build the snapshot table and hook it into the prefix cache lookup.
+
+        Raises:
+            ValueError: The snapshot pool has fewer than 2 rows.
+        """
+        additional = getattr(self.vllm_config, "additional_config", None) or {}
+        rows = (additional.get("neuron_config") or {}).get("deltanet_snapshot_rows", 0)
+        if rows < 2:
+            raise ValueError(
+                "Prefix caching on a DeltaNet model needs DeltaNet state snapshots. "
+                "Without a snapshot, a cache hit skips tokens whose recurrent state "
+                "the model does not have, and the output is wrong. Unset "
+                "VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_ROWS or set it to 2 or more, "
+                "or serve with --no-enable-prefix-caching."
+            )
+        self._dn_snapshots = DeltaNetSnapshotTable(
+            num_rows=rows,
+            block_size=self.block_size,
+            align=envs.VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_ALIGN,
+            tail_margin=envs.VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_TAIL_MARGIN,
+            policy=envs.VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_POLICY,
+            junction_min_tokens=envs.VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_JUNCTION_MIN,
+        )
+        # The base scheduler calls _deltanet_split_end through this hook. vLLM
+        # sets the flag only for the Mamba cache groups of its KV pool, and this
+        # model keeps its state outside the pool.
+        self.need_mamba_block_aligned_split = True
+        self._dn_base_get_computed_blocks = self.kv_cache_manager.get_computed_blocks
+        self.kv_cache_manager.get_computed_blocks = self._dn_get_computed_blocks
+        logger.info(
+            "DeltaNet snapshots for prefix caching: %d rows, align %d, tail margin %d, "
+            "policy %s, junction minimum %d",
+            rows,
+            self._dn_snapshots.align,
+            self._dn_snapshots.tail_margin,
+            self._dn_snapshots.policy,
+            self._dn_snapshots.junction_min_tokens,
+        )
+
+    def _dn_get_computed_blocks(self, request: Request):
+        """Cut the prefix cache hit of a request to its longest snapshot.
+
+        The KV cache can hold more of the prompt than the snapshots do. The part
+        of the hit past the snapshot becomes the junction of the request: the
+        prefill stops there and saves a snapshot, so the next request with the
+        same prefix restores it.
+
+        Args:
+            request: The waiting request.
+
+        Returns:
+            The base result ``(blocks, num_computed_tokens, junction)``, with the
+            blocks and the token count cut to the snapshot position.
+        """
+        blocks, num_tokens, _ = self._dn_base_get_computed_blocks(request)
+        table = self._dn_snapshots
+        assert table is not None
+        pos, row = (0, 0)
+        if num_tokens > 0:
+            pos, row = table.lookup(request.block_hashes, num_tokens)
+        if pos < num_tokens:
+            blocks = self.kv_cache_manager.truncate_computed_blocks(blocks, pos)
+        self._dn_restore[request.request_id] = (pos, row)
+        junction = num_tokens if num_tokens > pos else 0
+        return blocks, pos, junction
+
+    def _mamba_block_aligned_split(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_new_local_computed_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+    ) -> int:
+        """Cut a prefill step at the next DeltaNet snapshot save point.
+
+        The base scheduler calls this hook for each prefill step when
+        ``need_mamba_block_aligned_split`` is set.
+
+        Args:
+            request: The request of the step.
+            num_new_tokens: The token count of the step before the cut.
+            num_new_local_computed_tokens: The tokens of the prefix cache hit.
+            num_external_computed_tokens: The tokens that a KV connector loads.
+
+        Returns:
+            The token count of the step after the cut.
+        """
+        table = self._dn_snapshots
+        if table is None:
+            return super()._mamba_block_aligned_split(
+                request,
+                num_new_tokens,
+                num_new_local_computed_tokens,
+                num_external_computed_tokens,
+            )
+        start = (
+            request.num_computed_tokens
+            + num_new_local_computed_tokens
+            + num_external_computed_tokens
+        )
+        num_prompt_tokens = request.num_prompt_tokens
+        if start >= num_prompt_tokens:
+            return num_new_tokens
+        end = table.split_end(
+            start,
+            start + num_new_tokens,
+            num_prompt_tokens,
+            getattr(request, "shared_prefix_boundary", 0),
+        )
+        return max(end - start, 0)
+
+    def _attach_deltanet_snapshot_ops(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        """Give the worker the snapshot row to restore and to save for each prefill.
+
+        The worker reads ``scheduler_output.deltanet_snapshot_ops``: a map from a
+        request id to ``(restore_row, save_row)``. Row 0 means "none". The first
+        step of a request restores the snapshot of its cache hit. A step that ends
+        at a save point saves the state at its end.
+
+        Args:
+            scheduler_output: The output of this step. Its token counts are the
+                counts before the step.
+        """
+        table = self._dn_snapshots
+        assert table is not None
+        ops: dict[str, tuple[int, int]] = {}
+        starts: list[tuple[str, int, bool]] = [
+            (new_req.req_id, new_req.num_computed_tokens, True)
+            for new_req in scheduler_output.scheduled_new_reqs
+        ]
+        cached = scheduler_output.scheduled_cached_reqs
+        if cached is not None:
+            resumed = getattr(cached, "resumed_req_ids", None) or set()
+            for i, req_id in enumerate(cached.req_ids):
+                starts.append(
+                    (req_id, cached.num_computed_tokens[i], req_id in resumed)
+                )
+        for req_id, start, first in starts:
+            request = self.requests.get(req_id)
+            if request is None or start >= request.num_prompt_tokens:
+                continue
+            restore_row = 0
+            if first:
+                pos, row = self._dn_restore.pop(req_id, (0, 0))
+                if pos > 0 and pos == start:
+                    restore_row = row
+                    table.stats.restored_tokens += pos
+            end = start + scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            save_row = 0
+            if table.is_save_point(
+                end,
+                request.num_prompt_tokens,
+                getattr(request, "shared_prefix_boundary", 0),
+            ):
+                save_row = table.save_at(
+                    request.block_hashes, end, keep_row=restore_row
+                )
+            if restore_row or save_row:
+                ops[req_id] = (restore_row, save_row)
+        scheduler_output.deltanet_snapshot_ops = ops
+        now = time.monotonic()
+        if now - self._dn_last_log >= 60.0:
+            self._dn_last_log = now
+            self._log_deltanet_snapshot_stats()
+
+    def _log_deltanet_snapshot_stats(self) -> None:
+        """Log the counts of the snapshot table since the start of the engine."""
+        table = self._dn_snapshots
+        if table is None:
+            return
+        s = table.stats
+        logger.info(
+            "DeltaNet snapshots: %d lookups, %d hits, %d restored tokens, "
+            "%d saves, %d evictions, %d of %d rows valid",
+            s.lookups,
+            s.hits,
+            s.restored_tokens,
+            s.saves,
+            s.evictions,
+            table.num_valid,
+            table.num_rows - 1,
+        )
+
+    def reset_prefix_cache(self, *args, **kwargs) -> bool:
+        """Reset the prefix cache, and forget the DeltaNet snapshots with it.
+
+        A snapshot without the KV cache of its prefix cannot serve a hit, and a
+        benchmark resets the cache between two arms to start each arm cold.
+
+        Returns:
+            The result of the base reset.
+        """
+        ok = super().reset_prefix_cache(*args, **kwargs)
+        table = getattr(self, "_dn_snapshots", None)
+        if ok and table is not None:
+            # Log the counts first, so a benchmark can read the counts of an arm.
+            self._log_deltanet_snapshot_stats()
+            table.reset()
+            self._dn_restore.clear()
+            logger.info("DeltaNet snapshots: reset with the prefix cache")
+        return ok
+
     def _free_request(self, request, delay_free_blocks: bool = False):
         """Attach this request's EC locators onto kv_transfer_params for the PD.
 
@@ -458,6 +708,8 @@ class NeuronScheduler(Scheduler):
         """
         # clear jf tokens at req_id for removed request.
         self._pending_jf_tokens.pop(request.request_id, None)
+        # Forget the snapshot lookup of a request that leaves before it runs.
+        self._dn_restore.pop(request.request_id, None)
 
         kv_xfer_params, ec_xfer_params = super()._free_request(
             request, delay_free_blocks
@@ -658,6 +910,150 @@ class NeuronScheduler(Scheduler):
         parked in the send-lane awaiting their NIXL handoff."""
         return len(self.running) + len(self._pending_kv_send)
 
+    def _init_kv_admission_by_len(
+        self, vllm_config: "VllmConfig", kv_cache_config: "KVCacheConfig"
+    ) -> None:
+        """Turn on the KV admission by request length if the KV pool supports it.
+
+        The rule counts the blocks of each KV cache group for the largest length
+        of a request. This count is correct for full attention layers only. A
+        pool with another type of group keeps the default rule.
+
+        Example:
+            >>> # On by default for Qwen3.5; VLLM_NEURON_BACKEND_KV_ADMIT_BY_REQUEST_LEN=1
+            >>> # forces it for another model. The scheduler logs
+            >>> # "KV admission by request length: on".
+        """
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        # Use the exact type. A subclass of FullAttentionSpec can keep a
+        # different count of blocks for each token.
+        def is_full_attention(spec) -> bool:
+            inner = getattr(spec, "kv_cache_specs", None)
+            if isinstance(inner, dict):
+                return bool(inner) and all(
+                    type(s) is FullAttentionSpec for s in inner.values()
+                )
+            return type(spec) is FullAttentionSpec
+
+        groups = kv_cache_config.kv_cache_groups
+        dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        if (
+            not groups
+            or dcp_size > 1
+            or not all(is_full_attention(g.kv_cache_spec) for g in groups)
+        ):
+            logger.warning(
+                "KV admission by request length is not available for this KV "
+                "pool (groups: %s, decode context parallel size: %d). The "
+                "scheduler assumes max_model_len for each request.",
+                [type(g.kv_cache_spec).__name__ for g in groups],
+                dcp_size,
+            )
+            return
+        self._kv_group_block_sizes = tuple(g.kv_cache_spec.block_size for g in groups)
+        # One block of the pool is the null block of vLLM.
+        self._kv_budget_blocks = kv_cache_config.num_blocks - 1
+        self._kv_admit_by_len = True
+        logger.info(
+            "KV admission by request length: on. The pool has %d blocks for "
+            "requests, and a request at max_model_len=%d takes %d blocks.",
+            self._kv_budget_blocks,
+            self.max_model_len,
+            self._kv_blocks_for_tokens(self.max_model_len),
+        )
+
+    def _kv_blocks_for_tokens(self, num_tokens: int) -> int:
+        """Return the KV blocks of all groups that ``num_tokens`` tokens take."""
+        return sum(-(-num_tokens // bs) for bs in self._kv_group_block_sizes)
+
+    def _kv_blocks_of(self, request: Request) -> int:
+        """Return the KV blocks that a request can take before it finishes.
+
+        A request stops at its prompt tokens plus its max_tokens, or at
+        max_model_len. Thus the sum of this count over the admitted requests
+        is the most blocks that they can take together. The admission keeps
+        the sum in the pool, so a decode request is never preempted. Shared
+        prefix blocks count for each request, so the sum is an upper limit.
+
+        Returns:
+            The count of blocks over all KV cache groups.
+
+        Example:
+            >>> # 2 groups of block size 64, prompt 2000 tokens, max_tokens 50:
+            >>> # scheduler._kv_blocks_of(request)
+            >>> # 66
+        """
+        max_tokens = request.max_tokens
+        if max_tokens is None:
+            max_tokens = self.max_model_len
+        num_tokens = min(self.max_model_len, request.num_prompt_tokens + max_tokens)
+        num_tokens += getattr(self, "num_lookahead_tokens", 0) or 0
+        return self._kv_blocks_for_tokens(num_tokens)
+
+    def _kv_blocks_in_use(self) -> int:
+        """Return the largest KV block count of the requests that hold KV blocks.
+
+        The requests are the requests in the running queue and the producers in
+        the send-lane. See _kv_in_use.
+        """
+        held = list(self.running)
+        held += [self.requests[r] for r in self._pending_kv_send if r in self.requests]
+        return sum(self._kv_blocks_of(r) for r in held)
+
+    def _kv_pool_is_full_for(self, request: Request) -> bool:
+        """Return True if the KV pool cannot admit ``request`` now.
+
+        The default rule allows floor(pool / max_model_len) requests. The rule
+        by request length allows requests while the sum of their largest block
+        counts fits the pool. See _kv_blocks_of.
+        """
+        if not getattr(self, "_kv_admit_by_len", False):
+            return self._kv_in_use() >= self._max_kv_concurrent
+        need = self._kv_blocks_in_use() + self._kv_blocks_of(request)
+        return need > self._kv_budget_blocks
+
+    def _kv_pool_has_room_for_prefill(self) -> bool:
+        """Return True if the KV pool can admit the requests in the waiting queue.
+
+        A structured-output request can come from the skipped-waiting queue.
+        Its length is not known here, so the rule by request length then
+        assumes max_model_len.
+        """
+        if not getattr(self, "_kv_admit_by_len", False):
+            return self._kv_in_use() < self._max_kv_concurrent
+        need = sum(self._kv_blocks_of(r) for r in self.waiting)
+        if need == 0:
+            need = self._kv_blocks_for_tokens(self.max_model_len)
+        return self._kv_blocks_in_use() + need <= self._kv_budget_blocks
+
+    def _state_rows_in_use(self) -> int:
+        """Recurrent state rows that requests hold now.
+
+        3 groups of requests hold a row:
+
+        1. A request in the running queue. The worker gives it a row for the batch.
+        2. A producer parked in the send-lane. `_release_dispatched_producers` takes
+           it out of the running queue to free the compute slot, but the consumer
+           reads its state after that, so the row stays in use.
+        3. A request in the waiting queue. On a decode engine the connector reads
+           the remote state into the row of the request before the request runs.
+
+        `schedule` calls this function inside its admission loop. The loop starts
+        with an empty waiting queue and appends one request at a time, so group 3
+        counts the requests that the loop admitted for this step.
+
+        Returns:
+            The count of rows in use. 0 for a model that keeps no state.
+
+        Example:
+            >>> # scheduler._state_rows_in_use()
+            >>> # 1
+        """
+        if self._num_state_rows == 0:
+            return 0
+        return len(self.running) + len(self._pending_kv_send) + len(self.waiting)
+
     def _is_dispatched_producer(self, request: Request) -> bool:
         """A do_remote_decode producer past its (final) prefill chunk and safe to
         park: it holds KV blocks awaiting the async send but no longer needs the
@@ -829,9 +1225,26 @@ class NeuronScheduler(Scheduler):
         # Prevent livelock: don't admit a new prefill if running requests
         # already saturate KV cache capacity at worst-case (max_model_len).
         # This is conservative — it doesn't account for prefix cache sharing
-        # — but guarantees no decode-decode preemption.
-        if self._kv_in_use() >= self._max_kv_concurrent:
-            if not self._kv_exhaustion_warned:
+        # — but guarantees no decode-decode preemption. The opt-in rule by
+        # request length uses the largest length of each request instead.
+        if self._kv_pool_is_full_for(request):
+            if self._kv_exhaustion_warned:
+                logger.debug("Prefill deferred: the KV pool is at its admission limit.")
+            elif getattr(self, "_kv_admit_by_len", False):
+                logger.warning(
+                    "Prefill deferred: the KV pool cannot hold the largest length "
+                    "of %d running requests and the new request (%d + %d of %d "
+                    "blocks). Waiting for decode requests to complete. To "
+                    "increase concurrency, raise "
+                    "VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION or send a smaller "
+                    "max_tokens.",
+                    len(self.running),
+                    self._kv_blocks_in_use(),
+                    self._kv_blocks_of(request),
+                    self._kv_budget_blocks,
+                )
+                self._kv_exhaustion_warned = True
+            else:
                 logger.warning(
                     "Prefill deferred: %d requests already holding KV at the "
                     "cache concurrency limit (%d, assuming max_model_len=%d "
@@ -843,11 +1256,36 @@ class NeuronScheduler(Scheduler):
                     _kv_capacity_guidance(),
                 )
                 self._kv_exhaustion_warned = True
+            return False
+
+        # A model with linear attention holds one recurrent state row for each
+        # request, and a producer in the send-lane still holds its row. Without
+        # this check the worker raises "The DeltaNet state pool holds no free
+        # slot" and the request fails. Defer the request instead.
+        if (
+            self._num_state_rows
+            and self._state_rows_in_use() >= self._usable_state_rows
+        ):
+            if not self._state_exhaustion_warned:
+                logger.warning(
+                    "Prefill deferred: %d requests hold the %d usable recurrent "
+                    "state rows of %d. A request in the running queue holds one "
+                    "row, and a producer that waits for a remote read also holds "
+                    "one row. A decode batch that pads needs 1 free row for its "
+                    "padded rows. To raise the concurrency, raise --max-num-seqs "
+                    "with the last entry of additional_config.neuron_config."
+                    "num_seqs_buckets, or give that ladder a bucket for each count, "
+                    "or add a prefill engine.",
+                    self._state_rows_in_use(),
+                    self._usable_state_rows,
+                    self._num_state_rows,
+                )
+                self._state_exhaustion_warned = True
             else:
                 logger.debug(
-                    "Prefill deferred: %d holding KV >= limit %d.",
-                    self._kv_in_use(),
-                    self._max_kv_concurrent,
+                    "Prefill deferred: %d of %d usable recurrent state rows in use.",
+                    self._state_rows_in_use(),
+                    self._usable_state_rows,
                 )
             return False
 
@@ -1126,7 +1564,7 @@ class NeuronScheduler(Scheduler):
             has_prefill_waiting
             and not self.at_capacity
             and not self.has_prefill_in_running
-            and self._kv_in_use() < self._max_kv_concurrent
+            and self._kv_pool_has_room_for_prefill()
         )
         running_holdback: list[Request] = []
         max_num_running_reqs_override: int | None = None
@@ -1271,6 +1709,8 @@ class NeuronScheduler(Scheduler):
             scheduler_output = self._call_base_schedule(throttle_prefills)
         finally:
             self.max_num_running_reqs = original_max_num_running_reqs
+        if getattr(self, "_dn_snapshots", None) is not None:
+            self._attach_deltanet_snapshot_ops(scheduler_output)
 
         # Step 5: Restore holdbacks
         self.running = self.running + running_holdback
