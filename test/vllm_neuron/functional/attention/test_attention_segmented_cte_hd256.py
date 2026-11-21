@@ -28,7 +28,9 @@ DEVICE = "cpu" if envs.VLLM_NEURON_CPU_MODE else "neuron:0"
 _slow = pytest.mark.slow
 
 
-def _golden(q, k_cache, v_cache, block_tables, prior_tokens, block_size, scale):
+def _golden(
+    q, k_cache, v_cache, block_tables, prior_tokens, block_size, scale, tp_out=False
+):
     """Eager fp32 run of the torch fallback, the reference for the kernel."""
     out = _torch_segmented_attention_impl(
         q=q.float(),
@@ -40,7 +42,7 @@ def _golden(q, k_cache, v_cache, block_tables, prior_tokens, block_size, scale):
         kv_segment_size=q.shape[1],  # unused by the fallback
         scale=scale,
         tp_q=True,
-        tp_out=False,
+        tp_out=tp_out,
     )
     return out.to(DTYPE)
 
@@ -121,15 +123,63 @@ def test_segmented_hd256(
     assert_close(result.cpu(), expected, atol=1e-2, rtol=4e-2)
 
 
+# The call of the Qwen3.8-27B prefill at TP=4: scale 1 / sqrt(256) = 1/16 (a power of
+# two, which segmented_attention may fold into the kernel), output transposed to
+# [heads, head_dim, tokens], 6 q heads per KV head. Each setting also alone.
+_model_call_params = [
+    pytest.param(1 / 16, True, 6, id="scale1_16-tp_out-q6"),
+    pytest.param(1 / 16, False, 2, id="scale1_16"),
+    pytest.param(1.0, True, 2, id="tp_out"),
+]
+
+
+@pytest.mark.parametrize("scale, tp_out, num_q_heads", _model_call_params)
+def test_segmented_hd256_model_call(scale, tp_out, num_q_heads):
+    torch.manual_seed(7)
+    seqlen_q, kv_segment_size, prior_tokens, block_size, head_dim = (
+        256,
+        8192,
+        0,
+        64,
+        256,
+    )
+    num_blocks_needed = -(-(prior_tokens + seqlen_q) // block_size)
+    k_cache, v_cache = _block_cache(num_blocks_needed + 50, block_size, head_dim)
+    block_tables = _block_tables(num_blocks_needed, kv_segment_size // block_size)
+    # Large q values so that a scale of 1/16 still gives a peaked softmax.
+    q = torch.randn((num_q_heads, seqlen_q, head_dim), dtype=DTYPE) * 4
+    expected = _golden(
+        q, k_cache, v_cache, block_tables, prior_tokens, block_size, scale, tp_out
+    )
+    compiled = torch.compile(
+        segmented_attention, backend=envs.get_compile_backend_name(), fullgraph=True
+    )
+    result = compiled(
+        q=q.to(DEVICE),
+        k_cache=k_cache.to(DEVICE),
+        v_cache=v_cache.to(DEVICE),
+        block_tables=block_tables.to(DEVICE),
+        prior_tokens=torch.tensor([[prior_tokens]], dtype=torch.int32).to(DEVICE),
+        block_size=block_size,
+        kv_segment_size=kv_segment_size,
+        scale=scale,
+        tp_q=True,
+        tp_out=tp_out,
+    )
+    assert_close(result.cpu(), expected, atol=1e-2, rtol=4e-2)
+
+
 class _FakeKernel:
     """Stands in for a wrapped NKI kernel and records that it ran."""
 
     def __init__(self):
         self.calls = 0
+        self.kwargs = None
 
     def __getitem__(self, grid):
         def run(**kwargs):
             self.calls += 1
+            self.kwargs = kwargs
             return torch.zeros_like(kwargs["q"])
 
         return run
@@ -151,11 +201,21 @@ def test_head_dim_selects_the_kernel(monkeypatch, head_dim, wide):
         prior_tokens=torch.tensor([[0]], dtype=torch.int32),
         block_size=block_size,
         kv_segment_size=512,
-        scale=1.0,
+        scale=1 / 16,
         tp_q=True,
         tp_out=False,
     )
     assert (nkilib.calls, vendored.calls) == ((0, 1) if wide else (1, 0))
+    kwargs = (vendored if wide else nkilib).kwargs
+    if wide:
+        # The vendored kernel takes scale=1.0 only (Q is pre-scaled) and has no
+        # allow_vector_exp parameter.
+        assert kwargs["scale"] == 1.0
+        assert "allow_vector_exp" not in kwargs
+    else:
+        # The nkilib kernel folds the power-of-two scale.
+        assert kwargs["scale"] == 1 / 16
+        assert "allow_vector_exp" in kwargs
 
 
 def test_head_dim_above_256_uses_the_torch_fallback():

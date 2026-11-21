@@ -1056,12 +1056,16 @@ def segmented_attention(
     # Segmented kernel does not yet support tp_q=False natively, so we
     # transpose Q at the boundary.
     q_seg = q.transpose(1, 2) if not tp_q else q
-    # Let the kernel apply the scale: it folds a power-of-two scale into the
-    # tensor_scalar already on the Q load, instead of a separate elementwise pass
-    # over [N, S, d]. A non-power-of-two scale also disables the kernel's
+    # The vendored kernel for 128 < head_dim <= 256 takes scale=1.0 only (its
+    # validation rejects any other scale with prefix caching), so Q is pre-scaled.
+    wide_head = q_seg.shape[2] > _MAX_HEAD_DIM
+    # Otherwise let the kernel apply the scale: it folds a power-of-two scale into
+    # the tensor_scalar already on the Q load, instead of a separate elementwise
+    # pass over [N, S, d]. A non-power-of-two scale also disables the kernel's
     # static-causal range_select path, so pre-scale here in that case.
     _scale_is_pow2 = scale > 0.0 and math.frexp(scale)[0] == 0.5
-    if not _scale_is_pow2:
+    fold_scale = _scale_is_pow2 and not wide_head
+    if not fold_scale:
         q_seg = q_seg * scale
 
     # Only forward fp8_packed when the installed kernel supports it (the packed
@@ -1079,11 +1083,12 @@ def segmented_attention(
             "ships the segmented packed FP8 read path."
         )
 
-    d_head = q_seg.shape[2]
-    if d_head > _MAX_HEAD_DIM:
+    if wide_head:
+        # The vendored kernel has no allow_vector_exp parameter.
         kernel = _wrapped_attention_segmented_cte_wide_head
     else:
         kernel = _wrapped_attention_segmented_cte
+        extra_kwargs["allow_vector_exp"] = allow_vector_exp
     result = kernel[2](
         q=q_seg,
         k_cache=k_cache,
@@ -1092,7 +1097,7 @@ def segmented_attention(
         prior_tokens=prior_tokens,
         block_size=block_size,
         prior_seg_size=kv_segment_size,
-        scale=1.0 if not _scale_is_pow2 else scale,
+        scale=scale if fold_scale else 1.0,
         tp_q=True,
         tp_out=tp_out,
         sliding_window=sliding_window if sliding_window else None,
@@ -1100,7 +1105,6 @@ def segmented_attention(
         num_q_heads=q_seg.shape[0],
         k_scale=k_scale,
         v_scale=v_scale,
-        allow_vector_exp=allow_vector_exp,
         **extra_kwargs,
     )
 
