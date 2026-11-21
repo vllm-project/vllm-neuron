@@ -139,6 +139,13 @@ def _init_backend():
             compiler_fn=capture, name="neuron_libtorch_graph_capture"
         )
 
+    # The XLA route cannot use an unsigned NKI kernel output after Lite re-types it.
+    from vllm_neuron.vllm.patches.nki_xla_unsigned_output_patch import (
+        apply_nki_xla_unsigned_output_patch,
+    )
+
+    apply_nki_xla_unsigned_output_patch()
+
     if not envs.VLLM_NEURON_CPU_MODE or _has_neuron_hw:
         try:
             from libtorch_neuronx_lite.overrides import neuron_collectives  # noqa: F401
