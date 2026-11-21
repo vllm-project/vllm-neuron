@@ -163,3 +163,24 @@ def test_the_qwen3_5_model_declares_its_defaults():
     assert Qwen3_5ForCausalLM.supports_async_readback_skip is True
     assert Qwen3_5ForCausalLM.default_kv_cap_fraction == 0.23
     assert getattr(Qwen3_5ForCausalLM, "supports_async_reorder", False) is False
+
+
+def test_the_factory_takes_the_multimodal_call_of_the_runner(monkeypatch):
+    # The checkpoint has a vision_config, so the runner calls
+    # from_configs(hf_config=..., text_neuron_config=..., encoder_neuron_config=...).
+    from vllm_neuron.model.qwen3_5 import factory
+
+    seen = {}
+
+    def select(cls, hf_config, neuron_config):
+        seen["neuron_config"] = neuron_config
+        return "model"
+
+    monkeypatch.setattr(
+        factory.Qwen3_5ForCausalLM, "_select_implementation", classmethod(select)
+    )
+    text = object()
+    out = factory.Qwen3_5ForConditionalGeneration.from_configs(
+        hf_config=None, text_neuron_config=text, encoder_neuron_config=object()
+    )
+    assert out == "model" and seen["neuron_config"] is text

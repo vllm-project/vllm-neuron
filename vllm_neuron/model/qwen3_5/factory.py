@@ -29,12 +29,12 @@ class Qwen3_5ForCausalLM(nn.Module):
         neuron_config: NeuronConfig | None = None,
         *,
         text_neuron_config: NeuronConfig | None = None,
-        vision_neuron_config: object | None = None,
+        encoder_neuron_config: object | None = None,
     ) -> nn.Module:
         # The checkpoint is Qwen3_5ForConditionalGeneration, so the runner sees
         # hf_config.vision_config and calls the multimodal form
-        # (text_neuron_config=..., vision_neuron_config=...). This port is the
-        # language model only: take the text config and ignore the vision one.
+        # (text_neuron_config=..., encoder_neuron_config=...). This port is the
+        # language model only: take the text config and ignore the encoder one.
         if neuron_config is None:
             neuron_config = text_neuron_config
         return cls._select_implementation(hf_config, neuron_config)
