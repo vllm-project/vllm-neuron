@@ -232,6 +232,47 @@ class Qwen3_5RotaryEmbedding(nn.Module):
         return freqs_t
 
 
+def _causal_depthwise_conv(conv_in: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Run the depthwise causal conv of a prefill chunk as K shifted multiply-adds.
+
+    The result has the values of ``F.conv1d`` over the channels-first transpose of
+    ``conv_in``. The sum accumulates in float32 and is returned in the dtype of
+    ``conv_in``.
+
+    The layout is token-major, the layout of the QKV projection. A shift by j
+    tokens is then a contiguous block of rows. On the native route a shift along
+    the last axis of a channels-first [1, C, T] tensor is a strided copy: each of
+    the K slices becomes DMA transfers of one row per channel, about 11 ms for
+    each linear attention layer at 8192 tokens against about 1 ms on the XLA route.
+
+    The native route uses this form, and the XLA route keeps ``F.conv1d``. The
+    8192-token prefill graph is split at token 4096, and each route lowers one of
+    the two forms wrong across that split. On the native route ``F.conv1d`` loses
+    the conv window at the split: tokens 4096, 4097 and 4098 get a wrong conv
+    output in each linear attention layer, and the recurrent state carries the
+    error to the rest of the chunk. On the XLA route this form gives zero keys and
+    values for every token from 4096 on. Either error makes every prompt of more
+    than 4096 tokens give wrong output. ``-O3`` (no neuronx-cc modular flow) is
+    right, but the 64-layer graph then exceeds the instruction limit.
+
+    Args:
+        conv_in: [K - 1 + T, C]. The K - 1 tokens of left context, then the T
+            tokens of the chunk.
+        weight: [C, 1, K].
+
+    Returns:
+        [T, C].
+    """
+    kernel = weight.shape[-1]
+    tokens = conv_in.shape[0] - (kernel - 1)
+    w = weight.squeeze(1).float().transpose(0, 1)  # [K, C]
+    x = conv_in.float()
+    out = x[0:tokens] * w[0]
+    for j in range(1, kernel):
+        out = out + x[j : j + tokens] * w[j]
+    return out.to(conv_in.dtype)
+
+
 def _swap_adjacent_dims(tensor: torch.Tensor, dim: int = 1) -> torch.Tensor:
     """Exchange dimension `dim` and dimension `dim` + 1 of a tensor.
 
@@ -1985,8 +2026,6 @@ class Qwen3_5DeltaNet(nn.Module):
 
         # ── Causal Conv1d on QKV ──
         if is_prefill:
-            # Prefill: [tokens, qkv_per_rank] → [1, qkv_per_rank, tokens]
-            qkv_transposed = qkv.transpose(0, 1).unsqueeze(0)
             k_minus_1 = self.conv_kernel - 1
 
             # Left context of the causal conv. Chunk 0 of a request sees zeros.
@@ -2000,7 +2039,7 @@ class Qwen3_5DeltaNet(nn.Module):
             # one request only: the Neuron platform chunks a prefill at batch
             # size 1, and it does not mix a prefill with a decode. `batch_size`
             # above is 1 for this reason.
-            prev_ctx = self.conv_state[slot_idx].to(qkv_transposed.dtype)
+            prev_ctx = self.conv_state[slot_idx].to(qkv.dtype)
             if deltanet_snapshot_rows is not None:
                 # A prefix cache hit starts from the saved conv window of its prefix.
                 snap_src = deltanet_snapshot_rows[:1]
@@ -2011,23 +2050,36 @@ class Qwen3_5DeltaNet(nn.Module):
             if positions is not None:
                 cont_mask = (positions[:1].long() != 0).reshape(1, 1, 1)
                 prev_ctx = torch.where(cont_mask, prev_ctx, torch.zeros_like(prev_ctx))
-            conv_in = torch.cat([prev_ctx, qkv_transposed], dim=-1)
-            conv_out = F.conv1d(
-                conv_in,
-                self.conv_weight,
-                bias=None,
-                padding=0,
-                groups=conv_in.shape[1],
-            )
+            # The K-1 tokens of left context, then the chunk. Each route takes the
+            # form that its compiler lowers correctly and fast in the 8192-token graph
+            # (see _causal_depthwise_conv): token-major shifted multiply-adds on the
+            # native route, F.conv1d over channels-first on the XLA route.
+            token_major = envs.is_native_backend()
+            if token_major:
+                # [K-1 + tokens, qkv_per_rank]
+                conv_in = torch.cat([prev_ctx[0].transpose(0, 1), qkv], dim=0)
+                conv_out = _causal_depthwise_conv(conv_in, self.conv_weight)
+            else:
+                # [1, qkv_per_rank, K-1 + tokens]
+                conv_in = torch.cat(
+                    [prev_ctx, qkv.transpose(0, 1).unsqueeze(0)], dim=-1
+                )
+                conv_out = F.conv1d(
+                    conv_in,
+                    self.conv_weight,
+                    bias=None,
+                    padding=0,
+                    groups=conv_in.shape[1],
+                )
 
             # Update conv state buffer: save the last (kernel-1) REAL token positions.
             #
-            # `qkv_transposed` spans the PADDED bucket length, not the prompt length, so
-            # `[:, :, -(K-1):]` took the last K-1 positions of the *padding* -- e.g. indices
+            # The chunk spans the PADDED bucket length, not the prompt length, so a state
+            # taken from its last K-1 positions holds the *padding* -- e.g. indices
             # 125..127 for a 16-token prompt in a 128 bucket. Decode then convolved
             # [pad, pad, pad, x_new] instead of [x[n-3], x[n-2], x[n-1], x_new], so its q/k/v
             # were wrong from the first decode step while prefill's own outputs stayed correct
-            # (at a real position t, the window t-3..t is real or zero-padded by F.conv1d).
+            # (at a real position t, the window t-3..t is real tokens or the left context).
             #
             # Measured, port against port at the same position: with padding, decode's q/k/v
             # differed from prefill's by 2.1% / 3.0% / 1.4% and the recurrence output by 7.5%;
@@ -2045,14 +2097,25 @@ class Qwen3_5DeltaNet(nn.Module):
             # is always in range and spans the chunk boundary when real_len < K-1.
             real_len = deltanet_padding_mask.float().sum().to(torch.int32)
             conv_idx = real_len + torch.arange(
-                k_minus_1, device=qkv_transposed.device, dtype=torch.int32
+                k_minus_1, device=qkv.device, dtype=torch.int32
             )
-            new_conv_state = conv_in.index_select(-1, conv_idx.long()).contiguous()
+            if token_major:
+                # [K-1, qkv_per_rank] -> the state layout [1, qkv_per_rank, K-1]
+                new_conv_state = (
+                    conv_in.index_select(0, conv_idx.long())
+                    .transpose(0, 1)
+                    .unsqueeze(0)
+                    .contiguous()
+                )
+            else:
+                new_conv_state = conv_in.index_select(-1, conv_idx.long()).contiguous()
             self._write_prefill_conv_state(
                 slot_idx, new_conv_state, deltanet_snapshot_rows
             )
-            # [1, qkv_per_rank, tokens] → [tokens, qkv_per_rank]
-            qkv_post_conv = F.silu(conv_out).squeeze(0).transpose(0, 1)
+            qkv_post_conv = F.silu(conv_out)
+            if not token_major:
+                # [1, qkv_per_rank, tokens] -> [tokens, qkv_per_rank]
+                qkv_post_conv = qkv_post_conv.squeeze(0).transpose(0, 1)
         else:
             # Decode: [B, qkv_per_rank, 1] — each request has 1 new token
             qkv_3d = qkv.unsqueeze(-1)  # [B, qkv_per_rank, 1]

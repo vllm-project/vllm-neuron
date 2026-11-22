@@ -8,7 +8,9 @@ nothing). VLLM_NEURON_BACKEND_DELTANET_CONV_STATE_WRITE selects the write:
 these tests require equal bits:
 - the state row and the save row get the window, and every other row keeps its own,
 - prefill steps (a first chunk, a continuation, a restore from a snapshot) give
-  the same output, conv buffers and recurrent buffers with each write.
+  the same output, conv buffers and recurrent buffers with each write,
+- and on each route: the native route runs the prefill conv as token-major
+  multiply-adds, the XLA route as F.conv1d (see _causal_depthwise_conv).
 
 These tests run the pure-torch paths in CPU mode at TP=1.
 """
@@ -202,3 +204,28 @@ def test_prefill_steps_are_the_same_with_each_write(monkeypatch):
     # The steps did write: the state row of the first request changed.
     fresh = _layer(monkeypatch, "scatter")
     assert not torch.equal(ref[1][3], fresh.conv_state[3])
+
+
+def test_prefill_steps_are_the_same_on_each_route(monkeypatch):
+    conv1d, calls = m.F.conv1d, []
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return conv1d(*args, **kwargs)
+
+    monkeypatch.setattr(m.F, "conv1d", spy)
+    results, conv1d_calls = {}, {}
+    for route in ("neuron_native", "vllm_neuron"):
+        monkeypatch.setenv("VLLM_NEURON_BACKEND", route)
+        calls.clear()
+        results[route] = _run_steps(_layer(monkeypatch, "select"))
+        conv1d_calls[route] = len(calls)
+    assert conv1d_calls == {"neuron_native": 0, "vllm_neuron": 3}
+    ref, got = results["vllm_neuron"], results["neuron_native"]
+    # The conv windows only move data, so the conv buffers match bit for bit. The
+    # outputs and recurrent buffers follow a float32 sum in another order.
+    assert torch.equal(ref[1], got[1]) and torch.equal(ref[2], got[2])
+    for a, b in zip(ref[0], got[0]):
+        torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-5)
+    for a, b in zip(ref[3:], got[3:]):
+        torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-5)
