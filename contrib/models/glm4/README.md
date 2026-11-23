@@ -136,7 +136,7 @@ full list of `VLLM_NEURON_*` environment variables.
 
 | Instance / SDK version | 2.33 (vLLM Neuron 0.29.0.1.2.0) | 2.32 and earlier |
 | ---------------------- | ------------------------------- | ---------------- |
-| Trn2 (trn2.48xlarge)   | TP 8, single node: see the Validation report | Not tested |
+| Trn2 (trn2.48xlarge)   | See the Validation report: TP 8, one node | Not tested |
 | Trn3                   | Not tested | Not tested |
 
 CPU mode (`VLLM_NEURON_CPU_MODE=1`) on vLLM Neuron 0.29.0.1.2.0 (vLLM 0.29.0,
@@ -223,10 +223,82 @@ plugin's `MPExecutor` worker pool at the end of the session.
 
 ## Validation report
 
-### vLLM Neuron 0.29.0.1.2.0
+### vLLM Neuron 0.29.0.1.2.0 (2026-11-23)
 
-_Pending: the device results of the integration test, the unit tests and a
-`vllm serve` smoke test on trn2.48xlarge go here._
+#### Environment
+
+| Image | Instance | TP | vLLM | vllm-neuron | torch | transformers | neuronx-cc |
+|---|---|---|---|---|---|---|---|
+| `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04` | `trn2.48xlarge` (LNC 2), 1 node | 8 | 0.29.0 | 0.29.0.1.2.0 | 2.13.0 | 5.17.0 | 2.28.7631.0+8f7b0cf5 |
+
+Checkpoint of the integration test: `zai-org/GLM-4-32B-0414` at
+`077b5c2f5c43bd3239fd605a0600229e8facbd4a`.
+
+#### Results
+
+| Test | Configuration | Result |
+|---|---|---|
+| CPU unit tests, `test/unit/` | `VLLM_NEURON_CPU_MODE=1`, `GLM4_0414_CHECKPOINT_PATH` set | 15 passed, 0 failed (includes the 3 weight tests and both `test_tiny_glm4_e2e.py` cases) |
+| `test_model_accuracy[1-2048]` | TP 8, `neuron_native`, BF16, batch 1, max model length 2,048, segmented prefill (bucket 1,024, KV segment 1,024), 2 prompts × 16 greedy tokens, on-device greedy sampling | PASSED (340.040 s): 2/2 prompts within `TOL_MAP` on all 16 tokens, no argmax divergence; aggregate σ-ratio 0.9207 ≤ 1.0 |
+| `test_model_accuracy[4-2048]` | TP 8, `neuron_native`, BF16, batch 4 (each prompt in 4 rows), max model length 2,048, segmented prefill (bucket 1,024, KV segment 1,024), 2 prompts × 16 greedy tokens, on-device greedy sampling | PASSED (387.375 s): 2/2 prompts within `TOL_MAP` on all 64 tokens, no argmax divergence; aggregate σ-ratio 0.9385 ≤ 1.0 |
+| `vllm serve` smoke | The Usage command (with `--revision` and the three timeout variables), installed with `pip install --no-deps -e contrib/models/glm4` | Passed: 3/3 prompts, 32 completion tokens each; a batched request of all 3 at `max_tokens` 16 returned a prefix of each |
+
+Engine start (profile, KV cache, warmup) took 212.18 s (compilation 204.87 s)
+in `[1-2048]`, 232.51 s (compilation 225.24 s) in `[4-2048]` and 225.58 s
+(compilation 220.47 s) for `vllm serve`.
+
+#### Logit validation
+
+| Case | Prompt | Overall Status | Max K5 (0.03) | Max K50 (0.05) | Max K1000 (0.08) | Max All (0.09) | Argmax divergence (1 ULP) |
+|---|---|---|---|---|---|---|---|
+| `[1-2048]` | 1 of 2, `The Amazon rainforest …` | PASSED | 0.0075 at token 6 | 0.0076 at token 2 | 0.0077 at token 5 | 0.0151 at token 11 | 0.0000 |
+| `[1-2048]` | 2 of 2, `The human genome …` | PASSED | 0.0084 at token 4 | 0.0092 at token 10 | 0.0094 at token 1 | 0.0174 at token 1 | 0.0000 |
+| `[4-2048]` | 1 of 2, `The Amazon rainforest …` | PASSED | 0.0074 at token 4 | 0.0074 at token 4 | 0.0090 at token 13 | 0.0091 at token 0 | 0.0000 |
+| `[4-2048]` | 2 of 2, `The human genome …` | PASSED | 0.0074 at token 2 | 0.0123 at token 4 | 0.0123 at token 4 | 0.0135 at token 6 | 0.0000 |
+
+Neuron vs CPU BF16 reference; token = generated token. `[4-2048]`: positions
+of batch row 0; each of the 4 rows printed the same per-row maxima. No argmax
+divergence.
+`[1-2048]`: two-way validation 2/2 prompts (`multi_prompt_logit_validation`);
+aggregate σ-ratio 0.9207 ≤ 1.0; `agg_bc` FAIL, `agg_l2_1.2x` PASS,
+`agg_l2_1.5x` PASS, `agg_linf_1.2x` FAIL, `agg_linf_1.5x` FAIL; printed
+per-prompt checks: `pp_max_linf_1.5x` 2/2, `pp_max_linf_2.0x` 2/2,
+`pp_max_l2_1.5x` 2/2, `pp_max_l2_2.0x` 2/2, `pp_tok_linf_1.5x` 0/2,
+`pp_tok_linf_2.0x` 1/2, `pp_tok_l2_1.5x` 2/2, `pp_tok_l2_2.0x` 2/2,
+`pp_static_0.03` 2/2, `pp_static_0.05` 2/2.
+`[4-2048]`: two-way validation 2/2 prompts; aggregate σ-ratio 0.9385 ≤ 1.0;
+`agg_bc` FAIL, `agg_l2_1.2x` FAIL, `agg_l2_1.5x` PASS, `agg_linf_1.2x` PASS,
+`agg_linf_1.5x` PASS; printed per-prompt checks: `pp_max_linf_1.5x` 2/2,
+`pp_max_linf_2.0x` 2/2, `pp_max_l2_1.5x` 2/2, `pp_max_l2_2.0x` 2/2,
+`pp_tok_linf_1.5x` 0/2, `pp_tok_linf_2.0x` 2/2, `pp_tok_l2_1.5x` 2/2,
+`pp_tok_l2_2.0x` 2/2, `pp_static_0.03` 2/2, `pp_static_0.05` 2/2.
+Per-token L-inf ratios over 1.5x: `[1-2048]` prompt 1 tokens 0 (1.72x),
+9 (1.79x) and 12 (2.58x), prompt 2 token 11 (1.82x); `[4-2048]` row 0,
+prompt 1 token 0 (1.72x), prompt 2 tokens 5 (1.73x) and 11 (1.80x).
+
+Error against the FP32 reference, per prompt (max over the 16 generated
+tokens; `[4-2048]` prints batch row 0):
+
+| Case | Prompt | CPU BF16 L-inf | Neuron L-inf | Neuron / CPU BF16 | CPU BF16 L2 | Neuron L2 | Neuron / CPU BF16 |
+|---|---|---|---|---|---|---|---|
+| `[1-2048]` | 1 of 2 | 0.0097 | 0.0104 | 1.07x | 0.0103 | 0.0099 | 0.96x |
+| `[1-2048]` | 2 of 2 | 0.0106 | 0.0104 | 0.98x | 0.0125 | 0.0100 | 0.80x |
+| `[4-2048]` | 1 of 2 | 0.0097 | 0.0095 | 0.98x | 0.0103 | 0.0096 | 0.93x |
+| `[4-2048]` | 2 of 2 | 0.0106 | 0.0103 | 0.97x | 0.0125 | 0.0125 | 1.00x |
+
+Generated token of each Neuron maximum: `[1-2048]` prompt 1 L-inf tokens 11
+and 12, L2 token 12; prompt 2 L-inf token 11, L2 token 7. `[4-2048]` prompt 1
+L-inf and L2 token 3; prompt 2 L-inf token 11, L2 token 13.
+
+#### Serve smoke
+
+`/v1/completions`, `temperature` 0, `max_tokens` 32; first 60 characters of each output as a Python string literal.
+
+| Prompt | Output |
+|---|---|
+| `The capital of France is` | `" Paris. It is the largest city in France and the country's p"` |
+| `1, 2, 3, 4, 5,` | `' 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16'` |
+| `def fibonacci(n):` | `' \n    if n<0: \n        print("Incorrect input") \n    elif n='` |
 
 ### Exceptions
 
@@ -243,6 +315,14 @@ _Pending: the device results of the integration test, the unit tests and a
   `create_offline_vllm_generate_fn`, because the model scores 151552 ids and
   the tokenizer has 151329 base tokens; see the function's docstring. The
   comparison and the tolerance map are the plugin's.
+- **Informational checks that did not pass.** `pp_tok_linf_1.5x` 0/2 in both
+  cases, `pp_tok_linf_2.0x` 1/2 in `[1-2048]`, `agg_bc` FAIL in both cases,
+  `agg_linf_1.2x` and `agg_linf_1.5x` FAIL in `[1-2048]`, `agg_l2_1.2x` FAIL
+  in `[4-2048]` (see Logit validation).
+- **Single-chunk prompts on device.** Both prompts are shorter than one
+  1024-token chunk, so the device runs used the segmented-prefill graph with
+  no prior KV. A prompt over several chunks is covered only by the CPU test
+  `test_tiny_glm4_e2e.py[4-segmented]` (random weights).
 - **Dropped: the port's disaggregated-inference test** (1P1D logits and a
   1024-in / 512-out serving request). It needs two nodes, a KV transfer
   connector, a proxy and MPI, and imports helpers from the plugin's test tree.
@@ -250,13 +330,13 @@ _Pending: the device results of the integration test, the unit tests and a
   the prompts copied locally.
 - **Dropped: the port's device module tests** (layer-0 attention prefill,
   segmented prefill and decode, and MLP prefill and decode at TP 8 with the
-  real weights, against HF). They run only on a Neuron device with the full
-  checkpoint and were not re-run on vLLM Neuron 0.29.0.1.2.0. The CPU tiny
-  decoder-layer test and the tiny end-to-end test cover the same code paths
-  with random weights.
+  real weights, against HF). They were not run on vLLM Neuron 0.29.0.1.2.0.
+  The CPU tiny decoder-layer test and the tiny end-to-end test cover the same
+  code paths with random weights.
 - **Rewritten assertion.** The port's CPU test asserted that
   `vllm_neuron.model.registry.get_models()` maps `Glm4ForCausalLM` to the
   factory. A contrib model is deliberately absent from that registry, so the
   shipped test checks the registration contract instead.
-- **Untested:** prefix caching, context beyond 2048 tokens, tensor parallel
-  sizes other than 8 on device, speculative decoding and Trn3.
+- Flash-attention prefill on device, prefix caching, context beyond 2048
+  tokens, tensor parallel sizes other than 8 on device, speculative decoding
+  and Trn3 are not tested.

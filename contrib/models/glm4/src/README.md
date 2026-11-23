@@ -95,14 +95,14 @@ verdicts in the Validation report of the model folder's `README.md`.
 
 | Feature | Status |
 |---|---|
-| BF16 checkpoint and compute | Implemented; see the Validation report |
-| TP 8, single node | Implemented; see the Validation report |
+| BF16 checkpoint and compute | Exercised on device (see the Validation report) |
+| TP 8, single node | Exercised on device (see the Validation report) |
 | TP 2, 4, 16 | Implemented, not covered on device. CPU mode covers TP 4 with a tiny random-weight model. |
 | TP 1 | Not covered. Both KV heads land on one rank; the decode call passes a 2D block table, which `NF.attention_decode` routes to its torch fallback for more than one KV head per rank. |
-| Segmented (chunked) prefill, prefill bucket 1024 | Implemented; see the Validation report |
+| Segmented (chunked) prefill, prefill bucket 1024 | Exercised on device with single-chunk prompts (see the Validation report); a prompt over several chunks is covered only in CPU mode with a tiny model |
 | Flash-attention prefill | Implemented, not covered on device: the recorded runs set `max_num_batched_tokens` 1024 below `max_model_len` 2048. CPU mode covers it with a tiny model. |
-| Fused decode attention kernel | Implemented; see the Validation report |
-| On-device greedy sampling | Implemented; see the Validation report |
+| Fused decode attention kernel | Exercised on device (see the Validation report) |
+| On-device greedy sampling | Exercised on device (see the Validation report) |
 | Prefix caching | Implemented through the segmented-prefill path, not covered (every recorded run disabled it) |
 | Context beyond 2048 tokens (up to 32768) | Implemented, not covered |
 | `inputs_embeds` | Not supported, pass `input_ids` |
