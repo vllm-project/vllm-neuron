@@ -1,0 +1,887 @@
+diff --git a/vllm_neuron/__init__.py b/vllm_neuron/__init__.py
+index eddf2363d41a50d3e361c489a3966c9a11b8985b..db04ed41fe404ee597ff57f5aca67afea1ceb984 100644
+--- a/vllm_neuron/__init__.py
++++ b/vllm_neuron/__init__.py
+@@ -275,6 +275,16 @@ from vllm_neuron.vllm.patches.accelerator_empty_cache_patch import (
+ 
+ apply_accelerator_empty_cache_patch()
+ 
++# dynamo's recompilation-reason report evaluates the old entry's tensor-aliasing
++# sources against the new frame's locals with no error handling; a frame
++# re-entered with a module lacking a submodule the earlier entry had raises
++# KeyError out of the diagnostic and kills the forward. See the patch module.
++from vllm_neuron.vllm.patches.dynamo_recompile_reason_patch import (
++    apply_dynamo_recompile_reason_patch,
++)
++
++apply_dynamo_recompile_reason_patch()
++
+ # Replica-mesh patches are installed by NeuronWorker.init_device() right before
+ # it calls _init_neuron_distributed_environment_and_runtime(). That location
+ # runs *after* vLLM has finished importing (avoiding the vllm.utils.torch_utils
+diff --git a/vllm_neuron/parallel/neuron_parallel_state.py b/vllm_neuron/parallel/neuron_parallel_state.py
+index fd5dd4f3483209bf2b8f6b41d2e9b0d0019e9543..f8413aab7316ac7df6b7f252042ade0226f2248f 100644
+--- a/vllm_neuron/parallel/neuron_parallel_state.py
++++ b/vllm_neuron/parallel/neuron_parallel_state.py
+@@ -378,6 +378,26 @@ _ORIGINAL_DESTROY_MODEL_PARALLEL = None
+ # ---------------------------------------------------------------------------
+ 
+ 
++def _uses_trn2_torus_mesh() -> bool:
++    """Whether the hand-laid Trn2 8x8 mesh applies to this host.
++
++    True on Trn2, and when the instance family cannot be read (CPU mode, or a
++    host without the sysfs product name), which keeps the long-standing
++    default. False on every other family, Trn3 included.
++    """
++    from vllm_neuron import envs
++
++    if envs.VLLM_NEURON_CPU_MODE:
++        return True
++    from vllm_neuron.utils.hardware_config import get_instance_family
++
++    try:
++        family = get_instance_family()
++    except RuntimeError:
++        return True
++    return family == "trn2"
++
++
+ def _build_2d_mesh(
+     ranks: list[int],
+     row_size: int,
+@@ -408,8 +428,20 @@ def _build_2d_mesh(
+ 
+     total = row_size * num_rows
+ 
+-    # Special case: 8x8 topology for TRN2
+-    if not envs.VLLM_NEURON_SWITCH_CC and total == 64 and row_size == 8:
++    # Special case: 8x8 topology for TRN2. The pairing below (devices 0+3, 1+2,
++    # ...) follows Trn2's 4x4 torus; on a Trn3 box the device graph is a switch
++    # and those pairs are not linked, so the runtime refuses the group:
++    #   ENC:enc_post_operation Collective operation ALLREDUCE ... over group id 0
++    #   (rank_n:8 node_n:1) is currently not supported.
++    #   Replica-group 0: [0,1,2,3,12,13,14,15]
++    # So the mesh is applied to Trn2 only; every other family keeps contiguous
++    # rows, whose device pairs (0+1, 2+3, ...) are linked on Trn3.
++    if (
++        not envs.VLLM_NEURON_SWITCH_CC
++        and total == 64
++        and row_size == 8
++        and _uses_trn2_torus_mesh()
++    ):
+         mesh = [
+             [0, 1, 2, 3, 12, 13, 14, 15],
+             [4, 5, 6, 7, 8, 9, 10, 11],
+diff --git a/vllm_neuron/vllm/core/scheduler.py b/vllm_neuron/vllm/core/scheduler.py
+index 1b687f4e21edcba25e1c1f0fe01fbfbca9d6acfd..c462451eb8f3fec544e18404726c9a016e1d79c8 100644
+--- a/vllm_neuron/vllm/core/scheduler.py
++++ b/vllm_neuron/vllm/core/scheduler.py
+@@ -8,6 +8,7 @@ bucket-aware admission control.
+ """
+ 
+ import logging
++import os
+ from collections import deque
+ from enum import Enum, auto
+ from typing import TYPE_CHECKING
+@@ -1487,8 +1488,57 @@ class NeuronAsyncScheduler(NeuronScheduler, AsyncScheduler):
+         NeuronScheduler.schedule() calls this method to delegate to the base scheduler.
+         For async scheduling, we need AsyncScheduler's behavior.
+         """
++        if os.environ.get("VLLM_NEURON_ASYNC_MAX_TOKENS_HOLDBACK", "") not in ("", "0"):
++            self._hold_back_possibly_final_steps()
++            self._hold_back_first_decodes()
+         return AsyncScheduler.schedule(self, throttle_prefills)
+ 
++    def _hold_back_first_decodes(self) -> None:
++        """Do not schedule a request's first decode while its prefill is still in flight.
++
++        Scheduled right after the prefill was submitted, that decode runs before any prefill
++        of a request that reaches the scheduler a moment later -- requests sent together
++        arrive over a few milliseconds -- and that prefill, and every one queued behind it,
++        waits a decode step longer (~40 ms of TTFT for nine of ten requests sent at once,
++        2026-10-30). Waiting for the first token instead is what synchronous scheduling did,
++        once per request."""
++        for request in self.running:
++            if (
++                request.num_output_placeholders > 0
++                and request.num_output_tokens == 0
++                and not request.is_prefill_chunk
++            ):
++                request.next_decode_eligible_step = max(
++                    request.next_decode_eligible_step, self.current_step + 2
++                )
++
++    def _hold_back_possibly_final_steps(self) -> None:
++        """``VLLM_NEURON_ASYNC_MAX_TOKENS_HOLDBACK``: do not schedule a lone running
++        request's next step while its in-flight one may already reach ``max_tokens``.
++
++        vLLM skips the next step only when the in-flight one is *sure* to finish the
++        request (every draft rejected). When the in-flight step merely *can* finish it,
++        the next step is scheduled ahead and, when it does finish, runs for nothing --
++        a whole decode step of device time that the next request's prefill queues
++        behind (with a speculative model ~20 ms of TTFT for a request sent after the
++        previous one's last token). Holding such a step back until the output is in
++        costs one host round trip when the request did not finish. Only for a request
++        that is alone: in a batch the step serves the others too."""
++        if len(self.running) != 1:
++            return
++        request = self.running[0]
++        if (
++            request.num_output_placeholders > 0
++            and not request.is_prefill_chunk
++            and request.num_output_tokens + request.num_output_placeholders
++            >= request.max_tokens
++        ):
++            # ``schedule()`` advances ``current_step`` first, then skips a request
++            # whose ``next_decode_eligible_step`` is still ahead of it.
++            request.next_decode_eligible_step = max(
++                request.next_decode_eligible_step, self.current_step + 2
++            )
++
+     def _update_after_schedule(self, scheduler_output: "SchedulerOutput") -> None:
+         """Override to suppress spec-token placeholders near max_model_len.
+ 
+diff --git a/vllm_neuron/vllm/patches/dynamo_recompile_reason_patch.py b/vllm_neuron/vllm/patches/dynamo_recompile_reason_patch.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cdff082f4cce8b1e1768080fb46ae120d0c9b80d
+--- /dev/null
++++ b/vllm_neuron/vllm/patches/dynamo_recompile_reason_patch.py
+@@ -0,0 +1,69 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Make dynamo's recompilation-reason report best-effort.
++
++On every recompilation ``torch._dynamo.convert_frame._compile`` calls
++``get_and_maybe_log_recompilation_reasons`` to say *why* the cached entries'
++guards failed. When the failing guard is the no-tensor-aliasing one, torch 2.13
++re-evaluates each aliasing source of the **old** entry against the **new**
++frame's locals (``guards.recompilation_reason_for_no_tensor_aliasing_guard``),
++with no exception handling:
++
++    tensor_id = id(eval(tensor_source, global_scope, scope))
++    KeyError: 'wgate'
++
++The sources are attribute paths through ``nn.Module`` ``_modules`` dicts, so a
++frame re-entered with a module that *lacks* a submodule the earlier entry had
++— a decoder layer without a KV compressor, called through the same per-block
++helper as one with it — raises ``KeyError`` out of the report, and the forward
++dies on a diagnostic. The recompilation itself is legitimate; only the
++explanation of it is broken.
++
++This wraps that reporter so a source that cannot be evaluated against the new
++frame is skipped rather than fatal. Every other path in
++``get_guard_fail_reason_helper`` already evaluates its parts under
++``try/except Exception``; this gives the aliasing path the same treatment.
++Applied at import time so it survives spawn-mode re-imports in worker
++processes.
++"""
++
++import functools
++import logging
++
++logger = logging.getLogger(__name__)
++
++_applied = False
++
++
++def apply_dynamo_recompile_reason_patch() -> None:
++    global _applied
++    if _applied:
++        return
++    _applied = True
++
++    try:
++        from torch._dynamo import guards as dynamo_guards
++    except Exception:  # noqa: BLE001 - no dynamo, nothing to patch
++        return
++
++    orig = getattr(
++        dynamo_guards, "recompilation_reason_for_no_tensor_aliasing_guard", None
++    )
++    if orig is None or getattr(orig, "_vllm_neuron_best_effort", False):
++        return
++
++    @functools.wraps(orig)
++    def _best_effort(guard_manager, scope):  # noqa: ANN001 - torch's signature
++        try:
++            return orig(guard_manager, scope)
++        except Exception as e:  # noqa: BLE001 - a diagnostic must not kill the forward
++            logger.debug(
++                "Skipped dynamo's no-tensor-aliasing recompilation reason: "
++                "a guard source does not evaluate against the new frame (%s: %s)",
++                type(e).__name__,
++                e,
++            )
++            return []
++
++    _best_effort._vllm_neuron_best_effort = True  # type: ignore[attr-defined]
++    dynamo_guards.recompilation_reason_for_no_tensor_aliasing_guard = _best_effort
++    logger.debug("Applied best-effort dynamo recompilation-reason patch")
+diff --git a/vllm_neuron/vllm/patches/in_model_proposer_patch.py b/vllm_neuron/vllm/patches/in_model_proposer_patch.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..83735838a156c573e98e525cbc6413562e1de6df
+--- /dev/null
++++ b/vllm_neuron/vllm/patches/in_model_proposer_patch.py
+@@ -0,0 +1,111 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Let a model's own layers be its speculative drafter, with no second checkpoint.
++
++`SpeculativeConfig.__post_init__` assumes a draft *model*. For an MTP method with
++`model=None` it points `model` at the target checkpoint, builds a second `ModelConfig` from
++it, and then re-detects the method from *that* config's `model_type`. A model whose MTP
++stages are layers of the target's own checkpoint fails the re-detection: only `model_type`s
++in vLLM's `MTPModelTypes` survive it (plus the handful `hf_config_override` rewrites), so a
++port whose `model_type` is its own -- `deepseek_v41` -- ends the chain at
++
++    NotImplementedError: Unsupported speculative method: 'mtp'
++
++before any Neuron code runs. The second `ModelConfig` would be wrong anyway: there is no
++separate draft to configure, and nothing on this backend would load it, because the runner
++builds the proposer the model registered.
++
++So for exactly the in-model case -- `model is None`, an MTP method name, and a proposer
++registered under that name in `vllm_neuron.vllm.spec_decode` -- this sets the fields
++downstream actually reads and skips the draft-model machinery. Every other configuration,
++including every real draft model, takes the original path untouched.
++
++The method is canonicalised to `"mtp"`. That is what upstream does with every MTP alias, and
++it is what `SpeculativeConfig.use_eagle()` keys on -- which is what makes the v1 scheduler
++reserve `num_speculative_tokens` lookahead slots per request, and what keeps the method out
++of the "unsupported speculative method" lists in `VllmConfig`. `PROPOSERS` stays keyed by the
++name the model chose; `resolve_proposer` accepts either spelling.
++
++Installed by `register_proposer`, so a build where no model brings a drafter is upstream
++exactly.
++"""
++
++from typing import get_args
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++_applied = False
++_original_post_init = None
++
++
++def mtp_aliases() -> frozenset[str]:
++    """Every method name vLLM folds into `"mtp"`, including `"mtp"` itself."""
++    try:
++        from vllm.config.speculative import MTPModelTypes
++    except ImportError:  # pragma: no cover - vLLM version without the alias list
++        return frozenset({"mtp"})
++    return frozenset(get_args(MTPModelTypes))
++
++
++def _in_model_drafter(cfg) -> bool:
++    """Is this a model drafting from its own weights, rather than a draft model?"""
++    if cfg.model is not None or cfg.method not in mtp_aliases():
++        return False
++    from vllm_neuron.vllm.spec_decode import resolve_proposer
++
++    return resolve_proposer(cfg.method) is not None
++
++
++def _patched_post_init(self):
++    if not _in_model_drafter(self):
++        return _original_post_init(self)
++
++    if self.target_model_config is None:
++        raise ValueError(
++            "an in-model speculative drafter needs target_model_config: the draft is the "
++            "target model's own layers, so there is nothing else to describe it"
++        )
++    if self.num_speculative_tokens is None:
++        raise ValueError(
++            f"speculative method {self.method!r} is registered by the model, but "
++            "num_speculative_tokens was not given. It cannot be inferred: there is no "
++            "draft model config to read `n_predict` from."
++        )
++
++    requested = self.method
++    self.method = "mtp"
++    self.prompt_lookup_max = 0
++    self.prompt_lookup_min = 0
++    # The draft *is* the target, so these are the target's. Set rather than left None
++    # because `compute_hash` and the eagle3 aux-layer lookup both dereference them.
++    self.draft_model_config = self.target_model_config
++    self.draft_parallel_config = self.target_parallel_config
++    self.draft_tensor_parallel_size = self.target_parallel_config.tensor_parallel_size
++
++    logger.info(
++        "Speculative method %r is drafted inside the target model: keeping "
++        "num_speculative_tokens=%d and skipping draft-model configuration.",
++        requested,
++        self.num_speculative_tokens,
++    )
++    return self
++
++
++def apply_in_model_proposer_patch() -> None:
++    """Idempotent; safe to call from every `register_proposer`."""
++    global _applied, _original_post_init
++    if _applied:
++        return
++    try:
++        from vllm.config.speculative import SpeculativeConfig
++    except ImportError:  # pragma: no cover
++        logger.warning(
++            "Could not import SpeculativeConfig; an in-model proposer will only work if "
++            "vLLM accepts its method name unaided."
++        )
++        return
++    _original_post_init = SpeculativeConfig.__post_init__
++    SpeculativeConfig.__post_init__ = _patched_post_init
++    _applied = True
++    logger.debug("In-model speculative proposer patch applied.")
+diff --git a/vllm_neuron/vllm/spec_decode/__init__.py b/vllm_neuron/vllm/spec_decode/__init__.py
+index 3792c8233bf1dd1531fd4e06366e6432524b04ff..92a98e1f1e18b59b2a4d3896c9d5e833c1a24168 100644
+--- a/vllm_neuron/vllm/spec_decode/__init__.py
++++ b/vllm_neuron/vllm/spec_decode/__init__.py
+@@ -1,2 +1,104 @@
+ # SPDX-License-Identifier: Apache-2.0
+-"""Speculative decoding module for vllm_neuron backend."""
++"""Speculative decoding module for vllm_neuron backend.
++
++`eagle3` is built in: a separate draft model, loaded and compiled beside the target. A model
++whose draft path is *inside itself* -- DeepSeek V4.1 Flash's MTP stages are checkpoint layers
++40-42 of the same weights -- has nothing for `EagleProposer` to load, so it supplies its own
++proposer instead and registers it here at import time.
++
++The registry exists so that proposer can live with the model it belongs to rather than in this
++package. That is not only tidiness: the integrate loop may edit `vllm_neuron/model/<model>/`
++and may not edit this directory, so a drafter kept here is one no agent can work on.
++
++A proposer is duck-typed. `NeuronModelRunner` calls `num_speculative_tokens`, `load_model`,
++`warmup`, `graph_extract`, `propose`, `validate_same_kv_cache_group`, and reads `.model`; see
++`eagle.EagleProposer` for the reference shape. One whose drafts come from the target model also
++gets `target_model_provider`, a callable returning the loaded target, since the runner builds
++the proposer before any model exists.
++"""
++
++from typing import Any
++
++#: Speculative method name -> proposer class, for methods not built into this package.
++PROPOSERS: dict[str, Any] = {}
++
++
++def register_proposer(method: str, proposer_cls: Any) -> None:
++    """Make `proposer_cls` available as `speculative_config.method == method`.
++
++    Called from a model package's `__init__`, which the platform plugin imports when the model
++    is registered, so the entry exists before the runner reads `speculative_config`.
++
++    Registering also installs the patch that lets vLLM build a `SpeculativeConfig` for a
++    drafter with no draft model — see `patches/in_model_proposer_patch.py` for why that is
++    needed and why it is armed from here rather than unconditionally.
++    """
++    PROPOSERS[method] = proposer_cls
++
++    from vllm_neuron.vllm.patches.in_model_proposer_patch import (
++        apply_in_model_proposer_patch,
++    )
++
++    apply_in_model_proposer_patch()
++
++
++def get_proposer(method: str) -> Any | None:
++    return PROPOSERS.get(method)
++
++
++def resolve_proposer(method: str) -> Any | None:
++    """The proposer for `method`, accepting any spelling vLLM folds into the same method.
++
++    `SpeculativeConfig` rewrites every name in its `MTPModelTypes` list to `"mtp"` — logging
++    that the specific spelling is deprecated — so by the time the runner reads
++    `speculative_config.method`, a model that registered `"deepseek_mtp"` no longer matches it
++    by name. Both spellings resolve to the same proposer here.
++    """
++    found = PROPOSERS.get(method)
++    if found is not None:
++        return found
++
++    from vllm_neuron.vllm.patches.in_model_proposer_patch import mtp_aliases
++
++    aliases = mtp_aliases()
++    if method in aliases:
++        for alias in aliases:
++            found = PROPOSERS.get(alias)
++            if found is not None:
++                return found
++    return None
++
++
++def attach_speculative_config(vllm_config, method: str, num_speculative_tokens: int) -> Any:
++    """Give `vllm_config` a speculative config for an in-model drafter. Returns it.
++
++    For a model package to use from its `check_and_update_config` hook, which is the one point
++    where it can see a `VllmConfig` — and which runs *after* `VllmConfig.__post_init__` has
++    already made its speculative-decoding decisions. Only one of those decisions matters here
++    and it is redone: `_set_max_num_scheduled_tokens` holds back the token slots a drafter may
++    add to a batch, and it is a no-op when no speculative config exists yet.
++
++    Raises if nothing is registered for `method`, because the alternative is an engine that
++    builds fine and then fails several minutes later inside the runner.
++    """
++    from vllm.config.speculative import SpeculativeConfig
++
++    if resolve_proposer(method) is None:
++        raise ValueError(
++            f"no speculative proposer registered for method {method!r}. "
++            f"Registered: {sorted(PROPOSERS) or 'none'}. Call register_proposer() from the "
++            "model package's __init__ before its platform hook runs."
++        )
++
++    vllm_config.speculative_config = SpeculativeConfig(
++        target_model_config=vllm_config.model_config,
++        target_parallel_config=vllm_config.parallel_config,
++        method=method,
++        num_speculative_tokens=num_speculative_tokens,
++    )
++
++    recompute = getattr(vllm_config, "_set_max_num_scheduled_tokens", None)
++    if recompute is not None:
++        recompute()
++
++    return vllm_config.speculative_config
+diff --git a/vllm_neuron/vllm/worker/neuron_model_runner.py b/vllm_neuron/vllm/worker/neuron_model_runner.py
+index 468986494eb02c5da4be7a2696b82133e57b372f..0dfcd3408d6762e79032de55a322e2ddd1743ff6 100644
+--- a/vllm_neuron/vllm/worker/neuron_model_runner.py
++++ b/vllm_neuron/vllm/worker/neuron_model_runner.py
+@@ -94,6 +94,7 @@ from vllm_neuron.model.neuron_config import (
+ )
+ from libtorch_neuronx_lite.compile.capture_backend import CaptureComplete
+ from vllm_neuron.vllm.sample.rejection_sampler import RejectionSampler
++from vllm_neuron.vllm.spec_decode import PROPOSERS, resolve_proposer
+ from vllm_neuron.vllm.spec_decode.dflash import DFlashProposer
+ from vllm_neuron.vllm.spec_decode.eagle import EagleProposer
+ from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE
+@@ -223,6 +224,12 @@ def _remap_null_block_to_sentinel(block_table: torch.Tensor) -> torch.Tensor:
+ # at 4, so 8 leaves two windows of margin.
+ _BLOCK_TABLE_STAGE_DEPTH = 8
+ 
++#: Capabilities a model package can test for (by name, before importing this module):
++#: a model-registered proposer whose drafts are a device future (``device_draft_futures``)
++#: gets the async-spec transition cache, and a model with ``wants_host_step_inputs`` gets
++#: the step's host positions / slot mapping / block table.
++RUNNER_CAPABILITIES = ("device_draft_futures", "host_step_inputs")
++
+ # threading.Lock is a factory and not a class, so capture the instance type one time for the
+ # seam check in _batch_mutation_lock. A test stand-in holds a Mock there, and a Mock satisfies
+ # `is not None` while failing the context-manager protocol.
+@@ -795,6 +802,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+     # thread. See _batch_mutation_lock for the race and for why it cannot deadlock. A
+     # mutable class attribute would be shared between runners, so __init__ makes the lock.
+     _input_batch_lock: "threading.Lock | None" = None
++    #: One-shot flags for `_sanitize_sync_drafts`, class-level so the repair
++    #: needs nothing from `__init__` and an instance that never reaches it pays
++    #: nothing. Each repair logs the first time it fires, per process.
++    _sync_draft_rows_warned = False
++    _sync_draft_ids_warned = False
+ 
+     # ------------------------------------------------------------------------
+     # INITIALIZATION
+@@ -1216,7 +1228,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+             self._transition_bonus_tensor: torch.Tensor | None = None
+ 
+         # Set up speculative decoding.
+-        self.drafter: EagleProposer | DFlashProposer | None = None
++        # `Any` rather than the built-in union: a model package may register its own
++        # proposer class through `vllm_neuron.vllm.spec_decode.register_proposer`, and
++        # that class is not known here.
++        self.drafter: EagleProposer | DFlashProposer | Any | None = None
+         self.is_eagle3_spec = False
+         self.is_dflash_spec = False
+         self._draft_token_ids = None
+@@ -1227,21 +1242,34 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+         self._async_spec_transition_full_draft_cache: dict[str, torch.Tensor] = {}
+ 
+         if self.speculative_config:
+-            if self.speculative_config.method == "eagle3":
++            method = self.speculative_config.method
++            proposer_cls = resolve_proposer(method)
++            if method == "eagle3":
+                 self.is_eagle3_spec = True
+                 self.drafter = EagleProposer(
+                     self.vllm_config,
+                     self.device,
+                     self.on_device_sampling,
+                 )
+-            elif self.speculative_config.method == "dflash":
++            elif method == "dflash":
+                 self.is_dflash_spec = True
+                 self.drafter = DFlashProposer(
+                     self.vllm_config, self.device, self.on_device_sampling
+                 )
++            elif proposer_cls is not None:
++                # A proposer registered by the model package: its draft path is inside the
++                # target model, so there is no second model to load. It is handed a way to
++                # reach the target, because the drafter is built here and `self.model` is not
++                # loaded until `load_model` below.
++                self.drafter = proposer_cls(
++                    self.vllm_config, self.device, self.on_device_sampling
++                )
++                self.drafter.target_model_provider = lambda: self.model
+             else:
+                 raise ValueError(
+-                    f"Unsupported speculative decoding method: {self.speculative_config.method}"
++                    f"Unsupported speculative decoding method: {method}. Built in: "
++                    f"'eagle3', 'dflash'. "
++                    f"Registered by a model: {sorted(PROPOSERS) or 'none'}."
+                 )
+             self.rejection_sampler = RejectionSampler()
+ 
+@@ -1814,10 +1842,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+             if encoder_capture is not None:
+                 encoder_capture.register_clear_hook(fresh_encoder)
+         drafter = getattr(self, "drafter", None)
+-        if drafter is not None:
++        # An in-model proposer (one registered through `spec_decode.register_proposer`)
++        # drafts inside the target's own forward, so it owns no separately compiled
++        # model and sets no `compile_kwargs`. The target's fresh wrapper above already
++        # covers its draft stages; there is nothing of its own to wrap again.
++        compile_kwargs = getattr(drafter, "compile_kwargs", None)
++        if drafter is not None and compile_kwargs is not None:
+             drafter.model = torch.compile(
+                 getattr(drafter.model, "_orig_mod", drafter.model),
+-                **drafter.compile_kwargs,
++                **compile_kwargs,
+             )
+             draft_capture = getattr(self, "_draft_tensor_capture", None)
+             if draft_capture is not None:
+@@ -2173,7 +2206,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+         # / _plain_decode_capture). The model compiler_args_for maps that type
+         # to its arguments. The encoder graph uses the "encoder" type. Prefill
+         # and JF keep the base args on self.model.
+-        if eager_mode or cpu_mode or debug_mode or skip_graph_capture_backend:
++        #
++        # `debug_mode` is deliberately NOT part of this condition. It already
++        # selects `fullgraph=False` just above, which is what "allow graph breaks
++        # and print statements" means; nulling the graph-capture backend as well
++        # made one flag do two unrelated things, so a model whose graph breaks are
++        # load-bearing could not use parallel compilation at all. The two concerns
++        # are now separate, and `skip_graph_capture_backend` is the flag that turns
++        # capture off.
++        if eager_mode or cpu_mode or skip_graph_capture_backend:
+             logger.debug("Graph capture and parallel compilation is disabled.")
+             self.capture_backend_model = None
+         else:
+@@ -2210,7 +2251,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+         if self.encoder_neuron_config is not None and encoder_attr is not None:
+             encoder = getattr(inner_model, encoder_attr)
+ 
+-            if eager_mode or cpu_mode or debug_mode or skip_graph_capture_backend:
++            if eager_mode or cpu_mode or skip_graph_capture_backend:
+                 self.encoder_capture_backend = None
+             else:
+                 self.encoder_capture_backend = torch.compile(
+@@ -2334,8 +2375,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+                     subdirectory="vision",
+                 )
+ 
+-        # Draft model capture
+-        if self.drafter is not None:
++        # Draft model capture. Eagle only: an in-model drafter's `.model` *is* the target, so
++        # capturing it again under `draft/` would duplicate the target's own capture.
++        if self.drafter is not None and self.is_eagle3_spec:
+             draft_modules = getattr(capture_config, "draft_modules", None)
+             self._draft_tensor_capture = self._setup_capture(
+                 self.drafter.model, draft_modules or [], subdirectory="draft"
+@@ -2484,6 +2526,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+             and prev_future.shape[0] > 0
+         )
+ 
++        if use_real_prev and getattr(self, "_async_prev_consumed", False):
++            # An empty step ran since the previous one (the scheduler held this one back
++            # until that output was in): the positions already account for it.
++            use_real_prev = False
+         if use_real_prev:
+             prev_sampled = self._remap_prev_sampled_by_req_id(
+                 prev_future, num_reqs_padded
+@@ -5694,6 +5740,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+                 attn_metadata_i["raw_block_table_tensor"] = raw_blk_table_tensor
+             if swa_kv_pos_offset is not None:
+                 attn_metadata_i["swa_kv_pos_offset"] = swa_kv_pos_offset
++            if self._model_wants_host_inputs():
++                # The host copies the device tensors were uploaded from (the raw table:
++                # null blocks 0, not the -1 sentinel), so a model planning its step on
++                # the host reads nothing back from the device.
++                attn_metadata_i["host_slot_mapping"] = slot_mapping_cpu[
++                    :total_num_scheduled_tokens
++                ].clone()
++                attn_metadata_i["host_block_table"] = blk_table.get_cpu_tensor()[
++                    :padded_num_reqs
++                ].clone()
+ 
+             for layer_name in kv_cache_group_spec.layer_names:
+                 attn_metadata[layer_name] = attn_metadata_i
+@@ -7260,6 +7316,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+         logger.debug("Total scheduled tokens: %s", total_scheduled_tokens)
+ 
+         if total_scheduled_tokens == 0:
++            if self.use_async_scheduling:
++                # The engine waits for the step in flight before it schedules again, so
++                # the next step's positions are exact: nothing for the on-device
++                # correction to subtract (``_get_prev_spec_tensors_for_on_device_correction``).
++                self._async_prev_consumed = True
+             if not has_kv_transfer_group():
+                 # Return empty ModelRunnerOutput if there's no work to do.
+                 logger.debug("No scheduled tokens, returning empty output")
+@@ -7524,6 +7585,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+         self.kv_connector_output = kv_connector_output
+         return None
+ 
++    def _model_wants_host_inputs(self) -> bool:
++        """Whether the model takes the step's host positions / slot mapping / block
++        table (``wants_host_step_inputs``) alongside the device copies."""
++        model = getattr(self, "model", None)
++        return bool(
++            getattr(model, "wants_host_step_inputs", False)
++            or getattr(getattr(model, "_orig_mod", None), "wants_host_step_inputs", False)
++        )
++
+     def sample_tokens(
+         self,
+         grammar_output: GrammarOutput | None,
+@@ -7721,8 +7791,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+         )
+ 
+         # If spec decode enabled, log acceptance stats and propose draft tokens.
+-        # aux_hidden_states is None when eagle3 is not active.
+-        if self.is_spec_decode and aux_hidden_states is not None:
++        #
++        # eagle3 proposes from the target's auxiliary hidden states, so it has nothing to
++        # propose from until the target emits them. dflash and a proposer registered by a
++        # model package draft without them, so requiring them would disable those silently —
++        # the drafter would be built and never called.
++        if self.drafter is not None and (
++            aux_hidden_states is not None or not self.is_eagle3_spec
++        ):
+             max_position = positions.max().item() if positions.numel() > 0 else 0
+             num_spec_tokens = self.drafter.num_speculative_tokens
+             # Stop proposing early enough that the scheduler never trims
+@@ -8512,7 +8588,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+         cross-step device future, so the transition cache must replay those
+         futures across batch-composition changes.
+         """
+-        return self.use_async_scheduling and self.is_spec_decode
++        # (also a model-registered proposer whose drafts are such a future,
++        # ``device_draft_futures``)
++        return self.use_async_scheduling and (
++            self.is_spec_decode or bool(getattr(self.drafter, "device_draft_futures", False))
++        )
+ 
+     def _cache_async_spec_transition_drafts(
+         self,
+@@ -8899,6 +8979,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+                 positions,
+             )
+ 
++        # A model that plans its step on the host takes the host positions too
++        # (`_model_wants_host_inputs`).
++        host_positions = (
++            positions
++            if self._model_wants_host_inputs() and positions.device.type == "cpu"
++            else None
++        )
+         # Move inputs to Neuron device
+         input_ids = input_ids.to(self.device)
+         positions = positions.to(self.device)
+@@ -8969,6 +9056,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+         if isinstance(self._async_reorder_kwargs, dict):
+             model_kwargs.update(self._async_reorder_kwargs)
+         model_kwargs["logit_mask"] = logit_mask
++        if host_positions is not None:
++            model_kwargs["host_positions"] = host_positions
++        # Models that sample on their own full-vocabulary path (`accepts_sampling_hint`)
++        # get the batch's sampling kind as host booleans -- (all_greedy, no_top_k,
++        # no_top_p) -- so an all-greedy step needs no device read to pick its graph.
++        if sampling_params_tensor is not None and getattr(self.model, "accepts_sampling_hint", False):
++            sm = self.input_batch.sampling_metadata
++            model_kwargs["sampling_hint"] = (
++                bool(sm.all_greedy), sm.top_k is None, sm.top_p is None,
++            )
+         if rotary_position_ids is not None:
+             model_kwargs["rotary_position_ids"] = rotary_position_ids.to(self.device)
+ 
+@@ -8996,6 +9093,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+                 num_reqs_padded=num_reqs_padded,
+             )
+             model_kwargs.update(async_spec_kwargs)
++            self._async_prev_consumed = False
+ 
+         # Multimodal kwargs (encoder_embedding_buffer + encoder_block_ids + encoder_positions)
+         if mm_kwargs:
+@@ -10580,6 +10678,99 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+         self._draft_token_ids = None
+         return DraftTokenIds(req_ids, draft_token_ids)
+ 
++    def _sanitize_sync_drafts(
++        self, drafts: torch.Tensor, num_reqs: int
++    ) -> torch.Tensor:
++        """Make a sync-mode proposal safe to hand the scheduler.
++
++        Two repairs, both **no-ops on a well-formed proposal** -- the row count
++        matches ``num_reqs`` and every id is in ``[0, vocab_size)`` -- and both
++        logged the first time they fire, so a server log says it happened.
++
++        Why this is a repair and not a suppression. A draft token is only ever
++        *verified*: the rejection sampler keeps it if and only if it matches
++        what the target would have sampled anyway. So replacing an unusable
++        draft slot with an in-range token **cannot change an emitted token** --
++        the target rejects it and the step falls back to the bonus token. What
++        it costs is acceptance rate on that row, which is the honest price of a
++        draft the proposer could not produce. The alternative is handing the
++        scheduler an id that kills the engine, which is what happens today:
++
++            neuron_model_runner.py:2615  Error in _prepare_model_input:
++              Token IDs out of range [0, 129280). Found min=-1, max=27438.
++              Invalid IDs: [-1, -1, -1, -1, -1]
++            EngineCore encountered a fatal error.
++
++        — all 64 workers, two tokens into the first uncapped multi-sequence
++        decode this port has ever run (iteration 6, ``max_num_seqs=10``). Five
++        ``-1``s is exactly ``num_speculative_tokens``: one request's whole draft
++        row. The route is a **row-count mismatch**, not a bad token.
++        ``DSparkProposer.propose`` builds one row per *scheduled span*, so a
++        request with no committed-token row in this step -- one that has just
++        finished a prefill segment while the others decode -- gets no draft
++        row. The scheduler then zips N rows against N+1 ``req_ids``, the
++        uncovered request keeps ``_update_after_schedule``'s optimistic
++        ``[-1] * num_spec`` placeholder (the same placeholder
++        ``take_draft_token_ids`` hands out deliberately on the async path), and
++        the next step's
++        ``_validate_token_ids`` refuses it because ``-1`` is only tolerated
++        under async scheduling.
++
++        **Why batch 1 and the verifier never see it.** With one row the
++        rejection sampler's row always carries the bonus token, so the
++        proposer always has a valid seed; and a step is only ever mixed
++        prefill/decode when several sequences are in flight. The verifier's
++        ``short`` phase runs ``max_num_seqs=4`` over 3 prompts and this stays
++        inert there: it logged **zero** times in the passing verifier runs of
++        both iteration 6 and iteration 7. In the first uncapped batch-10 run it
++        logged 128 times (64 ranks x 2 messages) -- *"the proposer returned 9
++        draft row(s) for 10 request(s)"* -- and the engine survived where
++        iteration 6's had died two tokens in.
++
++        **What it does not claim.** It does not stop the uncovered-request case
++        from arising. The better fix is to return *no* drafts for an uncovered
++        request -- an empty list, which ``DraftTokenIds`` accepts and
++        ``take_draft_token_ids`` forwards unchanged -- so the target does not
++        verify five tokens it will certainly reject. That needs a **ragged**
++        draft layout, which crosses ``_pad_to_compiled_shapes``' flat
++        ``padded_num_reqs * num_speculative_tokens`` padding, so it needs a
++        device run to prove the shape still hits the warmed NEFF. Uniform
++        padding first, ragged second.
++        """
++        if drafts.ndim != 2:
++            return drafts
++        rows = int(drafts.shape[0])
++        if rows != num_reqs and num_reqs > 0:
++            if not self._sync_draft_rows_warned:
++                self._sync_draft_rows_warned = True
++                logger.warning(
++                    "deepseek_v41/spec: the proposer returned %d draft row(s) "
++                    "for %d request(s); padding/trimming to the request count "
++                    "so the scheduler cannot zip a request against another "
++                    "request's row and leave it holding a [-1] placeholder. "
++                    "See _sanitize_sync_drafts. Logged once.",
++                    rows, num_reqs,
++                )
++            if rows > num_reqs:
++                drafts = drafts[:num_reqs]
++            else:
++                pad = drafts.new_zeros((num_reqs - rows, drafts.shape[1]))
++                drafts = torch.cat([drafts, pad], dim=0)
++        bad = (drafts < 0) | (drafts >= self.vocab_size)
++        if bool(bad.any()):
++            if not self._sync_draft_ids_warned:
++                self._sync_draft_ids_warned = True
++                logger.warning(
++                    "deepseek_v41/spec: %d draft id(s) outside "
++                    "[0, %d) in a sync-mode proposal; replacing them with "
++                    "token 0, which the target will reject so the step falls "
++                    "back to its bonus token. See _sanitize_sync_drafts. "
++                    "Logged once.",
++                    int(bad.sum()), self.vocab_size,
++                )
++            drafts = torch.where(bad, torch.zeros_like(drafts), drafts)
++        return drafts
++
+     def _propose_draft_token_ids(
+         self,
+         scheduler_output: Any,
+@@ -10592,7 +10783,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+         logits_indices: torch.Tensor | None = None,
+         raw_sampled_token_ids: torch.Tensor | None = None,
+     ) -> list[list[int]] | torch.Tensor:
+-        assert isinstance(self.drafter, (EagleProposer, DFlashProposer))
++        # Everything below is proposer-agnostic except the hidden states, which only eagle3
++        # produces: the indices, the sampled-token tensor and the return shapes are the same
++        # contract for a proposer registered by a model package.
++        assert self.drafter is not None
+ 
+         num_reqs = self.input_batch.num_reqs
+ 
+@@ -10648,8 +10842,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+         # single concatenated [T, 3*hidden_size] device tensor (the cat is
+         # done on the target side, inside its compile boundary). Passing
+         # it through as-is avoids any Python-side op between the target
+-        # NEFF and the draft NEFF.
+-        assert aux_hidden_states is not None
++        # NEFF and the draft NEFF. An in-model proposer has its draft from
++        # the target's own forward and is handed None.
++        if self.is_eagle3_spec:
++            assert aux_hidden_states is not None
+ 
+         async_spec_kwargs = {}
+         if self._model_is_async_spec_decoded() and spec_decode_metadata is not None:
+@@ -10700,7 +10896,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+         # only, contiguous), used by the rejection sampler. In sync mode,
+         # only ``drafts_only`` is needed by the scheduler.
+         if not self.use_async_scheduling:
+-            return drafts_only.cpu()
++            return self._sanitize_sync_drafts(drafts_only.cpu(), num_reqs)
+ 
+         # Stash the drafts-only tensor for the next step's runner to feed
+         # into ``spec_decode_metadata.draft_token_ids`` without slicing the
+@@ -11153,10 +11349,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+         # This binds the cache tensors to the model
+         self.model.bind_kv_cache(kv_caches)
+ 
+-        if self.speculative_config and self.speculative_config.use_eagle():
+-            assert isinstance(self.drafter, (EagleProposer, DFlashProposer))
+-            assert self.drafter.model is not None
+-            self.drafter.model.bind_kv_cache(kv_caches)
++        if self.drafter is not None:
++            # Only a *separate* draft model needs its own binding. An in-model proposer's
++            # `.model` is the target, bound just above, and binding it twice would register
++            # the same caches on the same module twice.
++            draft_model = getattr(self.drafter, "model", None)
++            if draft_model is not None and draft_model is not self.model:
++                # This binds the cache tensors to the draft model
++                draft_model.bind_kv_cache(kv_caches)
++            # validate all draft model layers belong to the same kv cache group
+             self.drafter.validate_same_kv_cache_group(kv_cache_config)
+             if isinstance(self.drafter, DFlashProposer):
+                 self.drafter.alias_target_weights(target_model=self.model)
+@@ -11233,11 +11434,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+                 )
+             all_kv_cache_specs[layer_name] = spec
+ 
+-        if self.speculative_config and self.speculative_config.use_eagle():
+-            assert isinstance(self.drafter, (EagleProposer, DFlashProposer))
+-            assert self.drafter.model is not None
+-
+-            drafter_kv_spec = self.drafter.model.get_kv_spec()
++        # A separate draft model declares KV caches of its own. An in-model proposer does
++        # not: its stages are layers of the target, so the target's `get_kv_spec` already
++        # named them, and re-adding them here would overwrite those entries.
++        draft_model = getattr(self.drafter, "model", None) if self.drafter else None
++        if draft_model is not None and draft_model is not self.model:
++            drafter_kv_spec = draft_model.get_kv_spec()
+             for layer in drafter_kv_spec.layers:
+                 layer_name = layer.name
+                 all_kv_cache_specs[layer_name] = FullAttentionSpec(
