@@ -38,6 +38,7 @@ from vllm_neuron.utils.bucket_utils import (
 from vllm_neuron.vllm.core.deltanet_snapshots import DeltaNetSnapshotTable
 from vllm_neuron.vllm.worker.deltanet_state_slots import (
     count_linear_attention_layers,
+    state_pool_rows,
     usable_state_rows,
 )
 from vllm_neuron.vllm.patches.jf_grammar_patch import (
@@ -219,7 +220,7 @@ class NeuronScheduler(Scheduler):
 
         # A model with linear attention keeps a recurrent state row for each
         # request, so the row count limits admission, and `_state_rows_in_use`
-        # counts it. The pool holds max(num_seqs_buckets) rows. See
+        # counts it. The pool holds state_pool_rows(num_seqs_buckets) rows. See
         # DeltaNetStateSlots.
         self._num_state_rows = 0
         self._usable_state_rows = 0
@@ -227,9 +228,9 @@ class NeuronScheduler(Scheduler):
             additional = getattr(vllm_config, "additional_config", None) or {}
             neuron_config = additional.get("neuron_config") or {}
             buckets = neuron_config.get("num_seqs_buckets") or []
-            self._num_state_rows = max(buckets) if buckets else 1
-            # A batch that pads needs 1 free row for its padded rows. Admission
-            # keeps that row free.
+            self._num_state_rows = state_pool_rows(buckets)
+            # A batch that pads needs 1 free row for its padded rows. The pool
+            # holds that row beyond max(buckets), and admission keeps it free.
             self._usable_state_rows = usable_state_rows(self._num_state_rows, buckets)
         self._state_exhaustion_warned: bool = False
 
@@ -1271,11 +1272,10 @@ class NeuronScheduler(Scheduler):
                     "Prefill deferred: %d requests hold the %d usable recurrent "
                     "state rows of %d. A request in the running queue holds one "
                     "row, and a producer that waits for a remote read also holds "
-                    "one row. A decode batch that pads needs 1 free row for its "
-                    "padded rows. To raise the concurrency, raise --max-num-seqs "
-                    "with the last entry of additional_config.neuron_config."
-                    "num_seqs_buckets, or give that ladder a bucket for each count, "
-                    "or add a prefill engine.",
+                    "one row. The pool keeps 1 more row free for the padded rows "
+                    "of a decode batch. To raise the concurrency, raise "
+                    "--max-num-seqs with the last entry of additional_config."
+                    "neuron_config.num_seqs_buckets, or add a prefill engine.",
                     self._state_rows_in_use(),
                     self._usable_state_rows,
                     self._num_state_rows,

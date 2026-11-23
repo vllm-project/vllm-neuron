@@ -72,6 +72,7 @@ from libtorch_neuronx_lite.compile.compiler_args import scoped_compiler_args
 from vllm_neuron.vllm.worker.deltanet_state_slots import (
     DeltaNetStateSlots,
     count_linear_attention_layers,
+    state_pool_rows,
 )
 from vllm_neuron.vllm.worker.neuron_ec_connector_model_runner_mixin import (
     ECLoadFailure,
@@ -1041,7 +1042,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self._deltanet_state_slots: DeltaNetStateSlots | None = None
         if count_linear_attention_layers(vllm_config.model_config) > 0:
             self._deltanet_state_slots = DeltaNetStateSlots(
-                max(self.neuron_config.num_seqs_buckets)
+                state_pool_rows(self.neuron_config.num_seqs_buckets)
             )
             logger.info(
                 "DeltaNet state slots: %d", self._deltanet_state_slots.num_slots

@@ -1084,14 +1084,17 @@ class Qwen3_5DeltaNet(nn.Module):
 
         # Recurrent state buffers — nn.Parameters with requires_grad=False so they
         # appear as graph inputs/outputs for torch.compile.
-        # Allocated with max_batch_size; actual batch sliced in forward.
-        max_batch_size = 1
-        if config.neuron_config and config.neuron_config.num_seqs_buckets:
-            max_batch_size = max(config.neuron_config.num_seqs_buckets)
-        # One row for each concurrent request. The caller gives the row of each
-        # batch row in `batch_slot_indices`, because a request keeps one row for
-        # its whole life while its position in the batch can change. The forward
-        # stops a batch of more than one row that has no row map (see below).
+        # One row for each concurrent request, and one more row for the padded
+        # rows of a decode batch when the ladder pads (state_pool_rows). The
+        # caller gives the row of each batch row in `batch_slot_indices`, because
+        # a request keeps one row for its whole life while its position in the
+        # batch can change. The forward stops a batch of more than one row that
+        # has no row map (see below).
+        from vllm_neuron.vllm.worker.deltanet_state_slots import state_pool_rows
+
+        max_batch_size = state_pool_rows(
+            config.neuron_config.num_seqs_buckets if config.neuron_config else None
+        )
         self.recurrent_state = nn.Parameter(
             torch.zeros(
                 max_batch_size,

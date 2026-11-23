@@ -92,7 +92,7 @@ def hybrid_scheduler_two_rows(
 def hybrid_scheduler_wide(
     mock_vllm_config, mock_kv_cache_config, mock_structured_output_manager
 ):
-    """A wide decode engine: 8 state rows, and a ladder that has gaps."""
+    """A wide decode engine: 8 requests, and a ladder that has gaps (9 state rows)."""
     return _make_scheduler(
         mock_vllm_config,
         [1, 2, 4, 8],
@@ -148,9 +148,11 @@ class TestThePaddedRowKeepsOneRowFree:
     batch is not.
     """
 
-    def test_a_ladder_with_a_gap_keeps_one_row_free(self, hybrid_scheduler_wide):
-        assert hybrid_scheduler_wide._num_state_rows == 8
-        assert hybrid_scheduler_wide._usable_state_rows == 7
+    def test_a_ladder_with_a_gap_adds_the_free_row(self, hybrid_scheduler_wide):
+        # The pool holds 1 row beyond the largest bucket, so max_num_seqs
+        # requests can hold a row and a padded batch still finds a free row.
+        assert hybrid_scheduler_wide._num_state_rows == 9
+        assert hybrid_scheduler_wide._usable_state_rows == 8
 
     def test_a_ladder_with_every_count_uses_every_row(
         self, hybrid_scheduler_full_ladder
@@ -165,24 +167,6 @@ class TestThePaddedRowKeepsOneRowFree:
         from vllm_neuron.vllm.core.scheduler import SchedulerState
 
         hybrid_scheduler_wide._state = SchedulerState.ACTIVE_DECODE
-        for index in range(6):
-            hybrid_scheduler_wide.running.append(
-                mock_request_factory(
-                    request_id=f"req-{index}",
-                    num_prompt_tokens=100,
-                    num_computed_tokens=100,
-                )
-            )
-        assert hybrid_scheduler_wide._state_rows_in_use() == 6
-        request = mock_request_factory(request_id="req-6", num_prompt_tokens=100)
-        assert hybrid_scheduler_wide.can_schedule(request) is True
-
-    def test_the_engine_defers_the_request_that_takes_the_last_row(
-        self, hybrid_scheduler_wide, mock_request_factory
-    ):
-        from vllm_neuron.vllm.core.scheduler import SchedulerState
-
-        hybrid_scheduler_wide._state = SchedulerState.ACTIVE_DECODE
         for index in range(7):
             hybrid_scheduler_wide.running.append(
                 mock_request_factory(
@@ -191,10 +175,29 @@ class TestThePaddedRowKeepsOneRowFree:
                     num_computed_tokens=100,
                 )
             )
-        # 7 rows of 8 are in use. Row 8 must stay free for the padded rows of a
-        # batch of 7, which pads up to the bucket of 8.
         assert hybrid_scheduler_wide._state_rows_in_use() == 7
+        # The 8th request (max_num_seqs) is admitted.
         request = mock_request_factory(request_id="req-7", num_prompt_tokens=100)
+        assert hybrid_scheduler_wide.can_schedule(request) is True
+
+    def test_the_engine_defers_the_request_that_takes_the_last_row(
+        self, hybrid_scheduler_wide, mock_request_factory
+    ):
+        from vllm_neuron.vllm.core.scheduler import SchedulerState
+
+        hybrid_scheduler_wide._state = SchedulerState.ACTIVE_DECODE
+        for index in range(8):
+            hybrid_scheduler_wide.running.append(
+                mock_request_factory(
+                    request_id=f"req-{index}",
+                    num_prompt_tokens=100,
+                    num_computed_tokens=100,
+                )
+            )
+        # 8 rows of 9 are in use. Row 9 must stay free for the padded rows of a
+        # batch of 7, which pads up to the bucket of 8.
+        assert hybrid_scheduler_wide._state_rows_in_use() == 8
+        request = mock_request_factory(request_id="req-8", num_prompt_tokens=100)
         assert hybrid_scheduler_wide.can_schedule(request) is False
 
     def test_the_admitted_requests_can_fill_a_padded_batch(self, hybrid_scheduler_wide):

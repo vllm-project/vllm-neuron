@@ -259,3 +259,32 @@ def test_a_long_run_does_not_leak_rows():
         pool.free(f"req-{i}")
     assert pool.num_free == 1
     assert pool.num_active == 0
+
+
+@pytest.mark.parametrize(
+    "buckets, rows",
+    [([1, 4, 8], 9), ([32], 33), ([1, 2], 2), ([1, 2, 3, 4], 4), (None, 1), ([], 1)],
+)
+def test_the_pool_adds_one_row_when_a_batch_can_pad(buckets, rows):
+    from vllm_neuron.vllm.worker.deltanet_state_slots import state_pool_rows
+
+    assert state_pool_rows(buckets) == rows
+
+
+@pytest.mark.parametrize("buckets", [[1, 4, 8], [8], [32], [1, 2, 3, 4]])
+def test_max_num_seqs_requests_fit_with_a_padded_batch(buckets):
+    # Every one of max(buckets) requests holds a row, one waits out the step, and
+    # the batch pads up to the largest bucket: the padded rows still find a row.
+    from vllm_neuron.vllm.worker.deltanet_state_slots import state_pool_rows
+
+    num_slots = state_pool_rows(buckets)
+    max_num_seqs = max(buckets)
+    assert usable_state_rows(num_slots, buckets) == max_num_seqs
+    pool = DeltaNetStateSlots(num_slots=num_slots)
+    admitted = [f"req-{index}" for index in range(max_num_seqs)]
+    for req_id in admitted:
+        pool.allocate(req_id)
+    if max_num_seqs > 1 and num_slots > max_num_seqs:
+        slots = pool.slots_for_batch(admitted[:-1], padded_size=max_num_seqs)
+        held = {pool.get(req_id) for req_id in admitted}
+        assert set(slots[max_num_seqs - 1 :]).isdisjoint(held)

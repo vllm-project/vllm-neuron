@@ -292,12 +292,20 @@ def test_one_row_still_runs_without_the_row_map(layer):
     assert out.shape[0] == 1
 
 
-def test_the_state_buffers_hold_one_row_for_each_bucket_row():
-    # The pool sizes itself from max(num_seqs_buckets). The buffers must agree,
-    # because the pool hands out a row index that indexes these buffers.
-    layer = m.Qwen3_5DeltaNet(_tiny_config([1, 2, 4]), layer_idx=0)
-    assert layer.recurrent_state.shape[0] == 4
-    assert layer.conv_state.shape[0] == 4
+@pytest.mark.parametrize(
+    "buckets, rows", [([1, 2, 3, 4], 4), ([1, 2, 4], 5), ([1, 4], 5), ([8], 9)]
+)
+def test_the_state_buffers_hold_the_rows_of_the_pool(buckets, rows):
+    # The pool sizes itself with state_pool_rows(num_seqs_buckets): a row for
+    # each request, and 1 row for the padded rows when the ladder pads. The
+    # buffers must agree, because the pool hands out a row index that indexes
+    # these buffers.
+    from vllm_neuron.vllm.worker.deltanet_state_slots import state_pool_rows
+
+    assert state_pool_rows(buckets) == rows
+    layer = m.Qwen3_5DeltaNet(_tiny_config(buckets), layer_idx=0)
+    assert layer.recurrent_state.shape[0] == rows
+    assert layer.conv_state.shape[0] == rows
 
 
 @pytest.mark.parametrize("rows", [2, 4, 8])

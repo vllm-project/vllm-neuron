@@ -55,6 +55,39 @@ def usable_state_rows(num_rows: int, buckets: list[int] | None) -> int:
     return max(1, num_rows - 1)
 
 
+def state_pool_rows(buckets: list[int] | None) -> int:
+    """Return the row count of the DeltaNet state buffers for a bucket ladder.
+
+    The pool holds ``max(buckets)`` rows for the requests, and 1 more row when a
+    decode batch can pad (see `usable_state_rows`). That row takes the padded
+    rows of a batch, so ``max(buckets)`` requests (``max_num_seqs``) can hold a
+    row at the same time. The model, the runner and the scheduler all size the
+    pool with this function.
+
+    Args:
+        buckets: The compiled `num_seqs_buckets` ladder. None or empty gives 1 row.
+
+    Returns:
+        The row count of the state buffers.
+
+    Example:
+        >>> state_pool_rows([1, 4, 8])
+        9
+        >>> state_pool_rows([32])
+        33
+        >>> state_pool_rows([1, 2])
+        2
+        >>> state_pool_rows(None)
+        1
+    """
+    if not buckets:
+        return 1
+    num_rows = max(buckets)
+    if usable_state_rows(num_rows, buckets) == num_rows:
+        return num_rows
+    return num_rows + 1
+
+
 def count_linear_attention_layers(model_config) -> int:
     """Count the layers that keep a recurrent state instead of a KV cache.
 
@@ -107,12 +140,12 @@ class DeltaNetStateSlots:
 
     A decode batch pads up to a compiled bucket, so it can hold more rows than
     there are requests. ``slots_for_batch`` gives each padded row a row that no
-    request holds. The pool needs no extra row for this, and the model keeps one
-    row for each slot. See ``slots_for_batch`` for the reason.
+    request holds. ``state_pool_rows`` adds that row to the pool when a batch can
+    pad, and the model keeps one row for each slot. See ``slots_for_batch``.
 
     Args:
-        num_slots: Number of state rows. Use ``max(num_seqs_buckets)``, which is
-            the row count the model allocates.
+        num_slots: Number of state rows. Use ``state_pool_rows(num_seqs_buckets)``,
+            which is the row count the model allocates.
 
     Example:
         >>> pool = DeltaNetStateSlots(num_slots=2)
