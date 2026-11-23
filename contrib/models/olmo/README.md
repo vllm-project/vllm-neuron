@@ -166,32 +166,60 @@ down the plugin's worker pool at the end of the session.
 
 ## Validation report
 
-<!-- Filled in from the device run of test/integration/test_model.py. -->
+### vLLM Neuron 0.29.0.1.2.0 (2026-11-19)
 
-### Source and environment
+#### Environment
 
-- vLLM Neuron 0.29.0.1.2.0 (vLLM 0.29.0), Neuron SDK 2.33, transformers 5.17.
-- Checkpoint `allenai/OLMo-1B-hf`, revision
-  `aee7752d9c08ee4775e9b0091426d8410e8f6a89`.
-- Instance: _to be filled from the device run_.
+| Image | Instance | TP | vLLM | vllm-neuron | torch | transformers | neuronx-cc |
+|---|---|---|---|---|---|---|---|
+| `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04` | `trn2.48xlarge` (LNC 2), 1 node | 8 | 0.29.0 | 0.29.0.1.2.0 | 2.13.0 | 5.17.0 | 2.28.7631.0+8f7b0cf5 |
 
-### Numerical correctness
+#### Results
 
-| Test | TP | Batch | Model length | Result |
-|---|---|---|---|---|
-| `test/integration/test_model.py` (logit validation) | 8 | 1 | 2048 | _to be filled_ |
-| `test/integration/test_model.py` (logit validation) | 8 | 4 | 2048 | _to be filled_ |
+| Test | Configuration | Result |
+|---|---|---|
+| CPU unit tests, `test/unit/` | `VLLM_NEURON_CPU_MODE=1`, `OLMO_CHECKPOINT_PATH` set | 12 passed (`test_loading.py` 7, `test_components.py` 3, `test_tiny_e2e.py` 2) |
+| Integration logit test, `test_model_accuracy[1-2048]` | batch 1, max model length 2,048, TP 8 | PASSED (129.5 s) |
+| Integration logit test, `test_model_accuracy[4-2048]` | batch 4, max model length 2,048, TP 8 | PASSED (162.8 s) |
+| `vllm serve` smoke | the serve command under Usage | Passed, 3 of 3 prompts |
 
-The test keeps the strict argmax bound of `1e-5` and the template's top-K logit
-bounds: 0.03 (K=5), 0.05 (K=50), 0.08 (K=1000) and 0.09 (all).
+#### Logit validation
 
-### CPU tests
+| Case | Prompt | Overall Status | Max divergence (1 ULP) | Max K5 (0.03) | Max K50 (0.05) | Max K1000 (0.08) | Max All (0.09) |
+|---|---|---|---|---|---|---|---|
+| `[1-2048]` | 1/2, `The Amazon rainforest is …` | FAILED | 0.0000 (argmax differs at token 15, Δ 0.0000) | 0.0213 | 0.0377 | 0.0868 (> 0.08) at token 0 | 0.1340 (> 0.09) at token 0 |
+| `[1-2048]` | 2/2, `The human genome contains …` | PASSED | 0.0000 | 0.0144 | 0.0266 | 0.0693 | 0.0876 |
+| `[4-2048]` | 1/2, `The Amazon rainforest is …` | FAILED | 0.0000 (argmax differs at token 15, Δ 0.0000) | 0.0213 | 0.0377 | 0.0868 (> 0.08) at token 0 | 0.1340 (> 0.09) at token 0 |
+| `[4-2048]` | 2/2, `The human genome contains …` | PASSED | 0.0000 | 0.0144 | 0.0266 | 0.0693 | 0.0876 |
 
-On the vLLM Neuron 0.29.0.1.2.0 container in CPU mode
-(`VLLM_NEURON_CPU_MODE=1`): `test/unit/` — 12 passed, 0 skipped.
+Neuron vs CPU BF16 reference; token = generated token. Prompt 1: K1000 0.0868 > 0.08 and All 0.1340 > 0.09 at generated token 0 (batch 4: all four rows); at generated token 15 the argmax differs with Δ 0.0000, within the 1-ULP bound, and validation continues teacher-forced.
+Test passed on aggregate σ-ratio 0.5610 (`[1-2048]`) and 0.5615 (`[4-2048]`) ≤ 1.0 (`multi_prompt_logit_validation`); `agg_bc` FAIL in both cases; `pp_static_0.03` 0/2 and every other `pp_*` check 2/2 in both cases.
+16 generated tokens per prompt vs the HF BF16 reference (FP32 baseline).
+
+Error against the FP32 reference, per prompt (max over the 16 generated tokens):
+
+| Case | Prompt | CPU BF16 L-inf | Neuron L-inf | Neuron / CPU BF16 | CPU BF16 L2 | Neuron L2 | Neuron / CPU BF16 |
+|---|---|---|---|---|---|---|---|
+| `[1-2048]` | 1/2 | 0.1015 | 0.0334 | 0.33x | 0.1166 | 0.0423 | 0.36x |
+| `[1-2048]` | 2/2 | 0.0595 | 0.0407 | 0.68x | 0.0694 | 0.0507 | 0.73x |
+| `[4-2048]` | 1/2 | 0.1015 | 0.0334 | 0.33x | 0.1166 | 0.0423 | 0.36x |
+| `[4-2048]` | 2/2 | 0.0595 | 0.0407 | 0.68x | 0.0694 | 0.0507 | 0.73x |
+
+Every maximum is at generated token 0, the token of the prompt 1 miss.
+
+#### Serve smoke
+
+`/v1/completions`, max_tokens 32, temperature 0; 32 tokens returned per prompt. Batched request (all three, max_tokens 16): a prefix of the same text.
+
+| Prompt | Start of the completion (first 60 characters) |
+|---|---|
+| `The capital of France is` | ` the city of Paris. The capital of France is the city of Par` |
+| `1, 2, 3, 4, 5,` | ` 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,` (the whole completion) |
+| `def fibonacci(n):` | `\n        if n == 0:\n            return 1\n        if n == 1:\n` |
 
 ### Exceptions
 
+- **Prompt 1 is over the two-way K1000 and All tolerances.**
 - **Tests not carried over from the original port.** The port's GSM8K
   accuracy test, its performance comparison test, its two-node serving test
   and launcher, and its device module tests for attention and MLP depend on
