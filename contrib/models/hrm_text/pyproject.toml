@@ -1,0 +1,22 @@
+# Installs this folder's src/ as the ``hrm_text_neuron`` package and registers
+# HrmTextForCausalLM with vLLM in every process (front end, engine core, Neuron
+# workers) through a general-plugin entry point:
+#     pip install -e contrib/models/hrm_text
+[build-system]
+requires = ["setuptools>=77.0.3,<80.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-neuron-contrib-hrm-text"
+version = "0.1.0"
+description = "HrmTextForCausalLM contrib model for vllm-neuron"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = []  # runs inside an environment that already has vllm-neuron
+
+[project.entry-points."vllm.general_plugins"]
+hrm_text_neuron = "hrm_text_neuron.plugin:register"
+
+[tool.setuptools]
+package-dir = {"hrm_text_neuron" = "src"}
+packages = ["hrm_text_neuron"]
