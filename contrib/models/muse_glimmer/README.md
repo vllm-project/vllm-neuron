@@ -23,6 +23,14 @@ The validated configuration runs at logical NeuronCore config 2. vLLM Neuron set
 export NEURON_LOGICAL_NC_CONFIG=2
 ```
 
+Also select the native compile route explicitly. vLLM Neuron uses it when the variable is unset, but libtorch-neuronx-lite reads the variable itself: unset, it replaces `torch.nn.functional.gelu` with a wrapper that `torch.compile` cannot trace, and the vision encoder fails to compile:
+
+```bash
+export VLLM_NEURON_BACKEND=neuron_native
+```
+
+For a step-by-step walkthrough (environment, install, serving, offline inference, tests), see [TUTORIAL.md](TUTORIAL.md).
+
 ### Serve with the OpenAI-compatible server
 
 ```bash
@@ -62,14 +70,14 @@ The first start compiles the text and vision graphs (about 15 minutes). The sett
   | Portrait image (for example 480x640) | 476x672 | 1632 | 408 |
   | Video | 8 frames at 480x368, real timestamps | 2080 | 520 |
 
-- **`encoder_cache_num_blocks: 16`**: encoder-cache blocks hold 256 tokens (`encoder_attention_block_size` / 4), and each item pads its last block (a 520-token video takes 3 blocks, a 391-token image 2). The default size counts tokens only, so a video and an image together can fill it; 16 blocks leave room.
+- **`encoder_cache_num_blocks: 16`**: encoder-cache blocks hold 256 tokens (`encoder_attention_block_size` / 4), and each item pads its last block (a 520-token video takes 3 blocks, a 391-token image 2). The default size counts tokens only, without that padding; 16 blocks leave room.
 - **`--no-enable-prefix-caching`**: in vLLM Neuron 0.29.0.1.2.0, a prefix-cache hit can leave only an image's end marker to prefill; the runner then requires the image in the encoder cache and stops the engine (fixed in later vLLM Neuron releases).
 - **`--media-io-kwargs '{"video": {"num_frames": -1}}'`**: vLLM passes all decoded frames and their timestamps; the processor picks 8 frames and writes the real timestamps into the prompt.
-- **`--reasoning-parser muse_glimmer`**: puts the `to=self` reasoning in `reasoning_content`, so `content` holds only the final answer.
+- **`--reasoning-parser muse_glimmer`**: puts the `to=self` reasoning in `reasoning`, so `content` holds only the final answer.
 - **`--default-chat-template-kwargs '{"reasoning_strength": "low"}'`**: the chat template defaults to `high`. A request can set its own strength with a system message such as `Reasoning strength: high`.
 - **`--num-gpu-blocks-override 512`**: vLLM makes 4 KV-cache groups (sliding-window and full layers), so one 2048-token sequence needs 4 x 64 blocks of 32 tokens.
 
-Then send a request (the reasoning is in `reasoning_content`):
+Then send a request (the reasoning is in `message.reasoning`):
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
@@ -81,7 +89,7 @@ curl http://localhost:8000/v1/chat/completions \
     }'
 ```
 
-Images and videos go in as OpenAI `image_url` / `video_url` content parts (URLs or base64 data URLs).
+Images and videos go in as OpenAI `image_url` / `video_url` content parts (URLs or base64 data URLs). Send one image **or** one video per prompt: a prompt with both stops the engine (`Encoder block truncation: request has more cached blocks than max_encoder_blocks_per_request=3`), and the server must be restarted.
 
 ### Offline inference with the Python API
 
@@ -129,7 +137,8 @@ Tested on the Neuron DLC `pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py
 
 | Feature | Status |
 |---|---|
-| Text; single image + text; video + text; image + video + text in one prompt | ✅ |
+| Text; single image + text; video + text | ✅ |
+| Image and video in one prompt | ❌ (stops the engine; see Usage) |
 | Multi-image + text | ❌ |
 | BF16 | ✅ |
 | MXFP8 | ❌ |
