@@ -250,6 +250,8 @@ Checkpoint of the unit, integration and serve runs: `ByteDance/Ouro-1.4B` at
 | `test_model_accuracy[4-2048]` | TP 8, `neuron_native`, BF16, batch 4 (each prompt in 4 rows), max model length 2,048, prefill bucket 1,024, 2 prompts × 16 greedy tokens, on-device greedy sampling | PASSED (351.339 s): 2/2 prompts within the static bounds; aggregate σ-ratio 0.9505 ≤ 1.0 |
 | `vllm serve` smoke | The Usage command, installed with `pip install -e contrib/models/ouro` | Passed: 3/3 prompts, 32 completion tokens each; a batched request of all 3 returned a prefix of each |
 
+The integration test asserts `pp_max_linf_1.5x` and `pp_max_l2_1.5x` on every prompt; both were 2/2 in both cases of this run.
+
 Not run on 0.29: module tests (`test/module/`), not part of the 0.29 run.
 
 #### Logit validation
