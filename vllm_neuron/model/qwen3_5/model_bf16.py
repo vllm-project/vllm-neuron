@@ -848,6 +848,23 @@ _INPLACE_DECODE_MAX_STATE_BYTES = 96 * 1024
 _GDN_TKG_EPS = 1e-6
 
 
+def _decode_kernel_grids() -> tuple[int, ...]:
+    """Return the grids that a DeltaNet decode kernel call can use in this compile.
+
+    neuronx-cc rejects a kernel whose grid is not the logical NC config of the
+    graph (NCC_EVRF066: "configured with LNC=1, but neuronx-cc is using LNC=2").
+    At LNC=2 a batch whose rows do not split over 2 cores, such as the decode
+    bucket of 1 at TP8 for the in-place kernel, therefore takes another path.
+
+    Example:
+        >>> _decode_kernel_grids()  # doctest: +SKIP
+        (2,)
+    """
+    from vllm_neuron.utils.hardware_config import get_logical_nc_config
+
+    return (get_logical_nc_config(),)
+
+
 def _check_deltanet_prefill_settings(
     kernel: str,
     formulation: str,
@@ -1517,22 +1534,18 @@ class Qwen3_5DeltaNet(nn.Module):
 
     def _batched_decode_grid(self, query: torch.Tensor) -> int:
         """Return the grid of the batched decode kernel for query (B, ...), or 0 if it cannot run."""
-        from vllm_neuron.utils.hardware_config import get_logical_nc_config
-
         if not can_run_kernel(query):
             return 0
         if self.key_dim != 128 or self.value_dim != 128:
             return 0
         rows = query.shape[0] * self.num_value_heads_per_rank
-        for grid in (get_logical_nc_config(), 1):
+        for grid in _decode_kernel_grids():
             if rows % grid == 0 and rows // grid <= _BATCHED_DECODE_MAX_ROWS:
                 return grid
         return 0
 
     def _inplace_decode_grid(self, query: torch.Tensor) -> int:
         """Return the grid of the in-place decode kernel for query (B, ...), or 0 if it cannot run."""
-        from vllm_neuron.utils.hardware_config import get_logical_nc_config
-
         if not can_run_kernel(query):
             return 0
         if self.key_dim != 128 or self.value_dim != 128:
@@ -1544,7 +1557,7 @@ class Qwen3_5DeltaNet(nn.Module):
             return 0
         batch = query.shape[0]
         row_bytes = hv * self.value_dim * self.recurrent_state.element_size()
-        for grid in (get_logical_nc_config(), 1):
+        for grid in _decode_kernel_grids():
             if (
                 batch % grid == 0
                 and batch // grid * row_bytes <= _INPLACE_DECODE_MAX_STATE_BYTES
@@ -1626,8 +1639,6 @@ class Qwen3_5DeltaNet(nn.Module):
         Returns:
             (grid, batch sizes), or (0, ()) if the kernel cannot run.
         """
-        from vllm_neuron.utils.hardware_config import get_logical_nc_config
-
         if not can_run_kernel(query):
             return 0, ()
         batch = query.shape[0]
@@ -1637,7 +1648,7 @@ class Qwen3_5DeltaNet(nn.Module):
         if self.key_dim != 128 or self.value_dim != 128:
             return 0, ()
         hv = self.num_value_heads_per_rank
-        for grid in (get_logical_nc_config(), 1):
+        for grid in _decode_kernel_grids():
             max_batch = grid * _BATCHED_DECODE_MAX_ROWS // hv
             if max_batch == 0:
                 continue

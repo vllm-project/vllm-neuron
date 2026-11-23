@@ -157,8 +157,10 @@ def test_inplace_decode_step_matches_reference(monkeypatch, batch):
     slots = torch.tensor([6, 1, 3, 0][:batch])
     state0 = layer.recurrent_state.detach().clone()
     grid = layer._inplace_decode_grid(q)
-    assert grid == (2 if batch % 2 == 0 else 1)
-    out = layer._nki_inplace_decode_step(q, k, v, a, b, z, slots, grid)
+    # An LNC=2 graph takes only grid 2 (NCC_EVRF066). The kernel still runs an
+    # odd batch on 1 program, as in an LNC=1 graph.
+    assert grid == (2 if batch % 2 == 0 else 0)
+    out = layer._nki_inplace_decode_step(q, k, v, a, b, z, slots, grid or 1)
     ref_out, ref_state = _decode_reference(layer, q, k, v, a, b, z, state0[slots])
     new = layer.recurrent_state.detach()
     assert out.shape == (batch, hv * DIM)
@@ -173,8 +175,8 @@ def test_layer_decode_inplace_matches_batched(monkeypatch):
     layer = _bf16_layer(monkeypatch)
     state0 = layer.recurrent_state.detach().clone()
     conv0 = layer.conv_state.detach().clone()
-    batch = 5
-    slots = torch.tensor([4, 0, 6, 2, 5])
+    batch = 4
+    slots = torch.tensor([4, 0, 6, 2])
     h = torch.randn(batch, layer.hidden_size).to(torch.bfloat16)
     calls = []
     step = layer._nki_inplace_decode_step
@@ -203,9 +205,33 @@ def test_layer_decode_inplace_matches_batched(monkeypatch):
     assert _rel_rms(out2, out1) < 3e-3
     assert _rel_rms(st2[slots], st1[slots]) < 3e-3
     # The rows of other requests do not change.
-    others = torch.tensor([1, 3, 7])
+    others = torch.tensor([1, 3, 5, 7])
     assert torch.equal(st2[others], state0.float()[others])
     assert not torch.equal(st2[slots], state0.float()[slots])
+
+
+def test_an_odd_batch_takes_the_batched_kernel_at_lnc2(monkeypatch):
+    """The in-place kernel cannot split an odd batch over 2 programs; the batched one can."""
+    layer = _bf16_layer(monkeypatch)
+    batch = 1
+    h = torch.randn(batch, layer.hidden_size).to(torch.bfloat16)
+    calls = []
+    step = layer._nki_batched_decode_step
+
+    def counted_step(*args):
+        calls.append(args[0].shape[0])
+        return step(*args)
+
+    monkeypatch.setattr(layer, "_nki_batched_decode_step", counted_step)
+    layer._dn_decode_kernel = "inplace"
+    out = layer(
+        h,
+        torch.full((batch,), 7),
+        is_prefill=False,
+        batch_slot_indices=torch.tensor([3]),
+    )
+    assert calls == [batch]
+    assert torch.isfinite(out.float()).all()
 
 
 def test_inplace_decode_falls_back_to_batched(monkeypatch):
@@ -240,7 +266,9 @@ def test_inplace_decode_grid_limits(monkeypatch):
     # A program keeps rows x v-heads x 128 bf16 values on each partition, at most 96 KiB.
     max_rows = m._INPLACE_DECODE_MAX_STATE_BYTES // (hv * DIM * 2)
     assert grid_for(2) == 2
-    assert grid_for(3) == 1
+    # neuronx-cc rejects a grid-1 kernel in an LNC=2 graph (NCC_EVRF066), so a
+    # batch the 2 programs cannot split takes the batched path instead.
+    assert grid_for(3) == 0
     assert grid_for(2 * max_rows) == 2
     assert grid_for(2 * max_rows + 2) == 0
     assert grid_for(max_rows + 1) == 0
