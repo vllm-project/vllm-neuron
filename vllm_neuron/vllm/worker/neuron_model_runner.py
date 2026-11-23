@@ -11153,6 +11153,26 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # This binds the cache tensors to the model
         self.model.bind_kv_cache(kv_caches)
 
+        # Allocate + bind the linear-attention (GDN) recurrent state. This is a
+        # fixed per-sequence buffer, not a paged cache: one conv_state and one
+        # ssm_state per linear-attention layer, indexed by batch row (correct
+        # for a single sequence; a stable slot map is a batch > 1 follow-up).
+        if hasattr(self.model, "get_linear_cache_spec"):
+            linear_caches = {}
+            for spec in self.model.get_linear_cache_spec():
+                conv_state = torch.zeros(
+                    (self.max_num_reqs, *spec["conv_shape"]),
+                    dtype=spec["conv_dtype"],
+                    device=self.device,
+                )
+                ssm_state = torch.zeros(
+                    (self.max_num_reqs, *spec["ssm_shape"]),
+                    dtype=spec["ssm_dtype"],
+                    device=self.device,
+                )
+                linear_caches[spec["layer_name"]] = (conv_state, ssm_state)
+            self.model.bind_linear_cache(linear_caches)
+
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, (EagleProposer, DFlashProposer))
             assert self.drafter.model is not None
