@@ -1,0 +1,22 @@
+# Installs this folder's src/ as the ``stablelm_neuron`` package and registers
+# StableLmForCausalLM with vLLM in every process (front end, engine core, Neuron
+# workers) through a general-plugin entry point:
+#     pip install -e contrib/models/stablelm
+[build-system]
+requires = ["setuptools>=77.0.3,<80.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-neuron-contrib-stablelm"
+version = "0.1.0"
+description = "StableLM (StableLmForCausalLM) contrib model for vllm-neuron"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = []  # runs inside an environment that already has vllm-neuron
+
+[project.entry-points."vllm.general_plugins"]
+stablelm_neuron = "stablelm_neuron.plugin:register"
+
+[tool.setuptools]
+package-dir = {"stablelm_neuron" = "src"}
+packages = ["stablelm_neuron"]
