@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 
 
 class EagleProposer:
+    # Speculative-config methods this proposer serves. Subclasses that reuse
+    # the fused draft contract for other draft models extend it (see MTPProposer).
+    supported_methods: tuple[str, ...] = ("eagle3",)
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -42,7 +46,9 @@ class EagleProposer:
 
         self.draft_model_config = self.speculative_config.draft_model_config
         self.method = self.speculative_config.method
-        assert self.method == "eagle3"
+        assert self.method in self.supported_methods, (
+            f"{type(self).__name__} serves {self.supported_methods}, got {self.method!r}"
+        )
 
         self.device = device
         self.on_device_sampling = on_device_sampling
@@ -128,13 +134,24 @@ class EagleProposer:
         logger.info("Completed compilation for draft model.")
 
         # Set draft model attn layer names
-        draft_num_layers = self.draft_model_config.hf_config.num_hidden_layers
+        draft_num_layers = self._num_draft_layers()
         self.attn_layer_names = [
             f"layers.{i}.self_attn"
             for i in range(target_num_layers, target_num_layers + draft_num_layers)
         ]
 
         # TODO some weights can be shared across target and draft models. e.g., embedding, lm_heads in certain cases
+
+    def _num_draft_layers(self) -> int:
+        """Number of draft decoder layers, placed after the target's layers."""
+        return self.draft_model_config.hf_config.num_hidden_layers
+
+    def _target_hidden_states_dim(self, hidden_size: int) -> int:
+        """Width of the target hidden states fed to the draft.
+
+        EAGLE3 concatenates three auxiliary layers.
+        """
+        return hidden_size * 3
 
     def _build_synthetic_inputs(
         self,
@@ -181,7 +198,9 @@ class EagleProposer:
             num_tokens * target_mlp_dp_size if is_decode_shape else num_tokens
         )
         target_hidden_states = torch.ones(
-            hidden_state_rows, hidden_size * 3, dtype=torch.bfloat16
+            hidden_state_rows,
+            self._target_hidden_states_dim(hidden_size),
+            dtype=torch.bfloat16,
         ).to(device)
 
         # last_token_indices: index of last token for each request
