@@ -1142,6 +1142,53 @@ class TestNKIIntegration:
         assert async_output.pending_nki_logprobs is None
         assert result.logprobs.slice_request(1, 1).logprobs.tolist() == [[-0.75]]
 
+    def test_a_discarded_prefill_row_draws_no_uniform(self):
+        # A chunked prefill that is not final discards its token. Its seed must
+        # not advance, so the tokens do not depend on how the prompt is chunked.
+        from vllm_neuron.vllm.worker.neuron_model_runner import (
+            build_nki_sampling_params_tensor,
+        )
+
+        def batch():
+            return SimpleNamespace(
+                num_reqs=2,
+                temperature_cpu=np.array([0.7, 0.9], dtype=np.float32),
+                generators={
+                    0: torch.Generator().manual_seed(5),
+                    1: torch.Generator().manual_seed(6),
+                },
+            )
+
+        b, ref = batch(), batch()
+        params = build_nki_sampling_params_tensor(b, 2, discard_rows={1})
+        assert params[1].tolist() == [0.0, 1.0, 1.0]
+        assert params[0, 0] == torch.rand((), generator=ref.generators[0])
+        assert torch.equal(b.generators[1].get_state(), ref.generators[1].get_state())
+
+    def test_the_separate_sampler_restores_a_discarded_row_seed(self):
+        from vllm_neuron.vllm.worker import neuron_model_runner as runner_module
+
+        md = metadata([0.7, 1.0])
+        state = md.generators[1].get_state()
+
+        def sample(logits, sampling_metadata):
+            for generator in sampling_metadata.generators.values():
+                torch.rand((), generator=generator)
+            return "nki-result"
+
+        runner = self._runner(md, Mock(side_effect=sample), Mock(), 32)
+        runner._nki_discard_rows = {1}
+        group = SimpleNamespace(rank_in_group=0, world_size=1)
+        with patch.object(runner_module, "get_tp_group", return_value=group):
+            assert (
+                runner_module.NeuronModelRunner._sample(runner, torch.zeros(2, 32))
+                == "nki-result"
+            )
+        assert torch.equal(md.generators[1].get_state(), state)
+        assert not torch.equal(
+            md.generators[0].get_state(), metadata([0.7, 1.0]).generators[0].get_state()
+        )
+
     def test_in_graph_padding_rows_are_greedy(self):
         from vllm_neuron.vllm.worker.neuron_model_runner import (
             build_nki_sampling_params_tensor,

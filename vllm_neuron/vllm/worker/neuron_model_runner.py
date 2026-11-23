@@ -553,7 +553,9 @@ def _nki_logprobs_tensors(
     return LogprobsTensors(ids, scores, ranks)
 
 
-def build_nki_sampling_params_tensor(input_batch, num_rows: int) -> torch.Tensor:
+def build_nki_sampling_params_tensor(
+    input_batch, num_rows: int, discard_rows: Collection[int] = ()
+) -> torch.Tensor:
     """Build the ``[num_rows, 3]`` (uniform, temperature, greedy) NKI input.
 
     The in-graph NKI sampler reads this instead of [top_k, top_p, temperature].
@@ -561,6 +563,8 @@ def build_nki_sampling_params_tensor(input_batch, num_rows: int) -> torch.Tensor
     tensor while step N runs. Each stochastic row draws one uniform from its
     request's CPU generator (or the global CPU RNG when unseeded); greedy rows
     draw none and run at temperature 1. Rows past ``num_reqs`` are padding.
+    ``discard_rows`` (a chunked prefill that is not final, whose token is
+    discarded) run greedy and draw none, so a seed does not depend on chunking.
 
     Example:
         >>> build_nki_sampling_params_tensor(batch, 4)  # doctest: +SKIP
@@ -572,6 +576,9 @@ def build_nki_sampling_params_tensor(input_batch, num_rows: int) -> torch.Tensor
     params[:, 2] = 1.0
     temperatures = torch.from_numpy(input_batch.temperature_cpu[:num_reqs]).float()
     stochastic = temperatures >= 1e-5
+    for row in discard_rows:
+        if row < num_reqs:
+            stochastic[row] = False
     params[:num_reqs, 1] = torch.where(stochastic, temperatures, 1.0)
     params[:num_reqs, 2] = (~stochastic).float()
     for row in stochastic.nonzero(as_tuple=True)[0].tolist():
@@ -1488,6 +1495,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self._logprobs_mode = logprobs_mode
         self._on_device_nki_scores: tuple[torch.Tensor, torch.Tensor] | None = None
         self._pending_nki_logprobs: tuple[torch.Tensor, ...] | None = None
+        # Batch rows whose sampled token is discarded this step (execute_model).
+        self._nki_discard_rows: set[int] = set()
         # The vLLM sampler. The separate NKI route also uses it for a batch
         # with top_k/top_p filtering.
         self.cpu_sampler = Sampler(logprobs_mode=logprobs_mode)
@@ -8034,6 +8043,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     "Disable async scheduling with: --no-async-scheduling"
                 )
 
+        # The NKI samplers draw no random number for a row whose chunked prefill
+        # is not final: its token is discarded. A seed then gives the same tokens
+        # however the prompt is chunked or prefix-cached, as on vLLM's GPU runner.
+        if self.nki_sampling or self.nki_in_graph_sampling:
+            index = self.input_batch.req_id_to_index
+            self._nki_discard_rows = {
+                index[req_id]
+                for req_id in self._get_partial_prefill_req_ids(
+                    scheduler_output, self.input_batch.req_ids
+                )
+                if req_id in index
+            }
+
         # Wrap with set_forward_context for DI support
         with (
             set_forward_context(
@@ -9656,7 +9678,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
             if self.nki_in_graph_sampling:
                 sampling_params_tensor = build_nki_sampling_params_tensor(
-                    self.input_batch, num_reqs
+                    self.input_batch, num_reqs, self._nki_discard_rows
                 )
             else:
                 sampling_params_tensor = build_sampling_params_tensor(
@@ -11231,6 +11253,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         f"Expected full vocabulary width {self.vocab_size}, "
                         f"received logits shape {tuple(logits.shape)}"
                     )
+                # A discarded row (a chunked prefill that is not final) must not
+                # advance its seed: restore its generator after the draw.
+                saved = {
+                    row: generator.get_state()
+                    for row, generator in sampling_metadata.generators.items()
+                    if row in getattr(self, "_nki_discard_rows", ())
+                }
                 if use_cpu:
                     sampling_metadata = replace(
                         sampling_metadata,
@@ -11252,6 +11281,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     sampler(logits=logits, sampling_metadata=sampling_metadata),
                     None,
                 )
+                for row, state in saved.items():
+                    sampling_metadata.generators[row].set_state(state)
             except Exception as error:
                 # Send the failure, so the other ranks do not wait for a result.
                 payload = (None, f"{type(error).__name__}: {error}")
