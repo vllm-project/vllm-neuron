@@ -216,6 +216,8 @@ Checkpoint of the integration test and the serve smoke: `EssentialAI/rnj-1-instr
 | `test_model_accuracy[4-2048]` | TP 8, `neuron_native`, BF16 (FP32 checkpoint), batch 4 (each prompt in 4 rows), max model length 2,048, 2 prompts × 16 greedy tokens, on-device greedy sampling | PASSED (243.35 s); static per-prompt bounds 2/2 (below); aggregate σ-ratio 0.9085 ≤ 1.0 |
 | `vllm serve` smoke | The Usage command, installed with `pip install -e contrib/models/gemma3` | Passed: 3/3 prompts, 32 completion tokens each; a batched request of all 3 returned a prefix of each |
 
+The integration test asserts the per-prompt checks `pp_max_linf_1.5x` and `pp_max_l2_1.5x` on every prompt; both were 2/2 in both cases of this run.
+
 #### Logit validation
 
 | Case | Prompt | Overall Status | Max K5 (0.03) | Max K50 (0.05) | Max K1000 (0.08) | Max All (0.09) | Argmax divergence (1 ULP) |
@@ -261,12 +263,11 @@ Prompt 1: CPU BF16 L-inf maximum at generated token 0, Neuron L-inf at token 2, 
   sampling parameters with `temperature` 0.2. The smoke run used `all_greedy`
   on-device sampling; sampled serving was not run.
 - **Dropped: the port's GSM8K (100 samples, batch 1 and 4) and serving
-  benchmark (1024 input / 100 output tokens, batch 1 and 4) tests at TP 8**,
-  which passed on `vllm-neuron` 0.31.0.1.2.0 with the port before the 0.29
-  changes, and its two-node disaggregated logit test (TP 16, 1 prefill + 1
-  decode node). They depend on the plugin's shared serving and multi-node test
+  benchmark (1024 input / 100 output tokens, batch 1 and 4) tests at TP 8,
+  and its two-node disaggregated logit test (TP 16, 1 prefill + 1 decode
+  node).** They depend on the plugin's shared serving and multi-node test
   harness, which is outside this folder. No accuracy-benchmark score and no
-  performance figures on 0.29.
+  performance figures.
 - **Dropped: the port's kernel-dispatch instrumentation** (a debug FX pass in
   the plugin and the test that read its records). It does not change the
   model.

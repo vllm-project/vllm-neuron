@@ -76,6 +76,11 @@ TOL_MAP = {
     "all": (1e-5, 0.09),
 }
 
+# Per-prompt checks of the three-way validation. Each one compares the
+# largest error of one prompt against 1.5x the largest error of the CPU BF16
+# reference for the same prompt.
+PER_PROMPT_CHECKS = ("pp_max_linf_1.5x", "pp_max_l2_1.5x")
+
 # The tensor parallel degree of the recorded runs: 32 Q heads and 8 KV heads
 # give 4 Q heads and one KV head on each rank.
 TENSOR_PARALLEL_SIZE = 8
@@ -206,6 +211,12 @@ def test_model_accuracy(batch_size: int, seq_len: int) -> None:
         assert result.passed, (
             f"Logit validation failed for parameters: {batch_size=}, {seq_len=}"
         )
+        n_prompts = len(result.per_prompt_results)
+        for check in PER_PROMPT_CHECKS:
+            value = result.aggregate_metrics.get(check)
+            assert value == f"{n_prompts}/{n_prompts}", (
+                f"{check} is {value} for parameters: {batch_size=}, {seq_len=}"
+            )
     finally:
         llm.llm_engine.engine_core.shutdown()
 
