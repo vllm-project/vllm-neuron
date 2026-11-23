@@ -1,0 +1,22 @@
+# Installs this folder's src/ as the ``glm_neuron`` package and registers
+# GlmForCausalLM with vLLM in every process (front end, engine core, Neuron
+# workers) through a general-plugin entry point:
+#     pip install -e contrib/models/glm
+[build-system]
+requires = ["setuptools>=77.0.3,<80.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-neuron-contrib-glm"
+version = "0.1.0"
+description = "GLM-4 (GlmForCausalLM, glm-4-9b-chat-hf) contrib model for vllm-neuron"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = []  # runs inside an environment that already has vllm-neuron
+
+[project.entry-points."vllm.general_plugins"]
+glm_neuron = "glm_neuron.plugin:register"
+
+[tool.setuptools]
+package-dir = {"glm_neuron" = "src"}
+packages = ["glm_neuron"]
