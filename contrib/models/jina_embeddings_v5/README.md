@@ -245,23 +245,46 @@ multi-node executor reads.
 
 ## Validation report
 
-### Source and environment
+### vLLM Neuron 0.29.0.1.2.0 (2026-11-19)
 
-<!-- Filled from the device runs on vLLM Neuron 0.29.0.1.2.0 / SDK 2.33. -->
+#### Environment
 
-- Plugin: vLLM Neuron 0.29.0.1.2.0 (vLLM 0.29.0), Neuron SDK 2.33.
-- Instance: trn2, one node.
-- Checkpoint: `jinaai/jina-embeddings-v5-text-nano` at
-  `8a7f00aac812071b69403df470f1038ec85f8925`, without `adapters/`.
+| Image | Instance | TP | vLLM | vllm-neuron | torch | transformers | neuronx-cc |
+|---|---|---|---|---|---|---|---|
+| `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04` | `trn2.48xlarge` (LNC 2), 1 node | 2 | 0.29.0 | 0.29.0.1.2.0 | 2.13.0 | 5.17.0 | 2.28.7631.0+8f7b0cf5 |
 
-### Results
+Checkpoint: `jinaai/jina-embeddings-v5-text-nano` at
+`8a7f00aac812071b69403df470f1038ec85f8925`.
 
-| Test | TP | Result |
-| ---- | -- | ------ |
-| Unit tests, CPU mode (`test/unit/`) | 2 (CPU) | 5 of 5 passed |
-| Integration, CPU mode (`test/integration/`) | 2 (CPU) | 2 of 2 passed; worst cosine 0.99987 (1,024 tokens and text), 0.99938 (1 token); floor 0.99 |
-| Integration on device (`test/integration/`) | 2 | _To be filled_ |
-| Module tests on device (`test/module/`) | 2 | _Not run for this report_ |
+#### Results
+
+| Test | Configuration | Result |
+|---|---|---|
+| CPU unit tests, `test/unit/` | `VLLM_NEURON_CPU_MODE=1` | 5 passed, 0 failed |
+| `test_model_embeddings[tokens_1024_and_text]` | TP 2, BF16, two 1,024-token inputs and the two text inputs, test-side registration | PASSED (66.48 s) |
+| `test_model_embeddings[single_token]` | TP 2, BF16, four 1-token inputs, test-side registration | PASSED (42.89 s) |
+| `vllm serve` smoke | The flags under Usage with the hub name and `--revision 8a7f00aac812071b69403df470f1038ec85f8925` as the model, in place of the local directory and `--served-model-name`, after `pip install --no-deps -e contrib/models/jina_embeddings_v5` (entry-point registration) | Passed: 3 embeddings of dimension 768, all finite, related pair above unrelated pair |
+
+Not run on 0.29: module tests (`test/module/`) and the integration test in CPU mode, not part of the 0.29 run.
+
+#### Embedding validation
+
+| Case | Vectors | Overall Status | Neuron vs FP32 HF, min cos (floor 0.99) | Neuron vs FP32 HF, mean cos | BF16 HF vs FP32 HF, min cos (not gated) | BF16 HF vs FP32 HF, mean cos (not gated) |
+|---|---|---|---|---|---|---|
+| `tokens_1024_and_text` | 4 | PASSED | 0.999905 | 0.999950 | 0.999748 | 0.999912 |
+| `single_token` | 4 | PASSED | 0.999209 | 0.999510 | 0.999501 | 0.999576 |
+
+Gate: per-vector cosine against FP32 HF, `assert_pooling_close_three_way(task="embed", min_cos=0.99)`. No vector below the floor.
+The test also asserts, per case, that vLLM ran the token IDs of the HF reference and that each embedding has unit L2 norm (atol 1e-3).
+
+#### Serve smoke
+
+`/v1/embeddings`, one request with 3 inputs; cosine of the first input against the other two.
+
+| Pair | Cosine |
+|---|---|
+| "The capital of France is Paris." and "Paris is the capital city of France." | 0.960451068537213 |
+| "The capital of France is Paris." and "Bananas are yellow fruit." | 0.07963150205704207 |
 
 ### Exceptions
 
@@ -270,6 +293,7 @@ multi-node executor reads.
   (MTEB or similar) was run.
 - **Base encoder only.** The task LoRA adapters are not applied; see the note
   at the top.
+- **Module tests not run on 0.29.**
 - **Dropped: the port's 2-node online serving test.** It used a shared server
   harness and a multi-node launcher outside this folder. The offline
   integration test covers the same inputs (1,024-token token-ID inputs and
