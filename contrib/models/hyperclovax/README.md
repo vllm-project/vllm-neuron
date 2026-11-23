@@ -136,7 +136,7 @@ the top-level `README.md` and `AGENTS.md` for the full list of
 
 | Instance / version | `vllm-neuron` 0.29.0.1.2.0 (Neuron SDK 2.33, vLLM 0.29.0) | Other versions |
 | ------------------ | --------------------------------------------------------- | -------------- |
-| Trn2 (trn2.48xlarge) | TP 8: _pending the device runs (see the Validation report)_ | Not tested |
+| Trn2 (trn2.48xlarge) | Working (TP 8): unit, integration and `vllm serve` smoke passed (see the Validation report) | Not tested |
 | Trn3                 | Not tested                                              | Not tested     |
 
 The native route (`VLLM_NEURON_BACKEND=neuron_native`) is the only route this
@@ -217,95 +217,86 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hyperclovax/test/unit/ \
 
 ## Validation report
 
-### Results on vLLM Neuron 0.29.0.1.2.0
+### vLLM Neuron 0.29.0.1.2.0 (2026-11-23)
 
-_To be filled in from the device runs of this folder: the unit tests, the
-integration test and a `vllm serve` smoke test on `trn2.48xlarge` with the
-0.29.0.1.2.0 / Neuron SDK 2.33 container._
+#### Environment
 
-| Test | Instance | Result |
+| Image | Instance | TP | vLLM | vllm-neuron | torch | transformers | neuronx-cc |
+|---|---|---|---|---|---|---|---|
+| `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04` | `trn2.48xlarge` (LNC 2), 1 node | 8 | 0.29.0 | 0.29.0.1.2.0 | 2.13.0 | 5.17.0 | 2.28.7631.0+8f7b0cf5 |
+
+Checkpoint of the integration test: `naver-hyperclovax/HyperCLOVAX-SEED-Think-14B` at
+`9b74e35d4c7e4ffec489f4171273caca8948a2b9`.
+
+#### Results
+
+| Test | Configuration | Result |
 |---|---|---|
-| `test/unit` (CPU mode) | trn2.48xlarge | _pending_ |
-| `test/integration/test_model.py` (TP 8, batch 1 and 4) | trn2.48xlarge | _pending_ |
-| `vllm serve` smoke test (TP 8) | trn2.48xlarge | _pending_ |
+| CPU unit tests, `test/unit/` | `VLLM_NEURON_CPU_MODE=1`, `HYPERCLOVAX_CHECKPOINT_PATH` set | 48 passed, 0 failed (`test_factory.py` 40, `test_checkpoint.py` 4, `test_tiny_hyperclovax_e2e.py` 4) |
+| `test_model_accuracy[1-2048]` | TP 8, `neuron_native`, BF16, batch 1, max model length 2,048, 2 prompts × 16 greedy tokens, on-device greedy sampling | PASSED (216.41 s): static per-prompt bounds 2/2 (below); aggregate σ-ratio 0.8671 ≤ 1.0 |
+| `test_model_accuracy[4-2048]` | TP 8, `neuron_native`, BF16, batch 4 (each prompt in 4 rows), max model length 2,048, 2 prompts × 16 greedy tokens, on-device greedy sampling | PASSED (168.21 s): static per-prompt bounds 2/2 (below); aggregate σ-ratio 0.8932 ≤ 1.0 |
+| `vllm serve` smoke | The Usage command (`--revision 9b74e35d4c7e4ffec489f4171273caca8948a2b9`), `VLLM_NEURON_BACKEND=neuron_native`, installed with `pip install --no-deps -e contrib/models/hyperclovax` | Passed: 3/3 prompts, 32 completion tokens each; a batched request of all 3 at `max_tokens` 16 returned a prefix of each |
 
-Locally, in the 0.29.0.1.2.0 container without Neuron devices and without a
-local checkpoint, `test/unit` gives 47 passed and 1 skipped (the
-tensor-value case of `test_checkpoint.py`).
+Not run on 0.29: the port's two-node component, logit and serving tests (not shipped in this folder).
 
-### Recorded runs of the port
+#### Logit validation
 
-The implementation in `src/` comes from a port that was validated on a
-development build of the plugin, before it was adapted to the public
-0.29.0.1.2.0 release. These runs passed, all on `trn2.48xlarge` with the
-native route, against the pinned checkpoint revision:
+| Case | Prompt | Overall Status | Max K5 (0.011) | Max K50 (0.02) | Max K1000 (0.03) | Max All (0.05) | Argmax divergence (1 ULP) |
+|---|---|---|---|---|---|---|---|
+| `[1-2048]` | 1 of 2, `The Amazon rainforest …` | PASSED | 0.0079 at token 4 | 0.0084 at token 6 | 0.0084 at token 6 | 0.0084 at token 6 | 0.0000 |
+| `[1-2048]` | 2 of 2, `The human genome …` | PASSED | 0.0101 at token 14 | 0.0101 at token 14 | 0.0104 at token 8 | 0.0104 at token 8 | 0.0000 |
+| `[4-2048]` | 1 of 2, `The Amazon rainforest …` | PASSED | 0.0070 at token 15 | 0.0070 at token 15 | 0.0078 at token 14 | 0.0087 at token 3 | 0.0000 |
+| `[4-2048]` | 2 of 2, `The human genome …` | PASSED | 0.0086 at token 14 | 0.0144 at token 14 | 0.0144 at token 14 | 0.0144 at token 14 | 0.0000 |
 
-| Run | Nodes | TP | Result |
-|---|---|---|---|
-| CPU loading tests | 1 | 1 and 2 (CPU mode) | PASS |
-| Device tests | 2 (4 ranks each) | 8 | PASS |
+Neuron vs CPU BF16 reference; token = generated token, row = batch row. In `[4-2048]` the per-row maxima are equal in all 4 rows; the token is the one printed for row 0. Prompt 1, token 10, in both cases (all 4 rows of `[4-2048]`): the Neuron argmax differs from the reference argmax with Δ = 0.0000 ("Acceptable divergence", within 1 ULP); validation continued teacher-forced (K5 0.0001 / All 0.0051 at that token in `[1-2048]`, K5 0.0011 / All 0.0060 in `[4-2048]`). No other argmax difference.
+Both cases passed (`multi_prompt_logit_validation`; the test asserts `result.passed` only): two-way 2/2 prompts, aggregate σ-ratio 0.8671 (`[1-2048]`) and 0.8932 (`[4-2048]`) ≤ 1.0. Printed per-prompt checks, `[1-2048]`: `pp_max_l2_1.5x` 2/2, `pp_max_l2_2.0x` 2/2, `pp_max_linf_1.5x` 2/2, `pp_max_linf_2.0x` 2/2, `pp_static_0.03` 2/2, `pp_static_0.05` 2/2, `pp_tok_l2_1.5x` 1/2, `pp_tok_l2_2.0x` 1/2, `pp_tok_linf_1.5x` 1/2, `pp_tok_linf_2.0x` 2/2; `[4-2048]`: the same except `pp_tok_l2_1.5x` 0/2 and `pp_tok_l2_2.0x` 2/2. Printed informational aggregate checks, `[1-2048]`: `agg_bc` FAIL, `agg_l2_1.2x` FAIL, `agg_l2_1.5x` PASS, `agg_linf_1.2x` PASS, `agg_linf_1.5x` PASS; `[4-2048]`: `agg_bc` FAIL, `agg_l2_1.2x` FAIL, `agg_l2_1.5x` FAIL, `agg_linf_1.2x` FAIL, `agg_linf_1.5x` PASS.
 
-- The CPU run covers the tests shipped here in `test_factory.py`,
-  `test_checkpoint.py` and `test_tiny_hyperclovax_e2e.py`, before the changes
-  listed below. The record holds the aggregate verdict.
-- The device run compared layer-0 attention (flash prefill at 128 and 1,024
-  tokens, segmented prefill in two 512-token chunks, and decode) and the MLP
-  against the HF modules three-way; compared the full-model logits of 16
-  greedy tokens for the same two prompts as the integration test against the
-  HF FP32 and BF16 references with the default tolerance map of
-  `multi_prompt_logit_validation` (batch 1, 2,048-token model length, host
-  sampling); sent one 1,024-token prompt with 512 output tokens through
-  `vllm serve`; and checked that every TP rank compiled prefill and decode
-  graphs in which all 38 layers selected the NKI kernel of each main-path
-  component. We hold the verdicts, not the logit metrics.
+Error against the FP32 reference, per prompt (max over the 16 generated tokens):
 
-### Differences between this folder and the recorded runs
+| Case | Prompt | CPU BF16 L-inf | Neuron L-inf | Neuron / CPU BF16 | CPU BF16 L2 | Neuron L2 | Neuron / CPU BF16 |
+|---|---|---|---|---|---|---|---|
+| `[1-2048]` | 1 of 2 | 0.0080 | 0.0072 | 0.90x | 0.0126 | 0.0097 | 0.77x |
+| `[1-2048]` | 2 of 2 | 0.0134 | 0.0111 | 0.83x | 0.0314 | 0.0289 | 0.92x |
+| `[4-2048]` | 1 of 2 | 0.0080 | 0.0088 | 1.10x | 0.0126 | 0.0102 | 0.81x |
+| `[4-2048]` | 2 of 2 | 0.0134 | 0.0112 | 0.84x | 0.0314 | 0.0285 | 0.91x |
 
-- **The integration test is single-node.** The recorded logit run split the
-  8 TP ranks across two nodes and read the logits through `vllm serve` with
-  host sampling. `test/integration/test_model.py` runs all 8 ranks on one node
-  with the offline API and on-device greedy sampling, with the same two
-  prompts, 16 output tokens, the 2,048-token model length, and the same
-  tolerance map: `(1e-5, 0.011)` at top-5, `(1e-5, 0.02)` at top-50,
-  `(1e-5, 0.03)` at top-1000 and `(1e-5, 0.05)` over the full vocabulary, with
-  the strict `1e-5` argmax bound. It adds a batch-4 case.
-- **The logits are read over the full model vocabulary.** The tokenizer has
-  110,524 entries and a base `vocab_size` of 110,491, while the model scores
-  110,592 ids. The test therefore builds each logit row at the model's
-  vocabulary width, disables detokenization of the logprob ids (the 68 ids
-  past the tokenizer have no token string), and ignores end-of-sequence so
-  that vLLM decodes the same 16 tokens as the HF reference.
-- **The O projection travels with the model.** The port changed the plugin's
-  `NF.o_proj` torch fallback so that it accepts the FP32 attention output that
-  this model feeds it in prefill (the FP32 input keeps the TP reduce-scatter of
-  the partial sums in FP32). A contrib folder may not change the plugin, so
-  `src/o_proj.py` carries the 0.29.0.1.2.0 `o_proj` with that one fallback
-  change, and `src/model.py` calls it. The NKI kernel dispatch is the
-  plugin's, unchanged; on device the kernel takes the FP32 input as before.
-- **0.29 compatibility.** `hoist_rope_parameters` is not in vLLM Neuron
-  0.29.0.1.2.0, so `src/compat.py` carries a copy. Every other plugin API the
-  model uses resolves against the installed 0.29.0.1.2.0 plugin.
-- **Registration.** The port registered the model in the plugin's own
-  registry. This folder registers it through the `pyproject.toml` entry point,
-  or, in the tests, with `ModelRegistry.register_model` from `src/` directly.
-  The port's registry test became the registration-contract tests in
-  `test_factory.py`.
-- **Dropped from the port.** The kernel dispatch trace (a test-only wrapper of
-  the compile backend and its environment variable) is plugin
-  instrumentation, not part of the model, so it is not carried; the
-  kernel-dispatch checks that read it are dropped with it. The two-node
-  component and serving tests are not shipped: they depend on a two-node
-  launcher and shared test infrastructure outside this folder. Their results
-  are the device row above, but they cannot be re-run from this folder.
-- **Checkpoint resolution.** The port's tests read a fixed shared path. Here
-  the tests read `HYPERCLOVAX_CHECKPOINT_PATH`. The unit tests never download
-  the 59 GB checkpoint, and the integration test downloads the pinned revision
-  without it.
+CPU BF16 maxima: prompt 1 at generated token 3, prompt 2 at token 13. Neuron maxima (L-inf, L2): `[1-2048]` prompt 1 tokens 13 and 3, prompt 2 tokens 13 and 8; `[4-2048]` prompt 1 token 15 for both, prompt 2 tokens 13 and 8.
 
-### Untested configurations
+#### Serve smoke
 
-Prefix caching and segmented prefill on this folder (the port's component
-test covered segmented prefill for one layer), TP degrees other than 8 on
-device, context beyond 2,048 tokens, quantization, speculative decoding,
-other HyperCLOVAX checkpoints, Trn3, and any plugin version other than the
-development build above and 0.29.0.1.2.0.
+`/v1/completions`, `temperature` 0, `max_tokens` 32; first 60 characters of each output as a Python string literal.
+
+| Prompt | Output |
+|---|---|
+| `The capital of France is` | `' Paris. The capital of Germany is Berlin. The capital of Jap'` |
+| `1, 2, 3, 4, 5,` | `' 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16'` |
+| `def fibonacci(n):` | `' \n    if n <= 0: \n        return "Invalid input. Please ente'` |
+
+### Exceptions
+
+- **Prompt 1 has one argmax difference within the 1-ULP bound** (generated
+  token 10, Δ = 0.0000, both cases). The informational aggregate checks
+  `agg_bc` and `agg_l2_1.2x` failed in both cases, and `agg_l2_1.5x` and
+  `agg_linf_1.2x` in `[4-2048]` (see Logit validation).
+- **Port tests not shipped and not run on 0.29.** The port's two-node TP 8
+  device run (layer-0 attention in flash prefill at 128 and 1,024 tokens,
+  segmented prefill in two 512-token chunks and decode, the MLP, full-model
+  logits with host sampling, one 1,024-token prompt with 512 output tokens
+  through `vllm serve`, and per-rank NKI kernel-dispatch checks) passed on a
+  development build of the plugin. Those tests depend on a two-node launcher
+  and shared test infrastructure outside this folder, and the kernel-dispatch
+  trace they read is plugin instrumentation that this folder does not carry.
+- **The integration test differs from the port's logit run**: one node instead
+  of two, the offline API with on-device greedy sampling instead of
+  `vllm serve` with host sampling, an added batch-4 case, and logit rows over
+  the full 110,592-id vocabulary with detokenization off and end-of-sequence
+  ignored.
+- **`src/o_proj.py`** carries the 0.29.0.1.2.0 `o_proj` with the port's
+  FP32-input torch fallback. The CPU unit tests exercise the fallback and
+  compare it with the NKI kernel in the simulator; which path the device
+  graphs used was not recorded.
+- **The serve smoke ran with `VLLM_NEURON_BACKEND=neuron_native` and
+  `VLLM_ENGINE_READY_TIMEOUT_S=7200` set**; the Usage command sets neither.
+- Prefix caching (the segmented-prefill path), TP sizes other than 1 and 2
+  (CPU) and 8, context beyond 2,048 tokens, quantization, speculative
+  decoding, other HyperCLOVAX checkpoints and Trn3 are not tested.
