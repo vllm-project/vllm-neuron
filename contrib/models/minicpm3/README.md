@@ -207,6 +207,8 @@ Checkpoint of the integration test: `openbmb/MiniCPM3-4B` at
 | `test_model_accuracy[4-2048]` | TP 8, `neuron_native`, BF16, batch 4 (each prompt in 4 rows), max model length 2,048, 2 prompts × 16 greedy tokens, on-device greedy sampling | PASSED (207.22 s): 2/2 prompts within the K5/K50/K1000/All bounds, no argmax divergence; aggregate σ-ratio 0.5559 ≤ 1.0 |
 | `vllm serve` smoke | The Usage command (`--revision d6b14ddaefdb11c624dd75c3c779549bc90b08cb`), installed with `pip install -e contrib/models/minicpm3` | Passed: 3/3 prompts, 32 completion tokens each; a batched request of all 3 returned a prefix of each |
 
+The integration test also asserts `pp_max_linf_1.5x` and `pp_max_l2_1.5x` on every prompt; both were 2/2 in both cases of this run.
+
 #### Logit validation
 
 | Case | Prompt | Overall Status | Max K5 (0.03) | Max K50 (0.05) | Max K1000 (0.08) | Max All (0.09) | Argmax divergence (1 ULP) |
@@ -217,7 +219,7 @@ Checkpoint of the integration test: `openbmb/MiniCPM3-4B` at
 | `[4-2048]` | 2 of 2, `The human genome …` | PASSED | 0.0074 at token 4 | 0.0115 at token 15 | 0.0134 at token 0 | 0.0144 at token 14 | 0.0000 |
 
 Neuron vs CPU BF16 reference; token = generated token, row = batch row. For `[4-2048]` the location is that of row 0, and the printed per-row maxima are the same in all 4 rows. Every token of every prompt is within all four bounds (`[1-2048]`: 16 tokens per prompt; `[4-2048]`: 64 tokens per prompt, 4 rows). No argmax divergence.
-Both cases passed (`multi_prompt_logit_validation`: two-way validation 2/2 prompts; aggregate σ-ratio 0.5557 (`[1-2048]`) and 0.5559 (`[4-2048]`) ≤ 1.0; the test asserts `result.passed` only); `agg_bc` FAIL; printed per-prompt checks, the same in both cases: `pp_max_linf_1.5x` 2/2, `pp_max_linf_2.0x` 2/2, `pp_max_l2_1.5x` 2/2, `pp_max_l2_2.0x` 2/2, `pp_tok_linf_1.5x` 2/2, `pp_tok_linf_2.0x` 2/2, `pp_tok_l2_1.5x` 2/2, `pp_tok_l2_2.0x` 2/2, `pp_static_0.03` 2/2, `pp_static_0.05` 2/2.
+Both cases passed (`multi_prompt_logit_validation`: two-way validation 2/2 prompts; aggregate σ-ratio 0.5557 (`[1-2048]`) and 0.5559 (`[4-2048]`) ≤ 1.0; the test asserts `result.passed` and the per-prompt checks `pp_max_linf_1.5x` and `pp_max_l2_1.5x`); `agg_bc` FAIL; printed per-prompt checks, the same in both cases: `pp_max_linf_1.5x` 2/2, `pp_max_linf_2.0x` 2/2, `pp_max_l2_1.5x` 2/2, `pp_max_l2_2.0x` 2/2, `pp_tok_linf_1.5x` 2/2, `pp_tok_linf_2.0x` 2/2, `pp_tok_l2_1.5x` 2/2, `pp_tok_l2_2.0x` 2/2, `pp_static_0.03` 2/2, `pp_static_0.05` 2/2.
 
 Error against the FP32 reference, per prompt (max over the 16 generated tokens):
 
