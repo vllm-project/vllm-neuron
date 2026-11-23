@@ -1,0 +1,22 @@
+# Installs this folder's src/ as the ``olmo_neuron`` package and registers
+# OlmoForCausalLM with vLLM in every process (front end, engine core, Neuron
+# workers) through a general-plugin entry point:
+#     pip install -e contrib/models/olmo
+[build-system]
+requires = ["setuptools>=77.0.3,<80.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-neuron-contrib-olmo"
+version = "0.1.0"
+description = "OlmoForCausalLM contrib model for vllm-neuron"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = []  # runs inside an environment that already has vllm-neuron
+
+[project.entry-points."vllm.general_plugins"]
+olmo_neuron = "olmo_neuron.plugin:register"
+
+[tool.setuptools]
+package-dir = {"olmo_neuron" = "src"}
+packages = ["olmo_neuron"]
