@@ -230,37 +230,76 @@ start method, so do not set `VLLM_WORKER_MULTIPROC_METHOD=spawn`.
 
 ## Validation report
 
-### vLLM Neuron 0.29.0.1.2.0
+### vLLM Neuron 0.29.0.1.2.0 (2026-11-23)
 
-_Device results pending._
+#### Environment
 
-#### Changes for 0.29
+| Image | Instance | TP | vLLM | vllm-neuron | torch | transformers | neuronx-cc |
+|---|---|---|---|---|---|---|---|
+| `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04` | `trn2.48xlarge` (LNC 2), 1 node | 8 | 0.29.0 | 0.29.0.1.2.0 | 2.13.0 | 5.17.0 | 2.28.7631.0+8f7b0cf5 |
 
-- `src/plugin.py`, `pyproject.toml` (new): install `src/` as the
-  `ouro_neuron` package with a `vllm.general_plugins` entry point. Its
-  `register()` replaces the port's hook in the plugin's platform class
-  (`pre_register_and_update`), which registered the `"ouro"` config type
-  with `AutoConfig` and the architecture with vLLM's `ModelRegistry`.
-- `src/compat.py` (new): vendors `hoist_rope_parameters` (0.29 has no
-  `vllm_neuron.model.config_utils`) and `build_per_head_block_table` (not in
-  0.29's `vllm_neuron.model.kv_cache`).
-- `src/config.py`, `src/model.py`: import those helpers from `.compat`.
-- Tests: the port's CPU and device tests, rewritten to load `src/` through
-  `test/_local_src.py` and to resolve the checkpoint without the plugin's
-  shared test utilities. The KV-owner check no longer uses a forward-adapter
-  helper that 0.29 does not have; it counts the modules that hold a bound
-  cache. New tiny-checkpoint CPU tests and a single-node integration test.
-- Model code, weight loaders and the reference: otherwise unchanged.
+Checkpoint of the unit, integration and serve runs: `ByteDance/Ouro-1.4B` at
+`574fa66cb8bf5abdc979642d01cf2b79b16bfab1`.
+
+#### Results
+
+| Test | Configuration | Result |
+|---|---|---|
+| CPU unit tests, `test/unit/` | `VLLM_NEURON_CPU_MODE=1`, `OURO_CHECKPOINT_PATH` set (the 6 real-weight tests of `test_checkpoint_cpu.py` ran) | 24 passed, 0 failed |
+| `test_model_accuracy[1-2048]` | TP 8, `neuron_native`, BF16, batch 1, max model length 2,048, prefill bucket 1,024, 2 prompts × 16 greedy tokens, on-device greedy sampling | PASSED (288.288 s): 2/2 prompts within the static bounds; aggregate σ-ratio 0.9627 ≤ 1.0 |
+| `test_model_accuracy[4-2048]` | TP 8, `neuron_native`, BF16, batch 4 (each prompt in 4 rows), max model length 2,048, prefill bucket 1,024, 2 prompts × 16 greedy tokens, on-device greedy sampling | PASSED (351.339 s): 2/2 prompts within the static bounds; aggregate σ-ratio 0.9505 ≤ 1.0 |
+| `vllm serve` smoke | The Usage command, installed with `pip install -e contrib/models/ouro` | Passed: 3/3 prompts, 32 completion tokens each; a batched request of all 3 returned a prefix of each |
+
+Not run on 0.29: module tests (`test/module/`), not part of the 0.29 run.
+
+#### Logit validation
+
+| Case | Prompt | Overall Status | Max K5 (0.03) | Max K50 (0.05) | Max K1000 (0.08) | Max All (0.09) | Argmax divergence (1 ULP) |
+|---|---|---|---|---|---|---|---|
+| `[1-2048]` | 1 of 2, `The color of the sky is` | PASSED | 0.0113 at token 11 | 0.0113 at token 11 | 0.0113 at token 11 | 0.0105 at token 11 | 0.0000 |
+| `[1-2048]` | 2 of 2, `A short summary of the history of the printing press:` | PASSED | 0.0104 at token 12 | 0.0104 at token 12 | 0.0104 at token 12 | 0.0109 at token 3 | 0.0000 |
+| `[4-2048]` | 1 of 2, `The color of the sky is` | PASSED | 0.0110 at token 11, all 4 rows | 0.0110 at token 11, all 4 rows | 0.0110 at token 11, all 4 rows | 0.0104 at token 13, all 4 rows | 0.0000 |
+| `[4-2048]` | 2 of 2, `A short summary of the history of the printing press:` | PASSED | 0.0086 at token 3, all 4 rows | 0.0086 at token 1, all 4 rows | 0.0131 at token 12, all 4 rows | 0.0107 at token 12, all 4 rows | 0.0000 |
+
+Neuron vs the CPU BF16 reference (`test/ouro_reference.py`); token = generated token, row = batch row. No token over a bound. No argmax divergence.
+Both cases passed with 2/2 prompts within the static bounds (two-way validation) and aggregate σ-ratio 0.9627 (`[1-2048]`) and 0.9505 (`[4-2048]`) ≤ 1.0 (`multi_prompt_logit_validation`); `agg_bc` PASS (`[1-2048]`) and FAIL (`[4-2048]`); printed per-prompt checks: `[1-2048]`: `pp_max_linf_1.5x` 2/2, `pp_max_linf_2.0x` 2/2, `pp_max_l2_1.5x` 2/2, `pp_max_l2_2.0x` 2/2, `pp_tok_linf_1.5x` 1/2, `pp_tok_linf_2.0x` 2/2, `pp_tok_l2_1.5x` 2/2, `pp_tok_l2_2.0x` 2/2, `pp_static_0.03` 2/2, `pp_static_0.05` 2/2; `[4-2048]`: each of the same ten checks 2/2.
+
+Error against the FP32 reference, per prompt (max over the 16 generated tokens):
+
+| Case | Prompt | CPU BF16 L-inf | Neuron L-inf | Neuron / CPU BF16 | CPU BF16 L2 | Neuron L2 | Neuron / CPU BF16 |
+|---|---|---|---|---|---|---|---|
+| `[1-2048]` | 1 of 2 | 0.0102 | 0.0085 | 0.83x | 0.0107 | 0.0112 | 1.05x |
+| `[1-2048]` | 2 of 2 | 0.0118 | 0.0114 | 0.97x | 0.0161 | 0.0143 | 0.89x |
+| `[4-2048]` | 1 of 2 | 0.0102 | 0.0074 | 0.73x | 0.0107 | 0.0099 | 0.93x |
+| `[4-2048]` | 2 of 2 | 0.0118 | 0.0114 | 0.97x | 0.0161 | 0.0143 | 0.89x |
+
+Prompt 1: CPU BF16 L-inf maximum at generated token 13, Neuron L-inf maximum at token 2. Prompt 2: every maximum at generated token 0.
+
+#### Serve smoke
+
+`/v1/completions`, on-device greedy sampling (`all_greedy`), 32 completion tokens; first 60 characters of each output as a Python string literal.
+
+| Prompt | Output |
+|---|---|
+| `The capital of France is` | `' Paris.\n\n## Step 2: Evaluate the options\nA: London - This is'` |
+| `1, 2, 3, 4, 5,` | `' 6, 7, 8, 9, 10, 11, 12, 13, 14,'` (the whole output) |
+| `def fibonacci(n):` | `'\n    if n <= 0:\n        return "Input should be a positive i'` |
 
 ### Exceptions
 
-- **Dropped: the two-node disaggregated (1P1D) tests.** They depend on the
-  plugin's shared multi-node test harness, which is outside this folder. The
-  shipped integration test is single-node and colocated at the same TP
-  degree (TP 8), with the same reference. It uses the template's tolerance
-  map; the port's disaggregated logit test used a tighter map
-  (K5 0.015, K50 0.04, K1000 0.06, all 0.065).
-- **Dropped: the disaggregated serving test** (4 requests of 1024 prompt
-  tokens and 512 output tokens).
-- **Untested:** contexts beyond 2048 tokens, prefix caching end to end, TP
-  degrees other than 8 on device, sampled (non-greedy) requests, Trn3.
+- **Module tests not run on 0.29.**
+- **Dropped: the two-node disaggregated (1P1D) logit and serving tests.**
+  They depend on the plugin's shared multi-node test harness, which is
+  outside this folder. The shipped integration test is single-node at the
+  same TP degree (TP 8), with the same reference (`test/ouro_reference.py`,
+  not the checkpoint's remote code). It uses the template's tolerance map;
+  the port's disaggregated logit test used a tighter map (K5 0.015, K50
+  0.04, K1000 0.06, All 0.065). The maxima of this run (K5 0.0113, K50
+  0.0113, K1000 0.0131, All 0.0109) are within that map.
+- **CPU-mode decode at TP 4.** The decode cases of `test/unit/` run at TP 4,
+  because the torch fallback of the decode attention kernel supports one KV
+  head per rank. `test_tiny_e2e.py` skips when `/dev/shm` has less than
+  240 MiB free.
+- Prefix caching (end to end), TP sizes other than 8 on device, context
+  beyond 2048 tokens, sampled (non-greedy) requests, `early_exit_step`,
+  speculative decoding and Trn3 are not tested.
