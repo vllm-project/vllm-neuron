@@ -1,0 +1,22 @@
+# Installs this folder's src/ as the ``jina_embeddings_v5_neuron`` package and
+# registers JinaEmbeddingsV5Model with vLLM in every process (front end, engine
+# core, Neuron workers) through a general-plugin entry point:
+#     pip install -e contrib/models/jina_embeddings_v5
+[build-system]
+requires = ["setuptools>=77.0.3,<80.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-neuron-contrib-jina-embeddings-v5"
+version = "0.1.0"
+description = "JinaEmbeddingsV5Model contrib model for vllm-neuron"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = []  # runs inside an environment that already has vllm-neuron
+
+[project.entry-points."vllm.general_plugins"]
+jina_embeddings_v5_neuron = "jina_embeddings_v5_neuron.plugin:register"
+
+[tool.setuptools]
+package-dir = {"jina_embeddings_v5_neuron" = "src"}
+packages = ["jina_embeddings_v5_neuron"]
