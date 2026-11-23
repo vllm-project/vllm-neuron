@@ -2,10 +2,19 @@
 """Full-vocabulary NKI sampler for synchronous Neuron inference."""
 
 import torch
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 
 logger = init_logger(__name__)
+
+
+class NKISamplingRequestError(VLLMValidationError, ValueError):
+    """A request that the NKI sampler cannot serve exactly.
+
+    vLLM answers a VLLMClientError with HTTP 400 and its message. A plain
+    ValueError from request validation becomes an HTTP 500 without a message.
+    """
 
 
 class NeuronNKISampler(torch.nn.Module):
@@ -174,6 +183,6 @@ def validate_nki_sampling_params(params, logprobs_mode="processed_logprobs"):
     ):
         unsupported.append("score modes other than raw_logprobs or processed_logprobs")
     if unsupported:
-        raise ValueError(
+        raise NKISamplingRequestError(
             "Neuron NKI sampling does not yet support: " + ", ".join(unsupported)
         )

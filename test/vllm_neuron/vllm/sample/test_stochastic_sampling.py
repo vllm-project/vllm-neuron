@@ -855,6 +855,29 @@ class TestNKIIntegration:
                 with pytest.raises(ValueError):
                     NeuronPlatform.validate_request({}, params)
 
+    def test_a_rejection_is_a_client_error(self):
+        # vLLM answers a VLLMClientError with HTTP 400 and the message; a plain
+        # ValueError from request validation becomes an HTTP 500.
+        from vllm import SamplingParams
+        from vllm.exceptions import VLLMClientError
+
+        from vllm_neuron.vllm.platform import NeuronPlatform
+
+        for in_graph, params in (
+            (False, SamplingParams(logprobs=5)),
+            (True, SamplingParams(top_k=20)),
+        ):
+            with patch.multiple(
+                NeuronPlatform,
+                _nki_sampling=True,
+                _nki_in_graph=in_graph,
+                _sampling_logprobs_mode="processed_logprobs",
+            ):
+                with pytest.raises(VLLMClientError) as error:
+                    NeuronPlatform.validate_request({}, params)
+            assert isinstance(error.value, ValueError)
+            assert "NKI sampling" in str(error.value)
+
     def test_the_cpu_backend_validates_nothing_new(self):
         from vllm import SamplingParams
         from vllm_neuron.vllm.platform import NeuronPlatform

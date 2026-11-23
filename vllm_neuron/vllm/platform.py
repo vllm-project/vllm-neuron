@@ -918,7 +918,10 @@ class NeuronPlatform(Platform):
         Example:
             >>> NeuronPlatform._validate_nki_request(SamplingParams(logprobs=0))  # doctest: +SKIP
         """
-        from vllm_neuron.vllm.sample.nki_sampler import validate_nki_sampling_params
+        from vllm_neuron.vllm.sample.nki_sampler import (
+            NKISamplingRequestError,
+            validate_nki_sampling_params,
+        )
 
         validate_nki_sampling_params(params, cls._sampling_logprobs_mode)
         if not cls._nki_in_graph:
@@ -928,11 +931,13 @@ class NeuronPlatform(Platform):
         top_k = getattr(params, "top_k", 0)
         top_p = getattr(params, "top_p", 1.0)
         if (top_k is not None and top_k > 0) or (top_p is not None and top_p < 1.0):
-            raise ValueError(
+            raise NKISamplingRequestError(
                 "In-graph NKI sampling samples the full vocabulary and does not "
                 f"support top_k/top_p (got top_k={top_k}, top_p={top_p}). Send "
-                "top_k=-1 and top_p=1.0, or serve with on_device_sampling_config="
-                "null and async scheduling off to filter on the CPU."
+                "top_k=-1 and top_p=1.0; a request that omits them gets the "
+                "checkpoint's generation_config.json values unless the server runs "
+                "with --generation-config vllm. To filter on the CPU, serve with "
+                "on_device_sampling_config=null and async scheduling off."
             )
 
     @classmethod
