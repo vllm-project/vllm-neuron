@@ -139,8 +139,8 @@ full list of `VLLM_NEURON_*` environment variables.
 
 Software: vLLM Neuron 0.29.0.1.2.0 with vLLM 0.29.0, transformers 5.17.0,
 Python 3.14, the default native route (`neuron_native`). In CPU mode
-(`VLLM_NEURON_CPU_MODE=1`) on the same software, the unit and module tests
-pass (see [Testing](#testing)).
+(`VLLM_NEURON_CPU_MODE=1`) on the same software, the unit tests pass (see
+[Validation report](#validation-report)).
 
 | Feature | Status |
 |---|---|
