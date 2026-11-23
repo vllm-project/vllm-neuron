@@ -139,8 +139,8 @@ batch 1 and batch 4 at a 2048-token model length, and validates the raw
 logits of 16 decoded tokens for two prompts against a HuggingFace reference
 (`multi_prompt_logit_validation`, three-way: FP32 HF, BF16 HF, Neuron). The
 tolerance map is the plugin's default map, the one the port's own logit test
-passed with: argmax bound 1e-5, top-K bounds 0.011 (K=5), 0.02 (K=50), 0.03
-(K=1000) and 0.05 (all).
+passed with: top-K bounds 0.011 (K=5), 0.02 (K=50), 0.03 (K=1000) and 0.05
+(all). The argmax-divergence bound is the plugin's default, 1 BF16 ULP.
 
 ```bash
 STABLELM_CHECKPOINT_PATH=/data/stablelm-zephyr-3b \
@@ -196,26 +196,67 @@ component runners).
 
 ## Validation report
 
-<!-- Filled in from the device runs. -->
+### vLLM Neuron 0.29.0.1.2.0 (2026-11-19)
 
-### Source and environment
+#### Environment
 
-- Instance: `trn2.48xlarge`, one node.
-- Software: the 0.29.0.1.2.0 Neuron Deep Learning Container named under Usage.
-- Checkpoint: `stabilityai/stablelm-zephyr-3b` at
-  `fe1fd5e36ccb8cb2cb1dc225ab6d2962692b9837`.
+| Image | Instance | TP | vLLM | vllm-neuron | torch | transformers | neuronx-cc |
+|---|---|---|---|---|---|---|---|
+| `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04` | `trn2.48xlarge` (LNC 2), 1 node | 8 | 0.29.0 | 0.29.0.1.2.0 | 2.13.0 | 5.17.0 | 2.28.7631.0+8f7b0cf5 |
 
-### Results
+Checkpoint of the integration test: `stabilityai/stablelm-zephyr-3b` at
+`fe1fd5e36ccb8cb2cb1dc225ab6d2962692b9837`.
 
-| Test | TP | Result |
-| ---- | -- | ------ |
-| Unit tests, CPU mode (`test/unit/`) | 2 | 13 of 13 passed |
-| Integration, batch 1 / 2048 | 8 | Pending |
-| Integration, batch 4 / 2048 | 8 | Pending |
-| Module tests (`test/module/`) | 8 | Pending |
-| `vllm serve` with the command under Usage | 8 | Pending |
+#### Results
+
+| Test | Configuration | Result |
+|---|---|---|
+| CPU unit tests, `test/unit/` | `VLLM_NEURON_CPU_MODE=1` | 13 passed, 0 failed |
+| `test_model_accuracy[1-2048]` | TP 8, `neuron_native`, BF16, batch 1, max model length 2,048, 2 prompts × 16 greedy tokens, on-device greedy sampling | PASSED (174.77 s) on aggregate σ-ratio 0.6857 ≤ 1.0; static per-prompt bounds 0/2 (below) |
+| `test_model_accuracy[4-2048]` | TP 8, `neuron_native`, BF16, batch 4 (each prompt in 4 rows), max model length 2,048, 2 prompts × 16 greedy tokens, on-device greedy sampling | PASSED (223.25 s) on aggregate σ-ratio 0.7430 ≤ 1.0; static per-prompt bounds 0/2 (below) |
+| `vllm serve` smoke | The Usage command without `--revision` (served revision `main`), installed with `pip install --no-deps -e contrib/models/stablelm` | Passed: 3/3 prompts, 32 completion tokens each; a batched request of all 3 at `max_tokens` 16 returned a prefix of each |
+
+Not run on 0.29: module tests (`test/module/`), not part of the 0.29 run.
+
+#### Logit validation
+
+| Case | Prompt | Overall Status | Max K5 (0.011) | Max K50 (0.02) | Max K1000 (0.03) | Max All (0.05) | Argmax divergence (1 ULP) |
+|---|---|---|---|---|---|---|---|
+| `[1-2048]` | 1 of 2, `The Amazon rainforest …` | FAILED | 0.1055 (> 0.011) at token 0 | 0.1055 (> 0.02) at token 0 | 0.1055 (> 0.03) at token 0 | 0.1055 (> 0.05) at token 0 | 0.0000 |
+| `[1-2048]` | 2 of 2, `The human genome …` | FAILED | 0.0475 (> 0.011) at token 6 | 0.0475 (> 0.02) at token 6 | 0.0482 (> 0.03) at token 8 | 0.0559 (> 0.05) at token 1 | 0.0000 |
+| `[4-2048]` | 1 of 2, `The Amazon rainforest …` | FAILED | 0.1055 (> 0.011) at token 0, all 4 rows | 0.1055 (> 0.02) at token 0, all 4 rows | 0.1055 (> 0.03) at token 0, all 4 rows | 0.1055 (> 0.05) at token 0, all 4 rows | 0.0000 |
+| `[4-2048]` | 2 of 2, `The human genome …` | FAILED | 0.0397 (> 0.011) at token 5, row 2 | 0.0397 (> 0.02) at token 5, row 2 | 0.0513 (> 0.03) at token 8, row 0 | 0.0598 (> 0.05) at token 8, row 0 | 0.0000 |
+
+Neuron vs CPU BF16 reference; token = generated token, row = batch row. Tokens over a bound: `[1-2048]` prompt 1 tokens 0 and 13 (token 13: K5 0.0164), prompt 2 tokens 0 to 11 and 14; `[4-2048]` prompt 1 token 0 and token 8 (rows 0, 2 and 3: K5 0.0115), prompt 2 tokens 0 to 11 and 14. No argmax divergence.
+Both cases passed on aggregate σ-ratio 0.6857 (`[1-2048]`) and 0.7430 (`[4-2048]`) ≤ 1.0 (`multi_prompt_logit_validation`; the test asserts `result.passed` only); `agg_bc` FAIL; printed per-prompt checks, the same in both cases: `pp_max_linf_1.5x` 2/2, `pp_max_linf_2.0x` 2/2, `pp_max_l2_1.5x` 2/2, `pp_max_l2_2.0x` 2/2, `pp_tok_linf_1.5x` 2/2, `pp_tok_linf_2.0x` 2/2, `pp_tok_l2_1.5x` 2/2, `pp_tok_l2_2.0x` 2/2, `pp_static_0.03` 0/2, `pp_static_0.05` 1/2.
+
+Error against the FP32 reference, per prompt (max over the 16 generated tokens):
+
+| Case | Prompt | CPU BF16 L-inf | Neuron L-inf | Neuron / CPU BF16 | CPU BF16 L2 | Neuron L2 | Neuron / CPU BF16 |
+|---|---|---|---|---|---|---|---|
+| `[1-2048]` | 1 of 2 | 0.0808 | 0.0346 | 0.43x | 0.0913 | 0.0437 | 0.48x |
+| `[1-2048]` | 2 of 2 | 0.1253 | 0.0837 | 0.67x | 0.1235 | 0.0863 | 0.70x |
+| `[4-2048]` | 1 of 2 | 0.0808 | 0.0346 | 0.43x | 0.0913 | 0.0437 | 0.48x |
+| `[4-2048]` | 2 of 2 | 0.1253 | 0.0837 | 0.67x | 0.1235 | 0.0863 | 0.70x |
+
+Every maximum is at generated token 0.
+
+#### Serve smoke
+
+`/v1/completions`, `temperature` 0, `max_tokens` 32; first 60 characters of each output as a Python string literal.
+
+| Prompt | Output |
+|---|---|
+| `The capital of France is` | `' Paris., Paris is known for its rich history, beautiful arch'` |
+| `1, 2, 3, 4, 5,` | `' 6, 7, 8, 9, 10, 11, 12\n\nHere is a Python code that reads a '` |
+| `def fibonacci(n):` | `'\n    if n <= 1:\n        return n\n    else:\n        return fi'` |
 
 ### Exceptions
 
+- **All four prompt-runs are outside the static per-prompt bounds.** Both
+  integration cases passed on the aggregate σ-ratio (see Logit validation).
+- **Module tests not run on 0.29.**
+- **The serve smoke ran at revision `main`**, without the `--revision` flag of
+  the Usage command.
 - Prefix caching (the segmented-prefill path), TP sizes other than 2 and 8,
   context beyond 2048 tokens, speculative decoding and Trn3 are not tested.
