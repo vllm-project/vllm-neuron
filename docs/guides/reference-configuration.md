@@ -78,6 +78,7 @@ For conceptual overview, see [On-device sampling](features-guide.md#on-device-sa
 | Option | Type | Default | Description |
 | ---- | ---- | ---- | ---- |
 | `on_device_sampling_config` | dict or null | null (CPU sampling) | Enable on-device sampling. Supported sub-parameters: `temperature`, `top_k`, `top_p`, `all_greedy`. Required for async scheduling, speculative decoding, and structured output enforcement. |
+| `stochastic_sampling_backend` | `"cpu"` or `"nki"` | `"cpu"` | `"nki"` samples the full vocabulary with an NKI kernel and returns the sampled token's logprob (`logprobs=0`), for RL rollouts. See [Full-vocabulary NKI sampling](#full-vocabulary-nki-sampling). |
 
 ```python
 # Greedy on-device sampling
@@ -86,6 +87,47 @@ For conceptual overview, see [On-device sampling](features-guide.md#on-device-sa
 # Temperature-based
 "on_device_sampling_config": {"temperature": "0.7"}
 ```
+
+### Full-vocabulary NKI sampling
+
+An RL rollout engine needs the logprob of each sampled token, at a
+temperature above 0, with seeds, from the full vocabulary.
+`stochastic_sampling_backend: "nki"` runs
+`vllm_neuron/functional/stochastic_sampling.py` on the device. The kernel
+samples by inverse CDF over the full vocabulary from one host uniform per
+request. A seeded request draws its uniform from its own CPU generator. The
+kernel returns the token, its logprob and its rank. `--logprobs-mode`
+selects `raw_logprobs` (before temperature) or `processed_logprobs` (after).
+
+| `on_device_sampling_config` | Where the kernel runs | Scheduling |
+| ---- | ---- | ---- |
+| set (`{}`) | In the model graph. The model must support it (Qwen3.5). | Async or sync |
+| `null` | In a separate graph after the gathered LM head, on TP rank 0. A batch with `top_k`/`top_p` goes to the vLLM CPU sampler. | Sync only (`--no-async-scheduling`) |
+
+A request that the kernel does not compute gets an HTTP 400 error:
+`logprobs` other than 0, `prompt_logprobs`, penalties, `min_p`,
+`logit_bias`, `allowed_token_ids`, `bad_words`, structured outputs, and
+(in the model graph) `top_k`/`top_p`. Send `top_k: -1` and `top_p: 1.0`, or
+serve with `--generation-config vllm`: a checkpoint's `generation_config.json`
+otherwise sets the default `top_k`/`top_p` of a request that omits them.
+Speculative decoding and custom logits processors are rejected at startup.
+
+```bash
+# Qwen3.5/3.6-27B rollout server: TP8, 64K context, 8 sequences, async scheduling
+vllm serve <model> --tensor-parallel-size 8 --max-model-len 65536 \
+    --max-num-seqs 8 --max-num-batched-tokens 2048 --enable-prefix-caching \
+    --logprobs-mode processed_logprobs --generation-config vllm \
+    --additional-config '{"neuron_config": {
+        "num_seqs_buckets": [1, 4, 8],
+        "decode_context_length_buckets": [4096, 8192, 16384, 32768],
+        "on_device_sampling_config": {},
+        "stochastic_sampling_backend": "nki"}}'
+```
+
+With `--data-parallel-size` greater than 1, the API server waits for the
+engine cores for `VLLM_ENGINE_READY_TIMEOUT_S` (600 s by default). The first
+start compiles every graph and takes longer, so raise it, for example
+`VLLM_ENGINE_READY_TIMEOUT_S=14400`.
 
 ## Scheduling options
 
