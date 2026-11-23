@@ -2685,20 +2685,37 @@ class Qwen3_5ForCausalLM(nn.Module, SupportsMRoPE):
             if config.neuron_config
             else None
         )
+        # Opt-in in-graph NKI sampling (stochastic_sampling_backend="nki"): the
+        # full-vocabulary kernel runs in this graph on every TP rank and returns
+        # token IDs, selected-token logprobs and ranks as device tensors, so
+        # async scheduling can chain steps. The runner sets raw_logprobs from
+        # logprobs_mode before compilation.
+        self.nki_in_graph_sampling = (
+            self.on_device_sampling_config is not None
+            and config.neuron_config.stochastic_sampling_backend == "nki"
+        )
+        self.raw_logprobs = True
         debug_logits_enabled = (
             config.neuron_config is not None
             and config.neuron_config.debug_logits_dir is not None
         )
-        self._gather_logits = (
-            config.neuron_config is not None and config.neuron_config.max_logprobs != 0
-        ) or debug_logits_enabled
+        self._gather_logits = not self.nki_in_graph_sampling and (
+            (
+                config.neuron_config is not None
+                and config.neuron_config.max_logprobs != 0
+            )
+            or debug_logits_enabled
+        )
 
         self.lm_head = neuron_nn.ColumnParallelLinear(
             config.hidden_size,
             config.vocab_size,
             bias=False,
             dtype=config.torch_dtype,
-            gather_output=not self.on_device_sampling_config,
+            # The NKI kernel and host sampling read the full vocabulary.
+            gather_output=(
+                not self.on_device_sampling_config or self.nki_in_graph_sampling
+            ),
             tp_group=self.tp_group.device_group,
         )
         set_weight_loader(
@@ -2711,7 +2728,10 @@ class Qwen3_5ForCausalLM(nn.Module, SupportsMRoPE):
             ),
         )
 
-        if self.on_device_sampling_config is not None:
+        if (
+            self.on_device_sampling_config is not None
+            and not self.nki_in_graph_sampling
+        ):
             self.sampler = Sampler(
                 self.on_device_sampling_config,
                 process_group=self.tp_group.device_group,
@@ -2779,6 +2799,13 @@ class Qwen3_5ForCausalLM(nn.Module, SupportsMRoPE):
         if self.on_device_sampling_config is None:
             return logits
 
+        if self.nki_in_graph_sampling:
+            if spec_decode_metadata is not None:
+                raise NotImplementedError(
+                    "In-graph NKI sampling does not support speculative decoding"
+                )
+            return self._nki_sample(logits, sampling_params, rank)
+
         sampled_tokens = self.sampler(
             logits, sampling_params, logit_mask=logit_mask, tp_rank=rank
         )
@@ -2796,6 +2823,50 @@ class Qwen3_5ForCausalLM(nn.Module, SupportsMRoPE):
             return rejection_sampler(spec_decode_metadata, sampled_tokens)
 
         return sampled_tokens, gathered_logits
+
+    def _nki_sample(
+        self,
+        logits: torch.Tensor,
+        sampling_params: torch.Tensor,
+        rank: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample the full-vocabulary logits with the NKI kernel.
+
+        ``sampling_params`` is ``[batch, 3]`` (uniform, temperature, greedy)
+        from ``build_nki_sampling_params_tensor``, with greedy rows at
+        temperature 1. TP rank 0's values are broadcast in the graph, so every
+        rank selects the same token even when the host RNG states differ.
+
+        Returns:
+            Token IDs ``[batch]`` int32, the selected token's logprob
+            ``[batch, 1]`` fp32 (raw or processed per ``raw_logprobs``) and its
+            rank ``[batch, 1]`` int32.
+
+        Example:
+            >>> ids, scores, ranks = model._nki_sample(logits, params, rank)  # doctest: +SKIP
+        """
+        from vllm_neuron.functional.stochastic_sampling import (
+            stochastic_sample_kernel,
+        )
+
+        params = sampling_params.float()
+        if self.world_size > 1 and rank is not None:
+            params = params * (rank.reshape(1, 1) == 0).to(params.dtype)
+            reduced = self.tp_group.all_reduce(params)
+            if reduced is not None:
+                params = reduced
+        uniforms = params[:, 0:1].contiguous()
+        temperatures = params[:, 1:2].contiguous()
+        greedy = params[:, 2:3].to(torch.int32).contiguous()
+        ids, scores, ranks = wrap_nki(stochastic_sample_kernel)(
+            logits.contiguous(),
+            uniforms,
+            temperatures,
+            greedy_rows=greedy,
+            return_ranks=True,
+            raw_logprobs=self.raw_logprobs,
+        )
+        return ids.reshape(-1), scores, ranks
 
     def compiler_args_for(self, graph_type, example_inputs, base):
         """Compile every graph at ``-O2``.

@@ -258,6 +258,12 @@ class NeuronPlatform(Platform):
     # server-level compile choice. Validate requests before they reach the
     # engine so a bad request returns a normal request error.
     _enable_structured_outputs: bool = False
+    # stochastic_sampling_backend="nki" (opt-in RL rollout sampling). The
+    # in-graph variant runs the kernel inside the model graph; otherwise it
+    # runs as a separate synchronous graph after the gathered LM head.
+    _nki_sampling: bool = False
+    _nki_in_graph: bool = False
+    _sampling_logprobs_mode: str = "raw_logprobs"
 
     @classmethod
     def import_kernels(cls) -> None:
@@ -707,6 +713,7 @@ class NeuronPlatform(Platform):
                 f"got {enable_structured_outputs}"
             )
         cls._enable_structured_outputs = enable_structured_outputs
+        cls._configure_nki_sampling(vllm_config, neuron_config)
 
         # JF decoding was initially built for xgrammar only. vLLM-Neuron also
         # supports llguidance, but it is not yet compatible with JF decoding.
@@ -852,6 +859,83 @@ class NeuronPlatform(Platform):
             )
 
     @classmethod
+    def _configure_nki_sampling(cls, vllm_config, neuron_config: dict) -> None:
+        """Validate the server config for stochastic_sampling_backend="nki".
+
+        The NKI sampler is opt-in. With the default "cpu" backend this only
+        resets the class state, so every other configuration keeps its sampler.
+
+        Example:
+            >>> NeuronPlatform._configure_nki_sampling(cfg, {"stochastic_sampling_backend": "nki"})  # doctest: +SKIP
+        """
+        backend = neuron_config.get("stochastic_sampling_backend", "cpu")
+        if backend not in ("cpu", "nki"):
+            raise ValueError(
+                f"stochastic_sampling_backend must be 'cpu' or 'nki', got {backend!r}"
+            )
+        model_config = vllm_config.model_config
+        cls._nki_sampling = backend == "nki"
+        cls._sampling_logprobs_mode = getattr(
+            model_config, "logprobs_mode", "raw_logprobs"
+        )
+        separate = neuron_config.get("on_device_sampling_config", {}) is None
+        cls._nki_in_graph = cls._nki_sampling and not separate
+        if not cls._nki_sampling:
+            return
+        if vllm_config.speculative_config is not None:
+            raise ValueError("NKI sampling does not support speculative decoding")
+        if separate and vllm_config.scheduler_config.async_scheduling:
+            raise ValueError(
+                "The separate NKI sampler (on_device_sampling_config=null) "
+                "requires async scheduling to be off. Keep "
+                "on_device_sampling_config set to run NKI sampling in the model "
+                "graph with async scheduling."
+            )
+        if getattr(model_config, "logits_processors", None):
+            raise ValueError("NKI sampling does not support custom logits processors")
+        if cls._sampling_logprobs_mode not in ("raw_logprobs", "processed_logprobs"):
+            raise ValueError(
+                "NKI sampling returns raw_logprobs or processed_logprobs, got "
+                f"logprobs_mode={cls._sampling_logprobs_mode!r}"
+            )
+        if neuron_config.get("max_jump_forward_tokens", 0) > 0 or neuron_config.get(
+            "enable_structured_outputs", False
+        ):
+            raise ValueError(
+                "NKI sampling does not support structured outputs or jump-forward "
+                "decoding"
+            )
+        logger.info(
+            "NKI full-vocabulary sampling: %s graph, %s",
+            "in the model" if cls._nki_in_graph else "a separate",
+            cls._sampling_logprobs_mode,
+        )
+
+    @classmethod
+    def _validate_nki_request(cls, params) -> None:
+        """Reject a request the NKI sampler cannot serve exactly.
+
+        Example:
+            >>> NeuronPlatform._validate_nki_request(SamplingParams(logprobs=0))  # doctest: +SKIP
+        """
+        from vllm_neuron.vllm.sample.nki_sampler import validate_nki_sampling_params
+
+        validate_nki_sampling_params(params, cls._sampling_logprobs_mode)
+        if not cls._nki_in_graph:
+            return
+        # The in-graph kernel samples the full vocabulary. The separate sampler
+        # sends a filtered batch to the vLLM CPU sampler instead.
+        top_k = getattr(params, "top_k", 0)
+        top_p = getattr(params, "top_p", 1.0)
+        if (top_k is not None and top_k > 0) or (top_p is not None and top_p < 1.0):
+            raise ValueError(
+                "In-graph NKI sampling samples the full vocabulary and does not "
+                f"support top_k/top_p (got top_k={top_k}, top_p={top_p}). Send "
+                "top_k=-1 and top_p=1.0, or serve with on_device_sampling_config="
+                "null and async scheduling off to filter on the CPU."
+            )
+
+    @classmethod
     def validate_request(
         cls,
         processed_inputs: "EngineInput",
@@ -867,6 +951,9 @@ class NeuronPlatform(Platform):
             and getattr(params, "structured_outputs", None) is not None
         ):
             raise ValueError(SO_DISABLED_MESSAGE)
+
+        if cls._nki_sampling and hasattr(params, "temperature"):
+            cls._validate_nki_request(params)
 
         if cls._max_embeds_per_image is None:
             return

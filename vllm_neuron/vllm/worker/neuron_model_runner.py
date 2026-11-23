@@ -16,7 +16,7 @@ import threading
 import time
 from collections.abc import Callable, Collection
 from copy import copy, deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from typing import Any, NamedTuple, cast
 
 import numpy as np
@@ -50,11 +50,16 @@ from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     DraftTokenIds,
+    LogprobsTensors,
     ModelRunnerOutput,
     SamplerOutput,
     make_empty_encoder_model_runner_output,
 )
 from vllm.v1.sample.sampler import Sampler
+from vllm_neuron.vllm.sample.nki_sampler import (
+    NeuronNKISampler,
+    has_sampling_filters,
+)
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -392,6 +397,9 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
         self.model_runner_output = model_runner_output
         self._model_runner = model_runner
         self._partial_prefill_req_ids = partial_prefill_req_ids or set()
+        # In-graph NKI sampling: the (ids, scores, ranks) device futures of this
+        # step. get_output() reads them with the sampled tokens.
+        self.pending_nki_logprobs: tuple[torch.Tensor, ...] | None = None
         # Per-object lock: prevents double-materialization when both the async
         # output thread and the main thread call get_output() on the same object.
         self._lock = threading.Lock()
@@ -452,6 +460,7 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                         [] for _ in range(len(self.model_runner_output.req_ids))
                     ]
                     self.model_runner_output.sampled_token_ids = sampled_token_ids
+                    self.pending_nki_logprobs = None
                     return self.model_runner_output
 
                 # First call: materialize device future to CPU.
@@ -513,8 +522,61 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                     "Skip updating batch state."
                 )
 
+            if self.pending_nki_logprobs is not None:
+                num_reqs = len(self.model_runner_output.req_ids)
+                self.model_runner_output.logprobs = _nki_logprobs_tensors(
+                    *self.pending_nki_logprobs, num_reqs
+                ).tolists()
+                self.pending_nki_logprobs = None
+
         # Logprobs are computed in _sample() when on-device logits are available
         return self.model_runner_output
+
+
+def _nki_logprobs_tensors(
+    ids: torch.Tensor, scores: torch.Tensor, ranks: torch.Tensor, num_reqs: int
+) -> LogprobsTensors:
+    """Selected-token logprobs (``logprobs=0``) from the NKI sampler outputs.
+
+    Rows past ``num_reqs`` are decode padding and are dropped.
+
+    Example:
+        >>> lp = _nki_logprobs_tensors(ids, scores, ranks, 2)  # doctest: +SKIP
+        >>> lp.logprobs.shape  # doctest: +SKIP
+        torch.Size([2, 1])
+    """
+    ids = ids.cpu().reshape(-1, 1)[:num_reqs].int()
+    scores = scores.cpu().reshape(-1, 1)[:num_reqs].float()
+    ranks = ranks.cpu().reshape(-1)[:num_reqs].long()
+    if not torch.isfinite(scores).all():
+        raise ValueError("NKI sampling produced non-finite logprobs")
+    return LogprobsTensors(ids, scores, ranks)
+
+
+def build_nki_sampling_params_tensor(input_batch, num_rows: int) -> torch.Tensor:
+    """Build the ``[num_rows, 3]`` (uniform, temperature, greedy) NKI input.
+
+    The in-graph NKI sampler reads this instead of [top_k, top_p, temperature].
+    It uses host batch state only, so preparing step N+1 never reads a device
+    tensor while step N runs. Each stochastic row draws one uniform from its
+    request's CPU generator (or the global CPU RNG when unseeded); greedy rows
+    draw none and run at temperature 1. Rows past ``num_reqs`` are padding.
+
+    Example:
+        >>> build_nki_sampling_params_tensor(batch, 4)  # doctest: +SKIP
+        tensor([[0.4963, 0.7000, 0.0000], [0.0000, 1.0000, 1.0000], ...])
+    """
+    num_reqs = input_batch.num_reqs
+    params = torch.zeros((num_rows, 3), dtype=torch.float32)
+    params[:, 1] = 1.0
+    params[:, 2] = 1.0
+    temperatures = torch.from_numpy(input_batch.temperature_cpu[:num_reqs]).float()
+    stochastic = temperatures >= 1e-5
+    params[:num_reqs, 1] = torch.where(stochastic, temperatures, 1.0)
+    params[:num_reqs, 2] = (~stochastic).float()
+    for row in stochastic.nonzero(as_tuple=True)[0].tolist():
+        params[row, 0] = torch.rand((), generator=input_batch.generators.get(row))
+    return params
 
 
 class VeEncoderProducerAsyncOutput(AsyncModelRunnerOutput):
@@ -1417,7 +1479,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         logprobs_mode = getattr(
             vllm_config.model_config, "logprobs_mode", "raw_logprobs"
         )
-        self.sampler = Sampler(logprobs_mode=logprobs_mode)
+        nki_backend = self.neuron_config.stochastic_sampling_backend == "nki"
+        # Opt-in NKI full-vocabulary sampling. In-graph: the model samples and
+        # returns (ids, scores, ranks), which async scheduling can chain. Else a
+        # separate synchronous NKI graph samples the gathered logits.
+        self.nki_sampling: bool = nki_backend and not self.on_device_sampling
+        self.nki_in_graph_sampling: bool = nki_backend and self.on_device_sampling
+        self._logprobs_mode = logprobs_mode
+        self._on_device_nki_scores: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._pending_nki_logprobs: tuple[torch.Tensor, ...] | None = None
+        # The vLLM sampler. The separate NKI route also uses it for a batch
+        # with top_k/top_p filtering.
+        self.cpu_sampler = Sampler(logprobs_mode=logprobs_mode)
+        self.sampler = (
+            NeuronNKISampler(logprobs_mode=logprobs_mode)
+            if self.nki_sampling
+            else self.cpu_sampler
+        )
 
         # Cache numpy arange for efficient tensor operations
         self.arange_np = np.arange(
@@ -2059,6 +2137,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self._target_tensor_capture = None
         self._draft_tensor_capture = None
         self._encoder_tensor_capture = None
+
+        if self.nki_in_graph_sampling:
+            if not getattr(self.model, "nki_in_graph_sampling", False):
+                raise ValueError(
+                    "stochastic_sampling_backend='nki' with on_device_sampling_config "
+                    f"set needs a model that samples with NKI in its graph; "
+                    f"{type(self.model).__name__} does not. Set "
+                    "on_device_sampling_config to null and turn async scheduling "
+                    "off to use the separate NKI sampler."
+                )
+            # The scoring distribution is a compile-time choice in the graph.
+            self.model.raw_logprobs = self._logprobs_mode == "raw_logprobs"
 
         # Compile model with vllm_neuron backend for Neuron execution
         # This is where torch.compile uses the registered "vllm_neuron" backend
@@ -2887,7 +2977,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 sampling_params
                 and sampling_params.sampling_type == SamplingType.RANDOM_SEED
             ):
-                generator = torch.Generator(device=self.device)
+                # The NKI samplers draw their uniforms on the host.
+                generator = torch.Generator(
+                    device=(
+                        "cpu"
+                        if self.nki_sampling or self.nki_in_graph_sampling
+                        else self.device
+                    )
+                )
                 generator.manual_seed(sampling_params.seed)
             else:
                 generator = None
@@ -6177,6 +6274,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if previous is not None:
             self._materialize_warmup_output(previous)
 
+    def _warmup_nki_sampler(self, model_output: Any) -> None:
+        """Compile the separate NKI sampler for every batch size, once.
+
+        Only TP rank 0 samples on that route. The warmup draws no random number.
+
+        Example:
+            >>> runner._warmup_nki_sampler(logits)  # doctest: +SKIP
+        """
+        if self.nki_sampling and get_tp_group().rank_in_group == 0:
+            self.sampler.warmup(model_output, self.max_num_reqs)
+
     def _materialize_warmup_output(self, model_output: Any) -> None:
         """Bring a warmup forward's output to CPU to consume the async future.
 
@@ -6230,6 +6338,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 self._tensor_replacer.warmup_context(bucket_size, self.device)
             )
         model_output = self.model(**warmup_kwargs)
+        self._warmup_nki_sampler(model_output)
         if self.use_async_scheduling:
             self._materialize_warmup_output(model_output)
         if self._tensor_replacer is not None:
@@ -6731,6 +6840,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # scoped_compiler_args(self.resolve_graph_compiler_args(
             # "spec_verify")) and add a branch in the model compiler_args_for.
             model_output = self.model(**kwargs)
+        self._warmup_nki_sampler(model_output)
         if self.use_async_scheduling:
             self._materialize_warmup_output(model_output)
         if self._tensor_replacer is not None:
@@ -8343,6 +8453,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 self, "_async_partial_prefill_req_ids", set()
             ),
         )
+        async_output.pending_nki_logprobs = self._pending_nki_logprobs
+        self._pending_nki_logprobs = None
         self.async_execution_buffer["async_output"] = async_output
         return async_output
 
@@ -9542,9 +9654,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             sampling_metadata = self.input_batch.sampling_metadata
             num_reqs = self.input_batch.num_reqs
 
-            sampling_params_tensor = build_sampling_params_tensor(
-                sampling_metadata, num_reqs, self.device
-            )
+            if self.nki_in_graph_sampling:
+                sampling_params_tensor = build_nki_sampling_params_tensor(
+                    self.input_batch, num_reqs
+                )
+            else:
+                sampling_params_tensor = build_sampling_params_tensor(
+                    sampling_metadata, num_reqs, self.device
+                )
 
             # Pad sampling_params to match the decode batch bucket size.
             # block_table rows == padded_num_reqs (1 token per request),
@@ -9554,9 +9671,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 bt_rows = first_meta["block_table_tensor"].shape[0]
                 if sampling_params_tensor.shape[0] < bt_rows:
                     pad_rows = bt_rows - sampling_params_tensor.shape[0]
-                    sampling_params_tensor = torch.nn.functional.pad(
-                        sampling_params_tensor, (0, 0, 0, pad_rows), value=0
-                    )
+                    if self.nki_in_graph_sampling:
+                        # NKI padding rows: greedy at temperature 1, no draw.
+                        pad = torch.tensor([[0.0, 1.0, 1.0]]).expand(pad_rows, 3)
+                        sampling_params_tensor = torch.cat(
+                            [sampling_params_tensor, pad], dim=0
+                        )
+                    else:
+                        sampling_params_tensor = torch.nn.functional.pad(
+                            sampling_params_tensor, (0, 0, 0, pad_rows), value=0
+                        )
 
             # Replicate sampling params for spec-decode verify step
             # (no-op when speculative decoding is not active).
@@ -9746,9 +9870,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         # Parse model output based on on-device sampling and spec decode configuration
         self._on_device_logits = None
+        self._on_device_nki_scores = None
         last_accepted_token: torch.Tensor | None = None
 
-        if self.on_device_sampling:
+        if self.nki_in_graph_sampling:
+            # Token IDs [B], selected logprobs [B, 1], ranks [B, 1].
+            model_output_tensor, scores, ranks = model_output
+            self._on_device_nki_scores = (scores, ranks)
+            aux_hidden_states = None
+        elif self.on_device_sampling:
             if self.is_spec_decode:
                 if spec_decode_metadata is not None:
                     # Eagle3 + spec decode: model returns 4-tuple
@@ -9790,8 +9920,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             if self._debug_logits_dir:
                 self._on_device_logits = model_output_tensor
 
-        # Move model_output_tensor (logits or sampled token ids) back to CPU
-        if not self.use_async_scheduling:
+        # Move model_output_tensor (logits or sampled token ids) back to CPU.
+        # The separate NKI sampler reads the logits on the device.
+        if not self.use_async_scheduling and not self.nki_sampling:
             model_output_tensor = model_output_tensor.to("cpu")
 
         return model_output_tensor, aux_hidden_states, last_accepted_token
@@ -10933,6 +11064,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         sampling_metadata = self.input_batch.sampling_metadata
 
         if self.use_async_scheduling:
+            # In-graph NKI sampling: keep the selected-token logprobs as device
+            # futures. AsyncNeuronModelRunnerOutput.get_output() reads them
+            # with the sampled tokens.
+            self._pending_nki_logprobs = None
+            if (
+                self.nki_in_graph_sampling
+                and self._on_device_nki_scores is not None
+                and sampling_metadata.max_num_logprobs is not None
+            ):
+                self._pending_nki_logprobs = (
+                    model_output_tensor,
+                    *self._on_device_nki_scores,
+                )
             if spec_decode_metadata is not None:
                 # Async spec decode: keep the raw rejection-sampler output
                 # (device tensor [bs, num_spec+1]) as-is. Materialization is
@@ -10961,7 +11105,24 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 sampler_output = SamplerOutput(output_token_ids, None)
                 return sampler_output
 
-            if not self.on_device_sampling:
+            if self.nki_sampling:
+                sampler_output = self._sample_separate_nki(
+                    model_output_tensor, sampling_metadata
+                )
+            elif self.nki_in_graph_sampling:
+                output_token_ids = [[x] for x in model_output_tensor.tolist()]
+                logprobs = None
+                if (
+                    sampling_metadata.max_num_logprobs is not None
+                    and self._on_device_nki_scores is not None
+                ):
+                    logprobs = _nki_logprobs_tensors(
+                        model_output_tensor,
+                        *self._on_device_nki_scores,
+                        len(output_token_ids),
+                    )
+                sampler_output = SamplerOutput(output_token_ids, logprobs)
+            elif not self.on_device_sampling:
                 logger.info("Using vLLM Sampler")
                 sampler_output = self.sampler(
                     logits=model_output_tensor,
@@ -11045,6 +11206,60 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
             sampler_output.sampled_token_ids = output_token_ids
 
+        return sampler_output
+
+    def _sample_separate_nki(
+        self, logits: torch.Tensor, sampling_metadata
+    ) -> SamplerOutput:
+        """Sample the gathered logits with the separate NKI sampler graph.
+
+        TP rank 0 samples and broadcasts the result, so every rank emits the
+        same tokens. A batch with top_k/top_p filtering goes to the vLLM CPU
+        sampler, with the metadata and the logits on the CPU.
+
+        Example:
+            >>> out = runner._sample_separate_nki(logits, runner.input_batch.sampling_metadata)  # doctest: +SKIP
+        """
+        logits = logits[: self.input_batch.num_reqs]
+        use_cpu = has_sampling_filters(sampling_metadata, self.vocab_size)
+        tp_group = get_tp_group()
+        payload = None
+        if tp_group.rank_in_group == 0:
+            try:
+                if logits.ndim != 2 or logits.shape[1] != self.vocab_size:
+                    raise ValueError(
+                        f"Expected full vocabulary width {self.vocab_size}, "
+                        f"received logits shape {tuple(logits.shape)}"
+                    )
+                if use_cpu:
+                    sampling_metadata = replace(
+                        sampling_metadata,
+                        **{
+                            f.name: value.cpu()
+                            for f in fields(sampling_metadata)
+                            if isinstance(
+                                value := getattr(sampling_metadata, f.name),
+                                torch.Tensor,
+                            )
+                        },
+                    )
+                    # The CPU sampler changes the logits in place.
+                    logits = logits.cpu().clone()
+                    sampler = self.cpu_sampler
+                else:
+                    sampler = self.sampler
+                payload = (
+                    sampler(logits=logits, sampling_metadata=sampling_metadata),
+                    None,
+                )
+            except Exception as error:
+                # Send the failure, so the other ranks do not wait for a result.
+                payload = (None, f"{type(error).__name__}: {error}")
+        if tp_group.world_size > 1:
+            payload = tp_group.broadcast_object(payload, src=0)
+        sampler_output, error = payload
+        if error is not None:
+            raise RuntimeError(f"Neuron NKI sampling failed: {error}")
         return sampler_output
 
     def _parse_rejection_sampling_output(

@@ -132,6 +132,15 @@ class NeuronConfig:
     on_device_sampling_config: OnDeviceSamplingConfig | None = field(
         default_factory=OnDeviceSamplingConfig
     )
+    # Full-vocabulary stochastic sampling with selected-token logprobs, for RL
+    # rollouts. "cpu" keeps the sampler chosen by on_device_sampling_config.
+    # "nki" runs vllm_neuron/functional/stochastic_sampling.py on the device:
+    # inside the model graph when on_device_sampling_config is set (works with
+    # async scheduling; the model must set nki_in_graph_sampling), or as a
+    # separate graph after the gathered LM head when it is None (synchronous
+    # scheduling only). Requests are limited to what the kernel computes; see
+    # vllm_neuron/vllm/sample/nki_sampler.py:validate_nki_sampling_params.
+    stochastic_sampling_backend: Literal["cpu", "nki"] = "cpu"
     # TODO: Remove max_logprobs from NeuronConfig; use vllm_config directly in the model instead
     max_logprobs: int = 0  # 0 = logprobs disabled; -1 = gather all logits for logprobs;
     tensor_capture: TensorCaptureConfig | None = None
@@ -264,6 +273,9 @@ class NeuronConfig:
             mlp_dp_size=config_dict.get("mlp_dp_size", 1),
             draft_mlp_dp_size=config_dict.get("draft_mlp_dp_size"),
             on_device_sampling_config=on_device_sampling_config,
+            stochastic_sampling_backend=config_dict.get(
+                "stochastic_sampling_backend", "cpu"
+            ),
             max_logprobs=config_dict.get("max_logprobs", 0),
             tensor_capture=tensor_capture,
             tensor_replacement=tensor_replacement,
@@ -294,6 +306,11 @@ class NeuronConfig:
 
     def __post_init__(self):
         """Validate configuration."""
+        if self.stochastic_sampling_backend not in ("cpu", "nki"):
+            raise ValueError(
+                "stochastic_sampling_backend must be 'cpu' or 'nki', got "
+                f"{self.stochastic_sampling_backend!r}"
+            )
         if not isinstance(self.ep_degree, int) or self.ep_degree < 1:
             raise ValueError(
                 f"ep_degree must be a positive integer, got {self.ep_degree}"
