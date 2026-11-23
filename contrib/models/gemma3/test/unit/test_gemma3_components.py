@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Gemma3 (rnj-1) component tests in CPU mode, against the HF Gemma3 modules.
 
-The tests use random weights (the real checkpoint stores about 32 GB of FP32
+The tests use random weights (the real checkpoint stores about 33 GB of FP32
 weights), with the rnj-1 hidden size where a tensor stays small:
 
 - RMSNorm: the ``(1 + w)`` FP32 norm matches HF, and the kernel gamma is

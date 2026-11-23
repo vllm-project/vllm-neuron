@@ -71,21 +71,21 @@ each rank one KV head that two ranks share (`num_kv_replicas` 2).
 
 ## Feature status
 
-"Exercised" means that a recorded run covers the path. "CPU-tested" means
-that a CPU-mode test in `test/unit/` covers it. "Implemented, not covered"
-means that the code path is here but no test covers it. "Not supported" means
-that the factory or the code refuses it. Device results on vLLM Neuron
-0.29.0.1.2.0 are in the validation report of the model folder's `README.md`.
+"Exercised" means that a run in the validation report of the model folder's
+`README.md` (vLLM Neuron 0.29.0.1.2.0, `trn2.48xlarge`, TP 8) covers the path.
+"CPU-tested" means that a CPU-mode test in `test/unit/` covers it.
+"Implemented, not covered" means that the code path is here but no test covers
+it. "Not supported" means that the factory or the code refuses it.
 
 | Feature | Status |
 |---|---|
-| BF16 served dtype (FP32 checkpoint) | Exercised on the port's earlier runs; CPU-tested |
-| TP 8, single node | Exercised on the port's earlier runs (GSM8K and serving benchmark, batch 1 and 4) |
-| TP 16 | Implemented; the port's two-node disaggregated test used it, that test is not part of this folder |
+| BF16 served dtype (FP32 checkpoint) | Exercised; CPU-tested |
+| TP 8, single node | Exercised (integration test, batch 1 and 4, and `vllm serve`) |
+| TP 16 | Implemented, not covered: the port's two-node disaggregated test used it, and that test is not part of this folder |
 | One KV head per rank (the TP 8 and TP 16 decode branch) | CPU-tested at TP 2 with a tiny model that has 2 KV heads |
 | TP 1, 2, 4 (more than one KV head per rank) | Implemented, not covered. In CPU mode with the NKI simulator (`NKI_SIMULATOR=1`) the decode attention kernel of this branch returns NaN when the block table has inactive (`-1`) entries; the branch was not run on device |
-| Flash attention prefill (NKI) | Exercised on the port's earlier runs |
-| Fused decode attention kernel | Exercised on the port's earlier runs |
+| Flash attention prefill (NKI) | Exercised |
+| Fused decode attention kernel | Exercised |
 | Segmented prefill (the prefix-caching path) | Implemented, not covered: every recorded run disabled prefix caching |
 | On-device greedy sampling | Exercised; CPU-tested |
 | Sliding-window layers | Not supported (the factory rejects any `sliding_attention` layer) |

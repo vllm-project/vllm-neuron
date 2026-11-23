@@ -9,7 +9,7 @@ Two configs are used:
 
 * ``REAL_CONFIG``, the ``config.json`` of ``EssentialAI/rnj-1-instruct`` at
   the pinned revision, so that the config, RoPE and weight-map tests need no
-  download (the checkpoint stores about 32 GB of FP32 weights), and
+  download (the checkpoint stores about 33 GB of FP32 weights), and
 * ``TINY_CONFIG``, a random-weight model with the same layout, which
   :func:`make_tiny_checkpoint` saves in seconds for the CPU end-to-end test.
 """

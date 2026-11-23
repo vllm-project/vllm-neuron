@@ -31,7 +31,7 @@ The configuration below needs 8 NeuronCores on one trn2.48xlarge node:
         -v -s --timeout=10800 > /tmp/test_output.txt 2>&1
 
 Without ``GEMMA3_CHECKPOINT_PATH`` the test downloads the pinned revision
-(about 32 GB of FP32 weights) from the Hugging Face Hub.
+(about 33 GB of FP32 weights) from the Hugging Face Hub.
 
 Logit validation
 ----------------

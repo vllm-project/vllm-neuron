@@ -196,49 +196,87 @@ pytest prints its summary and then does not exit.
 
 ## Validation report
 
-### vLLM Neuron 0.29.0.1.2.0
+### vLLM Neuron 0.29.0.1.2.0 (2026-11-23)
 
-_Pending: the device results of the integration test and the serve smoke run
-on `trn2.48xlarge` go here._
+#### Environment
 
-### Earlier runs: `vllm-neuron` 0.31.0.1.2.0 (vLLM 0.31.0)
+| Image | Instance | TP | vLLM | vllm-neuron | torch | transformers | neuronx-cc |
+|---|---|---|---|---|---|---|---|
+| `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04` | `trn2.48xlarge` (LNC 2), 1 node | 8 | 0.29.0 | 0.29.0.1.2.0 | 2.13.0 | 5.17.0 | 2.28.7631.0+8f7b0cf5 |
 
-These runs used the port before the 0.29 changes below, on `trn2.48xlarge` at
-TP 8 with the `neuron_native` route, the FP32 checkpoint served with
-`--dtype bfloat16`, a 4096-token model length and prefix caching off. Only
-the verdicts were recorded.
+Checkpoint of the integration test and the serve smoke: `EssentialAI/rnj-1-instruct` at
+`5ef96d7a82b2bff8009192979432c9bc64e870cd`.
+
+#### Results
 
 | Test | Configuration | Result |
 |---|---|---|
-| GSM8K (chain of thought, 100 samples) | batch 1 and batch 4, TP 8, 1 node | PASS |
-| Serving benchmark (random 1024 input / 100 output tokens) | batch 1 and batch 4, TP 8, 1 node | PASS |
+| CPU unit tests, `test/unit/` | `VLLM_NEURON_CPU_MODE=1` | 17 passed, 0 failed |
+| `test_model_accuracy[1-2048]` | TP 8, `neuron_native`, BF16 (FP32 checkpoint), batch 1, max model length 2,048, 2 prompts × 16 greedy tokens, on-device greedy sampling | PASSED (210.86 s); static per-prompt bounds 2/2 (below); aggregate σ-ratio 0.9085 ≤ 1.0 |
+| `test_model_accuracy[4-2048]` | TP 8, `neuron_native`, BF16 (FP32 checkpoint), batch 4 (each prompt in 4 rows), max model length 2,048, 2 prompts × 16 greedy tokens, on-device greedy sampling | PASSED (243.35 s); static per-prompt bounds 2/2 (below); aggregate σ-ratio 0.9085 ≤ 1.0 |
+| `vllm serve` smoke | The Usage command, installed with `pip install -e contrib/models/gemma3` | Passed: 3/3 prompts, 32 completion tokens each; a batched request of all 3 returned a prefix of each |
 
-### Changes for 0.29
+#### Logit validation
 
-- `src/compat.py` (new): vendors `build_per_head_block_table` and
-  `scatter_new_kv`, which 0.29's `vllm_neuron.model.kv_cache` does not have.
-  `src/model.py` imports them from there, and `paged_slot_indices` from the
-  0.29 plugin.
-- `pyproject.toml`, `src/plugin.py` (new): install `src/` as the
-  `gemma3_neuron` package with a `vllm.general_plugins` entry point that
-  registers `Gemma3ForCausalLM`.
-- `test/conftest.py`: session fixture that shuts down the plugin's
-  `MPExecutor` worker pool at session end.
-- Model code and weight loaders: otherwise unchanged.
+| Case | Prompt | Overall Status | Max K5 (0.03) | Max K50 (0.05) | Max K1000 (0.08) | Max All (0.09) | Argmax divergence (1 ULP) |
+|---|---|---|---|---|---|---|---|
+| `[1-2048]` | 1 of 2, `The color of the sky is` | PASSED | 0.0080 at token 2 | 0.0109 at token 11 | 0.0126 at token 2 | 0.0139 at token 2 | 0.0000 |
+| `[1-2048]` | 2 of 2, `A short summary of the history of the printing press:` | PASSED | 0.0118 at token 15 | 0.0159 at token 15 | 0.0217 at token 15 | 0.0196 at token 13 | 0.0000 |
+| `[4-2048]` | 1 of 2, `The color of the sky is` | PASSED | 0.0080 at token 2, all 4 rows | 0.0109 at token 11, all 4 rows | 0.0126 at token 2, all 4 rows | 0.0139 at token 2, all 4 rows | 0.0000 |
+| `[4-2048]` | 2 of 2, `A short summary of the history of the printing press:` | PASSED | 0.0118 at token 15, all 4 rows | 0.0159 at token 15, all 4 rows | 0.0217 at token 15, all 4 rows | 0.0196 at token 13, all 4 rows | 0.0000 |
+
+Neuron vs CPU BF16 reference; token = generated token, row = batch row. No token over a bound. No argmax divergence.
+Both cases passed: two-way validation 2/2 prompts, aggregate σ-ratio 0.9085 ≤ 1.0 (`multi_prompt_logit_validation`; the test asserts `result.passed` only); `agg_bc` FAIL; `agg_l2_1.2x`, `agg_l2_1.5x`, `agg_linf_1.2x`, `agg_linf_1.5x` PASS; printed per-prompt checks, the same in both cases: `pp_max_linf_1.5x` 2/2, `pp_max_linf_2.0x` 2/2, `pp_max_l2_1.5x` 2/2, `pp_max_l2_2.0x` 2/2, `pp_tok_linf_1.5x` 2/2, `pp_tok_linf_2.0x` 2/2, `pp_tok_l2_1.5x` 2/2, `pp_tok_l2_2.0x` 2/2, `pp_static_0.03` 2/2, `pp_static_0.05` 2/2.
+
+Error against the FP32 reference, per prompt (max over the 16 generated tokens):
+
+| Case | Prompt | CPU BF16 L-inf | Neuron L-inf | Neuron / CPU BF16 | CPU BF16 L2 | Neuron L2 | Neuron / CPU BF16 |
+|---|---|---|---|---|---|---|---|
+| `[1-2048]` | 1 of 2 | 0.0155 | 0.0126 | 0.81x | 0.0352 | 0.0315 | 0.89x |
+| `[1-2048]` | 2 of 2 | 0.0163 | 0.0161 | 0.99x | 0.0313 | 0.0310 | 0.99x |
+| `[4-2048]` | 1 of 2 | 0.0155 | 0.0126 | 0.81x | 0.0352 | 0.0315 | 0.89x |
+| `[4-2048]` | 2 of 2 | 0.0163 | 0.0161 | 0.99x | 0.0313 | 0.0310 | 0.99x |
+
+Prompt 1: CPU BF16 L-inf maximum at generated token 0, Neuron L-inf at token 2, both L2 maxima at token 7. Prompt 2: both L-inf maxima at token 15, both L2 maxima at token 9.
+
+#### Serve smoke
+
+`/v1/completions`, `max_tokens` 32, on-device greedy sampling (`all_greedy`); first 60 characters of each output as a Python string literal.
+
+| Prompt | Output |
+|---|---|
+| `The capital of France is` | `' Paris. The capital of France is Paris. The capital of Franc'` |
+| `1, 2, 3, 4, 5,` | `' 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16'` (the whole output) |
+| `def fibonacci(n):` | `' #  (1) n = 10;\n    if n <= 0:\n        return 0\n    elif n ='` |
 
 ### Exceptions
 
+- **The serve smoke output for `The capital of France is` repeats itself.**
+  The full 32-token output is
+  `' Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital'`.
+  The logit validation of both integration cases passed against the HF
+  reference (see Logit validation).
+- **The server default temperature comes from the checkpoint.** The serve log
+  warns that the checkpoint's `generation_config.json` overrides the default
+  sampling parameters with `temperature` 0.2. The smoke run used `all_greedy`
+  on-device sampling; sampled serving was not run.
+- **Dropped: the port's GSM8K (100 samples, batch 1 and 4) and serving
+  benchmark (1024 input / 100 output tokens, batch 1 and 4) tests at TP 8**,
+  which passed on `vllm-neuron` 0.31.0.1.2.0 with the port before the 0.29
+  changes, and its two-node disaggregated logit test (TP 16, 1 prefill + 1
+  decode node). They depend on the plugin's shared serving and multi-node test
+  harness, which is outside this folder. No accuracy-benchmark score and no
+  performance figures on 0.29.
 - **Dropped: the port's kernel-dispatch instrumentation** (a debug FX pass in
   the plugin and the test that read its records). It does not change the
   model.
-- **Dropped: the port's GSM8K, serving-benchmark and two-node disaggregated
-  (TP 16, 1 prefill + 1 decode node) tests.** They depend on the plugin's
-  shared serving and multi-node test harness, which is outside this folder.
-  The shipped integration test is single-node at TP 8 and carries the
-  logit-validation shape of the disaggregated test, with locally defined
-  prompts and the template's tolerance map.
 - **Rewritten: the port's real-checkpoint component tests.** They read the
-  32 GB FP32 checkpoint. The shipped unit tests use the pinned `config.json`
+  33 GB FP32 checkpoint. The shipped unit tests use the pinned `config.json`
   and random weights, and add the tiny end-to-end test.
-- **Untested:** contexts beyond 2048 tokens from this folder, prefix caching,
-  TP other than 8 on device, Trn3.
+- **The decode branch with more than one KV head per rank (TP 1, 2, 4) is not
+  verified.** In CPU mode with the NKI simulator its decode attention returns
+  NaN when the block table has inactive (`-1`) entries; it was not run on
+  device. TP 8 and TP 16 use the one-KV-head-per-rank branch.
+- Prefix caching (the segmented-prefill path), TP sizes other than 8 on
+  device, context beyond 2048 tokens, speculative decoding and Trn3 are not
+  tested.
