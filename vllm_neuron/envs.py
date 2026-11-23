@@ -126,6 +126,8 @@ if TYPE_CHECKING:
     VLLM_NEURON_BACKEND_ASYNC_SKIP_PREFILL_READBACK: bool | None = None
     VLLM_NEURON_BACKEND_ASYNC_DEVICE_TOKEN_MERGE: bool | None = None
     VLLM_NEURON_BACKEND_KV_ADMIT_BY_REQUEST_LEN: bool | None = None
+    VLLM_NEURON_DP_PREFIX_AFFINITY: bool = False
+    VLLM_NEURON_DP_PREFIX_AFFINITY_SLACK: int | None = None
 
 
 def maybe_convert_bool(value: str | None) -> bool | None:
@@ -692,6 +694,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # off otherwise; 0 or 1 forces it. See NeuronScheduler._kv_blocks_of.
     "VLLM_NEURON_BACKEND_KV_ADMIT_BY_REQUEST_LEN": lambda: maybe_convert_bool(
         os.getenv("VLLM_NEURON_BACKEND_KV_ADMIT_BY_REQUEST_LEN")
+    ),
+    # ============ Data-parallel routing: prefix affinity ===============
+    # 1: send a request to the DP engine that holds the longest prefix of its
+    # prompt (its prompt or generated tokens), so the next turn of an agent
+    # session and the rollouts of one prompt reuse one engine's prefix cache.
+    # Needs --enable-prefix-caching and data parallelism inside the server
+    # (--data-parallel-size > 1); a non-MoE model only. A routing setting, not
+    # a graph setting: it does not change the compiled graphs or their cache.
+    # See vllm_neuron/vllm/patches/dp_prefix_affinity.py.
+    "VLLM_NEURON_DP_PREFIX_AFFINITY": lambda: bool(
+        maybe_convert_bool(os.getenv("VLLM_NEURON_DP_PREFIX_AFFINITY"))
+    ),
+    # Largest load difference, in requests, that a request accepts to go to
+    # the engine that holds its prefix instead of the least loaded engine.
+    # Unset: max(1, max_num_seqs // 2).
+    "VLLM_NEURON_DP_PREFIX_AFFINITY_SLACK": lambda: maybe_convert_int(
+        os.getenv("VLLM_NEURON_DP_PREFIX_AFFINITY_SLACK")
     ),
 }
 

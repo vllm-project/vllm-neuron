@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Keep internal-DP routing admissions consistent across API workers."""
+"""Keep internal-DP routing admissions consistent across API workers.
+
+With ``VLLM_NEURON_DP_PREFIX_AFFINITY=1``, a request also goes to the engine
+that holds the longest prefix of its prompt (see dp_prefix_affinity.py).
+"""
 
 import contextlib
 import logging
 import multiprocessing
+import time
 from collections import Counter
 from typing import Any
 
@@ -12,6 +17,8 @@ logger = logging.getLogger(__name__)
 _SHARED_INFLIGHT_ARG = "_vllm_neuron_dp_lb_shared_inflight"
 _SHARED_INFLIGHT_CONFIG = "dp_lb_shared_inflight"
 _ROUTING_ENABLED_ATTR = "_vllm_neuron_dp_lb_routing_enabled"
+_AFFINITY_ATTR = "_vllm_neuron_dp_prefix_affinity"
+_AFFINITY_LOG_INTERVAL_S = 60.0
 
 _applied = False
 _original_engine_core_run_busy_loop: Any = None
@@ -95,6 +102,100 @@ def _dplb_client_init(
     self.engine_indices = {
         engine: index for index, engine in enumerate(self.core_engines)
     }
+    setattr(
+        self,
+        _AFFINITY_ATTR,
+        _make_prefix_affinity(vllm_config, len(self.core_engines), client_count),
+    )
+
+
+def _make_prefix_affinity(vllm_config, num_engines: int, client_count: int):
+    """Build the prefix index when VLLM_NEURON_DP_PREFIX_AFFINITY is set.
+
+    Returns:
+        A PrefixAffinityIndex, or None when the routing is off.
+    """
+    from vllm_neuron import envs
+    from vllm_neuron.vllm.patches.dp_prefix_affinity import (
+        CHUNK_TOKENS,
+        DEFAULT_MAX_CHUNKS_PER_ENGINE,
+        PrefixAffinityIndex,
+    )
+
+    if not envs.VLLM_NEURON_DP_PREFIX_AFFINITY:
+        return None
+    cache_config = vllm_config.cache_config
+    if not getattr(cache_config, "enable_prefix_caching", False):
+        logger.warning(
+            "DP prefix affinity: off, because prefix caching is off "
+            "(VLLM_NEURON_DP_PREFIX_AFFINITY is set)."
+        )
+        return None
+
+    slack = envs.VLLM_NEURON_DP_PREFIX_AFFINITY_SLACK
+    if slack is None:
+        slack = max(1, vllm_config.scheduler_config.max_num_seqs // 2)
+    # The handshake sums the KV blocks of the engines of this client.
+    num_blocks = getattr(cache_config, "num_gpu_blocks", None) or 0
+    block_size = getattr(cache_config, "block_size", None) or 0
+    if num_blocks and block_size:
+        engine_tokens = num_blocks * block_size // num_engines
+        max_chunks = max(1, engine_tokens // CHUNK_TOKENS)
+    else:
+        max_chunks = DEFAULT_MAX_CHUNKS_PER_ENGINE
+    if client_count > 1:
+        logger.warning(
+            "DP prefix affinity: each of the %d API servers keeps its own prefix "
+            "index, so a session that moves between API servers can lose its "
+            "engine. Serve with --api-server-count 1 for full affinity.",
+            client_count,
+        )
+    logger.info(
+        "DP prefix affinity: on for %d engines, slack %s requests, %d-token "
+        "chunks, %d chunks per engine",
+        num_engines,
+        slack,
+        CHUNK_TOKENS,
+        max_chunks,
+    )
+    return PrefixAffinityIndex(num_engines, slack, max_chunks_per_engine=max_chunks)
+
+
+def _affinity_prefix(affinity, request):
+    """Return the prompt prefix of a request, or None if it cannot be matched."""
+    token_ids = request.prompt_token_ids
+    if (
+        affinity is None
+        or request.sampling_params is None
+        or not token_ids
+        or request.mm_features
+        or getattr(request, "prompt_embeds", None) is not None
+    ):
+        return None
+    lora = request.lora_request
+    return affinity.prefix(
+        token_ids,
+        lora_name=lora.lora_name if lora is not None else None,
+        cache_salt=request.cache_salt,
+    )
+
+
+def _maybe_log_affinity(self, affinity) -> None:
+    now = time.monotonic()
+    if now - getattr(self, "_dp_affinity_last_log", 0.0) < _AFFINITY_LOG_INTERVAL_S:
+        return
+    self._dp_affinity_last_log = now
+    s = affinity.stats
+    logger.info(
+        "DP prefix affinity: %d load-balanced requests, %d with a prefix on some "
+        "engines, %d sent to that engine (%.0f matched tokens each), %d sent to "
+        "the least loaded engine by the load guard",
+        s.requests,
+        s.matched,
+        s.followed,
+        s.matched_tokens / max(1, s.followed),
+        s.overridden,
+    )
 
 
 def _observed_engine_load(counts: list[int | float]) -> float:
@@ -120,6 +221,12 @@ def _get_core_engine_for_request(self, request):
         )
     load_balanced = eng_index is None
 
+    affinity = getattr(self, _AFFINITY_ATTR, None)
+    if affinity is not None:
+        affinity.resize(len(self.core_engines))
+    # Hash the prompt before taking the lock shared with the other API servers.
+    prefix = _affinity_prefix(affinity, request)
+
     routing_lock = (
         self.shared_engine_inflight.get_lock()
         if self.shared_engine_inflight is not None
@@ -130,9 +237,13 @@ def _get_core_engine_for_request(self, request):
             num_engines = len(self.lb_engines)
             min_score = (float("inf"), float("inf"))
             eng_index = 0
+            order = [
+                (self.eng_start_index + offset) % num_engines
+                for offset in range(num_engines)
+            ]
+            scores: list[tuple[float, float]] = [min_score] * num_engines
 
-            for offset in range(num_engines):
-                index = (self.eng_start_index + offset) % num_engines
+            for index in order:
                 observed_load = _observed_engine_load(self.lb_engines[index])
                 if self.shared_engine_inflight is not None:
                     score = (
@@ -145,10 +256,14 @@ def _get_core_engine_for_request(self, request):
                         * self.engine_inflight[self.core_engines[index]]
                     )
                     score = (max(float(local_inflight), observed_load), 0.0)
+                scores[index] = score
 
                 if score < min_score:
                     min_score = score
                     eng_index = index
+
+            if prefix is not None:
+                eng_index = affinity.choose(prefix, scores, eng_index, order)
 
             if self.shared_engine_inflight is None:
                 self.lb_engines[eng_index][0] += self.client_count
@@ -160,6 +275,9 @@ def _get_core_engine_for_request(self, request):
         if self.shared_engine_inflight is not None:
             self.shared_engine_inflight[eng_index] += 1
 
+    if prefix is not None:
+        affinity.admit(request.request_id, eng_index, prefix)
+        _maybe_log_affinity(self, affinity)
     return chosen_engine
 
 
@@ -167,6 +285,16 @@ async def _process_engine_outputs(self, outputs) -> None:
     if not getattr(self, _ROUTING_ENABLED_ATTR):
         await _original_dplb_process_engine_outputs(self, outputs)
         return
+
+    affinity = getattr(self, _AFFINITY_ATTR, None)
+    if affinity is not None:
+        # The engine caches the generated tokens too, so the next turn of a
+        # session, which starts with them, finds this engine.
+        for output in outputs.outputs:
+            if output.new_token_ids:
+                affinity.extend(output.request_id, output.new_token_ids)
+        for request_id in outputs.finished_requests or ():
+            affinity.finish(request_id)
 
     # vLLM reports aborted requests in finished_requests after scheduler cleanup.
     # Release here so an abort stays reserved until the engine acknowledges it.
