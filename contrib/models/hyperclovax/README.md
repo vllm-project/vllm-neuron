@@ -237,6 +237,8 @@ Checkpoint of the integration test: `naver-hyperclovax/HyperCLOVAX-SEED-Think-14
 | `test_model_accuracy[4-2048]` | TP 8, `neuron_native`, BF16, batch 4 (each prompt in 4 rows), max model length 2,048, 2 prompts × 16 greedy tokens, on-device greedy sampling | PASSED (168.21 s): static per-prompt bounds 2/2 (below); aggregate σ-ratio 0.8932 ≤ 1.0 |
 | `vllm serve` smoke | The Usage command (`--revision 9b74e35d4c7e4ffec489f4171273caca8948a2b9`), `VLLM_NEURON_BACKEND=neuron_native`, installed with `pip install --no-deps -e contrib/models/hyperclovax` | Passed: 3/3 prompts, 32 completion tokens each; a batched request of all 3 at `max_tokens` 16 returned a prefix of each |
 
+The integration test also asserts the per-prompt FP32 error checks `pp_max_linf_1.5x` and `pp_max_l2_1.5x`: 2/2 in both cases.
+
 Not run on 0.29: the port's two-node component, logit and serving tests (not shipped in this folder).
 
 #### Logit validation
