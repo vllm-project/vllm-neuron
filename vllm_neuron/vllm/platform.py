@@ -1144,6 +1144,36 @@ class NeuronPlatform(Platform):
     _QWEN3_5_MAX_NUM_BATCHED_TOKENS = 8192
     _QWEN3_5_PREFILL_BUCKETS = (256, 2048, 4096)
     _QWEN3_5_SNAPSHOT_ROWS = 129
+    # The smallest default decode context bucket: the measured 16K configuration.
+    # Each longer bucket doubles it. A decode step pays for its context bucket, so
+    # one bucket at a long max_model_len makes every short request slow.
+    _QWEN3_5_DECODE_CTX_FLOOR = 16384
+
+    @classmethod
+    def _qwen3_5_decode_ctx_buckets(cls, max_model_len: int) -> list[int]:
+        """Return the default decode context buckets for ``max_model_len``.
+
+        The buckets are 16384, 32768, ... below the top, and the top is the largest
+        multiple of 128 below ``max_model_len``. The runner adds ``max_model_len``
+        itself. Up to 16K this is the single measured bucket.
+
+        Example:
+            >>> NeuronPlatform._qwen3_5_decode_ctx_buckets(16384)
+            [16256]
+            >>> NeuronPlatform._qwen3_5_decode_ctx_buckets(65536)
+            [16384, 32768, 65408]
+            >>> NeuronPlatform._qwen3_5_decode_ctx_buckets(100)
+            []
+        """
+        top = (max_model_len - 1) // 128 * 128
+        if top < 128:
+            return []
+        buckets = []
+        ctx = cls._QWEN3_5_DECODE_CTX_FLOOR
+        while ctx < top:
+            buckets.append(ctx)
+            ctx *= 2
+        return buckets + [top]
 
     @classmethod
     def _is_qwen3_5(cls, vllm_config) -> bool:
@@ -1166,11 +1196,13 @@ class NeuronPlatform(Platform):
         - ``max_num_seqs`` 32 and ``max_num_batched_tokens`` 8192. vLLM's defaults
           (256 sequences, 2048 tokens) would size a 256-row DeltaNet state and a
           256-row decode graph.
-        - Buckets, when no bucket key is set: decode batch ``[max_num_seqs]`` (one
-          decode graph, so greedy output does not depend on load); prefill 256,
-          2048, 4096 up to ``max_num_batched_tokens`` (256 takes the chunk tails);
-          one KV segment of ``max_num_batched_tokens``; one decode context bucket,
-          the largest multiple of 128 below ``max_model_len``.
+        - Buckets, each key that is not set: decode batch ``[max_num_seqs]`` (one
+          decode graph per context bucket, so greedy output does not depend on
+          the batch size); prefill 256, 2048, 4096 up to
+          ``max_num_batched_tokens`` (256 takes the chunk tails); one KV segment
+          of ``max_num_batched_tokens``; decode context buckets 16384, 32768, ...
+          below the largest multiple of 128 below ``max_model_len``, and that
+          multiple (``_qwen3_5_decode_ctx_buckets``).
         - ``deltanet_snapshot_rows``: 129 with prefix caching, which needs 2 or more
           rows for a correct cache hit, and 0 without it.
         - Language model only: the port does not load the vision tower, so the
@@ -1205,22 +1237,23 @@ class NeuronPlatform(Platform):
             "kv_segment_size_buckets",
             "decode_context_length_buckets",
         )
-        if not any(k in neuron_config for k in bucket_keys):
-            from vllm_neuron.utils.bucket_utils import (
-                get_default_kv_segment_size_buckets,
-            )
+        # Fill each key that is not set, so one explicit key keeps the others.
+        from vllm_neuron.utils.bucket_utils import get_default_kv_segment_size_buckets
 
-            max_tokens = scheduler_config.max_num_batched_tokens
-            neuron_config["num_seqs_buckets"] = [scheduler_config.max_num_seqs]
-            neuron_config["num_batched_tokens_buckets"] = [
-                b for b in cls._QWEN3_5_PREFILL_BUCKETS if b < max_tokens
-            ] + [max_tokens]
+        max_tokens = scheduler_config.max_num_batched_tokens
+        neuron_config.setdefault("num_seqs_buckets", [scheduler_config.max_num_seqs])
+        neuron_config.setdefault(
+            "num_batched_tokens_buckets",
+            [b for b in cls._QWEN3_5_PREFILL_BUCKETS if b < max_tokens] + [max_tokens],
+        )
+        if "kv_segment_size_buckets" not in neuron_config:
             segments = get_default_kv_segment_size_buckets(max_tokens, max_model_len)
             if segments:
                 neuron_config["kv_segment_size_buckets"] = segments
-            ctx = (max_model_len - 1) // 128 * 128
-            if ctx >= 128:
-                neuron_config["decode_context_length_buckets"] = [ctx]
+        if "decode_context_length_buckets" not in neuron_config:
+            ctx_buckets = cls._qwen3_5_decode_ctx_buckets(max_model_len)
+            if ctx_buckets:
+                neuron_config["decode_context_length_buckets"] = ctx_buckets
 
         rows = envs.VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_ROWS
         if rows is None:

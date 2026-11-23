@@ -70,16 +70,56 @@ def test_explicit_values_win(monkeypatch):
     )
     monkeypatch.setenv("VLLM_NEURON_BACKEND_DELTANET_SNAPSHOT_ROWS", "33")
     cfg = _vllm_config(max_num_seqs=16, max_num_batched_tokens=4096)
-    nc = {"num_seqs_buckets": [8, 16]}
+    nc = {"num_seqs_buckets": [8, 16], "decode_context_length_buckets": [4096]}
     NeuronPlatform._apply_qwen3_5_defaults(cfg, nc)
     assert cfg.scheduler_config.max_num_seqs == 16
     assert cfg.scheduler_config.max_num_batched_tokens == 4096
-    # A bucket key is set, so no bucket default is added.
+    # The explicit bucket keys win, and each key that is not set gets its default.
     assert nc == {
         "num_seqs_buckets": [8, 16],
+        "decode_context_length_buckets": [4096],
+        "num_batched_tokens_buckets": [256, 2048, 4096],
+        "kv_segment_size_buckets": [4096],
         "_qwen3_5_defaults_applied": True,
         "deltanet_snapshot_rows": 33,
     }
+
+
+@pytest.mark.parametrize(
+    "max_model_len, expected",
+    [
+        (4096, [3968]),
+        (16384, [16256]),
+        (16385, [16384]),
+        (32768, [16384, 32640]),
+        (65536, [16384, 32768, 65408]),
+        (262144, [16384, 32768, 65536, 131072, 262016]),
+    ],
+)
+def test_decode_context_buckets_double_up_to_max_model_len(max_model_len, expected):
+    cfg, nc = _vllm_config(max_model_len=max_model_len), {}
+    NeuronPlatform._apply_qwen3_5_defaults(cfg, nc)
+    assert nc["decode_context_length_buckets"] == expected
+
+
+def test_an_art_rollout_profile_keeps_its_buckets_and_gets_the_rest(monkeypatch):
+    # ART's trn2.48xlarge Qwen3.6-27B profile: 64K, 8 sequences, 2048-token chunks.
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["vllm", "serve", "m", "--max-num-seqs", "8", "--max-num-batched-tokens", "2048"],
+    )
+    cfg = _vllm_config(max_model_len=65536, max_num_seqs=8, max_num_batched_tokens=2048)
+    nc = {
+        "num_batched_tokens_buckets": [2048],
+        "num_seqs_buckets": [1, 4, 8],
+        "decode_context_length_buckets": [4096, 8192, 16384, 32768],
+    }
+    NeuronPlatform._apply_qwen3_5_defaults(cfg, nc)
+    assert nc["num_batched_tokens_buckets"] == [2048]
+    assert nc["num_seqs_buckets"] == [1, 4, 8]
+    assert nc["decode_context_length_buckets"] == [4096, 8192, 16384, 32768]
+    assert nc["kv_segment_size_buckets"] == [2048]
 
 
 def test_no_prefix_caching_needs_no_snapshot_rows():
