@@ -128,6 +128,8 @@ Neuron DI uses the upstream **`NixlConnector`** for standard TP topologies.
 **`NeuronNixlConnector`** extends it with **DCP (Decode Context Parallel)**
 mapping and Neuron-specific sliding-window handling. Use `NeuronNixlConnector`
 for DCP topologies and sliding-window models such as GPT-OSS.
+**`NeuronMooncakeConnector`** runs upstream's **`MooncakeConnector`** (Mooncake
+Transfer Engine, EFA) over Neuron KV caches; see below.
 
 ### NeuronNixlConnector
 
@@ -143,10 +145,66 @@ Extends the upstream NIXL connector for DCP and sliding-window topologies:
   accounting aligned so the oldest in-window block is not dropped during a
   GPT-OSS KV transfer.
 
+- **KV-head replicas** — when TP exceeds the KV-head count (e.g. 8 KV heads at
+  TP=64, 8 replicas per head), each decode rank reads the producer replica with
+  its own replica index, so every producer rank has a reader and gets the
+  read-done notification; producer ranks that still have no reader (TP → DCP)
+  get a notification-only read from one designated decode rank. Without this
+  only replica 0 was notified, and the other replicas held each request's KV
+  until the 30 s lease expired, which throttled the prefill node.
+- **Extra per-layer tensors** and **coalesced registration** — see
+  [Registering KV memory](#registering-kv-memory).
+
 Hybrid TP alone (different TP on P vs D, e.g. TP4 prefill → TP8 decode) does not
 require this connector, but a sliding-window model using that topology does.
 EFA/LIBFABRIC is selected independently through the
 `kv_connector_extra_config` `{"backends": ["LIBFABRIC"]}` option.
+
+### NeuronMooncakeConnector
+
+```text
+vllm_neuron/vllm/kv_connector/neuron_mooncake_connector.py
+```
+
+Runs upstream's `MooncakeConnector` (push mode: the prefill node writes the KV
+into the decode node's blocks when its prefill finishes) over Neuron's KV
+caches. Mooncake recognises Neuron HBM by its `/dev/neuron<N>` mapping and
+registers it with `FI_HMEM_NEURON` over EFA (`mooncake-transfer-engine-non-cuda`
+≥ 0.3.14; `"mooncake_protocol": "efa"`). The connector adds:
+
+- **K/V slab layout** — vllm-neuron hands connectors `(2, num_blocks, heads,
+  block, head_size)` per layer; the connector passes upstream its
+  `transpose(0, 1)`, so upstream registers the K and the V slab as two
+  blocks-first regions.
+- **Prefill without DCP into a DCP decode** — `"remote_dcp_size": D` on the
+  prefill side maps the prefill rank's blocks `k * D + r % D` onto decode rank
+  `r`'s block `k` (equal TP, D dividing the KV-head replication).
+- **Extra per-layer tensors** and **coalesced registration**, as for NIXL.
+
+Hybrid TP with replicated KV heads (e.g. TP=64 prefill → TP=8 decode replicas)
+uses upstream's replicated-producer plan unchanged. Sliding-window and mamba
+models, and prefill DCP, are not supported by this connector.
+
+### Registering KV memory
+
+`vllm_neuron/vllm/kv_connector/neuron_hbm_registration.py`, used by both
+connectors:
+
+- **Coalesced registration.** The Neuron driver gives EFA 2 MiB pages only for
+  a registration of at least 256 MiB whose length, VA and PA are 2 MiB-aligned
+  (`neuron_p2p_register_va`); anything else gets 4 KiB pages, one NIC
+  page-table entry each. A KV cache registered slab by slab (hundreds of
+  buffers of ≤ 200 MiB per rank) exhausts the NIC page tables at TP=64 on a
+  trn2.48xlarge (`REG_MR err -12` in dmesg, failed or unusable registrations).
+  Both connectors therefore register one 2 MiB-aligned span per `/dev/neuron`
+  mapping instead: one ~15 GiB registration per rank, in well under a second
+  (minutes before). `VLLM_NEURON_KV_COALESCE_REGISTRATION=0` registers buffer
+  by buffer.
+- **Extra per-layer tensors.** A model module may expose
+  `CONNECTOR_EXTRA_KV_TENSORS = {layer name: tensor}` for tensors that are
+  blocks-first, indexed by the same block ids as the layer's KV and written by
+  prefill (e.g. sparse-attention K summaries). They are registered as more
+  regions of the layer and move with its K and V, block by block.
 
 ### Neuron-Specific DI Features
 
@@ -301,6 +359,8 @@ vllm serve $MODEL \
 | `VLLM_NEURON_SKIP_PREFILL_WARMUP` | `0` | Skip prefill NEFF compilation (decode-only) |
 | `VLLM_NEURON_SKIP_DECODE_WARMUP` | `0` | Skip decode NEFF compilation (prefill-only) |
 | `VLLM_NEURON_BIDIRECTIONAL_KV` | `0` | Enable D→P KV transfer for multi-turn |
+| `VLLM_NEURON_KV_COALESCE_REGISTRATION` | `1` | Register the KV cache as 2 MiB-aligned spans (see [Registering KV memory](#registering-kv-memory)) |
+| `MC_EFA_NIC_SELECTION` | `local` (Mooncake ≥ 0.3.14) | Mooncake: register each HBM buffer only on its topology-local NICs; set it explicitly with older Mooncake |
 | `NEURON_VISIBLE_DEVICES` | all | Core partitioning for single-node DI (assumes host-level NeuronCore numbering; under Kubernetes DRA a pod may see pod-local IDs). |
 
 ### Proxy Server
@@ -316,6 +376,21 @@ python examples/vllm_neuron/vllm/disaggregated_inference/toy_proxy_server.py \
     --decoder-hosts   <D_HOST> --decoder-ports   8200 \
     --port 8000
 ```
+
+With `NeuronMooncakeConnector` use upstream vLLM's Mooncake proxy, which sends
+each request to the prefill and the decode server at once (the prefill server
+also runs Mooncake's bootstrap server, `VLLM_MOONCAKE_BOOTSTRAP_PORT`, default
+8998):
+
+```bash
+python vllm/examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py \
+    --host 0.0.0.0 --port 8000 \
+    --prefill http://<P_HOST>:8100 8998 --decode http://<D_HOST>:8200
+```
+
+The toy proxy rewrites `kv_transfer_params.remote_host` to the prefill host it
+was given, so pass the prefill node's routable address, not `127.0.0.1`, when
+the decode server is on another node.
 
 ---
 
