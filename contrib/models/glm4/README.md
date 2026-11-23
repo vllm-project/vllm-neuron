@@ -243,6 +243,8 @@ Checkpoint of the integration test: `zai-org/GLM-4-32B-0414` at
 | `test_model_accuracy[4-2048]` | TP 8, `neuron_native`, BF16, batch 4 (each prompt in 4 rows), max model length 2,048, segmented prefill (bucket 1,024, KV segment 1,024), 2 prompts × 16 greedy tokens, on-device greedy sampling | PASSED (387.375 s): 2/2 prompts within `TOL_MAP` on all 64 tokens, no argmax divergence; aggregate σ-ratio 0.9385 ≤ 1.0 |
 | `vllm serve` smoke | The Usage command (with `--revision` and the three timeout variables), installed with `pip install --no-deps -e contrib/models/glm4` | Passed: 3/3 prompts, 32 completion tokens each; a batched request of all 3 at `max_tokens` 16 returned a prefix of each |
 
+The test asserts `pp_max_linf_1.5x` and `pp_max_l2_1.5x` on every prompt; both were 2/2 in `[1-2048]` and in `[4-2048]` in this run.
+
 Engine start (profile, KV cache, warmup) took 212.18 s (compilation 204.87 s)
 in `[1-2048]`, 232.51 s (compilation 225.24 s) in `[4-2048]` and 225.58 s
 (compilation 220.47 s) for `vllm serve`.
