@@ -143,7 +143,7 @@ for the `VLLM_NEURON_*` environment variables.
 
 | Instance / SDK version | 2.33 (vLLM Neuron 0.29.0.1.2.0) | 2.32 and earlier |
 | ---------------------- | ------------------------------- | ---------------- |
-| Trn2 (trn2.48xlarge)   | TP 8, one node, 9216-token model length; see the Validation report | Not tested |
+| Trn2 (trn2.48xlarge)   | Working: TP 8, one node, 9216-token model length (see the Validation report) | Not tested |
 | Trn3                   | Not tested | Not tested |
 
 CPU mode (`VLLM_NEURON_CPU_MODE=1`) on vLLM Neuron 0.29.0.1.2.0 (vLLM 0.29.0,
@@ -256,6 +256,104 @@ plugin's `MPExecutor` worker pool at the end of the session.
 
 ## Validation report
 
-The validation report for the 9216-token configuration (8k-token prompts,
-batch 1 and 4, TP 8) is pending. It will be filled in from the device results
-of `test/integration/test_model.py` and of the serve example above.
+### vLLM Neuron 0.29.0.1.2.0 (2026-11-24)
+
+#### Environment
+
+| Image | Instance | TP | vLLM | vllm-neuron | torch | transformers | neuronx-cc |
+|---|---|---|---|---|---|---|---|
+| `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04` | `trn2.48xlarge` (LNC 2), 1 node | 8 | 0.29.0 | 0.29.0.1.2.0 | 2.13.0 | 5.17.0 | 2.28.7631.0+8f7b0cf5 |
+
+Checkpoint of the integration test: `zai-org/GLM-4-32B-0414` at
+`077b5c2f5c43bd3239fd605a0600229e8facbd4a`.
+
+#### Results
+
+| Test | Configuration | Result |
+|---|---|---|
+| CPU unit tests, `test/unit/` | `VLLM_NEURON_CPU_MODE=1`, `GLM4_0414_CHECKPOINT_PATH` set | 15 passed, 0 failed (includes the 3 weight tests and both `test_tiny_glm4_e2e.py` cases) |
+| `test_model_accuracy[1-9216]` | TP 8, `neuron_native`, BF16, batch 1, max model length 9,216, segmented prefill (bucket 1,024, KV segment 1,024), 2 prompts of 8,000 to 8,192 tokens × 16 greedy tokens, on-device greedy sampling | PASSED (674.13 s, including the HF reference): 2/2 prompts within `TOL_MAP` on all 16 tokens, no argmax divergence; aggregate σ-ratio 0.9358 ≤ 1.0 |
+| `test_model_accuracy[4-9216]` | TP 8, `neuron_native`, BF16, batch 4 (each prompt in 4 rows), max model length 9,216, segmented prefill (bucket 1,024, KV segment 1,024), 2 prompts of 8,000 to 8,192 tokens × 16 greedy tokens, on-device greedy sampling | PASSED (397.12 s): 2/2 prompts within `TOL_MAP` on all 64 tokens, no argmax divergence; aggregate σ-ratio 0.9180 ≤ 1.0 |
+| `vllm serve` smoke | The Usage command (with `--revision` and the three timeout variables), installed with `pip install --no-deps -e contrib/models/glm4` | Passed: 3/3 prompts, 32 completion tokens each; a batched request of all 3 at `max_tokens` 16 returned a prefix of each |
+| `vllm serve` 8k-token request | Same server; one `/v1/completions` request with a deterministic synthetic ledger document (295 numbered records and a request to summarize them), measured with the server's `/tokenize` endpoint; `max_tokens` 1024, `temperature` 0, `ignore_eos` | Passed: 8,173 prompt tokens, 1,024 completion tokens, finish reason `length`, 28.8 s |
+
+The test asserts `pp_max_linf_1.5x` and `pp_max_l2_1.5x` on every prompt; both were 2/2 in `[1-9216]` and in `[4-9216]` in this run.
+
+Engine start (profile, KV cache, warmup) took 205.40 s (compilation 198.15 s)
+in `[1-9216]`, 232.21 s (compilation 225.08 s) in `[4-9216]` and 234.26 s
+(compilation 229.25 s) for `vllm serve`. The HF reference (FP32 and BF16) of
+`[1-9216]` took 385.38 s; `[4-9216]` read it from the golden cache.
+
+#### Logit validation
+
+| Case | Prompt | Overall Status | Max K5 (0.03) | Max K50 (0.05) | Max K1000 (0.08) | Max All (0.09) | Argmax divergence (1 ULP) |
+|---|---|---|---|---|---|---|---|
+| `[1-9216]` | 1 of 2, prose, `Section 1. Tropical rainforests …` | PASSED | 0.0131 at token 6 | 0.0132 at token 8 | 0.0327 at token 8 | 0.0463 at token 8 | 0.0000 |
+| `[1-9216]` | 2 of 2, code, `"""Helpers for lists of numbers. …` | PASSED | 0.0057 at token 4 | 0.0126 at token 2 | 0.0126 at token 2 | 0.0145 at token 4 | 0.0000 |
+| `[4-9216]` | 1 of 2, prose, `Section 1. Tropical rainforests …` | PASSED | 0.0152 at token 6 | 0.0152 at token 6 | 0.0266 at token 6 | 0.0237 at token 6 | 0.0000 |
+| `[4-9216]` | 2 of 2, code, `"""Helpers for lists of numbers. …` | PASSED | 0.0053 at token 7 | 0.0093 at token 5 | 0.0106 at token 6 | 0.0151 at token 4 | 0.0000 |
+
+Neuron vs CPU BF16 reference; token = generated token. `[4-9216]`: positions
+of batch row 0; each of the 4 rows printed the same per-row maxima. No argmax
+divergence.
+`[1-9216]`: two-way validation 2/2 prompts (`multi_prompt_logit_validation`);
+aggregate σ-ratio 0.9358 ≤ 1.0; `agg_bc` FAIL, `agg_l2_1.2x` FAIL,
+`agg_l2_1.5x` FAIL, `agg_linf_1.2x` FAIL, `agg_linf_1.5x` PASS; printed
+per-prompt checks: `pp_max_linf_1.5x` 2/2, `pp_max_linf_2.0x` 2/2,
+`pp_max_l2_1.5x` 2/2, `pp_max_l2_2.0x` 2/2, `pp_tok_linf_1.5x` 0/2,
+`pp_tok_linf_2.0x` 1/2, `pp_tok_l2_1.5x` 1/2, `pp_tok_l2_2.0x` 2/2,
+`pp_static_0.03` 1/2, `pp_static_0.05` 2/2.
+`[4-9216]`: two-way validation 2/2 prompts; aggregate σ-ratio 0.9180 ≤ 1.0;
+`agg_bc` FAIL, `agg_l2_1.2x` FAIL, `agg_l2_1.5x` PASS, `agg_linf_1.2x` FAIL,
+`agg_linf_1.5x` PASS; printed per-prompt checks: `pp_max_linf_1.5x` 2/2,
+`pp_max_linf_2.0x` 2/2, `pp_max_l2_1.5x` 2/2, `pp_max_l2_2.0x` 2/2,
+`pp_tok_linf_1.5x` 1/2, `pp_tok_linf_2.0x` 1/2, `pp_tok_l2_1.5x` 2/2,
+`pp_tok_l2_2.0x` 2/2, `pp_static_0.03` 2/2, `pp_static_0.05` 2/2.
+Per-token ratios over 1.5x: `[1-9216]` prompt 1 L-inf tokens 13 (1.56x) and
+14 (2.10x), L2 token 13 (1.53x), prompt 2 L-inf tokens 5 (1.78x) and 8
+(1.69x); `[4-9216]` row 0, prompt 1 L-inf tokens 13 (1.57x) and 14 (2.81x).
+
+Error against the FP32 reference, per prompt (max over the 16 generated
+tokens; `[4-9216]` prints batch row 0):
+
+| Case | Prompt | CPU BF16 L-inf | Neuron L-inf | Neuron / CPU BF16 | CPU BF16 L2 | Neuron L2 | Neuron / CPU BF16 |
+|---|---|---|---|---|---|---|---|
+| `[1-9216]` | 1 of 2 | 0.0228 | 0.0322 | 1.41x | 0.0390 | 0.0329 | 0.84x |
+| `[1-9216]` | 2 of 2 | 0.0152 | 0.0128 | 0.84x | 0.0215 | 0.0208 | 0.97x |
+| `[4-9216]` | 1 of 2 | 0.0228 | 0.0236 | 1.04x | 0.0390 | 0.0351 | 0.90x |
+| `[4-9216]` | 2 of 2 | 0.0152 | 0.0101 | 0.66x | 0.0215 | 0.0180 | 0.84x |
+
+Generated token of each Neuron maximum: `[1-9216]` prompt 1 L-inf and L2
+token 8; prompt 2 L-inf token 15, L2 token 1. `[4-9216]` prompt 1 L-inf and
+L2 token 3; prompt 2 L-inf token 2, L2 token 8.
+
+#### Serve smoke
+
+`/v1/completions`, `temperature` 0, `max_tokens` 32; first 60 characters of each output as a Python string literal. The 8k-token request: `max_tokens` 1024, `temperature` 0, `ignore_eos`.
+
+| Prompt | Output |
+|---|---|
+| `The capital of France is` | `' Paris. It is the largest city in France. It is located on t'` |
+| `1, 2, 3, 4, 5,` | `' 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16'` |
+| `def fibonacci(n):` | `' \n    if n<0: \n        print("Incorrect input") \n    # First'` |
+| Synthetic ledger document, 295 records, 8,173 tokens | `'Okay, here is a detailed report summarizing the trade ledger'` |
+
+### Exceptions
+
+- **Informational checks that did not pass.** `pp_tok_linf_1.5x` 0/2 in
+  `[1-9216]` and 1/2 in `[4-9216]`, `pp_tok_linf_2.0x` 1/2 in both cases,
+  `pp_tok_l2_1.5x` 1/2 and `pp_static_0.03` 1/2 in `[1-9216]`, `agg_bc`,
+  `agg_l2_1.2x` and `agg_linf_1.2x` FAIL in both cases, `agg_l2_1.5x` FAIL in
+  `[1-9216]` (see Logit validation). The test asserts `result.passed`,
+  `pp_max_linf_1.5x` and `pp_max_l2_1.5x`.
+- **Logits validated for 16 generated tokens per prompt.** The 1,024
+  generated tokens of the 8k-token serve request are not compared with a
+  reference; the end of that output repeats `Stored, Sold, Repaired,`.
+- **Full-vocabulary `generate_fn`.** The test packs logits with its own
+  `_full_vocab_generate_fn` instead of the plugin's
+  `create_offline_vllm_generate_fn`, because the model scores 151552 ids and
+  the tokenizer has 151329 base tokens, and it sets `ignore_eos`; see the
+  function's docstring. The comparison and the tolerance map are the plugin's.
+- Flash-attention (single-step) prefill on device, prefix caching, context
+  beyond 9,216 tokens, batch sizes other than 1 and 4, tensor parallel sizes
+  other than 8 on device, speculative decoding and Trn3 are not tested.
