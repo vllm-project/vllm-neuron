@@ -5766,10 +5766,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 ctx_for_blocks + dcp_block_size - 1
             ) // dcp_block_size
             # Match upstream's TRTLLM alignment (vLLM PR #39324): InputBatch
-            # block_table width is rounded up to a multiple of 128/block_size.
-            # Prefill doesn't trim at runtime so warmup must use the aligned
-            # width. Decode with ctx-length buckets trims back below.
-            alignment = 128 // block_size if block_size <= 128 else 1
+            # block_table width is rounded up to a multiple of
+            # 128 / gcd(128, block_size) (``get_block_table_width``). Prefill
+            # doesn't trim at runtime so warmup must use the aligned width.
+            # Decode with ctx-length buckets trims back below. The gcd matters
+            # for block sizes that are not powers of 2, which hybrid models get
+            # from _align_hybrid_block_size (Qwen3.5-27B: 800 -> alignment 4).
+            alignment = 128 // math.gcd(128, block_size)
             max_num_blocks_per_req = (
                 (max_num_blocks_per_req + alignment - 1) // alignment * alignment
             )
