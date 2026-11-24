@@ -17,7 +17,7 @@ MiniCPM3 uses multi-head latent attention (MLA):
     k        = [k_nope, k_pe]           k_pe is shared by all heads
     q_rope, k_pe get RoPE (rotate_half, LongRoPE frequencies)
 
-This port maps MLA onto the standard fused Neuron attention kernels:
+This implementation maps MLA onto the standard fused Neuron attention kernels:
 
 1. A replicated "latent" projection (NF.qkv_proj) computes
    [latent_q, c, k_pe] from x in one matmul. The torch code applies the two
@@ -34,9 +34,11 @@ This port maps MLA onto the standard fused Neuron attention kernels:
    zero rows at the pad channels. The softmax scale stays
    (qk_nope + qk_rope) ** -0.5.
 
-Prefill uses NF.qkv_proj, NF.flash_attention (or NF.segmented_attention) and
-NF.o_proj. Decode uses the fused NF.attention_decode megakernel with a
-per-head block table, as in Qwen3-VL.
+Prefill uses NF.qkv_proj, NF.o_proj and either NF.flash_attention (one-shot
+prefill) or NF.segmented_attention (when the runner sets a KV segment size,
+for example for chunked prefill: the queries of a chunk also attend to the KV
+cache that the earlier chunks wrote). Decode uses the fused
+NF.attention_decode megakernel with a per-head block table, as in Qwen3-VL.
 
 ANNOTATION GUIDE:
   # >>> PARALLELISM: ... <<<   Reusable parallelism code.
@@ -176,7 +178,7 @@ def minicpm3_head_layout(config: MiniCPM3Config) -> MiniCPM3HeadLayout:
     if d_head > _PMAX:
         raise ValueError(
             f"The padded MLA head dim ({d_head}) is larger than {_PMAX}. "
-            f"This port supports qk_nope_head_dim + qk_rope_head_dim <= 128."
+            f"This implementation supports qk_nope_head_dim + qk_rope_head_dim <= 128."
         )
 
     # The server builds the model under a meta device context. Put the index

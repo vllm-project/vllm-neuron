@@ -9,9 +9,9 @@ MiniCPM3 uses multi-head latent attention (MLA) with low-rank Q and KV
 projections, LongRoPE on the rotary part of each head, and muP scaling of the
 embeddings, the residual branches and the logits.
 
-The HF config sets ``head_dim`` to the rotary head dimension (32). This port
-does not use ``head_dim``. It uses ``qk_nope_head_dim``, ``qk_rope_head_dim``
-and ``v_head_dim``.
+The HF config sets ``head_dim`` to the rotary head dimension (32). This
+implementation does not use ``head_dim``. It uses ``qk_nope_head_dim``,
+``qk_rope_head_dim`` and ``v_head_dim``.
 """
 
 import json

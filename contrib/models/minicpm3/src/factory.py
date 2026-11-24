@@ -82,7 +82,8 @@ class MiniCPM3ForCausalLM(nn.Module):
                 f"Set --dtype bfloat16."
             )
 
-        # This port needs a low-rank Q projection (q_a_proj and q_b_proj).
+        # The fused MLA weights need a low-rank Q projection (q_a_proj and
+        # q_b_proj).
         if getattr(hf_config, "q_lora_rank", 768) is None:
             raise ValueError(
                 "MiniCPM3 on Neuron needs q_lora_rank. A checkpoint without the "

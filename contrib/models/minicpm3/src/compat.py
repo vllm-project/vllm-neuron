@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Helpers this model needs that vLLM Neuron 0.29.0.1.2.0 does not ship.
+"""Helpers this model needs that vLLM Neuron 0.29.0.1.2.0 does not provide.
 
-They are copied unchanged from a later vLLM Neuron release, so the model
-runs on the 0.29 plugin as installed. 0.29 has no
-``vllm_neuron.model.config_utils`` and no ``build_per_head_block_table`` in
-``vllm_neuron.model.kv_cache``.
+* ``hoist_rope_parameters`` reads the RoPE settings that transformers 5 keeps
+  under ``rope_parameters`` back into the ``rope_theta`` and ``rope_scaling``
+  fields of ``MiniCPM3Config`` (``config.py``).
+* ``build_per_head_block_table`` builds the per-head block table that the
+  fused decode kernel reads (``model.py``); ``vllm_neuron.model.kv_cache``
+  provides the per-head slot mapping but not this table.
+
+Keeping them here lets the model run on the installed 0.29 plugin without
+changes to it.
 """
 
 import logging

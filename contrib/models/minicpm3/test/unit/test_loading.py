@@ -6,7 +6,8 @@ Coverage:
     factory through ``src/plugin.py`` (the ``pyproject.toml`` entry point) and
     through a direct ``ModelRegistry.register_model`` call, and the factory
     satisfies vLLM 0.29's model protocol.
-  - The factory rejects the configurations that the port does not implement.
+  - The factory rejects the configurations that this implementation does not
+    support.
   - Config parse and padded MLA head layout of MiniCPM3-4B.
   - RoPE buffers: finite CPU buffers under a meta-device build, and LongRoPE
     values against an independent FP64 formula.
@@ -222,7 +223,7 @@ def test_rotary_buffers_under_meta_context():
     scaling = raw["rope_scaling"]
     rope = raw["qk_rope_head_dim"]
     half = rope // 2
-    # The checkpoint gives no rope_theta. The original MiniCPM3 code and
+    # The checkpoint gives no rope_theta. The checkpoint's remote code and
     # transformers then use the base 10000.
     theta = raw.get("rope_theta", 10000.0)
     assert cfg.rope_theta == theta
@@ -382,7 +383,7 @@ def test_load_sharded_from_torch_bin(tmp_path):
 
 
 def _fused_attention_fp32(checkpoint: str, h: torch.Tensor) -> torch.Tensor:
-    """Run layer LAYER_IDX attention with the fused port weights in FP32 torch."""
+    """Run layer LAYER_IDX attention with this folder's fused weights in FP32 torch."""
     model = src_module("model")
 
     cfg = U.neuron_model_config(U.load_hf_config(checkpoint))

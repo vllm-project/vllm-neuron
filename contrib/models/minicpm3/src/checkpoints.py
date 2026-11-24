@@ -6,11 +6,12 @@ The published MiniCPM3-4B checkpoint ships one ``pytorch_model.bin`` and no
 0.29.0.1.2.0 (``vllm_neuron/utils/checkpoints.py``) reads only
 ``.safetensors`` files, so it cannot load this checkpoint.
 
-This module is that 0.29 file with one change from a later vLLM Neuron
-release: when a checkpoint has no ``.safetensors`` file,
-``SafetensorsCheckpoint`` uses its ``pytorch_model*.bin`` files. It opens them
-with ``torch.load(mmap=True, weights_only=True)`` and gives each weight loader
-a lazy ``SliceView`` of each tensor, so the sharding, fusion and pipelining
+Apart from lint fixes (``%``-style logging arguments, an unused loop
+variable), this module is that 0.29 file with one change: when a checkpoint
+has no ``.safetensors`` file, ``SafetensorsCheckpoint`` uses its
+``pytorch_model*.bin`` files. It opens them with
+``torch.load(mmap=True, weights_only=True)`` and gives each weight loader a
+lazy ``SliceView`` of each tensor, so the sharding, fusion and pipelining
 code is the same as for a safetensors file. ``weights_only=True`` refuses a
 pickle that holds anything other than tensors and plain containers.
 
