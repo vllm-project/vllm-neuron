@@ -277,7 +277,110 @@ worker pool at the end of the session.
 
 ## Validation report
 
-The validation report for the 9216-token configuration (8k-token prompts,
-batch 1 and 4, TP 16 with expert parallelism) is pending. It will be filled in
-from the device results of `test/integration/test_model.py` and of the serve
-example above.
+### vLLM Neuron 0.29.0.1.2.0 (2026-11-24)
+
+#### Environment
+
+| Image | Instance | TP | vLLM | vllm-neuron | torch | transformers | neuronx-cc |
+|---|---|---|---|---|---|---|---|
+| `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04` | `trn2.48xlarge` (LNC 2), 1 node | 16, expert parallelism over the same 16 ranks | 0.29.0 | 0.29.0.1.2.0 | 2.13.0 | 5.17.0 | 2.28.7631.0+8f7b0cf5 |
+
+Checkpoint of the integration test: `Qwen/Qwen3-30B-A3B` at
+`ad44e777bcd18fa416d9da3bd8f70d33ebb85d39`.
+
+#### Results
+
+| Test | Configuration | Result |
+|---|---|---|
+| CPU unit tests, `test/unit/` | `VLLM_NEURON_CPU_MODE=1` | 14 passed, 0 failed |
+| `test_model_accuracy[1-9216]` | TP 16 with `enable_expert_parallel` (8 experts per rank), `neuron_native`, BF16, batch 1, max model length 9,216, segmented prefill (bucket 2,048, KV segment 2,048), 2 prompts of 8,000 to 8,192 tokens × 16 greedy tokens, on-device greedy sampling | PASSED (451.339 s, including the HF reference) on aggregate σ-ratio 0.9410 ≤ 1.0; static per-prompt bounds 0/2 (below); no argmax divergence |
+| `test_model_accuracy[4-9216]` | TP 16 with `enable_expert_parallel` (8 experts per rank), `neuron_native`, BF16, batch 4 (each prompt in 4 rows), max model length 9,216, segmented prefill (bucket 2,048, KV segment 2,048), 2 prompts of 8,000 to 8,192 tokens × 16 greedy tokens, on-device greedy sampling | PASSED (276.765 s) on aggregate σ-ratio 0.9393 ≤ 1.0; static per-prompt bounds 0/2 (below); no argmax divergence |
+| `vllm serve` smoke | The Usage command (with `--revision`), installed with `pip install --no-deps -e contrib/models/qwen3_moe` | Passed: 3/3 prompts, 32 completion tokens each; a batched request of all 3 at `max_tokens` 16 returned a prefix of each |
+| `vllm serve` 8k-token request | Same server; one `/v1/completions` request with a deterministic synthetic ledger document (258 numbered records), measured with the server's `/tokenize` endpoint; `max_tokens` 1024, `temperature` 0, `ignore_eos` | Passed: 8,171 prompt tokens, 1,024 completion tokens, finish reason `length`, 28.6 s |
+
+The test asserts `pp_max_linf_1.5x` and `pp_max_l2_1.5x` on every prompt; both were 2/2 in `[1-9216]` and in `[4-9216]` in this run.
+
+Engine start (profile, KV cache, warmup) took 122.11 s (compilation 116.44 s)
+in `[1-9216]`, 115.84 s (compilation 110.23 s) in `[4-9216]` and 117.46 s
+(compilation 111.25 s) for `vllm serve`. The HF reference (FP32 and BF16) of
+`[1-9216]` took 251.34 s; `[4-9216]` read it from the golden cache.
+
+#### Logit validation
+
+| Case | Prompt | Overall Status | Max K5 (0.03) | Max K50 (0.05) | Max K1000 (0.08) | Max All (0.09) | Argmax divergence (1 ULP) |
+|---|---|---|---|---|---|---|---|
+| `[1-9216]` | 1 of 2, prose, `Section 1. Coral reefs …` | FAILED | 0.0395 (> 0.03) at token 5 | 0.0395 at token 5 | 0.0503 at token 2 | 0.0699 at token 2 | 0.0000 |
+| `[1-9216]` | 2 of 2, code, `"""Helpers for lists of numbers. …` | FAILED | 0.0477 (> 0.03) at token 10 | 0.0576 (> 0.05) at token 12 | 0.0576 at token 12 | 0.0653 at token 10 | 0.0000 |
+| `[4-9216]` | 1 of 2, prose, `Section 1. Coral reefs …` | FAILED | 0.0395 (> 0.03) at token 5, all 4 rows | 0.0395 at token 5 | 0.0503 at token 2 | 0.0699 at token 2 | 0.0000 |
+| `[4-9216]` | 2 of 2, code, `"""Helpers for lists of numbers. …` | FAILED | 0.0477 (> 0.03) at token 10, row 0 | 0.0576 (> 0.05) at token 12, row 0 | 0.0579 at token 12, row 1 | 0.0663 at token 10, row 2 | 0.0000 |
+
+Neuron vs CPU BF16 reference; token = generated token, row = batch row.
+Tokens over a bound in `[1-9216]`: prompt 1 tokens 5 (K5 0.0395) and 11 (K5
+0.0342), prompt 2 tokens 2, 7, 10, 12 and 13; in `[4-9216]` the same tokens in
+each of the 4 rows. No argmax divergence.
+Both cases passed on the aggregate σ-ratio, 0.9410 (`[1-9216]`) and 0.9393
+(`[4-9216]`) ≤ 1.0 (`multi_prompt_logit_validation`: two-way validation 0/2
+prompts in both cases), and on the asserted `pp_max_linf_1.5x` and
+`pp_max_l2_1.5x`. Printed checks, the same in both cases: `agg_bc` FAIL,
+`agg_l2_1.2x` FAIL, `agg_l2_1.5x` FAIL, `agg_linf_1.2x` FAIL, `agg_linf_1.5x`
+FAIL; per-prompt `pp_max_linf_1.5x` 2/2, `pp_max_linf_2.0x` 2/2,
+`pp_max_l2_1.5x` 2/2, `pp_max_l2_2.0x` 2/2, `pp_tok_linf_1.5x` 0/2,
+`pp_tok_linf_2.0x` 0/2, `pp_tok_l2_1.5x` 0/2, `pp_tok_l2_2.0x` 0/2,
+`pp_static_0.03` 0/2, `pp_static_0.05` 0/2.
+Per-token ratios over 1.5x: prompt 1 L-inf tokens 0 (1.69x), 2 (1.75x), 5
+(2.64x) and 6 (1.73x), L2 tokens 2 (1.74x), 5 (2.15x) and 6 (1.93x); prompt 2
+L-inf token 7 (2.63x), L2 token 7 (2.17x).
+
+Error against the FP32 reference, per prompt (max over the 16 generated
+tokens; `[4-9216]` prints batch row 0, with the same values as `[1-9216]`):
+
+| Case | Prompt | CPU BF16 L-inf | Neuron L-inf | Neuron / CPU BF16 | CPU BF16 L2 | Neuron L2 | Neuron / CPU BF16 |
+|---|---|---|---|---|---|---|---|
+| `[1-9216]` | 1 of 2 | 0.0793 | 0.0673 | 0.85x | 0.0890 | 0.0700 | 0.79x |
+| `[1-9216]` | 2 of 2 | 0.0869 | 0.0581 | 0.67x | 0.2628 | 0.2712 | 1.03x |
+| `[4-9216]` | 1 of 2 | 0.0793 | 0.0673 | 0.85x | 0.0890 | 0.0700 | 0.79x |
+| `[4-9216]` | 2 of 2 | 0.0869 | 0.0581 | 0.67x | 0.2628 | 0.2712 | 1.03x |
+
+Generated token of each maximum: prompt 1 CPU BF16 L-inf and L2 token 11,
+Neuron L-inf token 2, Neuron L2 token 15; prompt 2 CPU BF16 L-inf and L2
+token 13, Neuron L-inf token 4, Neuron L2 token 12.
+
+#### Serve smoke
+
+`/v1/completions`, `temperature` 0, `max_tokens` 32; first 60 characters of each output as a Python string literal. The 8k-token request: `max_tokens` 1024, `temperature` 0, `ignore_eos`.
+
+| Prompt | Output |
+|---|---|
+| `The capital of France is` | `' Paris. The capital of the United Kingdom is London. The cap'` |
+| `1, 2, 3, 4, 5,` | `' 6, 7, 8, 9, 10, 11, 12, 13, 14,'` |
+| `def fibonacci(n):` | `'\n    if n <= 0:\n        return 0\n    elif n == 1:\n        re'` |
+| Synthetic ledger document, 258 records, 8,171 tokens | `' \n\nOkay, I need to create a detailed report summarizing the '` |
+
+### Exceptions
+
+- **All four prompt-runs are outside the static per-prompt bounds** (K5
+  0.03 for both prompts, K50 0.05 for prompt 2). Both integration cases
+  passed on the aggregate σ-ratio and on the asserted `pp_max_linf_1.5x` and
+  `pp_max_l2_1.5x` (see Logit validation).
+- **Informational checks that did not pass**, in both cases:
+  `pp_tok_linf_1.5x`, `pp_tok_linf_2.0x`, `pp_tok_l2_1.5x`, `pp_tok_l2_2.0x`,
+  `pp_static_0.03` and `pp_static_0.05` 0/2; `agg_bc`, `agg_l2_1.2x`,
+  `agg_l2_1.5x`, `agg_linf_1.2x` and `agg_linf_1.5x` FAIL. The test asserts
+  `result.passed`, `pp_max_linf_1.5x` and `pp_max_l2_1.5x`.
+- **Logits validated for 16 generated tokens per prompt.** The 1,024
+  generated tokens of the 8k-token serve request are not compared with a
+  reference; the end of that output lists ledger records
+  (`Record 46: Lisbon, counted 464 copper wire, new scale. Record 47: …`).
+- **Full-vocabulary `generate_fn`.** The test packs logits with its own
+  `_full_vocab_generate_fn` instead of the plugin's
+  `create_offline_vllm_generate_fn`, because the model scores 151936 ids and
+  the tokenizer has 151669 tokens, maps the token strings of the ids past the
+  tokenizer to `""`, and sets `ignore_eos`; see the function's docstring. The
+  comparison and the tolerance map are the plugin's.
+- **The NKI-or-PyTorch path of each op on device is not recorded** in the
+  logs. In vLLM Neuron 0.29.0.1.2.0 the prefill router (`NF.router`) runs its
+  PyTorch path.
+- Flash-attention (single-step) prefill on device, TP 16 without expert
+  parallelism and other tensor parallel sizes on device, context beyond 9,216
+  tokens, batch sizes other than 1 and 4, prefix caching, speculative
+  decoding, data parallelism and Trn3 are not tested.
