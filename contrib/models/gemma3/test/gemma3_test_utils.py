@@ -107,7 +107,7 @@ def hf_config_from_dict(config_dict: dict):
     return Gemma3TextConfig.from_dict(copy.deepcopy(config_dict))
 
 
-def port_config(hf_config):
+def src_config(hf_config):
     """Return the ``src/`` config for ``hf_config``."""
     from vllm_neuron.model.neuron_config import NeuronConfig
 

@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""KV cache helpers this model needs that vLLM Neuron 0.29.0.1.2.0 does not ship.
+"""KV cache helpers for the decode path with more than one KV head per rank.
 
-``vllm_neuron.model.kv_cache`` in 0.29 has ``paged_slot_indices`` but not
-``build_per_head_block_table`` or ``scatter_new_kv``. They are copied unchanged
-from a later vLLM Neuron release, so the model runs on the 0.29 plugin as
-installed. The decode path uses them when a rank holds more than one KV head
-(TP 1, 2 or 4 for the 8 KV heads of rnj-1).
+``build_per_head_block_table`` builds the per-head 3D block table that the
+fused decode kernel takes when a rank holds more than one KV head, and
+``scatter_new_kv`` writes the new K/V of every head into the paged cache.
+vLLM Neuron 0.29.0.1.2.0 has the same two functions inside its Qwen3-VL model
+package (``vllm_neuron/model/qwen3_vl/utils/decode_kv.py``), not in the
+shared ``vllm_neuron.model.kv_cache`` module. This folder keeps its own copy,
+so that it does not import another model's internals. The decode path uses
+them when a rank holds more than one KV head (TP 1, 2 or 4 for the 8 KV heads
+of rnj-1).
 """
 
 import torch

@@ -20,7 +20,7 @@ same classes.
 
 Every test in this folder reaches the implementation through this module.
 ``test/conftest.py`` puts this directory on ``sys.path`` so that
-``test/unit``, ``test/module`` and ``test/integration`` can all import it.
+``test/unit`` and ``test/integration`` can both import it.
 """
 
 from __future__ import annotations

@@ -42,7 +42,7 @@ from gemma3_test_utils import (
     TINY_CONFIG,
     hf_config_from_dict,
     make_tiny_checkpoint,
-    port_config,
+    src_config,
 )
 
 FOLDER = Path(__file__).resolve().parents[2]
@@ -162,7 +162,7 @@ def test_config_parse(tmp_path):
     # derives the layer types from sliding_window_pattern (1: all full).
     assert hf_config.rope_parameters["full_attention"]["rope_type"] == "yarn"
     assert hf_config.layer_types == ["full_attention"] * NUM_LAYERS
-    _check_rnj1_fields(port_config(hf_config))
+    _check_rnj1_fields(src_config(hf_config))
 
     Gemma3Config = src_module("config").Gemma3Config
     path = tmp_path / "config.json"
@@ -230,7 +230,7 @@ def test_yarn_rotary_matches_hf():
     """The YaRN inverse frequencies, scale and cos/sin tables match HF in fp32."""
     model = src_module("model")
     hf_config = hf_config_from_dict(REAL_CONFIG)
-    cfg = port_config(hf_config)
+    cfg = src_config(hf_config)
     hf_cos, hf_sin, hf_inv, hf_scale = _hf_rotary(hf_config, _POSITIONS)
 
     inv, scale = model.compute_rope_inv_freq(cfg)
@@ -262,7 +262,7 @@ def test_yarn_rotary_builds_on_meta():
     """
     model = src_module("model")
     hf_config = hf_config_from_dict(REAL_CONFIG)
-    cfg = port_config(hf_config)
+    cfg = src_config(hf_config)
     hf_cos, hf_sin, hf_inv, _ = _hf_rotary(hf_config, _POSITIONS)
 
     with torch.device("meta"):
@@ -321,7 +321,7 @@ def test_weight_mapping_coverage(monkeypatch, tmp_path):
     # The mapping keys are the parameter names of the model at TP 8. The RoPE
     # table is a buffer, so it needs no mapping.
     _patch_tp_group(monkeypatch, 8, 0)
-    cfg = port_config(hf_config)
+    cfg = src_config(hf_config)
     with torch.device("meta"):
         full = model.Gemma3ForCausalLM(cfg)
     assert {n for n, _ in full.named_parameters()} == set(mappings)
@@ -340,7 +340,7 @@ def test_weight_mapping_coverage(monkeypatch, tmp_path):
 def test_per_rank_shapes(monkeypatch, world_size):
     """The head split, the weight shapes and the KV spec at TP 8 and TP 16."""
     model = src_module("model")
-    cfg = port_config(hf_config_from_dict(REAL_CONFIG))
+    cfg = src_config(hf_config_from_dict(REAL_CONFIG))
     _patch_tp_group(monkeypatch, world_size, 0)
     with torch.device("meta"):
         full = model.Gemma3ForCausalLM(cfg)
@@ -375,7 +375,7 @@ def test_weight_loader_transforms(monkeypatch):
     from vllm_neuron.utils.weight_loader import get_weight_loader
 
     model = src_module("model")
-    cfg = port_config(hf_config_from_dict(REAL_CONFIG))
+    cfg = src_config(hf_config_from_dict(REAL_CONFIG))
     # A reduced hidden size keeps the random tensors small. The head layout
     # stays the rnj-1 one (32 Q heads, 8 KV heads, head_dim 128).
     cfg.hidden_size = 256
@@ -429,9 +429,7 @@ def test_weight_loader_transforms(monkeypatch):
         # embedding (128256 divides by 8 and by 16, so there is no padding).
         _patch_tp_group(monkeypatch, world_size, 0)
         with torch.device("meta"):
-            full = model.Gemma3ForCausalLM(
-                port_config(hf_config_from_dict(REAL_CONFIG))
-            )
+            full = model.Gemma3ForCausalLM(src_config(hf_config_from_dict(REAL_CONFIG)))
         for rank in (0, world_size - 1):
             got = load(full.lm_head.weight, [embed], rank)
             want = embed[rank * vocab_shard : (rank + 1) * vocab_shard]
