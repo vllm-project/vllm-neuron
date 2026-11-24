@@ -1,16 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """MiniCPM3 component and full-model tests (CPU mode, MPExecutor).
 
-These are the port's CPU component tests: layer-0 attention and MLP at the
-port's TP 4, and the full model at the TP size of the integration test (8
-ranks, 5 attention heads on each rank). They run on random-weight checkpoints
-with the real MiniCPM3-4B geometry, so nothing is downloaded. The independent reference is the MiniCPM3
-implementation built into ``transformers``; each check is three-way (FP32 HF
-baseline, BF16 HF reference, this port).
+Layer-0 attention and MLP run at TP 4, and the full model runs at the TP size
+of the integration test (8 ranks, 5 attention heads on each rank). The tests
+use random-weight checkpoints with the real MiniCPM3-4B geometry, so nothing
+is downloaded. The independent reference is the MiniCPM3 implementation built
+into ``transformers``; each check is three-way (FP32 HF baseline, BF16 HF
+reference, this folder's implementation).
 
 Coverage:
   - Attention prefill of 128 tokens, then 8 decode steps that read the paged
     KV cache that the prefill and the earlier steps wrote (TP 4).
+  - Attention chunked prefill: 1,536 tokens in three 512-token chunks through
+    the segmented-prefill branch (``NF.segmented_attention``, its torch
+    fallback on CPU). Each chunk attends to the KV cache that the earlier
+    chunks wrote (TP 4). The integration test and the serving configuration
+    prefill long prompts this way, in 2,048-token chunks.
   - MLP prefill (sequence-parallel reduce-scatter) and decode (all-reduce)
     (TP 4).
   - Full model with 2 layers at TP 8: ``load_weights`` (the vLLM path, which
@@ -44,8 +49,8 @@ pytestmark = pytest.mark.skipif(
 DEVICE = "cpu"
 # The full model runs at the integration TP size (8 ranks, 5 heads on each).
 WORLD_SIZE = U.WORLD_SIZE
-# The layer-0 attention and MLP checks run at TP 4, the topology of the port's
-# CPU component tests. On CPU each rank's partial output is rounded to BF16 and
+# The layer-0 attention and MLP checks run at TP 4. On CPU each rank's partial
+# output is rounded to BF16 and
 # the gloo all-reduce / reduce-scatter adds the partials in BF16, so this
 # rounding grows with the rank count; with 8 ranks it alone takes a single
 # layer's error past the three-way bound (the BF16 HF reference does one FP32
@@ -59,6 +64,11 @@ ATTN_DECODE_STEPS = 8
 ATTN_SEQ_LEN = 128 + ATTN_DECODE_STEPS
 BLOCK_SIZE = 32
 ATTN_NUM_BLOCKS = 8
+# Chunked prefill: three chunks of 512 tokens, the smallest KV segment size of
+# the segmented-prefill kernel. 48 blocks of 32 tokens hold the 1,536 tokens.
+CHUNK_TOKENS = 512
+CHUNKED_SEQ_LEN = 3 * CHUNK_TOKENS
+CHUNKED_NUM_BLOCKS = CHUNKED_SEQ_LEN // BLOCK_SIZE
 MLP_TOKENS = 128
 MLP_DECODE_TOKENS = 4
 # Full model: a prefill of 32 tokens, then a decode at position 32.
@@ -111,6 +121,38 @@ def test_attention_prefill_decode(two_layer_checkpoint):
             expected=[goldens["bf16"][i : i + 1] for i in steps],
             actual=outputs,
             name=f"minicpm3/attn_decode/pos{n}-{ATTN_SEQ_LEN - 1}/tp{world_size}/rank{rank}",
+        )
+
+
+def test_attention_chunked_prefill(two_layer_checkpoint):
+    """Attention prefill of 1,536 tokens in three 512-token segmented chunks."""
+    world_size = COMPONENT_WORLD_SIZE
+    checkpoint = two_layer_checkpoint
+    goldens = U.hf_attention_reference(checkpoint, CHUNKED_SEQ_LEN, SEED)
+    executor = MPExecutor(
+        world_size=world_size,
+        model_load=partial(
+            U.attention_model_load, checkpoint, CHUNKED_NUM_BLOCKS, BLOCK_SIZE, DEVICE
+        ),
+        device=DEVICE,
+    )
+    chunks = U.run_attention_chunked_prefill(
+        executor,
+        checkpoint,
+        goldens["input"],
+        CHUNK_TOKENS,
+        CHUNKED_NUM_BLOCKS,
+        BLOCK_SIZE,
+    )
+    # One three-way check per chunk: the rows of chunk c attend to the
+    # c * 512 rows that the earlier chunks put in the KV cache.
+    for c, per_rank in enumerate(chunks):
+        rows = slice(c * CHUNK_TOKENS, (c + 1) * CHUNK_TOKENS)
+        assert_close_three_way(
+            baseline=goldens["fp32"][rows],
+            expected=goldens["bf16"][rows],
+            actual=torch.cat(per_rank, dim=0),
+            name=f"minicpm3/attn_chunked_prefill/chunk{c}/tp{world_size}",
         )
 
 

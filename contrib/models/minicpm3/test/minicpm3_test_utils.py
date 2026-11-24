@@ -45,8 +45,8 @@ HF_REVISION = "d6b14ddaefdb11c624dd75c3c779549bc90b08cb"
 ARCHITECTURE = "MiniCPM3ForCausalLM"
 CHECKPOINT_ENV = "MINICPM3_CHECKPOINT_PATH"
 
-# The topology of the integration test and of the recorded single-node device
-# runs: TP 8 on one trn2.48xlarge. 40 heads give 5 heads on each rank.
+# The topology of the integration test and of the serving configuration in
+# README.md: TP 8 on one trn2.48xlarge. 40 heads give 5 heads on each rank.
 WORLD_SIZE = 8
 # Finite wait for one MPExecutor collect.
 COLLECT_TIMEOUT_S = 1800
@@ -485,8 +485,16 @@ def attention_inputs(
     num_blocks: int,
     block_size: int,
     max_query_len: int,
+    kv_segment_size: int | None = None,
 ):
-    """Build (hidden, positions, cos, sin, attn_metadata) for tokens [start, start+n)."""
+    """Build (hidden, positions, cos, sin, attn_metadata) for tokens [start, start+n).
+
+    With ``kv_segment_size`` set, the metadata selects the segmented-prefill
+    attention, as the vLLM Neuron model runner sets it for each prefill chunk
+    when ``kv_segment_size_buckets`` is configured: ``cached_seq_len`` is a
+    ``[1, 1]`` int32 tensor that holds ``start``, the number of tokens that the
+    earlier chunks wrote to the KV cache.
+    """
     model = src_module("model")
 
     config = neuron_model_config(load_hf_config(checkpoint))
@@ -504,6 +512,11 @@ def attention_inputs(
             "kv_segment_size": None,
         }
     }
+    if kv_segment_size is not None:
+        metadata[f"layers.{LAYER_IDX}.self_attn"].update(
+            cached_seq_len=torch.tensor([[start]], dtype=torch.int32),
+            kv_segment_size=kv_segment_size,
+        )
     return hidden[start : start + num_tokens], positions, cos, sin, metadata
 
 
@@ -670,6 +683,42 @@ def run_attention_prefill_decode(
         for rank, out in enumerate(outputs):
             decode[rank].append(out)
     return prefill, decode
+
+
+def run_attention_chunked_prefill(
+    executor,
+    checkpoint: str,
+    hidden: torch.Tensor,
+    chunk_tokens: int,
+    num_blocks: int,
+    block_size: int,
+) -> list[list[torch.Tensor]]:
+    """Prefill all rows of ``hidden`` in chunks of ``chunk_tokens`` tokens.
+
+    Each chunk goes through the segmented-prefill attention with
+    ``kv_segment_size=chunk_tokens``, and its queries attend to the KV cache
+    that the earlier chunks wrote. Return, for each chunk, the per-rank outputs
+    (the sequence-parallel slices of the chunk, in rank order).
+    """
+    num_tokens = hidden.shape[0]
+    assert num_tokens % chunk_tokens == 0, (num_tokens, chunk_tokens)
+    chunks = []
+    for start in range(0, num_tokens, chunk_tokens):
+        executor.dispatch(
+            *attention_inputs(
+                checkpoint,
+                hidden,
+                start,
+                chunk_tokens,
+                num_blocks,
+                block_size,
+                chunk_tokens,
+                kv_segment_size=chunk_tokens,
+            ),
+            True,
+        )
+        chunks.append(executor.collect(timeout=COLLECT_TIMEOUT_S))
+    return chunks
 
 
 def run_mlp_prefill_decode(
