@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Helpers this model needs that vLLM Neuron 0.29.0.1.2.0 does not ship.
 
-They are copied unchanged from a later vLLM Neuron release, so the model
-runs on the 0.29 plugin as installed.
+This folder carries its own copies of them, so the model runs on the
+0.29.0.1.2.0 plugin as installed.
 """
 
 import logging

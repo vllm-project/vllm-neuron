@@ -4,7 +4,7 @@ Ouro BF16 Implementation
 ========================
 
 Implementation of ByteDance Ouro (a looped language model) for the Neuron
-backend. Adapted from the SmolLM3 and Qwen3-VL BF16 dense models.
+backend.
 
 Ouro differs from a Llama-style dense model in three ways:
 

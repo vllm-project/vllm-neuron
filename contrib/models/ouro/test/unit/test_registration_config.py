@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Ouro registration and config tests (CPU, no weights).
 
-1. ``test_plugin_register``: ``src/plugin.py``'s ``register()`` does what the
-   port's platform hook did. It registers the ``"ouro"`` model type with
-   ``AutoConfig`` and the ``OuroForCausalLM`` architecture with vLLM.
+1. ``test_plugin_register``: ``src/plugin.py``'s ``register()`` registers
+   the ``"ouro"`` model type with ``AutoConfig`` and the ``OuroForCausalLM``
+   architecture with vLLM.
 2. ``test_installed_plugin_resolves``: with ``src/`` importable as
    ``ouro_neuron`` (what ``pip install -e`` gives), vLLM resolves and inspects
    the lazy registration in a fresh interpreter, and the entry point in

@@ -43,19 +43,34 @@ each UT step.
 | Phase | Operation | Function |
 |---|---|---|
 | Prefill | QKV projection and RoPE | `NF.qkv_proj` |
-| Prefill | Attention, one segment | `NF.flash_attention` |
-| Prefill | Attention, prior cached KV | `NF.segmented_attention` |
+| Prefill | Attention, segmented prefill off | `NF.flash_attention` |
+| Prefill | Attention, segmented prefill on | `NF.segmented_attention` |
 | Prefill | Output projection | `NF.o_proj` |
 | Decode | QKV, RoPE, attention, output projection | `NF.attention_decode` |
 | Both | MLP | `NF.mlp` |
 | Both | Early-exit gate | `NF.router` (torch path, see below) |
+
+The model takes the segmented path whenever the attention metadata has a KV
+segment size. With `kv_segment_size_buckets` set (the configuration of the
+README and of the integration test), the runner gives one for every prefill
+chunk, so every chunk, the first one included, runs `NF.segmented_attention`,
+and each later chunk attends to the KV cache of the earlier ones.
+`NF.flash_attention` runs when segmented prefill is off, for example when
+`max_num_batched_tokens` is at least `max_model_len`. The integration test
+does not run it; the CPU component tests and the module test
+`test/module/test_components_device.py` cover it.
 
 `NF.router` has no kernel path at this time, so the early-exit gate runs as a
 torch matmul. The gate runs only at the sampling positions.
 
 ## Limits
 
-- Supported: bf16, TP, SP, DP. Text only.
+- Implemented: bf16, TP with sequence parallelism (SP) between the layers in
+  prefill, DP. Text only.
+- Exercised by the device integration test: TP 8, batch 1 and 4, maximum
+  model length 9216 with prompts of 8000-8192 tokens, 1024-token prefill
+  chunks with 1024-token KV segments. DP, other TP degrees, other chunk
+  sizes and longer contexts are not validated.
 - Not supported: `early_exit_step`, RoPE scaling, sliding window attention.
   The factory stops with an error for these configurations.
 - The KV memory is `total_ut_steps` times the memory of a model with

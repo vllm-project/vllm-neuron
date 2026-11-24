@@ -8,8 +8,8 @@ Three things live here:
   loader for this model's ``src/``), ``ouro_reference`` and
   ``ouro_test_utils``. pytest puts the directory of a test file on
   ``sys.path``, not the directory above it.
-* ``dist_cleanup`` destroys the default process group after a test, as the
-  port's own test files did.
+* ``dist_cleanup`` destroys the default process group after a test, so
+  that the next test can create its own.
 * ``_worker_pool_cleanup`` shuts down the plugin's ``MPExecutor`` worker pool
   at the end of the session.
 """
@@ -41,8 +41,7 @@ def _worker_pool_cleanup():
 
     ``MPExecutor`` keeps its worker processes in a module-level pool so later
     tests can reuse them. Those workers outlive the last test, so without this
-    shutdown pytest prints its summary and then never exits. The plugin's own
-    test suite shuts the pool down the same way.
+    shutdown pytest prints its summary and then never exits.
     """
     pid = os.getpid()
     yield

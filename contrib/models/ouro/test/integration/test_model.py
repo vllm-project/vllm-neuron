@@ -25,16 +25,36 @@ registration. That is the default for a Python script. Do not set
 ``pip install -e contrib/models/ouro`` the plugin entry point registers both
 in every process instead, and the test still works.
 
+Long prompts and chunked prefill
+--------------------------------
+Each case runs at a maximum model length of 9216 tokens (8192 prompt tokens
+plus 1024 generated tokens). The two prompts are built in this file from
+fixed text and cut to ``PROMPT_TOKENS`` tokens with the checkpoint's own
+tokenizer, so they are the same on every run; the test checks that each one
+re-tokenizes to 8000-8192 tokens. The first prompt is a story, ledger lines
+and the story again, and ends inside the second copy, so its continuation
+repeats text about 7800 tokens back. The second prompt is ledger lines with
+a short repeating pattern.
+
+Prefill runs in chunks of ``MAX_NUM_BATCHED_TOKENS`` tokens. With
+``kv_segment_size_buckets`` set, every chunk runs ``NF.segmented_attention``,
+and each chunk after the first attends to the KV cache that the earlier
+chunks wrote. This is the path that ``vllm serve`` takes for a long prompt
+with the flags in the README.
+
 Running
 -------
 The configuration below needs 8 NeuronCores on one trn2.48xlarge node:
 
     OURO_CHECKPOINT_PATH=/path/to/Ouro-1.4B \
     pytest contrib/models/ouro/test/integration/test_model.py \
-        -v -s --timeout=10800 > /tmp/test_output.txt 2>&1
+        -v -s --timeout=14400 > /tmp/test_output.txt 2>&1
 
 Without ``OURO_CHECKPOINT_PATH`` the test downloads the pinned revision from
-the Hugging Face Hub.
+the Hugging Face Hub. The reference logits run on the host CPU, once in FP32
+and once in BF16 for each of the two 8100-token prompts, which takes tens of
+minutes; the first case computes them and the second reads them from the
+golden cache.
 
 Logit validation
 ----------------
@@ -43,13 +63,12 @@ remote modeling code is written for an older transformers. The reference is
 therefore ``test/ouro_reference.py``: an independent torch implementation of
 the HF ``modeling_ouro.py`` rounding order that reads the safetensors
 weights directly. ``get_cached_reference_goldens`` runs it through
-``model_loader=`` (the same reference the port's device logit test used) and
-caches the logits: ``fp32_logits`` is the FP32 baseline, and
-``dtype_logits`` is a BF16 pass teacher-forced along the FP32 greedy sequence.
-``create_offline_vllm_generate_fn`` wraps the vLLM ``LLM`` so that it returns
-dense per-token logits, and ``multi_prompt_logit_validation`` compares the
-two. It flags any argmax divergence and any top-K logit error outside
-``TOL_MAP``.
+``model_loader=`` and caches the logits: ``fp32_logits`` is the FP32
+baseline, and ``dtype_logits`` is a BF16 pass teacher-forced along the FP32
+greedy sequence. ``create_offline_vllm_generate_fn`` wraps the vLLM ``LLM``
+so that it returns dense per-token logits, and
+``multi_prompt_logit_validation`` compares the two. It flags any argmax
+divergence and any top-K logit error outside ``TOL_MAP``.
 """
 
 import os
@@ -66,15 +85,103 @@ from ouro_test_utils import (
     resolve_ouro_checkpoint,
 )
 
-# Prompts to validate. The reference logits come from these same prompts, so
-# no expected text or logits are hard-coded here.
-PROMPTS = [
-    "The color of the sky is",
-    "A short summary of the history of the printing press:",
-]
+# Maximum model length of both cases: 8192 prompt tokens plus 1024 generated
+# tokens, the configuration of the serve command in the README.
+MAX_MODEL_LEN = 9216
+
+# Each prompt is cut to PROMPT_TOKENS tokens, and must re-tokenize to
+# MIN_PROMPT_TOKENS-MAX_PROMPT_TOKENS tokens. 8100 is not a multiple of the
+# 1024-token prefill chunk, so the last chunk of each prompt is a partial one.
+PROMPT_TOKENS = 8100
+MIN_PROMPT_TOKENS = 8000
+MAX_PROMPT_TOKENS = 8192
 
 # Number of tokens to decode and validate per prompt.
 OUTPUT_LENGTH = 16
+
+# Fixed text of the two prompts: a story and numbered ledger lines.
+_STORY = (
+    "The lighthouse on the northern cape was built from grey stone that the "
+    "people of the harbour town carried up the cliff path one cart at a time. "
+    "It took four summers to raise the tower, because the winter storms closed "
+    "the path every year from the first frost until the thaw. When the lamp "
+    "was lit for the first time, the whole town climbed the hill to watch the "
+    "beam sweep across the water, and the fishing boats that were still out at "
+    "sea turned toward it and came home safely before dark.\n\n"
+    "The first keeper was a carpenter named Tomas, who had helped to build the "
+    "stairs inside the tower. He kept a logbook on a shelf beside the lamp and "
+    "wrote in it every evening: the direction of the wind, the height of the "
+    "waves, the ships he had seen and the hour at which he had trimmed the "
+    "wick. Over thirty years he filled eleven books, and the town still keeps "
+    "them in a glass case in the library, next to the old map of the coast.\n\n"
+    "The lamp burned whale oil at first, and later paraffin. Every morning "
+    "Tomas polished the brass and cleaned the soot from the glass with a soft "
+    "cloth, because a dirty lens could halve the reach of the light. On clear "
+    "nights the beam could be seen from twenty miles away, and sailors said "
+    "that they could set their course by it as surely as by the north star.\n\n"
+    "In the great storm of the ninth winter, the wind broke two of the tower "
+    "windows and the rain put out the lamp twice before midnight. Each time, "
+    "Tomas climbed the stairs in the dark, dried the wick and lit it again. In "
+    "the morning the townspeople found him asleep at the top of the tower with "
+    "the logbook open on his knees. The last line read: light kept through the "
+    "night, no ships lost.\n\n"
+    "Today the lamp is electric and turns on by itself at sunset, but the town "
+    "still chooses a keeper every spring. The keeper walks up the cliff path "
+    "once a week, checks the windows and the stairs, and writes a short note "
+    "in a new logbook, so that the record that Tomas began has never been "
+    "broken."
+)
+
+# The ledger items cycle with period 7 and the shelf numbers with period 12.
+_LEDGER_ITEMS = ("lamp", "rope", "barrel", "ladder", "kettle", "anchor", "lantern")
+
+# Ledger lines between the two copies of the story in the first prompt. With
+# 385 lines the second copy starts at token 7795, so the 8100-token prompt
+# ends 305 tokens into it.
+_RECALL_LEDGER_LINES = 385
+
+
+def _ledger_lines(count: int) -> str:
+    return "\n".join(
+        f"Entry {i}: moved the {_LEDGER_ITEMS[i % len(_LEDGER_ITEMS)]} from "
+        f"shelf {i % 12} to shelf {(i + 1) % 12}."
+        for i in range(1, count + 1)
+    )
+
+
+def _recall_text() -> str:
+    """The story, ledger lines, then the story again.
+
+    The prompt ends inside the second copy of the story, so the next tokens
+    repeat text about 7800 tokens back, in the first prefill chunk.
+    """
+    return (
+        f"Chapter 1\n\n{_STORY}\n\nChapter 2\n\nStoreroom ledger\n\n"
+        f"{_ledger_lines(_RECALL_LEDGER_LINES)}\n\nChapter 3\n\n{_STORY}"
+    )
+
+
+def _ledger_text() -> str:
+    """600 ledger lines. The next tokens follow the pattern of the last lines."""
+    return "Storeroom ledger\n\n" + _ledger_lines(600)
+
+
+def _long_prompt(tokenizer, text: str) -> str:
+    """Return the first ``PROMPT_TOKENS`` tokens of ``text`` as a string."""
+    ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+    assert len(ids) > PROMPT_TOKENS, (
+        f"The source text has {len(ids)} tokens, fewer than {PROMPT_TOKENS}."
+    )
+    return tokenizer.decode(ids[:PROMPT_TOKENS])
+
+
+def _check_prompt_lengths(lengths: list[int], what: str) -> None:
+    for i, length in enumerate(lengths):
+        assert MIN_PROMPT_TOKENS <= length <= MAX_PROMPT_TOKENS, (
+            f"Prompt {i} {what} has {length} tokens, not "
+            f"{MIN_PROMPT_TOKENS}-{MAX_PROMPT_TOKENS}."
+        )
+
 
 # The bf16 dense-golden tolerance map of the template. The argmax (divergence)
 # lower bound stays strict at 1e-5 — a nonzero divergence is a real
@@ -92,12 +199,13 @@ TOL_MAP = {
 # reference for the same prompt.
 PER_PROMPT_CHECKS = ("pp_max_linf_1.5x", "pp_max_l2_1.5x")
 
-# The tensor parallel degree of the port's device tests. 16 Q/KV heads give 2
-# of each to each rank.
+# TP 8 on one trn2.48xlarge. 16 Q/KV heads give 2 of each to each rank.
 TENSOR_PARALLEL_SIZE = 8
 
-# The batched-token limit and prefill bucket of the port's device tests.
+# The prefill chunk: the batched-token limit, the one prefill bucket and the
+# one KV segment size. An 8100-token prompt prefills in 8 chunks.
 MAX_NUM_BATCHED_TOKENS = 1024
+KV_SEGMENT_SIZE = 1024
 
 # The reference is not the HF remote code, so its goldens get their own cache
 # key.
@@ -119,15 +227,15 @@ def _register_model() -> None:
     ModelRegistry.register_model(ARCHITECTURE, getattr(src_package(), ARCHITECTURE))
 
 
-# The (batch_size, seq_len) pairs: batch 1 and batch 4 (the port's
-# max_num_seqs) at a 2048-token model length. Each pair compiles its own
-# graphs.
+# The (batch_size, seq_len) pairs: batch 1 and batch 4 (the max_num_seqs of
+# the serve command in the README) at a 9216-token model length. Each pair
+# compiles its own graphs.
 @pytest.mark.integration
 @pytest.mark.parametrize(
     "batch_size, seq_len",
     [
-        (1, 2048),
-        (4, 2048),
+        (1, MAX_MODEL_LEN),
+        (4, MAX_MODEL_LEN),
     ],
 )
 def test_model_accuracy(batch_size: int, seq_len: int) -> None:
@@ -162,23 +270,42 @@ def test_model_accuracy(batch_size: int, seq_len: int) -> None:
     _register_model()
     checkpoint = resolve_ouro_checkpoint()
 
-    # Compute (or load from cache) the reference logits for PROMPTS. The
-    # checkpoint stores BF16 weights, so the same-dtype reference is BF16.
     model_config = AutoConfig.from_pretrained(checkpoint)
     model_config.torch_dtype = torch.bfloat16
     tokenizer = AutoTokenizer.from_pretrained(checkpoint)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    # get_cached_reference_goldens tokenizes the prompt strings again, with
+    # this call. Check the lengths before the reference runs.
+    prompts = [
+        _long_prompt(tokenizer, text) for text in (_recall_text(), _ledger_text())
+    ]
+    _check_prompt_lengths(
+        [
+            len(tokenizer([p], padding=True, truncation=True)["input_ids"][0])
+            for p in prompts
+        ],
+        "string",
+    )
+
+    # Compute (or load from cache) the reference logits for the prompts. The
+    # checkpoint stores BF16 weights, so the same-dtype reference is BF16.
     cached_goldens = get_cached_reference_goldens(
         model_id=MODEL_ID,
         model_checkpoint=checkpoint,
         model_config=model_config,
         tokenizer=tokenizer,
-        prompts=PROMPTS,
+        prompts=prompts,
         output_length=OUTPUT_LENGTH,
         golden_variant=GOLDEN_VARIANT,
         model_loader=load_ouro_reference,
     )
+    prompts_input_ids = [
+        [list(ids) for ids in prompt] for prompt in cached_goldens["input_ids"]
+    ]
+    # The token ids that the reference ran and that vLLM receives.
+    _check_prompt_lengths([len(p[0]) for p in prompts_input_ids], "token ids")
 
     # Four of these arguments are required by logit validation, not optional
     # tuning. Do not remove them:
@@ -190,7 +317,9 @@ def test_model_accuracy(batch_size: int, seq_len: int) -> None:
     #   * on_device_sampling_config={"all_greedy": True} makes sampling greedy
     #     and deterministic, so a rerun compares the same token sequence.
     #
-    # The two bucket lists pin compilation to the one shape this case uses.
+    # The three bucket lists pin compilation to the one prefill shape (a
+    # 1024-token chunk with 1024-token KV segments) and the one decode shape
+    # of this case.
     llm = LLM(
         model=checkpoint,
         tensor_parallel_size=TENSOR_PARALLEL_SIZE,
@@ -206,15 +335,13 @@ def test_model_accuracy(batch_size: int, seq_len: int) -> None:
             "neuron_config": {
                 "on_device_sampling_config": {"all_greedy": True},
                 "num_batched_tokens_buckets": [MAX_NUM_BATCHED_TOKENS],
+                "kv_segment_size_buckets": [KV_SEGMENT_SIZE],
                 "num_seqs_buckets": [batch_size],
             }
         },
     )
     try:
         generate_fn = create_offline_vllm_generate_fn(llm, OUTPUT_LENGTH)
-        prompts_input_ids = [
-            [list(ids) for ids in prompt] for prompt in cached_goldens["input_ids"]
-        ]
         result = multi_prompt_logit_validation(
             prompts_input_ids=prompts_input_ids,
             generate_fn=generate_fn,

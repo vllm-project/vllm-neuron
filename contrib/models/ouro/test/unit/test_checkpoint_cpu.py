@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Ouro-1.4B tests in CPU mode with the real weights (the port's CPU tests).
+"""Ouro-1.4B tests in CPU mode with the real weights.
 
 These tests read the pinned ``ByteDance/Ouro-1.4B`` checkpoint (2.9 GB) from
 ``OURO_CHECKPOINT_PATH`` and skip when the variable is not set. They check the
