@@ -150,15 +150,19 @@ def _make_prefix_affinity(vllm_config, num_engines: int, client_count: int):
             "engine. Serve with --api-server-count 1 for full affinity.",
             client_count,
         )
+    capacity = vllm_config.scheduler_config.max_num_seqs
     logger.info(
-        "DP prefix affinity: on for %d engines, slack %s requests, %d-token "
-        "chunks, %d chunks per engine",
+        "DP prefix affinity: on for %d engines, slack %s requests, %d slots per "
+        "engine, %d-token chunks, %d chunks per engine",
         num_engines,
         slack,
+        capacity,
         CHUNK_TOKENS,
         max_chunks,
     )
-    return PrefixAffinityIndex(num_engines, slack, max_chunks_per_engine=max_chunks)
+    return PrefixAffinityIndex(
+        num_engines, slack, capacity=capacity, max_chunks_per_engine=max_chunks
+    )
 
 
 def _affinity_prefix(affinity, request):

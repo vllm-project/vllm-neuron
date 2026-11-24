@@ -67,6 +67,19 @@ def test_choose_follows_the_prefix_within_the_slack():
     assert s.matched_tokens == 4 * CHUNK
 
 
+def test_a_full_engine_loses_the_request_to_an_engine_with_a_free_slot():
+    """Waiting for a slot costs a decode, more than prefilling the prefix again."""
+    index = PrefixAffinityIndex(num_engines=2, slack=4, capacity=8)
+    prompt = index.prefix(tokens(1, 4 * CHUNK))
+    index.admit("a", 1, prompt)
+    order = [0, 1]
+    assert index.choose(prompt, [(5.0,), (7.0,)], 0, order) == 1
+    assert index.choose(prompt, [(5.0,), (8.0,)], 0, order) == 0
+    # Every engine is full: the request waits anyway, so it waits for its prefix.
+    assert index.choose(prompt, [(8.0,), (9.0,)], 0, order) == 1
+    assert index.stats.overridden == 1
+
+
 def test_a_prefix_on_every_engine_leaves_the_load_balanced_choice():
     index = PrefixAffinityIndex(num_engines=2, slack=4)
     system = index.prefix(tokens(1, 2 * CHUNK))
@@ -264,6 +277,7 @@ def test_affinity_defaults(monkeypatch):
     index = lb._make_prefix_affinity(vllm_config(), 2, 1)
     assert index.num_engines == 2
     assert index.slack == 4
+    assert index.capacity == 8
     # 5200 blocks of 64 tokens over 2 engines, in 128-token chunks.
     assert index.max_chunks_per_engine == 5200 * 64 // 2 // CHUNK
 

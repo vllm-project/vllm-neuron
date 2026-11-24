@@ -11,7 +11,9 @@ The index in this module remembers which engine received which tokens: the
 prompt of each request it routes, and the tokens that the engine generated for
 it. A new request goes to the engine that holds the longest prefix of its
 prompt, unless that engine carries more than ``slack`` requests above the least
-loaded engine. Then the request goes to the least loaded engine, as before.
+loaded engine, or has no free sequence slot while the least loaded engine has
+one. Then the request goes to the least loaded engine, as before: waiting for a
+slot costs a decode, more than prefilling the prefix again.
 
 The index needs no session ID: the next turn of a session starts with the
 tokens of the turn before, so its prefix finds the engine. It works on 128-token
@@ -77,6 +79,9 @@ class PrefixAffinityIndex:
         slack: The largest load difference, in requests, that a request accepts
             to go to the engine that holds its prefix instead of the least loaded
             engine.
+        capacity: The sequence slots of an engine (max_num_seqs), or None. A
+            request does not go to a full engine while the least loaded engine
+            has a free slot.
         max_chunks_per_engine: The capacity of each engine in chunks.
         chunk_tokens: The chunk size in tokens.
 
@@ -92,6 +97,7 @@ class PrefixAffinityIndex:
         self,
         num_engines: int,
         slack: float,
+        capacity: float | None = None,
         max_chunks_per_engine: int = DEFAULT_MAX_CHUNKS_PER_ENGINE,
         chunk_tokens: int = CHUNK_TOKENS,
     ) -> None:
@@ -103,6 +109,7 @@ class PrefixAffinityIndex:
                 f"{chunk_tokens} and {max_chunks_per_engine}"
             )
         self.slack = slack
+        self.capacity = capacity
         self.chunk_tokens = chunk_tokens
         self.max_chunks_per_engine = max_chunks_per_engine
         self.stats = PrefixAffinityStats()
@@ -176,7 +183,8 @@ class PrefixAffinityIndex:
 
         Returns:
             The engine that holds the longest prefix, if its load is within
-            ``slack`` of the load of ``least``, and otherwise ``least``.
+            ``slack`` of the load of ``least`` and it has a free slot (or
+            ``least`` has none either), and otherwise ``least``.
         """
         self.stats.requests += 1
         candidates, matched = self.match(prefix.hashes)
@@ -185,7 +193,10 @@ class PrefixAffinityIndex:
         self.stats.matched += 1
         holders = set(candidates)
         best = min((e for e in order if e in holders), key=lambda e: scores[e])
-        if scores[best][0] - scores[least][0] <= self.slack:
+        load, least_load = scores[best][0], scores[least][0]
+        full = self.capacity is not None and load >= self.capacity
+        least_full = self.capacity is not None and least_load >= self.capacity
+        if load - least_load <= self.slack and (not full or least_full):
             self.stats.followed += 1
             self.stats.matched_tokens += matched * self.chunk_tokens
             return best
