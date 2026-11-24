@@ -94,6 +94,7 @@ from vllm_neuron.model.neuron_config import (
 )
 from libtorch_neuronx_lite.compile.capture_backend import CaptureComplete
 from vllm_neuron.vllm.sample.rejection_sampler import RejectionSampler
+from vllm_neuron.vllm.spec_decode import PROPOSERS, resolve_proposer
 from vllm_neuron.vllm.spec_decode.dflash import DFlashProposer
 from vllm_neuron.vllm.spec_decode.eagle import EagleProposer
 from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE
@@ -795,6 +796,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     # thread. See _batch_mutation_lock for the race and for why it cannot deadlock. A
     # mutable class attribute would be shared between runners, so __init__ makes the lock.
     _input_batch_lock: "threading.Lock | None" = None
+    #: One-shot flags for `_sanitize_sync_drafts`, class-level so the repair
+    #: needs nothing from `__init__` and an instance that never reaches it pays
+    #: nothing. Each repair logs the first time it fires, per process.
+    _sync_draft_rows_warned = False
+    _sync_draft_ids_warned = False
 
     # ------------------------------------------------------------------------
     # INITIALIZATION
@@ -1216,7 +1222,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self._transition_bonus_tensor: torch.Tensor | None = None
 
         # Set up speculative decoding.
-        self.drafter: EagleProposer | DFlashProposer | None = None
+        # `Any` rather than the built-in union: a model package may register its own
+        # proposer class through `vllm_neuron.vllm.spec_decode.register_proposer`, and
+        # that class is not known here.
+        self.drafter: EagleProposer | DFlashProposer | Any | None = None
         self.is_eagle3_spec = False
         self.is_dflash_spec = False
         self._draft_token_ids = None
@@ -1227,21 +1236,34 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self._async_spec_transition_full_draft_cache: dict[str, torch.Tensor] = {}
 
         if self.speculative_config:
-            if self.speculative_config.method == "eagle3":
+            method = self.speculative_config.method
+            proposer_cls = resolve_proposer(method)
+            if method == "eagle3":
                 self.is_eagle3_spec = True
                 self.drafter = EagleProposer(
                     self.vllm_config,
                     self.device,
                     self.on_device_sampling,
                 )
-            elif self.speculative_config.method == "dflash":
+            elif method == "dflash":
                 self.is_dflash_spec = True
                 self.drafter = DFlashProposer(
                     self.vllm_config, self.device, self.on_device_sampling
                 )
+            elif proposer_cls is not None:
+                # A proposer registered by the model package: its draft path is inside the
+                # target model, so there is no second model to load. It is handed a way to
+                # reach the target, because the drafter is built here and `self.model` is not
+                # loaded until `load_model` below.
+                self.drafter = proposer_cls(
+                    self.vllm_config, self.device, self.on_device_sampling
+                )
+                self.drafter.target_model_provider = lambda: self.model
             else:
                 raise ValueError(
-                    f"Unsupported speculative decoding method: {self.speculative_config.method}"
+                    f"Unsupported speculative decoding method: {method}. Built in: "
+                    f"'eagle3', 'dflash'. "
+                    f"Registered by a model: {sorted(PROPOSERS) or 'none'}."
                 )
             self.rejection_sampler = RejectionSampler()
 
@@ -2173,7 +2195,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # / _plain_decode_capture). The model compiler_args_for maps that type
         # to its arguments. The encoder graph uses the "encoder" type. Prefill
         # and JF keep the base args on self.model.
-        if eager_mode or cpu_mode or debug_mode or skip_graph_capture_backend:
+        #
+        # `debug_mode` is deliberately NOT part of this condition. It already
+        # selects `fullgraph=False` just above, which is what "allow graph breaks
+        # and print statements" means; nulling the graph-capture backend as well
+        # made one flag do two unrelated things, so a model whose graph breaks are
+        # load-bearing could not use parallel compilation at all. The two concerns
+        # are now separate, and `skip_graph_capture_backend` is the flag that turns
+        # capture off.
+        if eager_mode or cpu_mode or skip_graph_capture_backend:
             logger.debug("Graph capture and parallel compilation is disabled.")
             self.capture_backend_model = None
         else:
@@ -2210,7 +2240,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if self.encoder_neuron_config is not None and encoder_attr is not None:
             encoder = getattr(inner_model, encoder_attr)
 
-            if eager_mode or cpu_mode or debug_mode or skip_graph_capture_backend:
+            if eager_mode or cpu_mode or skip_graph_capture_backend:
                 self.encoder_capture_backend = None
             else:
                 self.encoder_capture_backend = torch.compile(
@@ -2334,8 +2364,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     subdirectory="vision",
                 )
 
-        # Draft model capture
-        if self.drafter is not None:
+        # Draft model capture. Eagle only: an in-model drafter's `.model` *is* the target, so
+        # capturing it again under `draft/` would duplicate the target's own capture.
+        if self.drafter is not None and self.is_eagle3_spec:
             draft_modules = getattr(capture_config, "draft_modules", None)
             self._draft_tensor_capture = self._setup_capture(
                 self.drafter.model, draft_modules or [], subdirectory="draft"
@@ -7721,8 +7752,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         )
 
         # If spec decode enabled, log acceptance stats and propose draft tokens.
-        # aux_hidden_states is None when eagle3 is not active.
-        if self.is_spec_decode and aux_hidden_states is not None:
+        #
+        # eagle3 proposes from the target's auxiliary hidden states, so it has nothing to
+        # propose from until the target emits them. dflash and a proposer registered by a
+        # model package draft without them, so requiring them would disable those silently —
+        # the drafter would be built and never called.
+        if self.drafter is not None and (
+            aux_hidden_states is not None or not self.is_eagle3_spec
+        ):
             max_position = positions.max().item() if positions.numel() > 0 else 0
             num_spec_tokens = self.drafter.num_speculative_tokens
             # Stop proposing early enough that the scheduler never trims
@@ -8969,6 +9006,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if isinstance(self._async_reorder_kwargs, dict):
             model_kwargs.update(self._async_reorder_kwargs)
         model_kwargs["logit_mask"] = logit_mask
+        # Models that pick their own sampling path (`accepts_sampling_hint`) get the
+        # batch's sampling kind as host booleans -- (all_greedy, no_top_k, no_top_p) --
+        # so an all-greedy step needs no device read to pick its graph.
+        if sampling_params_tensor is not None and getattr(self.model, "accepts_sampling_hint", False):
+            sm = self.input_batch.sampling_metadata
+            model_kwargs["sampling_hint"] = (
+                bool(sm.all_greedy), sm.top_k is None, sm.top_p is None,
+            )
         if rotary_position_ids is not None:
             model_kwargs["rotary_position_ids"] = rotary_position_ids.to(self.device)
 
@@ -10580,6 +10625,99 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self._draft_token_ids = None
         return DraftTokenIds(req_ids, draft_token_ids)
 
+    def _sanitize_sync_drafts(
+        self, drafts: torch.Tensor, num_reqs: int
+    ) -> torch.Tensor:
+        """Make a sync-mode proposal safe to hand the scheduler.
+
+        Two repairs, both **no-ops on a well-formed proposal** -- the row count
+        matches ``num_reqs`` and every id is in ``[0, vocab_size)`` -- and both
+        logged the first time they fire, so a server log says it happened.
+
+        Why this is a repair and not a suppression. A draft token is only ever
+        *verified*: the rejection sampler keeps it if and only if it matches
+        what the target would have sampled anyway. So replacing an unusable
+        draft slot with an in-range token **cannot change an emitted token** --
+        the target rejects it and the step falls back to the bonus token. What
+        it costs is acceptance rate on that row, which is the honest price of a
+        draft the proposer could not produce. The alternative is handing the
+        scheduler an id that kills the engine, which is what happens today:
+
+            neuron_model_runner.py:2615  Error in _prepare_model_input:
+              Token IDs out of range [0, 129280). Found min=-1, max=27438.
+              Invalid IDs: [-1, -1, -1, -1, -1]
+            EngineCore encountered a fatal error.
+
+        — all 64 workers, two tokens into the first uncapped multi-sequence
+        decode this port has ever run (iteration 6, ``max_num_seqs=10``). Five
+        ``-1``s is exactly ``num_speculative_tokens``: one request's whole draft
+        row. The route is a **row-count mismatch**, not a bad token.
+        ``DSparkProposer.propose`` builds one row per *scheduled span*, so a
+        request with no committed-token row in this step -- one that has just
+        finished a prefill segment while the others decode -- gets no draft
+        row. The scheduler then zips N rows against N+1 ``req_ids``, the
+        uncovered request keeps ``_update_after_schedule``'s optimistic
+        ``[-1] * num_spec`` placeholder (the same placeholder
+        ``take_draft_token_ids`` hands out deliberately on the async path), and
+        the next step's
+        ``_validate_token_ids`` refuses it because ``-1`` is only tolerated
+        under async scheduling.
+
+        **Why batch 1 and the verifier never see it.** With one row the
+        rejection sampler's row always carries the bonus token, so the
+        proposer always has a valid seed; and a step is only ever mixed
+        prefill/decode when several sequences are in flight. The verifier's
+        ``short`` phase runs ``max_num_seqs=4`` over 3 prompts and this stays
+        inert there: it logged **zero** times in the passing verifier runs of
+        both iteration 6 and iteration 7. In the first uncapped batch-10 run it
+        logged 128 times (64 ranks x 2 messages) -- *"the proposer returned 9
+        draft row(s) for 10 request(s)"* -- and the engine survived where
+        iteration 6's had died two tokens in.
+
+        **What it does not claim.** It does not stop the uncovered-request case
+        from arising. The better fix is to return *no* drafts for an uncovered
+        request -- an empty list, which ``DraftTokenIds`` accepts and
+        ``take_draft_token_ids`` forwards unchanged -- so the target does not
+        verify five tokens it will certainly reject. That needs a **ragged**
+        draft layout, which crosses ``_pad_to_compiled_shapes``' flat
+        ``padded_num_reqs * num_speculative_tokens`` padding, so it needs a
+        device run to prove the shape still hits the warmed NEFF. Uniform
+        padding first, ragged second.
+        """
+        if drafts.ndim != 2:
+            return drafts
+        rows = int(drafts.shape[0])
+        if rows != num_reqs and num_reqs > 0:
+            if not self._sync_draft_rows_warned:
+                self._sync_draft_rows_warned = True
+                logger.warning(
+                    "deepseek_v41/spec: the proposer returned %d draft row(s) "
+                    "for %d request(s); padding/trimming to the request count "
+                    "so the scheduler cannot zip a request against another "
+                    "request's row and leave it holding a [-1] placeholder. "
+                    "See _sanitize_sync_drafts. Logged once.",
+                    rows, num_reqs,
+                )
+            if rows > num_reqs:
+                drafts = drafts[:num_reqs]
+            else:
+                pad = drafts.new_zeros((num_reqs - rows, drafts.shape[1]))
+                drafts = torch.cat([drafts, pad], dim=0)
+        bad = (drafts < 0) | (drafts >= self.vocab_size)
+        if bool(bad.any()):
+            if not self._sync_draft_ids_warned:
+                self._sync_draft_ids_warned = True
+                logger.warning(
+                    "deepseek_v41/spec: %d draft id(s) outside "
+                    "[0, %d) in a sync-mode proposal; replacing them with "
+                    "token 0, which the target will reject so the step falls "
+                    "back to its bonus token. See _sanitize_sync_drafts. "
+                    "Logged once.",
+                    int(bad.sum()), self.vocab_size,
+                )
+            drafts = torch.where(bad, torch.zeros_like(drafts), drafts)
+        return drafts
+
     def _propose_draft_token_ids(
         self,
         scheduler_output: Any,
@@ -10592,7 +10730,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         logits_indices: torch.Tensor | None = None,
         raw_sampled_token_ids: torch.Tensor | None = None,
     ) -> list[list[int]] | torch.Tensor:
-        assert isinstance(self.drafter, (EagleProposer, DFlashProposer))
+        # Everything below is proposer-agnostic except the hidden states, which only eagle3
+        # produces: the indices, the sampled-token tensor and the return shapes are the same
+        # contract for a proposer registered by a model package.
+        assert self.drafter is not None
 
         num_reqs = self.input_batch.num_reqs
 
@@ -10648,8 +10789,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # single concatenated [T, 3*hidden_size] device tensor (the cat is
         # done on the target side, inside its compile boundary). Passing
         # it through as-is avoids any Python-side op between the target
-        # NEFF and the draft NEFF.
-        assert aux_hidden_states is not None
+        # NEFF and the draft NEFF. An in-model proposer has its draft from
+        # the target's own forward and is handed None.
+        if self.is_eagle3_spec:
+            assert aux_hidden_states is not None
 
         async_spec_kwargs = {}
         if self._model_is_async_spec_decoded() and spec_decode_metadata is not None:
@@ -10700,7 +10843,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # only, contiguous), used by the rejection sampler. In sync mode,
         # only ``drafts_only`` is needed by the scheduler.
         if not self.use_async_scheduling:
-            return drafts_only.cpu()
+            return self._sanitize_sync_drafts(drafts_only.cpu(), num_reqs)
 
         # Stash the drafts-only tensor for the next step's runner to feed
         # into ``spec_decode_metadata.draft_token_ids`` without slicing the
@@ -11153,10 +11296,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # This binds the cache tensors to the model
         self.model.bind_kv_cache(kv_caches)
 
-        if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, (EagleProposer, DFlashProposer))
-            assert self.drafter.model is not None
-            self.drafter.model.bind_kv_cache(kv_caches)
+        if self.drafter is not None:
+            # Only a *separate* draft model needs its own binding. An in-model proposer's
+            # `.model` is the target, bound just above, and binding it twice would register
+            # the same caches on the same module twice.
+            draft_model = getattr(self.drafter, "model", None)
+            if draft_model is not None and draft_model is not self.model:
+                # This binds the cache tensors to the draft model
+                draft_model.bind_kv_cache(kv_caches)
+            # validate all draft model layers belong to the same kv cache group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
             if isinstance(self.drafter, DFlashProposer):
                 self.drafter.alias_target_weights(target_model=self.model)
@@ -11233,11 +11381,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 )
             all_kv_cache_specs[layer_name] = spec
 
-        if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, (EagleProposer, DFlashProposer))
-            assert self.drafter.model is not None
-
-            drafter_kv_spec = self.drafter.model.get_kv_spec()
+        # A separate draft model declares KV caches of its own. An in-model proposer does
+        # not: its stages are layers of the target, so the target's `get_kv_spec` already
+        # named them, and re-adding them here would overwrite those entries.
+        draft_model = getattr(self.drafter, "model", None) if self.drafter else None
+        if draft_model is not None and draft_model is not self.model:
+            drafter_kv_spec = draft_model.get_kv_spec()
             for layer in drafter_kv_spec.layers:
                 layer_name = layer.name
                 all_kv_cache_specs[layer_name] = FullAttentionSpec(
