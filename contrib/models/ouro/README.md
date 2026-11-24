@@ -154,7 +154,7 @@ configuration.
 |---|---|
 | BF16 checkpoint | Supported (other dtypes are rejected by the factory) |
 | Tensor parallelism | TP 8 in the device integration test; TP 2 and 4 in the CPU tests; other TP degrees not validated on device |
-| Context length | Maximum model length 9216 in the device integration test, with prompts of 8000-8192 tokens and 16 generated tokens. Longer contexts (the checkpoint allows 65536) are not validated |
+| Context length | Maximum model length 9216: the device integration test (prompts of 8000-8192 tokens, 16 generated tokens) and the long-prompt serve request of the validation report (8190 prompt tokens, 1024 generated tokens). Longer contexts (the checkpoint allows 65536) are not validated |
 | Batch size | 1 and 4 in the device integration test; larger batches not validated |
 | Chunked (segmented) prefill | 1024-token chunks with 1024-token KV segments in the device integration test; segmented prefill over a cached prefix also in the CPU component tests. Other chunk and segment sizes not validated |
 | Early exit | Threshold exit (`early_exit_threshold`, the checkpoint uses 1.0). `early_exit_step` is rejected by the factory |
@@ -261,6 +261,73 @@ start method, so do not set `VLLM_WORKER_MULTIPROC_METHOD=spawn`.
 
 ## Validation report
 
-The validation report for the configuration in this README (TP 8 on one
-`trn2.48xlarge`, maximum model length 9216, batch 1 and 4, prompts of
-8000-8192 tokens) is pending.
+### vLLM Neuron 0.29.0.1.2.0 (2026-11-24)
+
+#### Environment
+
+| Image | Instance | TP | vLLM | vllm-neuron | torch | transformers | neuronx-cc |
+|---|---|---|---|---|---|---|---|
+| `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04` | `trn2.48xlarge` (LNC 2), 1 node | 8 | 0.29.0 | 0.29.0.1.2.0 | 2.13.0 | 5.17.0 | 2.28.7631.0+8f7b0cf5 |
+
+Checkpoint of the unit, integration and serve runs: `ByteDance/Ouro-1.4B` at
+`574fa66cb8bf5abdc979642d01cf2b79b16bfab1`.
+
+#### Results
+
+| Test | Configuration | Result |
+|---|---|---|
+| CPU unit tests, `test/unit/` | `VLLM_NEURON_CPU_MODE=1`, `OURO_CHECKPOINT_PATH` set (the 6 real-weight tests of `test_checkpoint_cpu.py` ran) | 24 passed, 0 failed |
+| `test_model_accuracy[1-9216]` | TP 8, `neuron_native`, BF16, batch 1, max model length 9,216, prefill chunk 1,024 with KV segment 1,024, 2 prompts cut to 8,100 tokens (asserted 8,000-8,192) × 16 greedy tokens, on-device greedy sampling | PASSED (1009.709 s) on aggregate σ-ratio 0.6133 ≤ 1.0; static per-prompt bounds 0/2 (below) |
+| `test_model_accuracy[4-9216]` | TP 8, `neuron_native`, BF16, batch 4 (each prompt in 4 rows), max model length 9,216, prefill chunk 1,024 with KV segment 1,024, 2 prompts cut to 8,100 tokens (asserted 8,000-8,192) × 16 greedy tokens, on-device greedy sampling | PASSED (411.665 s) on aggregate σ-ratio 0.5410 ≤ 1.0; static per-prompt bounds 0/2 (below) |
+| `vllm serve` smoke | The Usage command, installed with `pip install --no-deps -e contrib/models/ouro`; `temperature` 0, `max_tokens` 32 | Passed: 3/3 prompts, 32 completion tokens each; a batched request of all 3 at `max_tokens` 16 returned a prefix of each |
+| `vllm serve` long prompt | The same server; a deterministic synthetic ledger document, measured with the server's `/tokenize` endpoint; `max_tokens` 1024, `temperature` 0, `ignore_eos` | 8,190 prompt tokens, 1,024 completion tokens, finish reason `length`, 31.9 s |
+
+The integration test asserts `pp_max_linf_1.5x` and `pp_max_l2_1.5x` on every prompt; both were 2/2 in both cases of this run.
+
+Not run on 0.29: module tests (`test/module/`), not part of the 0.29 run.
+
+#### Logit validation
+
+| Case | Prompt | Overall Status | Max K5 (0.03) | Max K50 (0.05) | Max K1000 (0.08) | Max All (0.09) | Argmax divergence (1 ULP) |
+|---|---|---|---|---|---|---|---|
+| `[1-9216]` | 1 of 2, `Chapter 1 …` | FAILED | 0.0427 (> 0.03) at token 15 | 0.0427 at token 15 | 0.0427 at token 15 | 0.0359 at token 15 | 0.0000 |
+| `[1-9216]` | 2 of 2, `Storeroom ledger …` | FAILED | 0.1005 (> 0.03) at token 14 | 0.1901 (> 0.05) at token 15 | 0.2247 (> 0.08) at token 15 | 0.2695 (> 0.09) at token 15 | 0.0000 |
+| `[4-9216]` | 1 of 2, `Chapter 1 …` | FAILED | 0.0397 (> 0.03) at token 15, all 4 rows | 0.0397 at token 15, all 4 rows | 0.0397 at token 15, all 4 rows | 0.0334 at token 15, all 4 rows | 0.0000 |
+| `[4-9216]` | 2 of 2, `Storeroom ledger …` | FAILED | 0.0814 (> 0.03) at token 14, all 4 rows | 0.1617 (> 0.05) at token 5, all 4 rows | 0.1939 (> 0.08) at token 5, all 4 rows | 0.1805 (> 0.09) at token 5, all 4 rows | 0.0000 |
+
+Neuron vs the CPU BF16 reference (`test/ouro_reference.py`); token = generated token, row = batch row. Tokens over a bound: `[1-9216]` prompt 1 token 15 (K5), prompt 2 token 5 (K50 0.1649, K1000 0.1968, All 0.1849), tokens 14 and 15 (K5, K50, K1000 and All); `[4-9216]` prompt 1 token 15 (K5), prompt 2 token 5 (K50 0.1617, K1000 0.1939, All 0.1805), tokens 14 and 15 (K5, K50, K1000 and All), all 4 rows. No argmax divergence. At prompt 2 tokens 5, 14 and 15 the CPU BF16 L-inf error against FP32 is 0.1793, 0.0954 and 0.2153.
+Both cases passed on aggregate σ-ratio 0.6133 (`[1-9216]`) and 0.5410 (`[4-9216]`) ≤ 1.0 (`multi_prompt_logit_validation`) and on the asserted per-prompt checks; `agg_bc`, `agg_l2_1.2x`, `agg_l2_1.5x`, `agg_linf_1.2x` and `agg_linf_1.5x` FAIL in both cases; printed per-prompt checks: `[1-9216]`: `pp_max_linf_1.5x` 2/2, `pp_max_linf_2.0x` 2/2, `pp_max_l2_1.5x` 2/2, `pp_max_l2_2.0x` 2/2, `pp_tok_linf_1.5x` 0/2, `pp_tok_linf_2.0x` 2/2, `pp_tok_l2_1.5x` 1/2, `pp_tok_l2_2.0x` 2/2, `pp_static_0.03` 1/2, `pp_static_0.05` 1/2; `[4-9216]`: the same, except `pp_tok_linf_1.5x` 1/2.
+
+Error against the FP32 reference, per prompt (max over the 16 generated tokens):
+
+| Case | Prompt | CPU BF16 L-inf | Neuron L-inf | Neuron / CPU BF16 | CPU BF16 L2 | Neuron L2 | Neuron / CPU BF16 |
+|---|---|---|---|---|---|---|---|
+| `[1-9216]` | 1 of 2 | 0.0317 | 0.0187 | 0.59x | 0.0312 | 0.0276 | 0.88x |
+| `[1-9216]` | 2 of 2 | 0.2153 | 0.1088 | 0.51x | 0.3265 | 0.2056 | 0.63x |
+| `[4-9216]` | 1 of 2 | 0.0317 | 0.0218 | 0.69x | 0.0312 | 0.0290 | 0.93x |
+| `[4-9216]` | 2 of 2 | 0.2153 | 0.1228 | 0.57x | 0.3265 | 0.1905 | 0.58x |
+
+Prompt 1: CPU BF16 maxima at generated token 15, Neuron maxima at token 11. Prompt 2: every maximum at generated token 15.
+
+#### Serve smoke
+
+`/v1/completions`, on-device greedy sampling (`all_greedy`), `temperature` 0; `max_tokens` 32 for the three short prompts, `max_tokens` 1024 with `ignore_eos` for the long prompt; first 60 characters of each output as a Python string literal.
+
+| Prompt | Output |
+|---|---|
+| `The capital of France is` | `" Paris.\n\n## Step 2: Evaluate the Options\nLet's evaluate each"` |
+| `1, 2, 3, 4, 5,` | `' 6, 7, 8, 9, 10, 11, 12, 13, 14,'` (the whole output) |
+| `def fibonacci(n):` | `'\n    if n <= 0:\n        return "Input should be a positive i'` |
+| Synthetic ledger document, 8,190 tokens | `' The ledger provides a detailed record of trade activities a'` |
+
+### Exceptions
+
+- **All four prompt-runs are outside the static per-prompt bounds.** Both
+  integration cases passed on the aggregate σ-ratio and on the asserted
+  per-prompt checks `pp_max_linf_1.5x` and `pp_max_l2_1.5x` (see Logit
+  validation).
+- **Module tests not run on 0.29.**
+- Prefix caching, TP sizes other than 8 on device, batch sizes other than 1
+  and 4, context beyond 9,216 tokens, prefill chunk and KV segment sizes
+  other than 1,024, sampled (non-greedy) requests, `early_exit_step`,
+  speculative decoding and Trn3 are not tested.
