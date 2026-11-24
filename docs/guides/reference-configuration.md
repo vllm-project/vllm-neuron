@@ -129,6 +129,12 @@ engine cores for `VLLM_ENGINE_READY_TIMEOUT_S` (600 s by default). The first
 start compiles every graph and takes longer, so raise it, for example
 `VLLM_ENGINE_READY_TIMEOUT_S=14400`.
 
+Each data-parallel engine has its own prefix cache. For agent rollouts, set
+`VLLM_NEURON_DP_PREFIX_AFFINITY=1` and serve with `--api-server-count 1`: the
+next turn of a session and the rollouts of one prompt then go to the engine
+that already holds their prefix. See
+[Data-parallel routing](#data-parallel-routing).
+
 ## Scheduling options
 
 For conceptual overview, see [Async scheduling](features-guide.md#async-scheduling).
@@ -304,6 +310,20 @@ Use the smallest value that passes the validated workload.
 | Variable | Type | Default | Description |
 | ---- | ---- | ---- | ---- |
 | `PROMETHEUS_MULTIPROC_DIR` | str | auto-created tempdir | Directory for prometheus_client multiprocess mode. Wipe between server restarts. |
+
+### Data-parallel routing
+
+With `--data-parallel-size` greater than 1, the server sends each request to
+the least loaded engine. Prefix affinity sends a request to the engine that
+holds the longest prefix of its prompt instead, unless that engine carries
+more requests than the slack allows. It applies to a non-MoE model with
+`--enable-prefix-caching`. It changes routing only, not the compiled graphs.
+For the design, see [DP prefix-affinity routing](../design/vllm/dp-prefix-affinity.md).
+
+| Variable | Type | Default | Description |
+| ---- | ---- | ---- | ---- |
+| `VLLM_NEURON_DP_PREFIX_AFFINITY` | bool | 0 | 1 sends a request to the engine that holds the longest prefix of its prompt. A request with an `X-data-parallel-rank` header still goes to that engine. Each API server keeps its own index, so serve with `--api-server-count 1`. |
+| `VLLM_NEURON_DP_PREFIX_AFFINITY_SLACK` | int | `max_num_seqs // 2` (at least 1) | Largest load difference, in requests, between the prefix engine and the least loaded engine. Above it, the request goes to the least loaded engine. |
 
 ## Complete configuration example
 

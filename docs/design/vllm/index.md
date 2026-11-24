@@ -19,6 +19,7 @@ framework. For user-facing configuration, see the
 | [Neuron scheduler](neuron-scheduler.md) | Holdback queue and admission control |
 | [Block KV batching and padding](padding-batching-block-kv.md) | Block KV cache architecture |
 | [Prefill processing and prefix caching](prefix-caching.md) | Prefill segmentation and KV reuse |
+| [DP prefix-affinity routing](dp-prefix-affinity.md) | Prefix-cache reuse across data-parallel engines, and rollout serving TODOs |
 | [Pooling models](pooling-models.md) | Pooling model execution on Neuron |
 | [Prompt embeddings](prompt-embeddings.md) | Prompt embedding support |
 | [Structured outputs and tool calling](structured-outputs-and-tool-calling.md) | JSON, regex, grammar-constrained generation |
@@ -41,6 +42,7 @@ neuron-profiling
 neuron-scheduler
 padding-batching-block-kv
 prefix-caching
+dp-prefix-affinity
 pooling-models
 prompt-embeddings
 structured-outputs-and-tool-calling
