@@ -146,6 +146,14 @@ def predicated_folded_load(
             dst=data_sb[ix, iy],
             dge_mode=nisa.dge_mode.hwdge,
         )
+        # vllm-neuron change: fill the partitions of a partial tile that the DMA does not
+        # write. The rotation matmul contracts over every partition, so uninitialized SBUF
+        # (possibly NaN) leaked into the valid rows: NaN values and index 0 for the last row.
+        if batch_bound < data_sb.shape[0]:
+            nisa.memset(
+                dst=data_sb[nl.ds(batch_bound, data_sb.shape[0] - batch_bound), iy],
+                value=fill_value,
+            )
         if return_out:
             return data_sb
         else:
@@ -160,6 +168,14 @@ def predicated_folded_load(
     src_hbm_flat = data_hbm.reshape((batch_size * n,))
 
     batch_size_sharded_bounded = min(batch_size_sharded, batch_size - batch_line_offset)
+    # vllm-neuron change: the rows below are written only for loaded batch lines; fill
+    # columns [0, remainder) of the partitions past them (see the fast path above).
+    loaded_rows = batch_size_sharded_bounded * fold_factor
+    if remainder > 0 and loaded_rows < data_sb.shape[0]:
+        nisa.memset(
+            dst=data_sb[nl.ds(loaded_rows, data_sb.shape[0] - loaded_rows), nl.ds(0, remainder)],
+            value=fill_value,
+        )
     for batch_line_idx in nl.affine_range(batch_size_sharded_bounded):
         row_idx = batch_line_idx + batch_line_offset
         base_idx = row_idx * n

@@ -560,6 +560,61 @@ class NeuronPlatform(Platform):
             )
             encoder_config[new_name] = encoder_config.pop(old_name)
 
+    @staticmethod
+    def _model_cls_implements(model_config, protocol) -> bool:
+        """Whether the Neuron model class registered for the architecture implements a
+        ``vllm_neuron.model.interfaces`` capability protocol."""
+        from vllm_neuron.model.registry import get_model_cls
+
+        model_cls = get_model_cls(getattr(model_config, "architectures", None))
+        return model_cls is not None and issubclass(model_cls, protocol)
+
+    @classmethod
+    def _configure_stateful_models(cls, vllm_config: "VllmConfig") -> None:
+        """Configure models with recurrent state (interfaces.HasRecurrentState).
+
+        KV transfer and jump-forward decoding are rejected. Prefix caching uses Mamba
+        "align" mode: the state is kept
+        per KV-manager block and copied to the next block when a request crosses into it
+        (NeuronModelRunner._preprocess_mamba_align), and prefills are scheduled in
+        block-aligned chunks. The block (the attention block enlarged to the state page)
+        must not exceed the prefill chunk (max_num_batched_tokens)."""
+        # Models with recurrent state (interfaces.HasRecurrentState). The plugin's model
+        # classes do not declare vLLM's IsHybrid interface, so vLLM's MambaModelConfig hook
+        # does not configure them.
+        from vllm_neuron.model.interfaces import HasRecurrentState
+
+        if not cls._model_cls_implements(vllm_config.model_config, HasRecurrentState):
+            return
+        archs = set(vllm_config.model_config.architectures or [])
+        # The recurrent state lives outside the attention KV that connectors move, and the
+        # jump-forward path does not advance it.
+        if vllm_config.kv_transfer_config is not None:
+            raise ValueError(
+                f"{', '.join(sorted(archs))}: KV transfer (disaggregated serving) is not "
+                "supported for models with recurrent state."
+            )
+        neuron_config = (vllm_config.additional_config or {}).get("neuron_config", {})
+        if neuron_config.get("max_jump_forward_tokens", 0):
+            raise ValueError(
+                f"{', '.join(sorted(archs))}: max_jump_forward_tokens is not supported for "
+                "models with recurrent state."
+            )
+        cache_config = vllm_config.cache_config
+        if not cache_config.enable_prefix_caching:
+            return
+        if cache_config.mamba_cache_mode != "align":
+            logger.info(
+                "Prefix caching for %s uses Mamba cache mode 'align' (was '%s').",
+                ", ".join(sorted(archs)),
+                cache_config.mamba_cache_mode,
+            )
+            cache_config.mamba_cache_mode = "align"
+        if not vllm_config.scheduler_config.enable_chunked_prefill:
+            raise ValueError(
+                "Prefix caching for models with recurrent state needs chunked prefill."
+            )
+
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         """Configure vLLM for vLLM Neuron platform."""
@@ -722,6 +777,7 @@ class NeuronPlatform(Platform):
         cls._auto_set_neuron_connector_module_path(vllm_config)
         cls._auto_set_neuron_ec_connector_module_path(vllm_config)
         cls._validate_quantization_config(vllm_config)
+        cls._configure_stateful_models(vllm_config)
 
         parallel_config = vllm_config.parallel_config
         # TODO: Implement a CPU fallback based on the value from DeviceConfig
@@ -760,7 +816,13 @@ class NeuronPlatform(Platform):
         # max_num_batched_tokens. The encoder budget cap in NeuronScheduler
         # already prevents overflow without needing this flag.
 
-        if hasattr(model_config.hf_config, "vision_config"):
+        # Models that serve only the text tower of a multimodal checkpoint (e.g. Qwen3.5
+        # dense: the config carries a vision_config) need no vision buckets.
+        from vllm_neuron.model.interfaces import ServesTextOnly
+
+        if hasattr(
+            model_config.hf_config, "vision_config"
+        ) and not cls._model_cls_implements(model_config, ServesTextOnly):
             cls._resolve_vision_auto_config(vllm_config, model_config)
 
         # Compute the per-item embed limit for request validation.

@@ -36,6 +36,7 @@ How vLLM Neuron works under the hood — parallelism strategies, plugin integrat
 | --- | --- |
 | [vLLM integration design reference](vllm/vllm-integration-design-reference.md) | Plugin registration, scheduler, KV cache |
 | [KV cache integration](vllm/vllm-integration-kv-cache.md) | KV cache integration points with vLLM |
+| [Hybrid recurrent state](hybrid-state-gdn.md) | Gated DeltaNet state pages alongside paged KV cache |
 | [Additional config](vllm/additional-config.md) | Additional configuration options |
 | [Async scheduling and execution](vllm/async-scheduling-and-async-execution.md) | Async scheduling and execution design |
 | [Context-length bucketing](vllm/decode-context-length-bucketing.md) | Reducing decode HBM reads |
@@ -91,6 +92,7 @@ parallelism/index
 speculation/index
 multimodal/index
 vllm/index
+hybrid-state-gdn
 framework/index
 compilation/index
 accuracy/index

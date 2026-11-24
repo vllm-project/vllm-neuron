@@ -646,16 +646,28 @@ def _topk_nki(
     leading_shape = tensor.shape[:-1]
     inp2d = tensor.reshape(-1, vocab_size)
     n_rows = inp2d.shape[0]
+    # Split over the LNC programs, an odd row count leaves the last program a one-row tile,
+    # which the rotational kernel can return as NaN values with index 0 in some compiles (an
+    # MTP verify at batch 1 has 3 rows; it surfaced as token id 0 for the bonus token). Pad
+    # with copies of the last row to a multiple of the program count and drop them from the
+    # outputs. The kernel's partial-tile fill (cascaded_max_utils.predicated_folded_load)
+    # fixes one uninitialized read but did not make that failure go away on its own.
+    n_programs = _get_topk_num_programs()
+    pad_rows = (-n_rows) % n_programs if n_rows > 1 else 0
+    if pad_rows:
+        inp2d = torch.cat([inp2d, inp2d[-1:].expand(pad_rows, vocab_size)], dim=0)
 
     kernel_fn = _TOPK_KERNELS[method]
     config_builder, kernel_label = _TOPK_CONFIG_BUILDERS[method]
-    _log_topk_choice(kernel_label, n_rows, vocab_size, k)
+    _log_topk_choice(kernel_label, n_rows + pad_rows, vocab_size, k)
 
     nki_dtype = getattr(nl, torch_to_nki_dtype(inp2d.dtype))
-    config = config_builder(n_rows, vocab_size, k, nki_dtype)
+    config = config_builder(n_rows + pad_rows, vocab_size, k, nki_dtype)
 
     topk_kernel = wrap_nki(kernel_fn)
-    values, indices = topk_kernel[_get_topk_num_programs()](inp2d, config)
+    values, indices = topk_kernel[n_programs](inp2d, config)
+    if pad_rows:
+        values, indices = values[:n_rows], indices[:n_rows]
 
     out_shape = (*leading_shape, k)
     values = values.reshape(out_shape)
