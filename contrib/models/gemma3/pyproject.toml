@@ -1,0 +1,22 @@
+# Installs this folder's src/ as the ``gemma3_neuron`` package and registers
+# Gemma3ForCausalLM with vLLM in every process (front end, engine core, Neuron
+# workers) through a general-plugin entry point:
+#     pip install -e contrib/models/gemma3
+[build-system]
+requires = ["setuptools>=77.0.3,<80.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-neuron-contrib-gemma3"
+version = "0.1.0"
+description = "Gemma3ForCausalLM (text) contrib model for vllm-neuron"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = []  # runs inside an environment that already has vllm-neuron
+
+[project.entry-points."vllm.general_plugins"]
+gemma3_neuron = "gemma3_neuron.plugin:register"
+
+[tool.setuptools]
+package-dir = {"gemma3_neuron" = "src"}
+packages = ["gemma3_neuron"]
