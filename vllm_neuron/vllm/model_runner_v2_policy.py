@@ -237,8 +237,6 @@ def get_neuron_model_runner_v2_policy(
         unsupported.append("weight transfer")
     if getattr(vllm_config, "lora_config", None) is not None:
         unsupported.append("LoRA")
-    if getattr(vllm_config, "reasoning_config", None) is not None:
-        unsupported.append("reasoning configuration")
 
     if cache_config is not None:
         if getattr(cache_config, "kv_offloading_size", None) is not None:

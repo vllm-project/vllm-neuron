@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 import torch
 from vllm_neuron import envs
 
+from vllm.exceptions import VLLMValidationError
 from vllm.platforms import Platform, PlatformEnum
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -44,6 +45,11 @@ SO_DISABLED_MESSAGE = (
     "Restart the server with enable_structured_outputs=true to serve "
     "structured-output requests. For this SO-off-only server, retry the "
     "request without structured_outputs."
+)
+
+THINKING_TOKEN_BUDGET_UNSUPPORTED_MESSAGE = (
+    "thinking_token_budget is not supported on Neuron. Retry the request "
+    "without thinking_token_budget, or limit the output with max_tokens."
 )
 
 
@@ -840,6 +846,12 @@ class NeuronPlatform(Platform):
             and getattr(params, "structured_outputs", None) is not None
         ):
             raise ValueError(SO_DISABLED_MESSAGE)
+
+        if getattr(params, "thinking_token_budget", None) is not None:
+            raise VLLMValidationError(
+                THINKING_TOKEN_BUDGET_UNSUPPORTED_MESSAGE,
+                parameter="thinking_token_budget",
+            )
 
         if cls._max_embeds_per_image is None:
             return
