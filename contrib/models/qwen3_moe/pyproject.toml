@@ -1,0 +1,22 @@
+# Installs this folder's src/ as the ``qwen3_moe_neuron`` package and registers
+# Qwen3MoeForCausalLM with vLLM in every process (front end, engine core,
+# Neuron workers) through a general-plugin entry point:
+#     pip install -e contrib/models/qwen3_moe
+[build-system]
+requires = ["setuptools>=77.0.3,<80.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-neuron-contrib-qwen3-moe"
+version = "0.1.0"
+description = "Qwen3MoeForCausalLM contrib model for vllm-neuron"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = []  # runs inside an environment that already has vllm-neuron
+
+[project.entry-points."vllm.general_plugins"]
+qwen3_moe_neuron = "qwen3_moe_neuron.plugin:register"
+
+[tool.setuptools]
+package-dir = {"qwen3_moe_neuron" = "src"}
+packages = ["qwen3_moe_neuron"]
