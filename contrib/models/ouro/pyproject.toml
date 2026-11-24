@@ -1,0 +1,22 @@
+# Installs this folder's src/ as the ``ouro_neuron`` package and registers
+# OuroForCausalLM (and the "ouro" config type) with vLLM in every process (front
+# end, engine core, Neuron workers) through a general-plugin entry point:
+#     pip install -e contrib/models/ouro
+[build-system]
+requires = ["setuptools>=77.0.3,<80.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-neuron-contrib-ouro"
+version = "0.1.0"
+description = "OuroForCausalLM contrib model for vllm-neuron"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = []  # runs inside an environment that already has vllm-neuron
+
+[project.entry-points."vllm.general_plugins"]
+ouro_neuron = "ouro_neuron.plugin:register"
+
+[tool.setuptools]
+package-dir = {"ouro_neuron" = "src"}
+packages = ["ouro_neuron"]
