@@ -159,8 +159,9 @@ def test_rope_permutation_matches_hf():
     perm = model.glm4_rope_permutation(hd, rot)
     assert perm.tolist() == reference_rope_permutation(hd, rot)
 
-    # Positions to 2047 cover the 2048-token model length of the recorded runs.
-    positions = torch.arange(0, 2048, 16, dtype=torch.int64)
+    # Positions to 9215 cover the 9216-token model length of the integration
+    # test and the serve example.
+    positions = torch.arange(0, 9216, 16, dtype=torch.int64)
     tokens = positions.shape[0]
     q = torch.randn(1, 6, tokens, hd)
     k = torch.randn(1, 1, tokens, hd)
@@ -173,14 +174,14 @@ def test_rope_permutation_matches_hf():
     )
     assert cos.shape == (tokens, hd)
     q_p, k_p = q[..., perm], k[..., perm]
-    q_port = q_p * cos + _rotate_half(q_p) * sin
-    k_port = k_p * cos + _rotate_half(k_p) * sin
+    q_out = q_p * cos + _rotate_half(q_p) * sin
+    k_out = k_p * cos + _rotate_half(k_p) * sin
 
-    torch.testing.assert_close(q_port, q_ref[..., perm], atol=1e-4, rtol=1e-4)
-    torch.testing.assert_close(k_port, k_ref[..., perm], atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(q_out, q_ref[..., perm], atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(k_out, k_ref[..., perm], atol=1e-4, rtol=1e-4)
     # The permutation is the same for Q and K, so the attention scores do not change.
     torch.testing.assert_close(
-        q_port @ k_port.transpose(-1, -2),
+        q_out @ k_out.transpose(-1, -2),
         q_ref @ k_ref.transpose(-1, -2),
         atol=1e-3,
         rtol=1e-4,
@@ -235,8 +236,7 @@ _TINY = dict(
 PREFILL_LEN = 64
 # The BC gate needs enough error values. With 4 steps (1024 values), the
 # histogram BC of two samples from one distribution is about 0.97, so the
-# 0.99 gate cannot pass. 64 steps give 16384 values. Steps 0 to 3 are the
-# original 4 decode positions.
+# 0.99 gate cannot pass. 64 steps give 16384 values.
 DECODE_STEPS = 64
 # Number of decode steps in each input of the three-way gate.
 DECODE_INPUT_STEPS = 4
@@ -376,7 +376,7 @@ def test_tiny_decoder_layer_matches_hf(world_size: int):
             torch.testing.assert_close(rank_out, outputs[0])
         decode_rows.append(outputs[0].reshape(1, -1))
     # Give each group of 4 steps to the gate as one input. The L-inf and L2
-    # guards then apply to each group. Group 0 is the original decode4 case.
+    # guards then apply to each group.
     # The BC gate uses the errors of all the groups.
     chunk = DECODE_INPUT_STEPS
     actual = torch.cat(decode_rows, dim=0)

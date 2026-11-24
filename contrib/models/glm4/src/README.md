@@ -69,7 +69,7 @@ Tensor parallelism shards the query heads, the MLP intermediate dimension and
 the vocabulary. The TP size must divide the attention head count (48), the
 intermediate size (23040) and the vocabulary (151552), and with TP >= 2 it
 must be a multiple of the KV head count (2). For GLM-4-32B-0414 that leaves
-TP 2, 4, 8 and 16; the recorded runs used TP 8.
+TP 2, 4, 8 and 16; the integration test and the serve example use TP 8.
 
 - With TP >= 2 every rank holds one KV head. At TP 8 each rank has 6 query
   heads, and each of the 2 KV heads is replicated on 4 ranks.
@@ -82,33 +82,40 @@ TP 2, 4, 8 and 16; the recorded runs used TP 8.
   QKV kernel writes the post-RoPE K/V into the cache. The runner picks the
   path through `kv_segment_size` in the attention metadata; vLLM Neuron
   0.29.0.1.2.0 sets it by default only when `max_num_batched_tokens` is a
-  supported segment size (512 to 8192), so keep the prefill chunk at one of
-  those sizes.
+  supported segment size (512, 1024, 2048, 4096 or 8192), so keep the
+  prefill chunk at one of those sizes.
 - Decode uses the fused `NF.attention_decode` kernel with the in-kernel KV
   cache update (`kv_cache_update_idx` as `uint32`), then a TP all-reduce.
 - The embedding and the LM head are sharded on the vocabulary dimension.
 
 ## Feature status
 
-The statuses come from the code in this folder and from the recorded test
-verdicts in the Validation report of the model folder's `README.md`.
+The statuses come from the code in this folder and from what the tests in
+`test/` run. "Device integration test" means that
+`test/integration/test_model.py` runs the feature on Neuron (TP 8, a
+9216-token model length, two prompts of 8000 to 8192 tokens, 16 validated
+tokens each, batch 1 and 4); its results are in the Validation report of the
+model folder's `README.md`.
 
 | Feature | Status |
 |---|---|
-| BF16 checkpoint and compute | Exercised on device (see the Validation report) |
-| TP 8, single node | Exercised on device (see the Validation report) |
-| TP 2, 4, 16 | Implemented, not covered on device. CPU mode covers TP 4 with a tiny random-weight model. |
+| BF16 checkpoint and compute | Device integration test |
+| TP 8, single node | Device integration test |
+| TP 2, 4, 16 | Implemented, not validated on device. CPU mode covers TP 4 with a tiny random-weight model and TP 2 with one tiny decoder layer. |
 | TP 1 | Not covered. Both KV heads land on one rank; the decode call passes a 2D block table, which `NF.attention_decode` routes to its torch fallback for more than one KV head per rank. |
-| Segmented (chunked) prefill, prefill bucket 1024 | Exercised on device with single-chunk prompts (see the Validation report); a prompt over several chunks is covered only in CPU mode with a tiny model |
-| Flash-attention prefill | Implemented, not covered on device: the recorded runs set `max_num_batched_tokens` 1024 below `max_model_len` 2048. CPU mode covers it with a tiny model. |
-| Fused decode attention kernel | Exercised on device (see the Validation report) |
-| On-device greedy sampling | Exercised on device (see the Validation report) |
-| Prefix caching | Implemented through the segmented-prefill path, not covered (every recorded run disabled it) |
-| Context beyond 2048 tokens (up to 32768) | Implemented, not covered |
+| Segmented (chunked) prefill, 1024-token chunks | Device integration test: 8 chunks per prompt, each chunk after the first attends to the earlier chunks in the paged KV cache. CPU mode also covers a 600-token prompt in two chunks of at most 512 tokens with a tiny model. |
+| Flash-attention (single-step) prefill | Implemented, not validated on device: the device configuration sets `max_num_batched_tokens` 1024 below `max_model_len` 9216. CPU mode covers it with a tiny model. |
+| Fused decode attention kernel | Device integration test (16 decode steps after each 8k-token prompt) |
+| On-device greedy sampling | Device integration test |
+| Context up to 9216 tokens | Device integration test |
+| Context beyond 9216 tokens (up to 32768) | Implemented, not validated |
+| Decode batch sizes 1 and 4 | Device integration test; other batch sizes not validated |
+| Prefix caching | Implemented through the segmented-prefill path, not validated (the tests and the serve example disable it) |
 | `inputs_embeds` | Not supported, pass `input_ids` |
 | Attention bias | Rejected by the factory (GLM-4-0414 checkpoints have none) |
 | Quantized checkpoints, non-BF16 checkpoints | Rejected by the factory (BF16 only) |
-| Speculative decoding | Code path present (`rejection_sampler`), not covered |
+| Speculative decoding | Code path present (`rejection_sampler`), not validated |
+| Disaggregated prefill and decode (KV transfer) | Prefill and decode use the same KV layout; not validated |
 | LoRA, multimodal input, pooling | Not implemented |
 | Trn3 | Not tested |
 
@@ -125,7 +132,9 @@ The tests are in the folder above this one:
 - `test/unit/test_tiny_glm4_e2e.py`: the whole vLLM pipeline in CPU mode at
   TP 4 on a random-weight tiny GLM-4, against HF.
 - `test/integration/test_model.py`: serves the model through vLLM on Neuron at
-  TP 8 and compares the raw logits with a HuggingFace golden reference.
+  TP 8 with a 9216-token model length, builds two prompts of 8000 to 8192
+  tokens, and compares the raw logits of 16 generated tokens with a
+  HuggingFace golden reference at batch 1 and batch 4.
 
 All of them reach this directory through `test/_local_src.py`, which loads it
 by file location under the module name `contrib_glm4_src`.

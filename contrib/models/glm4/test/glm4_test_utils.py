@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared helpers for the GLM-4-0414 (zai-org/GLM-4-32B-0414) contrib tests.
 
-This file travels with the model. It is the port's own test helper, cut down
-to what the tests in this folder use, and it sits at the ``test/`` root because
-``test/unit`` and ``test/integration`` both import it (``test/conftest.py`` puts
-this directory on ``sys.path``). The implementation under ``src/`` is reached
-through ``_local_src``.
+This file holds the checkpoint helpers, the independent references and the
+weight-loader drivers that the tests in this folder share. It sits at the
+``test/`` root because ``test/unit`` and ``test/integration`` both import it
+(``test/conftest.py`` puts this directory on ``sys.path``). The implementation
+under ``src/`` is reached through ``_local_src``.
 
 Checkpoint resolution:
 
@@ -17,8 +17,8 @@ Checkpoint resolution:
   about 20 MB) download those files of the pinned revision from the
   HuggingFace hub. They skip when the hub cannot be reached.
 
-The module also holds the picklable ``model_load`` function that the
-``MPExecutor`` decoder-layer test sends to its CPU workers.
+The module also holds ``load_tiny_decoder_layer``, the picklable model-load
+function that the ``MPExecutor`` decoder-layer test sends to its CPU workers.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from torch import nn
 from _local_src import src_module
 
 MODEL_ID = "zai-org/GLM-4-32B-0414"
-# The revision that every recorded run of this model used.
+# The revision that the tests and the serve example in README.md pin.
 HF_REVISION = "077b5c2f5c43bd3239fd605a0600229e8facbd4a"
 # Namespaces the cached HF goldens by checkpoint revision.
 GOLDEN_VARIANT = f"rev_{HF_REVISION[:12]}"

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A helper this model needs that vLLM Neuron 0.29.0.1.2.0 does not ship.
+"""A config helper this model needs that vLLM Neuron 0.29.0.1.2.0 does not ship.
 
-``hoist_rope_parameters`` lives in ``vllm_neuron.model.config_utils`` in later
-vLLM Neuron releases. That module does not exist in 0.29.0.1.2.0, so the
-function is copied here unchanged and the model runs on the 0.29 plugin as
-installed.
+``Glm4Config.from_configs`` (``config.py``) calls ``hoist_rope_parameters``
+to read the RoPE settings that transformers 5 keeps under
+``rope_parameters``. vLLM Neuron 0.29.0.1.2.0 has no such helper, so this
+folder defines it here.
 """
 
 import logging

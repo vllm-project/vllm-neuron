@@ -8,8 +8,7 @@ Two things live here:
   ``src/``) and ``glm4_test_utils``. pytest puts the directory of a test file on
   ``sys.path``, not the directory above it.
 * ``_worker_pool_cleanup`` shuts down the plugin's ``MPExecutor`` worker pool at
-  the end of the session. A test under ``contrib/`` does not pick up the
-  plugin's own ``test/conftest.py``, so the fixture is vendored here.
+  the end of the session.
 """
 
 import os
@@ -29,8 +28,7 @@ def _worker_pool_cleanup():
 
     ``MPExecutor`` keeps its worker processes in a module-level pool so later
     tests can reuse them. Those workers outlive the last test, so without this
-    shutdown pytest prints its summary and then never exits. The plugin's own
-    test suite shuts the pool down the same way.
+    shutdown pytest prints its summary and then never exits.
     """
     pid = os.getpid()
     yield

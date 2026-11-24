@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM-4-32B-0414 checkpoint loading tests (CPU only).
 
-The tests use the TP 8 sharding of the recorded runs. They replace the TP group
-with a stub, so they do not start a process group and they do not need a
-Neuron device.
+The tests use the TP 8 sharding of the integration test and the serve
+example in README.md. They replace the TP group with a stub, so they do not
+start a process group and they do not need a Neuron device.
 
 1. Key coverage: the parameters of the full 61-layer model refer to each
    checkpoint tensor, and each referenced key is in the checkpoint. This test

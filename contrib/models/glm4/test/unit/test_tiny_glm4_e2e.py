@@ -22,9 +22,10 @@ Two prefill paths are covered:
 - ``flash``: ``max_num_batched_tokens`` equals the model length, so the prompt
   runs in one step through ``NF.flash_attention``.
 - ``segmented``: ``max_num_batched_tokens`` 512 is below the model length 1024,
-  as in the recorded serving runs (1024 below 2048). vLLM Neuron turns
-  segmented prefill on by default only for a supported segment size (512 and
-  up), so the chunk is 512 tokens. A 600-token prompt runs as two chunks
+  as in the integration test and the serve example in README.md (1024 below
+  9216). vLLM Neuron turns segmented prefill on by default only for a
+  supported segment size (512 and up), so the chunk is 512 tokens. A
+  600-token prompt runs as two chunks
   through ``NF.qkv_proj`` with the in-kernel KV write and
   ``NF.segmented_attention``; the second chunk attends to the first chunk's
   K/V in the paged cache.
@@ -53,9 +54,10 @@ import torch
 from _local_src import src_package
 from glm4_test_utils import ARCHITECTURE
 
-# The environment the plugin's CPU-mode tests use:
-# - VLLM_ENABLE_V1_MULTIPROCESSING=0: run the engine core in this process; the
-#   engine-core subprocess hangs in CPU mode. TP workers still start.
+# The CPU-mode environment of this test:
+# - VLLM_ENABLE_V1_MULTIPROCESSING=0: run the engine core in this process, so
+#   the registration below is in effect there. The TP workers are still
+#   separate processes, forked from this one.
 # - VLLM_NEURON_MIN_KV_BUDGET_GIB=0: CPU mode has no real HBM.
 # - NKI_SIMULATOR=1 and NEURON_PLATFORM_TARGET_OVERRIDE=trn2: the CPU worker
 #   needs a concrete platform target.
