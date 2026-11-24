@@ -2880,6 +2880,21 @@ class NeuronWorker(WorkerBase):
         logger.debug("Executing dummy batch on NeuronWorker")
         self.model_runner.execute_dummy_batch()
 
+    def synchronize_device(self) -> None:
+        """Wait until the work queued on this worker's NeuronCores finishes.
+
+        vLLM calls this on every worker at the end of a pause
+        (``pause_generation``, for example before a weight refresh). The
+        default calls ``torch.accelerator.synchronize()``, which the Neuron
+        backend does not implement ("Backend doesn't support synchronizing all
+        streams on device"), so the pause failed.
+        """
+        if envs.VLLM_NEURON_CPU_MODE or envs.VLLM_NEURON_CPU_COMPILE:
+            return
+        synchronize = getattr(getattr(torch, "neuron", None), "synchronize", None)
+        if synchronize is not None:
+            synchronize()
+
     def shutdown(self) -> None:
         """Clean up resources held by the worker."""
         if self._profiler is not None:
