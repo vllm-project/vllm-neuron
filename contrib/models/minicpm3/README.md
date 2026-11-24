@@ -251,6 +251,81 @@ does not exit.
 
 ## Validation report
 
-The validation report for the 9,216-token configuration above (vLLM Neuron
-0.29.0.1.2.0, Trn2, TP 8) is pending. It will list the environment and the
-results of the unit tests, the integration test and the serve command.
+### vLLM Neuron 0.29.0.1.2.0 (2026-11-24)
+
+#### Environment
+
+| Image | Instance | TP | vLLM | vllm-neuron | torch | transformers | neuronx-cc |
+|---|---|---|---|---|---|---|---|
+| `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04` | `trn2.48xlarge` (LNC 2), 1 node | 8 | 0.29.0 | 0.29.0.1.2.0 | 2.13.0 | 5.17.0 | 2.28.7631.0+8f7b0cf5 |
+
+Checkpoint of the integration test: `openbmb/MiniCPM3-4B` at
+`d6b14ddaefdb11c624dd75c3c779549bc90b08cb`.
+
+#### Results
+
+| Test | Configuration | Result |
+|---|---|---|
+| CPU unit tests, `test/unit/` | `VLLM_NEURON_CPU_MODE=1`, `MINICPM3_CHECKPOINT_PATH` set (the 2 real-checkpoint tests ran) | 28 passed, 0 failed |
+| `test_model_accuracy[1-9216]` | TP 8, `neuron_native`, BF16, batch 1, max model length 9,216, 2 prompts of 8,161 tokens × 16 greedy tokens, prefill in 2,048-token chunks (prefill graph `(2048, 2048)`: 2,048 tokens, KV segment size 2,048), on-device greedy sampling | PASSED (1109.705 s, including the FP32 and BF16 HF reference runs on the host CPU): 2/2 prompts within the K5/K50/K1000/All bounds; one acceptable divergence (prompt 2, token 6); aggregate σ-ratio 0.6514 ≤ 1.0 |
+| `test_model_accuracy[4-9216]` | TP 8, `neuron_native`, BF16, batch 4 (each prompt in 4 rows), max model length 9,216, 2 prompts of 8,161 tokens × 16 greedy tokens, prefill in 2,048-token chunks (prefill graph `(2048, 2048)`), on-device greedy sampling | PASSED (265.145 s, cached HF reference): 2/2 prompts within the K5/K50/K1000/All bounds; one acceptable divergence in each row (prompt 2, token 6); aggregate σ-ratio 0.6524 ≤ 1.0 |
+| `vllm serve` smoke | The Usage command (`--revision d6b14ddaefdb11c624dd75c3c779549bc90b08cb`), installed with `pip install --no-deps -e contrib/models/minicpm3` | Passed: 3/3 prompts, 32 completion tokens each; a batched request of all 3 at `max_tokens` 16 returned a prefix of each |
+| `vllm serve` long prompt | The same server; `/v1/completions` with a deterministic synthetic ledger document (242 records) measured with the server's `/tokenize` endpoint, `max_tokens` 1024, `temperature` 0, `ignore_eos` | 8186 prompt tokens, 1024 completion tokens, finish reason `length`, 20.2 s |
+
+The integration test also asserts `pp_max_linf_1.5x` and `pp_max_l2_1.5x` on every prompt; both were 2/2 in both cases of this run.
+
+#### Logit validation
+
+| Case | Prompt | Overall Status | Max K5 (0.03) | Max K50 (0.05) | Max K1000 (0.08) | Max All (0.09) | Argmax divergence (1 ULP) |
+|---|---|---|---|---|---|---|---|
+| `[1-9216]` | 1 of 2, `Chapter 1. The river rises …` | PASSED | 0.0113 at token 11 | 0.0113 at token 11 | 0.0113 at token 11 | 0.0113 at token 11 | 0.0000 |
+| `[1-9216]` | 2 of 2, `Weather log. Each record …` | PASSED | 0.0293 at token 13 | 0.0426 at token 13 | 0.0451 at token 13 | 0.0487 at token 13 | 0.0000; acceptable divergence at token 6 (Δ = 0.0000) |
+| `[4-9216]` | 1 of 2, `Chapter 1. The river rises …` | PASSED | 0.0113 at token 11 | 0.0113 at token 11 | 0.0113 at token 11 | 0.0113 at token 11 | 0.0000 |
+| `[4-9216]` | 2 of 2, `Weather log. Each record …` | PASSED | 0.0293 at token 13 | 0.0426 at token 13 | 0.0451 at token 13 | 0.0487 at token 13 | 0.0000; acceptable divergence at token 6 in rows 0 to 3 (Δ = 0.0000) |
+
+Neuron vs CPU BF16 reference; token = generated token, row = batch row. For `[4-9216]` the location is that of row 0, and the printed per-row maxima are the same in all 4 rows. Every token of every prompt is within all four bounds (`[1-9216]`: 16 tokens per prompt; `[4-9216]`: 64 tokens per prompt, 4 rows). At token 6 of prompt 2 the Neuron greedy token differs from the argmax of the CPU BF16 reference, with a gap of 0.0000 between the Neuron logits of the two tokens (within the 1-ULP bound); the validation continued with the reference tokens (teacher forcing).
+Both cases passed (`multi_prompt_logit_validation`: two-way validation 2/2 prompts; aggregate σ-ratio 0.6514 (`[1-9216]`) and 0.6524 (`[4-9216]`) ≤ 1.0; the test asserts `result.passed` and the per-prompt checks `pp_max_linf_1.5x` and `pp_max_l2_1.5x`); `agg_bc` FAIL and `agg_linf_1.2x` FAIL in both cases; printed per-prompt checks, the same in both cases: `pp_max_linf_1.5x` 2/2, `pp_max_linf_2.0x` 2/2, `pp_max_l2_1.5x` 2/2, `pp_max_l2_2.0x` 2/2, `pp_tok_linf_1.5x` 2/2, `pp_tok_linf_2.0x` 2/2, `pp_tok_l2_1.5x` 2/2, `pp_tok_l2_2.0x` 2/2, `pp_static_0.03` 2/2, `pp_static_0.05` 2/2.
+
+Error against the FP32 reference, per prompt (max over the 16 generated tokens):
+
+| Case | Prompt | CPU BF16 L-inf | Neuron L-inf | Neuron / CPU BF16 | CPU BF16 L2 | Neuron L2 | Neuron / CPU BF16 |
+|---|---|---|---|---|---|---|---|
+| `[1-9216]` | 1 of 2 | 0.0096 | 0.0056 | 0.58x | 0.0104 | 0.0068 | 0.65x |
+| `[1-9216]` | 2 of 2 | 0.0270 | 0.0272 | 1.01x | 0.0652 | 0.0432 | 0.66x |
+| `[4-9216]` | 1 of 2 | 0.0096 | 0.0056 | 0.58x | 0.0104 | 0.0068 | 0.65x |
+| `[4-9216]` | 2 of 2 | 0.0270 | 0.0272 | 1.01x | 0.0652 | 0.0432 | 0.66x |
+
+Maxima, the same in both cases: prompt 1, CPU BF16 L-inf at generated token 11, Neuron L-inf at token 3, CPU BF16 L2 at token 9, Neuron L2 at token 4; prompt 2, all four at token 13.
+
+#### Serve smoke
+
+`/v1/completions`, `temperature` 0, `max_tokens` 32 (the long prompt: `max_tokens` 1024, `ignore_eos`); first 60 characters of each output as a Python string literal.
+
+| Prompt | Output |
+|---|---|
+| `The capital of France is` | `' Paris.\n\n- Paris, the capital of France, is a global city kn'` |
+| `1, 2, 3, 4, 5,` | `' 6, 7, 8, 9, 10, 11, 12, 13, 14,'` |
+| `def fibonacci(n):` | `'\n    if n <= 0:\n        return []\n    elif n == 1:\n        r'` |
+| Synthetic ledger document, 8186 prompt tokens | `'\n\nThe ledger above contains records of trade activities from'` |
+
+### Exceptions
+
+- **The unit tests ran in CPU mode** (`VLLM_NEURON_CPU_MODE=1`) on the
+  device host. Only the integration test and the serve checks ran on Neuron.
+- **The single-layer attention and MLP checks of
+  `test/unit/test_components.py` run at TP 4**, not at the TP 8 of the device
+  run. On CPU the collectives add the BF16 partial outputs of the ranks in
+  BF16, and at 8 ranks that rounding alone exceeds the three-way bound for one
+  layer. The full-model checks in the same file run at TP 8.
+- **Logits are validated for the first 16 generated tokens** after each
+  prompt. The 1,024 tokens of the long-prompt serve request are not compared
+  with a reference.
+- **One acceptable divergence** at generated token 6 of prompt 2 in both
+  cases (see Logit validation).
+- **The weight loader fetches `pytorch_model.bin` by the Hub id** (revision
+  `main`); `--revision` pins only the config and the tokenizer. The
+  integration test loaded a local snapshot of the pinned revision.
+- One-shot prefill (`NF.flash_attention`), prefix caching, contexts beyond
+  9,216 tokens, batch sizes other than 1 and 4 in the integration test, TP
+  sizes other than 8 on Neuron, sampled requests, async scheduling,
+  speculative decoding and Trn3 are not tested.
