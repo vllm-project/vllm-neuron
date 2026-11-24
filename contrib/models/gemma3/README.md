@@ -223,5 +223,92 @@ pytest prints its summary and then does not exit.
 
 ## Validation report
 
-The validation report for the 9216-token configuration (the integration test
-above and the `vllm serve` command in [Usage](#usage)) is pending.
+### vLLM Neuron 0.29.0.1.2.0 (2026-11-24)
+
+#### Environment
+
+| Image | Instance | TP | vLLM | vllm-neuron | torch | transformers | neuronx-cc |
+|---|---|---|---|---|---|---|---|
+| `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04` | `trn2.48xlarge` (LNC 2), 1 node | 8 | 0.29.0 | 0.29.0.1.2.0 | 2.13.0 | 5.17.0 | 2.28.7631.0+8f7b0cf5 |
+
+Checkpoint of the integration test and the serve smoke: `EssentialAI/rnj-1-instruct` at
+`5ef96d7a82b2bff8009192979432c9bc64e870cd`.
+
+#### Results
+
+| Test | Configuration | Result |
+|---|---|---|
+| CPU unit tests, `test/unit/` | `VLLM_NEURON_CPU_MODE=1` | 18 passed, 0 failed |
+| `test_model_accuracy[1-9216]` | TP 8, `neuron_native`, BF16 (FP32 checkpoint), batch 1, max model length 9,216, 2 prompts of 8,169 and 8,170 tokens × 16 greedy tokens, segmented prefill (8,192-token step and KV segment), on-device greedy sampling | PASSED (346.53 s) on two-way validation 2/2 prompts (every token within the tolerance map, no argmax divergence); aggregate σ-ratio 1.0339 (> 1.0) |
+| `test_model_accuracy[4-9216]` | TP 8, `neuron_native`, BF16 (FP32 checkpoint), batch 4 (each prompt in 4 rows), max model length 9,216, 2 prompts of 8,169 and 8,170 tokens × 16 greedy tokens, segmented prefill (8,192-token step and KV segment), on-device greedy sampling | PASSED (261.30 s) on two-way validation 2/2 prompts (every token within the tolerance map, no argmax divergence); aggregate σ-ratio 1.0339 (> 1.0) |
+| `vllm serve` smoke | The Usage command, installed with `pip install --no-deps -e contrib/models/gemma3` | Passed: 3/3 prompts, 32 completion tokens each; a batched request of all 3 at `max_tokens` 16 returned a prefix of each |
+| `vllm serve` 8k request | The same server; one prompt, a deterministic synthetic ledger document measured with the server's `/tokenize` endpoint; `max_tokens` 1024, `temperature` 0, `ignore_eos` | 8,167 prompt tokens, 1,024 completion tokens, finish reason `length` (17.8 s) |
+
+The integration test asserts the per-prompt checks `pp_max_linf_1.5x` and `pp_max_l2_1.5x` on every prompt; both were 2/2 in both cases of this run.
+
+#### Logit validation
+
+| Case | Prompt | Overall Status | Max K5 (0.03) | Max K50 (0.05) | Max K1000 (0.08) | Max All (0.09) | Argmax divergence (1 ULP) |
+|---|---|---|---|---|---|---|---|
+| `[1-9216]` | 1 of 2, `The following is a ledger …` (8,169 tokens) | PASSED | 0.0251 at token 5 | 0.0322 at token 5 | 0.0361 at token 11 | 0.0422 at token 11 | 0.0000 |
+| `[1-9216]` | 2 of 2, `The following is a log …` (8,170 tokens) | PASSED | 0.0098 at token 11 | 0.0139 at token 15 | 0.0192 at token 4 | 0.0252 at token 4 | 0.0000 |
+| `[4-9216]` | 1 of 2, `The following is a ledger …` (8,169 tokens) | PASSED | 0.0251 at token 5, row 0; the same in all 4 rows | 0.0322 at token 5, row 0; the same in all 4 rows | 0.0361 at token 11, row 0; the same in all 4 rows | 0.0422 at token 11, row 0; the same in all 4 rows | 0.0000 |
+| `[4-9216]` | 2 of 2, `The following is a log …` (8,170 tokens) | PASSED | 0.0098 at token 11, row 0; the same in all 4 rows | 0.0139 at token 15, row 0; the same in all 4 rows | 0.0192 at token 4, row 0; the same in all 4 rows | 0.0252 at token 4, row 0; the same in all 4 rows | 0.0000 |
+
+Neuron vs CPU BF16 reference; token = generated token, row = batch row. No token over a bound. No argmax divergence.
+Both cases passed on two-way validation 2/2 prompts (`multi_prompt_logit_validation`; the test asserts `result.passed`, `pp_max_linf_1.5x` and `pp_max_l2_1.5x`); aggregate σ-ratio 1.0339 (> 1.0) in both cases; `agg_bc` FAIL; `agg_l2_1.2x`, `agg_l2_1.5x`, `agg_linf_1.2x`, `agg_linf_1.5x` PASS; printed per-prompt checks, the same in both cases: `pp_max_linf_1.5x` 2/2, `pp_max_linf_2.0x` 2/2, `pp_max_l2_1.5x` 2/2, `pp_max_l2_2.0x` 2/2, `pp_tok_linf_1.5x` 1/2, `pp_tok_linf_2.0x` 2/2, `pp_tok_l2_1.5x` 2/2, `pp_tok_l2_2.0x` 2/2, `pp_static_0.03` 0/2, `pp_static_0.05` 1/2.
+
+Error against the FP32 reference, per prompt (max over the 16 generated tokens):
+
+| Case | Prompt | CPU BF16 L-inf | Neuron L-inf | Neuron / CPU BF16 | CPU BF16 L2 | Neuron L2 | Neuron / CPU BF16 |
+|---|---|---|---|---|---|---|---|
+| `[1-9216]` | 1 of 2 | 0.0788 | 0.0623 | 0.79x | 0.0908 | 0.0913 | 1.01x |
+| `[1-9216]` | 2 of 2 | 0.0291 | 0.0322 | 1.11x | 0.0304 | 0.0328 | 1.08x |
+| `[4-9216]` | 1 of 2 | 0.0788 | 0.0623 | 0.79x | 0.0908 | 0.0913 | 1.01x |
+| `[4-9216]` | 2 of 2 | 0.0291 | 0.0322 | 1.11x | 0.0304 | 0.0328 | 1.08x |
+
+Prompt 1: both L-inf maxima at generated token 4, both L2 maxima at token 8. Prompt 2: both L-inf maxima at token 8, both L2 maxima at token 11.
+
+#### Serve smoke
+
+`/v1/completions`, `temperature` 0, on-device greedy sampling (`all_greedy`); `max_tokens` 32 for the three short prompts, `max_tokens` 1024 with `ignore_eos` for the 8k request; first 60 characters of each output as a Python string literal.
+
+| Prompt | Output |
+|---|---|
+| `The capital of France is` | `' Paris. The capital of France is Paris. The capital of Franc'` |
+| `1, 2, 3, 4, 5,` | `' 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16'` (the whole output) |
+| `def fibonacci(n):` | `' #  (1) n = 10;\n    if n <= 0:\n        return 0\n    elif n ='` |
+| 8k request, `The following is a ledger of trade records …` (8,167 tokens) | `' The ledger contains 310 records of trade activities across '` |
+
+### Exceptions
+
+- **The serve smoke output for `The capital of France is` repeats itself.**
+  The full 32-token output is
+  `' Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital'`.
+- **The output of the 8k request repeats a list of words.** The ledger in the
+  prompt has 310 records. The first 400 characters of the output are
+  `' The ledger contains 310 records of trade activities across 10 depots located in different cities. Each record includes the day of the activity, the type of trade (e.g., weighed, sold, shipped, returned, stored, repaired, inspected, received, counted, loaded, shipped, inspected, weighed, sold, stored, returned, weighed, sold, stored, returned, weighed, sold, stored, returned, weighed, sold, stored'`
+  and the last 200 characters are
+  `'d, stored, returned, weighed, sold, stored, returned, weighed, sold, stored, returned, weighed, sold, stored, returned, weighed, sold, stored, returned, weighed, sold, stored, returned, weighed, sold,'`.
+  The request checks the token counts and the finish reason only.
+- **The aggregate σ-ratio is 1.0339 (> 1.0) and `agg_bc` is FAIL in both
+  integration cases.** Both cases passed on two-way validation 2/2 prompts,
+  with `pp_max_linf_1.5x` and `pp_max_l2_1.5x` 2/2. Printed per-prompt checks
+  below 2/2: `pp_tok_linf_1.5x` 1/2 (prompt 2, generated token 13: 1.59x),
+  `pp_static_0.03` 0/2, `pp_static_0.05` 1/2.
+- **Logit accuracy is validated for the first 16 generated tokens after each
+  prompt.** Generation further into the 9216-token context (the 1,024 tokens
+  of the 8k request) is not compared with a reference.
+- **The server default temperature comes from the checkpoint.** The serve log
+  warns that the checkpoint's `generation_config.json` overrides the default
+  sampling parameters with `temperature` 0.2. The smoke requests set
+  `temperature` 0 and the server ran with `all_greedy`; sampled serving was
+  not run.
+- **The decode branch with more than one KV head per rank (TP 1, 2, 4) is not
+  verified.** In CPU mode with the NKI simulator its decode attention returns
+  NaN when the block table has inactive (`-1`) entries; it was not run on
+  device. TP 8 and TP 16 use the one-KV-head-per-rank branch.
+- Prefix caching, prompts longer than 8,192 tokens (segmented prefill with
+  prior KV), full prefill without segments, TP sizes other than 8 on device,
+  context beyond 9,216 tokens, speculative decoding and Trn3 are not tested
+  on device.
