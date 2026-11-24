@@ -454,6 +454,26 @@ class NeuronPlatform(Platform):
         )
         scheduler_config.encoder_cache_size = budget
 
+    @staticmethod
+    def _runs_vision_encoder(model_config) -> bool:
+        """Return True if the server runs the vision encoder of the checkpoint.
+
+        A checkpoint with a ``vision_config`` served with vLLM's
+        ``language_model_only`` (which the Qwen3.5 defaults set) takes no
+        multimodal input, so it gets no encoder settings: the runner then has
+        no ``encoder_neuron_config``, and a client that checks for an encoder
+        (ART's weight refresh) sees a text-only server. Precomputed embeddings
+        (``enable_mm_embeds``) still need the encoder settings.
+        """
+        if not hasattr(model_config.hf_config, "vision_config"):
+            return False
+        mm_config = getattr(model_config, "multimodal_config", None)
+        return not (
+            mm_config is not None
+            and mm_config.language_model_only
+            and not getattr(mm_config, "enable_mm_embeds", False)
+        )
+
     @classmethod
     def _resolve_vision_auto_config(
         cls, vllm_config: "VllmConfig", model_config
@@ -794,7 +814,7 @@ class NeuronPlatform(Platform):
         # max_num_batched_tokens. The encoder budget cap in NeuronScheduler
         # already prevents overflow without needing this flag.
 
-        if hasattr(model_config.hf_config, "vision_config"):
+        if cls._runs_vision_encoder(model_config):
             cls._resolve_vision_auto_config(vllm_config, model_config)
 
         # Compute the per-item embed limit for request validation.

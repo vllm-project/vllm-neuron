@@ -2,8 +2,9 @@
 """The resolved Qwen3.5 defaults: a plain ``vllm serve`` gets the measured configuration.
 
 Covers NeuronPlatform._apply_qwen3_5_defaults (batch limits, buckets, snapshot rows,
-language-model-only), NeuronModelRunner._resolve_async_readback_skip and
-NeuronWorker._get_kv_cap_fraction. CPU only.
+language-model-only), NeuronPlatform._runs_vision_encoder,
+NeuronModelRunner._resolve_async_readback_skip and NeuronWorker._get_kv_cap_fraction.
+CPU only.
 """
 
 import sys
@@ -107,7 +108,15 @@ def test_an_art_rollout_profile_keeps_its_buckets_and_gets_the_rest(monkeypatch)
     monkeypatch.setattr(
         sys,
         "argv",
-        ["vllm", "serve", "m", "--max-num-seqs", "8", "--max-num-batched-tokens", "2048"],
+        [
+            "vllm",
+            "serve",
+            "m",
+            "--max-num-seqs",
+            "8",
+            "--max-num-batched-tokens",
+            "2048",
+        ],
     )
     cfg = _vllm_config(max_model_len=65536, max_num_seqs=8, max_num_batched_tokens=2048)
     nc = {
@@ -224,3 +233,36 @@ def test_the_factory_takes_the_multimodal_call_of_the_runner(monkeypatch):
         hf_config=None, text_neuron_config=text, encoder_neuron_config=object()
     )
     assert out == "model" and seen["neuron_config"] is text
+
+
+def _model_config(vision=True, language_model_only=False, mm_embeds=False):
+    hf_config = SimpleNamespace()
+    if vision:
+        hf_config.vision_config = SimpleNamespace()
+    return SimpleNamespace(
+        hf_config=hf_config,
+        multimodal_config=SimpleNamespace(
+            language_model_only=language_model_only, enable_mm_embeds=mm_embeds
+        ),
+    )
+
+
+def test_a_language_model_only_server_gets_no_encoder_settings():
+    """The checkpoint has a vision encoder, but the server takes text only."""
+    assert NeuronPlatform._runs_vision_encoder(_model_config()) is True
+    assert not NeuronPlatform._runs_vision_encoder(
+        _model_config(language_model_only=True)
+    )
+    # Precomputed embeddings still go through the encoder settings.
+    assert NeuronPlatform._runs_vision_encoder(
+        _model_config(language_model_only=True, mm_embeds=True)
+    )
+    assert not NeuronPlatform._runs_vision_encoder(_model_config(vision=False))
+
+
+def test_qwen3_5_defaults_leave_no_encoder_to_configure():
+    cfg = _vllm_config()
+    cfg.model_config.hf_config.vision_config = SimpleNamespace()
+    assert NeuronPlatform._runs_vision_encoder(cfg.model_config)
+    NeuronPlatform._apply_qwen3_5_defaults(cfg, {})
+    assert not NeuronPlatform._runs_vision_encoder(cfg.model_config)
