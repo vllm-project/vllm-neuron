@@ -112,6 +112,10 @@ serve with `--generation-config vllm`: a checkpoint's `generation_config.json`
 otherwise sets the default `top_k`/`top_p` of a request that omits them.
 Speculative decoding and custom logits processors are rejected at startup.
 
+For a complete rollout server for RL training, from the instance to the
+trainer's weight refresh, see
+[Set up a Trainium rollout server for RL training](../tutorials/tutorial-qwen3-5-rl-rollout.md).
+
 ```bash
 # Qwen3.5/3.6-27B rollout server: TP8, 64K context, 8 sequences, async scheduling
 vllm serve <model> --tensor-parallel-size 8 --max-model-len 65536 \
