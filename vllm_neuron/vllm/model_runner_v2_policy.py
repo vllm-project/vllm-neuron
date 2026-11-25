@@ -308,6 +308,12 @@ def get_neuron_model_runner_v2_policy(
     neuron_cfg = _neuron_config_dict(vllm_config)
     if neuron_cfg.get("decode_context_length_buckets") is not None:
         unsupported.append("decode context-length bucketing")
+    # MRv2 hard-requires exactly one active prefill row per scheduler step
+    # (neuron_model_runner_v2.py raises otherwise). Multi-prefill batching
+    # (max_prefills_per_batch > 1) therefore routes to MRv1, which supports
+    # multiple co-admitted prefills.
+    if int(neuron_cfg.get("max_prefills_per_batch", 1)) > 1:
+        unsupported.append("multi-prefill batching (max_prefills_per_batch > 1)")
 
     # MRv2 supports dense, non-speculative disaggregated inference with tensor
     # parallelism. Connector compatibility is validated during KV transfer
