@@ -72,16 +72,12 @@ Always use a timeout (e.g. `--timeout 60`) when running tests with the simulator
 
 ## Running tests
 
-``` bash
-# NKI unit tests (dtype conversion, can_run_kernel)
-VLLM_NEURON_CPU_MODE=1 pytest test/vllm_neuron/nki/test_nki_cpu_sim.py -v --timeout=60
+Follow the [CPU development workflow](cpu-development.md) to install the test
+dependencies and run the public CPU smoke test with the PyTorch fallback.
 
-# Functional tests in CPU mode (no simulator — fast)
-VLLM_NEURON_CPU_MODE=1 pytest test/vllm_neuron/functional/ -v --timeout=60
-
-# Functional tests with simulator (slow — small shapes only)
-VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 pytest test/vllm_neuron/functional/ -v --timeout=60
-```
+To test an NKI kernel with the simulator, set `VLLM_NEURON_CPU_MODE=1` and
+`NKI_SIMULATOR=1`, then run a test that calls the kernel with small inputs.
+Pass `--timeout=60` when running the test with pytest.
 
 ## Limitations
 
