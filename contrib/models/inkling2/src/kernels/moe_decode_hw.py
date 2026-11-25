@@ -16,7 +16,8 @@ Per token ``t`` and routed slot ``k`` (expert ``e``, routing weight ``r``)::
 
 Inputs (HBM): ``x [T, H]`` bf16, ``idx [1, T * K]`` int32 (row-major ``[T, K]``), ``w [1, T * K]`` fp32,
 ``gate_up [E, H, 2 I_r]`` bf16 (``[in, out]``, gate then up), ``down [E, I_r, H]`` bf16. Output ``[T, H]`` fp32
-(this rank's partial sum). ``H`` a multiple of 128, ``2 I_r <= 512``, ``T <= 4``.
+(this rank's partial sum). ``H`` a multiple of 128, ``2 I_r <= 512``, ``T <= 4``. An expert id ``>= E`` (a padding
+row) skips that expert's weight loads (``oob_mode=skip``); the row's output is then not meaningful.
 """
 
 from __future__ import annotations
@@ -67,10 +68,12 @@ try:
                 slot = n % RING
                 reg = nisa.register_alloc()
                 nisa.register_load(reg, idx_sb[0:1, n:n + 1])
-                nisa.dma_copy(dst=wgu[slot], src=gu_view.select(0, reg), dge_mode=nisa.dge_mode.hwdge)
+                nisa.dma_copy(dst=wgu[slot], src=gu_view.select(0, reg), dge_mode=nisa.dge_mode.hwdge,
+                              oob_mode=nisa.oob_mode.skip)
                 d_e = down.select(0, reg)                     # [I, H]
                 for pi, (s, sz) in enumerate(i_parts):
-                    nisa.dma_copy(dst=wd[slot][pi][0:sz, :], src=d_e[s:s + sz, :], dge_mode=nisa.dge_mode.hwdge)
+                    nisa.dma_copy(dst=wd[slot][pi][0:sz, :], src=d_e[s:s + sz, :], dge_mode=nisa.dge_mode.hwdge,
+                                  oob_mode=nisa.oob_mode.skip)
 
                 # gate / up of this token: [1, 2I] in PSUM, accumulated over the H1 hidden blocks
                 gu_ps = nl.ndarray((1, I2), dtype=nl.float32, buffer=nl.psum)
@@ -117,10 +120,12 @@ except ImportError:  # pragma: no cover
 
 
 def moe_decode_hw(wrap, x: torch.Tensor, idx: torch.Tensor, w: torch.Tensor, gate_up: torch.Tensor,
-                  down: torch.Tensor) -> torch.Tensor:
+                  down: torch.Tensor, valid: torch.Tensor | None = None) -> torch.Tensor:
     """``x [T, H]`` bf16, ``idx [T, k]``, ``w [T, k]`` fp32, ``gate_up [E, H, 2 I_r]``, ``down [E, I_r, H]``;
-    ``wrap`` turns the kernel into a callable (the caller's ``wrap_nki(...)[lnc]``). Returns this rank's partial
+    ``valid [T]`` (bool, optional) marks the real rows; ``wrap`` turns the kernel into a callable (the caller's ``wrap_nki(...)[lnc]``). Returns this rank's partial
     ``[T, H]`` fp32."""
     T, k = idx.shape
+    if valid is not None:   # padding rows: no weight traffic
+        idx = torch.where(valid.view(T, 1), idx, torch.full_like(idx, gate_up.shape[0]))
     return wrap(inkling2_moe_decode_hw)(x.contiguous(), idx.reshape(1, T * k).to(torch.int32),
                                         w.reshape(1, T * k).float(), gate_up, down)

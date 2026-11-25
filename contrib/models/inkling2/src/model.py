@@ -126,6 +126,9 @@ class PagedIO(ops.LayerIO):
         self.m, self.positions, self.slot_mapping = model, positions, slot_mapping
         self.block_table = block_table.to(torch.int64).clamp(min=0)
         self.B, self.S, self.valid = B, S, valid
+        # decode rows the runner padded (slot 0, the null block's first slot, as in prefill): the NKI MoE skips
+        # their expert loads
+        self.valid_rows = (slot_mapping.reshape(B, S)[:, 0] > 0) if S == 1 else None
         L = model.state_layout
         planes = model.state_planes                    # [N, plane_block] each: one row per block
         # whole-block reads and writes (one contiguous row a request): an element-indexed gather of the record
@@ -167,7 +170,7 @@ class PagedIO(ops.LayerIO):
         """The decode MoE on nkilib's selective-expert kernel with Inkling 2's activation (kernels/moe_decode.py)."""
         if self.m.moe_kernel == "hw":
             from .kernels import moe_decode_hw as K2
-            return K2.moe_decode_hw(_nki, x, idx, w, gate_up, down)
+            return K2.moe_decode_hw(_nki, x, idx, w, gate_up, down, self.valid_rows)
         if self.m.moe_kernel == "tkg":
             from .kernels import moe_decode as K
             return K.moe_decode(_nki, x, idx, w, gate_up, down)

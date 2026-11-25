@@ -28,9 +28,16 @@ N_TILE = 512
 NEG = -3.4028234663852886e38
 
 try:
+    import os
+
     import nki
     import nki.isa as nisa
     import nki.language as nl
+
+    # the bias row's runtime-offset DMA: hardware descriptors by default; INKLING2_ATTN_BIAS_DGE=sw|auto to compare
+    # (K2 + K4 in one graph hung on the dynamic hardware DMA queues once, see the notes)
+    _BIAS_DGE = {"sw": nisa.dge_mode.swdge, "auto": nisa.dge_mode.unknown}.get(
+        os.environ.get("INKLING2_ATTN_BIAS_DGE", ""), nisa.dge_mode.hwdge)
 
     @nki.jit
     def inkling2_attn_decode(q, k, v, relp, start, bounds, sink):
@@ -71,7 +78,7 @@ try:
             bias = nl.ndarray((hq, L), dtype=nl.float32, buffer=nl.sbuf)
             reg = nisa.register_alloc()
             nisa.register_load(reg, start_sb[0:1, b:b + 1])
-            nisa.dma_copy(dst=bias, src=relp2[b * hq:(b + 1) * hq, nl.ds(reg, L)], dge_mode=nisa.dge_mode.hwdge)
+            nisa.dma_copy(dst=bias, src=relp2[b * hq:(b + 1) * hq, nl.ds(reg, L)], dge_mode=_BIAS_DGE)
             nisa.tensor_tensor(dst=lg, data1=lg, data2=bias, op=nl.add)
 
             # mask (keep lo <= j < hi) and the row max
