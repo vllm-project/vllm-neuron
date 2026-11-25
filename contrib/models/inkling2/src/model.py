@@ -165,10 +165,21 @@ class PagedIO(ops.LayerIO):
 
     def moe_decode(self, x, idx, w, gate_up, down):
         """The decode MoE on nkilib's selective-expert kernel with Inkling 2's activation (kernels/moe_decode.py)."""
-        if not self.m.use_moe_kernel:
-            return ops.moe_gather(x, idx, w, gate_up, down, self.m.config.gate_cap, self.m.config.up_cap)
-        from .kernels import moe_decode as K
-        return K.moe_decode(_nki, x, idx, w, gate_up, down)
+        if self.m.moe_kernel == "hw":
+            from .kernels import moe_decode_hw as K2
+            return K2.moe_decode_hw(_nki, x, idx, w, gate_up, down)
+        if self.m.moe_kernel == "tkg":
+            from .kernels import moe_decode as K
+            return K.moe_decode(_nki, x, idx, w, gate_up, down)
+        return ops.moe_gather(x, idx, w, gate_up, down, self.m.config.gate_cap, self.m.config.up_cap)
+
+    @property
+    def attn_decode(self):
+        """The NKI decode attention core (kernels/attn_decode.py), opt-in with INKLING2_NKI_ATTN=1."""
+        if not self.m.attn_kernel:
+            return None
+        from .kernels import attn_decode as K4
+        return lambda *a: K4.attn_decode(_nki, *a)
 
     def all_reduce(self, x):
         tp = self.m.tp_group
@@ -221,8 +232,11 @@ class Inkling2ForCausalLM(nn.Module):
         # (TPOT 59.6 against 42.6 ms): a kernel call per visit costs more than the fused torch ops around it
         import os
 
-        self.use_moe_kernel = os.environ.get("INKLING2_NKI_MOE") == "1"
-        if self.use_moe_kernel:
+        # INKLING2_NKI_MOE: "1" nkilib moe_tkg (kernels/moe_decode.py), "hw" the one-kernel decode MoE with
+        # hardware DMA descriptors (kernels/moe_decode_hw.py); unset: torch
+        self.moe_kernel = {"1": "tkg", "hw": "hw"}.get(os.environ.get("INKLING2_NKI_MOE", ""), None)
+        self.attn_kernel = os.environ.get("INKLING2_NKI_ATTN") == "1"
+        if self.moe_kernel == "tkg":
             from .kernels import moe_decode as K
 
             K.install()
