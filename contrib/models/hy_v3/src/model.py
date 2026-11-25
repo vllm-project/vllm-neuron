@@ -1,0 +1,2960 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+Hy3 (HYV3) Static-FP8 Implementation
+====================================
+
+Implementation of tencent/Hy3-FP8 for the Neuron backend.
+
+Checkpoint format: every linear layer (attention, dense MLP, shared expert and
+each routed expert) stores ``float8_e4m3fn`` weights with a scalar BF16
+``weight_scale`` and a scalar static ``input_scale``. ``lm_head`` and
+``embed_tokens`` are BF16. The MTP (next-n) layer stored after the decoder
+stack is not loaded.
+
+Supported parallelism: TP (attention heads / dense MLP), SP (prefill), EP for
+the routed experts (``--enable-expert-parallel``; full EP by default), and DCP
+(``--decode-context-parallel-size``) to shard the KV cache across the ranks
+that hold a replicated KV head.
+
+Kernel mapping:
+  - Attention prefill: ``NF.qkv_proj`` (STATIC) -> torch QK-norm + RoPE ->
+    flash / segmented attention -> ``NF.o_proj`` (STATIC).
+  - Attention decode: ``NF.attention_decode`` megakernel (STATIC QKV/O, fused
+    input RMSNorm, pre-RoPE QK-norm, in-kernel KV cache update).
+  - Dense MLP / shared expert: ``NF.rmsnorm_quant`` + ``NF.mlp`` (STATIC).
+  - Routed experts: torch router (sigmoid + selection-only bias), then
+    ``kernels/moe_cte_fp8w`` (nkilib's ``shard_on_i_hybrid`` with the FP8
+    weight tiles fed to the matmul instead of copied to BF16 first) for prefill
+    and the ``moe_tkg`` kernel (STATIC FP8 weights) for decode. Both run BF16
+    activations x FP8 weights.
+
+FP8 range handling: every FP8 weight is halved at load time to fit TRN2's
+240-capped e4m3, with the scales compensated (see ``weight_loaders.py``).
+
+ANNOTATION GUIDE:
+  # >>> PARALLELISM: ... <<<   Reusable parallelism code.
+  # <-- MODEL-SPECIFIC: ...    Hy3 specific.
+  # <-- STATIC-FP8: ...        FP8 weight / scale handling.
+"""
+
+import logging
+import math
+
+import nki.language as nl
+import os
+
+import torch
+from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from nkilib.core.mlp.mlp_parameters import TKG_BS_SEQLEN_THRESHOLD
+from nkilib.core.moe.moe_cte.moe_cte import MoECTEImplementation
+from nkilib.core.utils.common_types import (
+    ActFnType,
+    ExpertAffinityScaleMode,
+    NormType,
+    QuantizationType,
+)
+from torch import nn
+from transformers import PretrainedConfig
+from vllm.distributed.parallel_state import get_dcp_group, get_tp_group
+from vllm.model_executor.models.interfaces import SupportsEagle3
+
+import vllm_neuron.functional as NF
+import vllm_neuron.nn as neuron_nn
+from vllm_neuron.accuracy.tensor_capture import capture_tensor
+from vllm_neuron.functional.moe.moe_tkg_wrapper import moe_tkg_wrapper
+from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, paged_slot_indices
+from vllm_neuron.model.neuron_config import NeuronConfig
+from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
+from vllm_neuron.nn.sampler import Sampler
+from vllm_neuron.parallel.neuron_parallel_state import shard_select
+from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
+from vllm_neuron.utils.dtype_utils import (
+    FP8_CLAMP_MAX,
+    QUANTIZED_KV_CACHE_DTYPES,
+)
+from vllm_neuron.utils.weight_loader import (
+    expert_parallel_grouped_loader,
+    fused_qkv_weight_loader,
+    set_weight_loader,
+    sharding_weight_loader,
+)
+from vllm_neuron.vllm.spec_decode.decorator import async_speculative_decoding
+
+from . import kv_scales
+from .fp8_kv_layout import packed_decode_viable, swizzle_packed_k, unswizzle_packed_k
+from .kvdp_attention import kvdp_attention_block_tkg, kvdp_kv_write
+from .config import HYV3Config
+from .kernels.moe_cte_fp8w import moe_cte_fp8w
+from .kernels.moe_tkg_hits import moe_tkg_hits
+from .kernels.moe_tkg_hits_batch import moe_tkg_hits_batch
+from .kernels.moe_tkg_fused import moe_tkg_fused
+from .weight_loaders import (
+    FP8_DTYPE as _FP8_DTYPE,
+)
+from .weight_loaders import (
+    PMAX as _PMAX,
+)
+from .weight_loaders import (
+    expert_down_loader,
+    expert_gate_up_loader,
+    expert_scale_loader,
+    padded_mlp_loader,
+    scalar_scale_loader,
+    with_fp8_halving,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Section 0: Constants and helpers
+# =============================================================================
+
+# CTE MLP kernel produces wrong results when the per-rank intermediate size is
+# not a multiple of 128, so the dense MLP intermediate is zero-padded per rank.
+_MLP_INTERMEDIATE_ALIGN = 128
+
+# Blockwise MoE prefill block size (shard_on_i requires a multiple of 256).
+_MOE_BLOCK_SIZE = 256
+# NF.build_blockwise_mapping uses nkilib's find_nonzero_indices kernel only for an even local
+# expert count (it splits the columns over the 2 cores of the logical NeuronCore); with 3 local
+# experts (EP64) it falls back to torch ops. On one core the fallback costs ~0.1 ms per layer, but
+# in the server it runs while the MoE all-gathers its tokens and slows that all-gather from 0.22
+# to 1.8 ms on every rank (~125 ms of a 637 ms 4096-token prefill step). Padding one
+# never-selected expert column puts the mapping on the kernel path with the same blocks (the pad
+# gets none); the routed-expert output is bit-identical. HY3_MOE_MAP_PAD=0 keeps the fallback.
+_MOE_MAP_PAD = os.environ.get("HY3_MOE_MAP_PAD", "1") != "0"
+# Prefill routed experts through kernels/moe_cte_fp8w (FP8 weight tiles into the
+# matmul, no BF16 copy; ~2x faster, identical output). 0: nkilib's kernel.
+_MOE_CTE_FP8W = os.environ.get("HY3_MOE_CTE_FP8W", "1") != "0"
+
+# Ranks per group sharing one copy of the shared expert during decode.
+_SHARED_DECODE_SHARDS = 8
+
+# The decode attention mask is identical for every layer; it is built once per
+# step and cached in attn_metadata under this key.
+_DECODE_MASK_CACHE_KEY = "_hy_v3_decode_mask"
+# EXPERIMENTAL, off (kvdp_attention.py, README "KV data parallelism on decode"): decode attention
+# with KV data parallelism over the ranks that share a KV head (HY3_DECODE_KVDP=8 at TP=64): each
+# attends for B / 8 of the requests. With sparse decode the blocks are chosen per GQA group
+# (sparse_select_blocks_kvdp). Batch buckets that are not a multiple of it and DCP keep the
+# default path.
+_DECODE_KVDP = int(os.environ.get("HY3_DECODE_KVDP", "1") or 1)
+_KVDP_MASK_CACHE_KEY = "_hy_v3_kvdp_mask"
+_DECODE_POSID = os.environ.get("HY3_DECODE_POSID", "0") == "1"
+_KVDP_ACTIVE_MASK_KEY = "_hy_v3_kvdp_active_mask"
+# EXPERIMENTAL: segmented prefill (no DCP, no sparse prefill) reads the packed FP8 KV cache directly
+# instead of a per-layer BF16 copy of the request's blocks. Same values (the copy is exact).
+_PREFILL_FP8_DIRECT = os.environ.get("HY3_PREFILL_FP8_DIRECT", "0") == "1"
+
+
+# HY3_DECODE_KVDP_PAD=1 (dense decode): a batch that 8 does not divide but 4 does (4, 12) runs
+# KVDP=8 on a batch padded to a multiple of 8 inside the attention (patch_kvdp_pad.py).
+_DECODE_KVDP_PAD = os.environ.get("HY3_DECODE_KVDP_PAD", "0") == "1"
+
+
+def _kvdp_plan(batch: int, sparse: bool) -> tuple[int, int]:
+    """(KVDP degree, attention batch) of a decode batch bucket."""
+    if _DECODE_KVDP_PAD and not sparse and _DECODE_KVDP >= 8 and batch % 8 and batch % 4 == 0:
+        return 8, -(-batch // 8) * 8
+    d = _kvdp_degree(batch)
+    return d, batch
+
+
+def _kvdp_degree(batch: int) -> int:
+    """The KVDP degree of a batch bucket: the largest of 8 / 4 that HY3_DECODE_KVDP allows and that
+    divides the batch (the kernel's all-to-all needs >= 4 ranks at LNC=2), else 1."""
+    for d in (8, 4):
+        if d <= _DECODE_KVDP and batch % d == 0:
+            return d
+    return 1
+
+
+def _validate_dcp_decode_sequence_length(dcp_size: int, sequence_length: int) -> None:
+    # The NKI CP decode kernel takes up to 8 new tokens per request (MTP verify: 1 + k).
+    if dcp_size > 1 and not 1 <= sequence_length <= 8:
+        raise ValueError(
+            "Hy3 DCP decode supports 1 to 8 tokens per request; "
+            f"got {sequence_length}."
+        )
+
+
+def _fp32_param(*shape) -> nn.Parameter:
+    return nn.Parameter(torch.empty(*shape, dtype=torch.float32), requires_grad=False)
+
+
+# FP8 KV cache. Scales are per-layer Python floats (src/kv_scales.py) that the
+# decode megakernel takes as graph constants: different scales trace to
+# different HLO and therefore different decode NEFFs (compile-cache isolation).
+_FP8_KV_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+# Test hook: decode reads the packed K cache through the unpacked kernel
+# (un-swizzle -> kernel -> re-swizzle the returned K) even when the packed
+# kernel is viable, so the fallback write-back can be exercised on every bucket.
+_FORCE_UNPACKED_DECODE = os.environ.get("HY3_FP8_KV_FORCE_UNPACKED_DECODE") == "1"
+
+# EXPERIMENTAL block-sparse decode attention (Quest-style, docs/SPARSE_DECODE.md):
+# HY3_SPARSE_DECODE=<fraction> lets each decode step of a request attend to at
+# most that fraction of the decode context bucket (rounded up to a multiple of
+# 256 blocks), in groups of HY3_SPARSE_GROUP 32-token blocks (128 tokens),
+# chosen per layer by an upper bound of q . k from per-group K min / max
+# summaries kept next to the KV cache (always kept: the first
+# HY3_SPARSE_SINK_GROUPS and the last HY3_SPARSE_RECENT_GROUPS groups). The
+# kept blocks go to the decode kernel as a narrower block table, so it reads
+# only them. Decode steps of fewer than HY3_SPARSE_MIN_BATCH requests stay
+# dense (the selection's fixed cost is more than the attention it saves).
+# No DCP.
+_SPARSE_DECODE = float(os.environ.get("HY3_SPARSE_DECODE", "0") or 0)
+_SPARSE_GROUP = int(os.environ.get("HY3_SPARSE_GROUP", "4"))
+_SPARSE_SINK = int(os.environ.get("HY3_SPARSE_SINK_GROUPS", "1"))
+_SPARSE_RECENT = int(os.environ.get("HY3_SPARSE_RECENT_GROUPS", "2"))
+_SPARSE_MIN_BATCH = int(os.environ.get("HY3_SPARSE_MIN_BATCH", "4"))
+# HY3_SPARSE_SELECT_EVERY=R: layers 0, R, 2R, ... select; the R - 1 layers
+# after each reuse its selection (all layers share the block table). They
+# still fold their K into their own summaries.
+_SPARSE_SELECT_EVERY = int(os.environ.get("HY3_SPARSE_SELECT_EVERY", "4"))
+_SPARSE_SEL_CACHE_KEY = "_hy_v3_sparse_selection"
+# EXPERIMENTAL block-sparse prefill attention (docs/SPARSE_DECODE.md, "Sparse prefill"):
+# HY3_SPARSE_PREFILL=<fraction> lets a segmented prefill chunk (FP8 KV, no DCP)
+# attend to at most that fraction of the context bucket's blocks of its prior
+# context (rounded up like the decode budget), chosen per layer and chunk with the
+# decode's group summaries: a group's score is its largest bound over the
+# chunk's queries. The kept prior blocks and the chunk's own blocks make the
+# BF16 copy the segmented kernel reads.
+_SPARSE_PREFILL = float(os.environ.get("HY3_SPARSE_PREFILL", "0") or 0)
+# HY3_SPARSE_EXPORT_DCP=<decode DCP> on a prefill node: export the K summaries in that DCP
+# decode's layout (sparse decode under DCP in a P/D split).
+_SPARSE_EXPORT_DCP = int(os.environ.get("HY3_SPARSE_EXPORT_DCP", "1") or 1)
+# Under DCP the K summaries are per block (one row per 32-token block, in the block's own row).
+# EXPERIMENTAL: the whole decode MoE block (post-attention RMSNorm, router, routed experts,
+# shared-expert decode shard) as one NKI kernel with static-FP8 activations and FP8
+# double-row matmuls (kernels/moe_tkg_fused.py). README, "Fused decode MoE".
+_DECODE_MOE_FUSED = os.environ.get("HY3_DECODE_MOE_FUSED", "0") == "1"
+# Per-layer tensors a KV connector must move along with the KV blocks, keyed like the KV caches
+# ("layers.{i}.self_attn"): the sparse-attention K summaries are blocks-first and indexed by the
+# same block ids, and prefill writes them, so a disaggregated decode needs the prefill node's rows
+# (NeuronMooncakeConnector registers them as extra regions of the layer).
+CONNECTOR_EXTRA_KV_TENSORS: dict[str, torch.Tensor] = {}
+
+
+def _is_fp8_kv(cache: torch.Tensor | None) -> bool:
+    return cache is not None and cache.dtype in _FP8_KV_DTYPES
+
+
+def bind_attention_kv(
+    attn, name: str, k_cache: torch.Tensor, v_cache: torch.Tensor, sparse: bool = True
+) -> None:
+    """Bind one attention layer's K/V cache (BF16, FP8, or FP8 with packed K)."""
+    k_fp8, v_fp8 = _is_fp8_kv(k_cache), _is_fp8_kv(v_cache)
+    if k_fp8 != v_fp8:
+        raise ValueError(
+            f"{name}: K cache {k_cache.dtype} and V cache {v_cache.dtype} "
+            "must both be FP8 or both BF16"
+        )
+    # Packed K (neuron_config.fp8_packed_kv) is one dim higher than V,
+    # which is never packed.
+    packed = k_cache.dim() == v_cache.dim() + 1
+    if packed and not (k_fp8 and k_cache.dim() == 5 and v_cache.dim() == 4):
+        raise ValueError(
+            f"{name}: unexpected KV layout K {tuple(k_cache.shape)} "
+            f"{k_cache.dtype}, V {tuple(v_cache.shape)} {v_cache.dtype}"
+        )
+    if k_fp8 and attn.kv_scale_t is None:
+        raise RuntimeError(f"{name}: FP8 KV cache bound before its KV scales were loaded")
+    attn.k_cache = k_cache
+    attn.v_cache = v_cache
+    attn.fp8_packed = packed
+    if sparse and (_SPARSE_DECODE > 0 or _SPARSE_PREFILL > 0) and (attn.dcp_size == 1 or _SPARSE_DECODE > 0):
+        # [blocks, (min, max), kvh, D]: a group's summary lives at the row of
+        # its first block. Empty: min > max.
+        shape = (v_cache.shape[0], v_cache.shape[1], v_cache.shape[-1])
+        attn.k_sum = torch.stack([
+            torch.full(shape, _SUMMARY_EMPTY, dtype=torch.bfloat16, device=v_cache.device),
+            torch.full(shape, -_SUMMARY_EMPTY, dtype=torch.bfloat16, device=v_cache.device),
+        ], dim=1)
+        # Per-block summaries (one row per block, in the block's own row) under DCP and on a
+        # prefill node feeding a DCP decode: the connector's DCP block map moves each row with its
+        # block, the DCP rank groups its local blocks, and the prefill node's own sparse prefill
+        # reduces each group's rows to the group summary (sparse_prefill_blocks per_block).
+        attn.k_sum_per_block = attn.dcp_size > 1 or _SPARSE_EXPORT_DCP > 1
+        if os.environ.get("HY3_SPARSE_EXPORT_KSUM", "1") != "0":  # local: 0 = sparse prefill into a non-sparse decode
+            CONNECTOR_EXTRA_KV_TENSORS[name] = attn.k_sum
+
+
+def _quantize_kv(x: torch.Tensor, q, dtype: torch.dtype) -> torch.Tensor:
+    """Cache write: ``fp8(clamp(x * q, +-FP8_CLAMP_MAX))`` (q = 1 / dequant)."""
+    return (x.to(torch.float32) * q).clamp(-FP8_CLAMP_MAX, FP8_CLAMP_MAX).to(dtype)
+
+
+def _write_packed_k(
+    k_cache: torch.Tensor,
+    k_rows: torch.Tensor,
+    block_idx: torch.Tensor,
+    head_idx: torch.Tensor,
+    pos_idx: torch.Tensor,
+) -> None:
+    """Write pair-aligned K rows into the packed cache [blocks, kvh, block // 2, D, 2].
+
+    Same pair coordinates and preconditions as vllm_neuron's ``scatter_packed_k``
+    (rows (2j, 2j + 1) are lanes 0 / 1 of one packed slot; null-block rows are
+    padding), but without its gather of every target slot to preserve the null
+    lane: that O(tokens) gather made the full-model prefill NEFFs 2-4x larger and
+    their compile outlast the startup TP barrier. In Hy3 prefill the only
+    half-valid slot is the last one of an odd-length chunk, whose null lane is
+    the request's next position in its own (not yet full, so never shared)
+    block; it is written before it is ever read. All-null slots go to the null
+    block like the upstream helper.
+    """
+    d_head = k_rows.shape[1]
+    k_pairs = k_rows.view(-1, 2, d_head).transpose(1, 2).contiguous()
+    block_lanes = block_idx.view(-1, 2)
+    head_lanes = head_idx.view(-1, 2)
+    pos_lanes = pos_idx.view(-1, 2)
+    lane0_valid = block_lanes[:, 0] > 0
+    block_pair = torch.where(lane0_valid, block_lanes[:, 0], block_lanes[:, 1])
+    head_pair = torch.where(lane0_valid, head_lanes[:, 0], head_lanes[:, 1])
+    outer_pair = torch.where(lane0_valid, pos_lanes[:, 0], pos_lanes[:, 1]) // 2
+    pair_valid = (block_lanes > 0).any(dim=1)
+    outer_pair = torch.where(pair_valid, outer_pair, torch.zeros_like(outer_pair))
+    k_cache.index_put_((block_pair, head_pair, outer_pair), k_pairs)
+
+
+def _request_blocks_bf16(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    packed: bool,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """BF16 copy of one prefill request's KV blocks and the matching block table.
+
+    Prefill runs one request per step, so its block table row lists every block
+    the segmented kernel may read. Gathering those (at most max_model_len /
+    block_size) blocks, un-swizzling a packed K and casting to BF16 is exact
+    (FP8 codes are representable in BF16) and small next to the prefill; the
+    kernel then reads a standard BF16 cache with a 0..n-1 block table.
+    """
+    blocks = block_table.reshape(-1).to(torch.long).clamp(min=0)
+    k_sel = torch.index_select(k_cache, 0, blocks)
+    if packed:
+        k_sel = unswizzle_packed_k(k_sel)
+    v_sel = torch.index_select(v_cache, 0, blocks)
+    local_table = torch.arange(
+        blocks.shape[0], dtype=block_table.dtype, device=block_table.device
+    ).view(block_table.shape)
+    return k_sel.to(dtype), v_sel.to(dtype), local_table
+
+
+def _scale_column(value: float, device: torch.device) -> torch.Tensor:
+    """A [PMAX, 1] fp32 replicated scalar, the layout the attention kernels take."""
+    return torch.full((_PMAX, 1), value, dtype=torch.float32, device=device)
+
+
+# =============================================================================
+# Section 1: RMSNorm + RoPE
+# <-- MODEL-SPECIFIC: standard RMSNorm, default RoPE (rotate_half)
+# =============================================================================
+
+
+class HYV3RMSNorm(nn.Module):
+    def __init__(self, hidden_size: int, eps: float, dtype: torch.dtype):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return (self.weight * hidden_states).to(input_dtype)
+
+
+_SUMMARY_EMPTY = 3.0e38  # min / max of a group nothing was written to (BF16-representable)
+
+
+def sparse_budget_blocks(nb: int, frac: float, sink: int, recent: int) -> int:
+    """Blocks a sparse decode step attends to for an ``nb``-block context bucket.
+
+    A multiple of 256 blocks (8192 tokens), so that the decode kernel keeps its
+    32-token block: below that it re-splits the cache into smaller blocks,
+    which gave wrong results with the compacted table. ``nb`` (dense) when
+    that is not smaller.
+    """
+    k = -(-(math.ceil(nb * frac) + sink + recent) // 256) * 256
+    return min(k, nb)
+
+
+def update_k_summary_prefill(k_sum, k, slot_mapping, block_row, block_size, group):
+    """Fold one prefill chunk's K into the per-group K min / max.
+
+    k_sum: [blocks, 2, kvh, D], k: [kvh, T, D] (after QK-norm + RoPE),
+    slot_mapping: [T] (-1 = padding), block_row: [nb] the request's block
+    table (one prefill per step). The chunk's tokens are contiguous; a group
+    the chunk starts inside of (a prefix hit that ends inside a group, the
+    re-computed last token) is merged with its summary, the others are
+    written fresh.
+    """
+    kvh, T, D = k.shape
+    L = block_size * group
+    nb = block_row.shape[0]
+    dev = k.device
+    blk, off = paged_slot_indices(slot_mapping, block_size, k_sum.shape[0])
+    valid = slot_mapping >= 0
+    # Logical position of the first token, from where its block is in the table.
+    lb0 = torch.argmax((block_row.to(torch.long) == blk[0]).to(torch.int32))
+    p0 = lb0 * block_size + off[0]
+    r = p0 % L
+    # Shift the tokens by r so that the group boundaries fall on multiples of L.
+    src = torch.arange(T + L, device=dev) - r
+    ok = (src >= 0) & (src < T)
+    src = torch.clamp(src, min=0, max=T - 1)
+    kk = k.permute(1, 0, 2).to(torch.float32)[src]  # [T + L, kvh, D]
+    v = (ok & valid[src]).view(-1, 1, 1)
+    G = T // L + 1
+    gmin = torch.where(v, kk, _SUMMARY_EMPTY).view(G, L, kvh, D).amin(1)
+    gmax = torch.where(v, kk, -_SUMMARY_EMPTY).view(G, L, kvh, D).amax(1)
+    gvalid = v.view(G, L).any(dim=1)
+    gi = torch.arange(G, device=dev)
+    sb = p0 // L + gi
+    key = block_row.to(torch.long)[torch.clamp(sb * group, max=nb - 1)].clamp(min=0)
+    key = torch.where(gvalid, key, 0)  # all-padding groups: the null block
+    cont = ((gi == 0) & (r != 0)).view(G, 1, 1)
+    old = k_sum[key].to(torch.float32)
+    gmin = torch.where(cont, torch.minimum(old[:, 0], gmin), gmin)
+    gmax = torch.where(cont, torch.maximum(old[:, 1], gmax), gmax)
+    k_sum.index_put_((key,), torch.stack([gmin, gmax], dim=1).to(k_sum.dtype))
+
+
+def update_k_summary_prefill_dcp_blocks(k_sum, k, p0, valid, block_row, block_size, W, rank):
+    """Fold one DCP prefill chunk's K into this DCP rank's per-block K min / max.
+
+    Every DCP rank has the whole chunk's K. Sequence block j belongs to rank j % W as its local
+    block j // W (interleave = block size); this rank writes the summaries of its blocks, merged
+    with the stored one for the block the chunk starts inside of. k: [kvh, T, D], p0: the
+    chunk's first position, valid: [T], block_row: [nb] this rank's local table.
+    Same reduction as update_k_summary_prefill with group 1, by sequence position.
+    """
+    kvh, T, D = k.shape
+    nb = block_row.shape[0]
+    dev = k.device
+    p0 = p0.to(torch.long).reshape(-1)[0]
+    r = p0 % block_size
+    G = T // block_size + 1
+    src = torch.arange(G * block_size, device=dev) - r
+    ok = (src >= 0) & (src < T)
+    src = torch.clamp(src, min=0, max=T - 1)
+    kk = k.permute(1, 0, 2).to(torch.float32)[src]  # [G * B, kvh, D]
+    v = (ok & valid[src]).view(-1, 1, 1)
+    gmin = torch.where(v, kk, _SUMMARY_EMPTY).view(G, block_size, kvh, D).amin(1)
+    gmax = torch.where(v, kk, -_SUMMARY_EMPTY).view(G, block_size, kvh, D).amax(1)
+    gvalid = v.view(G, block_size).any(dim=1)
+    gi = torch.arange(G, device=dev)
+    j = p0 // block_size + gi  # sequence block
+    R = rank.to(torch.long).reshape(-1)[0]
+    mine = (j % W) == R
+    key = block_row.to(torch.long)[torch.clamp(j // W, max=nb - 1)].clamp(min=0)
+    key = torch.where(gvalid & mine, key, 0)  # other ranks' blocks / padding: the null block
+    cont = ((gi == 0) & (r != 0)).view(G, 1, 1)
+    old = k_sum[key].to(torch.float32)
+    gmin = torch.where(cont, torch.minimum(old[:, 0], gmin), gmin)
+    gmax = torch.where(cont, torch.maximum(old[:, 1], gmax), gmax)
+    k_sum.index_put_((key,), torch.stack([gmin, gmax], dim=1).to(k_sum.dtype))
+
+
+def dcp_local_positions(positions, block_size, W, rank):
+    """(local position, owned) of sequence positions on DCP rank ``rank`` (interleave = block).
+
+    The local position of a token another rank owns is this rank's insertion point: the
+    number of its tokens before it, so a span's first owned token keeps its group."""
+    pos = positions.to(torch.long)
+    vb = block_size * W
+    full = torch.div(pos, vb, rounding_mode="floor")
+    rem = pos - full * vb
+    R = rank.to(torch.long).reshape(-1)[0]
+    off = rem - R * block_size
+    owned = (off >= 0) & (off < block_size)
+    return full * block_size + torch.clamp(off, min=0, max=block_size), owned
+
+
+def update_k_summary_decode(k_sum, k, positions, slot_mapping, block_table, block_size, group):
+    """Fold one decode step's K into the per-group K min / max.
+
+    k: [B, S, kvh, D] (after QK-norm + RoPE), positions / slot_mapping: [B * S]
+    (slot -1 = padding). A request's S tokens span at most two groups: the one
+    of its first token (merged, or fresh when that token starts the group) and
+    the next one (fresh). Rejected speculative tokens stay in the summary,
+    which only loosens the bound.
+    """
+    B, S = k.shape[:2]
+    L = block_size * group
+    nb = block_table.shape[1]
+    pos = positions.view(B, S).to(torch.long)
+    valid = slot_mapping.view(B, S) >= 0
+    sb = torch.div(pos, L, rounding_mode="floor")
+    sb0 = sb[:, :1]
+    in_a = (sb == sb0) & valid
+    in_b = (sb != sb0) & valid
+    kk = k.to(torch.float32)
+
+    def reduce(m):
+        m = m.view(B, S, 1, 1)
+        return (torch.where(m, kk, _SUMMARY_EMPTY).amin(dim=1),
+                torch.where(m, kk, -_SUMMARY_EMPTY).amax(dim=1))
+
+    min_a, max_a = reduce(in_a)
+    min_b, max_b = reduce(in_b)
+    t = block_table.to(torch.long)
+    key_a = t.gather(1, torch.clamp(sb0 * group, max=nb - 1)).view(B).clamp(min=0)
+    key_b = t.gather(1, torch.clamp((sb0 + 1) * group, max=nb - 1)).view(B).clamp(min=0)
+    has_a, has_b = in_a.any(dim=1), in_b.any(dim=1)
+    key_a = torch.where(has_a, key_a, 0)  # padding rows: the null block
+    fresh = (pos[:, 0] % L == 0).view(B, 1, 1)
+    old = k_sum[key_a].to(torch.float32)
+    new_a = torch.stack([
+        torch.where(fresh, min_a, torch.minimum(old[:, 0], min_a)),
+        torch.where(fresh, max_a, torch.maximum(old[:, 1], max_a)),
+    ], dim=1)
+    new_b = torch.stack([min_b, max_b], dim=1)
+    # No second group: write the first one twice (same row, same values).
+    key_b = torch.where(has_b, key_b, key_a)
+    new_b = torch.where(has_b.view(B, 1, 1, 1), new_b, new_a)
+    k_sum.index_put_((torch.cat([key_a, key_b]),), torch.cat([new_a, new_b]).to(k_sum.dtype))
+
+
+def prepare_moe_fused(layer, device, from_weights: bool = True) -> None:
+    """moe_tkg_fused (HY3_DECODE_MOE_FUSED): per-rank constants built from the loaded weights.
+
+    ``moe_fused_scales`` [1, 4 * (L + 1)]: per local expert, then the shared decode shard:
+    gate dequant x input scale, up dequant x input scale / down input scale, down dequant x
+    down input scale (x shared_decode_weight for the shared shard), 1 / input scale.
+    ``moe_router_wT``: the router transposed, BF16 (the checkpoint router is BF16, so exact).
+    ``moe_ebase``: this rank's first local expert id. ``from_weights=False`` (CPU compile)
+    allocates placeholders.
+    """
+    mlp = layer.mlp
+    if not getattr(mlp, "use_moe_fused", False) or mlp.shared_mlp_decode is None:
+        return
+    assert mlp.route_norm, "moe_tkg_fused renormalizes the top-k weights"
+    L = mlp.num_local_experts
+    sh = mlp.shared_mlp_decode
+    f = lambda t: t.detach().to("cpu").float()
+    if from_weights:
+        s_in = f(mlp.gate_up_in_scale_tkg).amax(1)
+        s_din = f(mlp.down_in_scale_tkg)[:, 0]
+        gu = f(mlp.gate_up_proj_scale_tkg)
+        dw = f(mlp.down_proj_scale_tkg)[:, 0]
+        sc = torch.stack([gu[:, 0, 0] * s_in, gu[:, 1, 0] * s_in / s_din, dw * s_din, 1 / s_in], 1)
+        g = lambda t: f(t).reshape(-1)[0]
+        sh_in, sh_din = g(sh.gate_up_input_scale), g(sh.down_input_scale)
+        row = torch.stack([
+            g(sh.gate_weight_scale) * sh_in,
+            g(sh.up_weight_scale) * sh_in / sh_din,
+            g(sh.down_weight_scale) * sh_din * mlp.shared_decode_weight,
+            1 / sh_in,
+        ]).view(1, 4)
+        rw = mlp.router_weight.detach().to("cpu")
+    else:
+        sc, row = torch.ones(L, 4), torch.ones(1, 4)
+        rw = torch.zeros(mlp.total_num_experts, mlp.hidden_size)
+
+    def param(t):
+        return nn.Parameter(t.contiguous().to(device), requires_grad=False)
+
+    mlp.moe_fused_scales = param(torch.cat([sc, row], 0).reshape(1, 4 * (L + 1)))
+    mlp.moe_router_wT = param(rw.to(torch.bfloat16).t())
+    mlp.moe_ebase = param(torch.full((1, 1), float(mlp.ep_rank * L)))
+
+
+def prepare_sparse_decode(layer, device, from_weights: bool = True) -> None:
+    """EXPERIMENTAL (HY3_SPARSE_DECODE): own copies of the weights the selection reads.
+
+    The selection computes the decode Q and K in torch. Reading the parameters
+    the decode megakernel also reads (QKV weight, QK-norm and input RMSNorm
+    gammas) from those torch ops gave wrong attention results; separate copies
+    (the Q and K columns dequantized to BF16, ~2 MB per layer and rank) do not.
+    ``from_weights=False`` (CPU compile) allocates placeholders.
+    """
+    attn = layer.self_attn
+    if (_SPARSE_DECODE <= 0 and _SPARSE_PREFILL <= 0) or (attn.dcp_size > 1 and _SPARSE_DECODE <= 0):
+        return
+    nh, kvh = attn.num_attention_heads_per_rank, attn.num_key_value_heads_per_rank
+    D, H = attn.head_dim, attn.hidden_size
+    if from_weights:
+        w = attn.qkv_proj_weight.detach().to("cpu")[:, : (nh + kvh) * D].to(torch.float32)
+        sc = attn.qkv_weight_scale.detach().to("cpu").to(torch.float32)[0]
+        w = torch.cat([w[:, : nh * D] * sc[0], w[:, nh * D :] * sc[1]], dim=1)
+        qn = attn.q_norm.weight.detach().to("cpu").clone()
+        kn = attn.k_norm.weight.detach().to("cpu").clone()
+        ln = layer.input_layernorm.weight.detach().to("cpu").clone()
+    else:
+        w, qn, kn, ln = torch.zeros(H, (nh + kvh) * D), torch.ones(D), torch.ones(D), torch.ones(H)
+
+    def param(t, dtype):
+        return nn.Parameter(t.to(dtype).contiguous().to(device), requires_grad=False)
+
+    attn.sparse_wqk = param(w, attn.dtype)
+    attn.sparse_qnorm_w = param(qn, torch.float32)
+    attn.sparse_knorm_w = param(kn, torch.float32)
+    attn.sparse_ln_w = param(ln, torch.float32)
+
+
+def sparse_select_blocks(q, k_sum, block_table, n_hist, block_size, group, n_sel, sink, recent,
+                         per_block=False):
+    """The ``n_sel`` blocks a decode step attends to, and the history tokens they hold.
+
+    q: [nh, B, S, D] fp32 (QK-norm + RoPE), k_sum: [blocks, 2, kvh, D],
+    block_table: [B, nb], n_hist: [B] history tokens. A request whose history
+    fits in ``n_sel / group - 1`` groups gets the head of its table (dense).
+    Otherwise every group is scored with the Quest bound
+    max_k q . k <= relu(q) . max + min(q, 0) . min (max over the step's queries
+    and the KV head's query heads); the first ``sink`` and the ``recent`` last
+    groups are always kept. The table ([B, n_sel]) holds the kept groups' blocks
+    in any order, then the history's last group, then the group after it: the
+    kernel reads a step's earlier tokens back through the table (MTP verify),
+    so that one must be in it when they cross into it. Returns the table and
+    the number of history tokens it holds ([B]).
+    """
+    nh, B, S, D = q.shape
+    kvh = k_sum.shape[2]
+    t = block_table.to(torch.long)
+    nb = t.shape[1]
+    ns, L, k_g = nb // group, block_size * group, n_sel // group
+    t3 = t.view(B, ns, group)
+    # per_block (DCP): one summary per block; a group scores the max of its blocks' bounds.
+    rows = t if per_block else t3[:, :, 0]
+    summ = k_sum[torch.clamp(rows, min=0)].to(torch.float32)  # [B, nb or ns, 2, kvh, D]
+    qg = q.view(kvh, nh // kvh, B, S, D).permute(2, 0, 1, 3, 4).reshape(B, kvh, -1, D)
+    # Both terms are <= 0 for a group without a summary (min = +3e38,
+    # max = -3e38): it scores very low (or -inf), never NaN.
+    bound = torch.einsum("bhqd,bnhd->bnhq", torch.clamp(qg, min=0), summ[:, :, 1]) + torch.einsum(
+        "bhqd,bnhd->bnhq", torch.clamp(qg, max=0), summ[:, :, 0])
+    score = bound.amax(dim=(2, 3))  # [B, ns] (or [B, nb])
+    if per_block:
+        score = score.view(B, ns, group).amax(dim=2)
+    n = n_hist.to(torch.long).view(B, 1)
+    nsv = torch.div(n + L - 1, L, rounding_mode="floor")
+    idx = torch.arange(ns, device=q.device).view(1, ns)
+    big = torch.finfo(torch.float32).max
+    # Candidates: the history groups but the last; sink and recent ones first.
+    cand = idx < nsv - 1
+    forced = (idx < sink) | (idx >= nsv - recent)
+    score = torch.where(cand, torch.where(forced, big, score), -big)
+    top = torch.topk(score, k_g - 2, dim=1).indices  # [B, k_g - 2], any order
+    last = torch.clamp(torch.cat([nsv - 1, nsv], dim=1), min=0, max=ns - 1)
+    dense = nsv <= k_g - 1
+    pick = torch.where(dense, torch.arange(k_g, device=q.device).view(1, k_g), torch.cat([top, last], dim=1))
+    # Whole groups of block ids at a time (one row of `group` ids per kept group).
+    compact = t3[torch.arange(B, device=q.device).view(B, 1), pick].reshape(B, n_sel)
+    fill = n - L * (nsv - 1)  # tokens in the history's last group
+    prior = torch.where(dense, n, L * (k_g - 2) + fill).view(B)
+    return compact.to(block_table.dtype), prior
+
+
+def sparse_select_blocks_kvdp(
+    q, k_sum, block_table, n_hist, block_size, group, n_sel, sink, recent, tp_group, own, mine
+):
+    """``sparse_select_blocks`` for KVDP: the kept blocks of this rank's requests (``own``).
+
+    Every rank scores all B requests with its query head; one TP all-gather of the scores and the
+    max over this KV head's ranks (``mine``) gives the group score. Returns the table
+    [B / KVDP, n_sel] and the history tokens it holds [B / KVDP].
+    """
+    nh, B, S, D = q.shape
+    kvh = k_sum.shape[2]
+    t = block_table.to(torch.long)
+    nb = t.shape[1]
+    ns, L, k_g = nb // group, block_size * group, n_sel // group
+    t3 = t.view(B, ns, group)
+    summ = k_sum[torch.clamp(t3[:, :, 0], min=0)].to(torch.float32)  # [B, ns, 2, kvh, D]
+    qg = q.view(kvh, nh // kvh, B, S, D).permute(2, 0, 1, 3, 4).reshape(B, kvh, -1, D)
+    bound = torch.einsum("bhqd,bnhd->bnhq", torch.clamp(qg, min=0), summ[:, :, 1]) + torch.einsum(
+        "bhqd,bnhd->bnhq", torch.clamp(qg, max=0), summ[:, :, 0])
+    score = bound.amax(dim=(2, 3))  # [B, ns], this rank's head
+    # >>> PARALLELISM: the KV head's score is the max over its KVDP query heads <<<
+    every = tp_group.all_gather(score.reshape(1, B * ns), dim=0)  # [world, B * ns]
+    score = every.index_select(0, mine).amax(dim=0).view(B, ns)
+    score = score.index_select(0, own)
+    t3 = t3.index_select(0, own)
+    Ba = own.shape[0]
+    n = n_hist.to(torch.long).view(B, 1).index_select(0, own)
+    nsv = torch.div(n + L - 1, L, rounding_mode="floor")
+    idx = torch.arange(ns, device=q.device).view(1, ns)
+    big = torch.finfo(torch.float32).max
+    cand = idx < nsv - 1
+    forced = (idx < sink) | (idx >= nsv - recent)
+    score = torch.where(cand, torch.where(forced, big, score), -big)
+    top = torch.topk(score, k_g - 2, dim=1).indices
+    last = torch.clamp(torch.cat([nsv - 1, nsv], dim=1), min=0, max=ns - 1)
+    dense = nsv <= k_g - 1
+    pick = torch.where(dense, torch.arange(k_g, device=q.device).view(1, k_g), torch.cat([top, last], dim=1))
+    compact = t3[torch.arange(Ba, device=q.device).view(Ba, 1), pick].reshape(Ba, n_sel)
+    fill = n - L * (nsv - 1)
+    prior = torch.where(dense, n, L * (k_g - 2) + fill).view(Ba)
+    return compact.to(block_table.dtype), prior
+
+
+def sparse_prefill_blocks(q, k_sum, block_row, prior, valid, block_size, group, n_sel, sink, recent,
+                          per_block=False):
+    """EXPERIMENTAL (HY3_SPARSE_PREFILL): the blocks a segmented prefill chunk reads.
+
+    q: [nh, T, D] (QK-norm + RoPE), k_sum: [blocks, 2, kvh, D], block_row: [nb]
+    the request's block table, prior: [1, 1] int32 tokens before the chunk (a
+    multiple of block_size), valid: [T] real (not padding) queries. Each complete
+    prior group is scored with its largest Quest bound over the chunk's queries;
+    the first ``sink`` and last ``recent`` complete groups, the incomplete last
+    one and the ``n_sel / group - recent - sink`` best others are kept (all
+    of them when they fit). Returns ``blocks`` [n_sel + group + T / block_size]
+    -- the kept prior blocks (complete groups in any order), then the chunk's
+    blocks, then filler --
+    and the kept prior tokens [1, 1] int32, which is where the segmented kernel
+    finds the chunk in that layout.
+    """
+    nh, T, D = q.shape
+    kvh = k_sum.shape[2]
+    t = block_row.to(torch.long)
+    nb = t.shape[0]
+    ns, L, k_g = nb // group, block_size * group, n_sel // group
+    if per_block:
+        # One summary per block: the group's is the min / max over its blocks' (exactly the
+        # group summary of the grouped layout), so the selection is unchanged.
+        rows = k_sum[torch.clamp(t, min=0)].to(torch.float32).view(ns, group, 2, kvh, D)
+        summ = torch.stack([rows[:, :, 0].amin(dim=1), rows[:, :, 1].amax(dim=1)], dim=1)
+    else:
+        summ = k_sum[torch.clamp(t.view(ns, group)[:, 0], min=0)].to(torch.float32)  # [ns, 2, kvh, D]
+    # Padding queries (at the end of the chunk) repeat the first one, so they never raise the max.
+    qg = torch.where(valid.view(1, T, 1), q, q[:, :1]).to(torch.float32).reshape(kvh, (nh // kvh) * T, D)
+    # Both halves of the bound in one matmul: [relu(q), min(q, 0)] . [max, min].
+    qq = torch.cat([torch.clamp(qg, min=0), torch.clamp(qg, max=0)], dim=-1)
+    ss = torch.cat([summ[:, 1], summ[:, 0]], dim=-1).permute(1, 2, 0)  # [kvh, 2D, ns]
+    score = torch.bmm(qq, ss).amax(dim=(0, 1))  # [ns]
+    p = prior.reshape(()).to(torch.long)
+    full = torch.div(p, L, rounding_mode="floor")  # complete prior groups
+    pb = torch.div(p, block_size, rounding_mode="floor")  # prior blocks
+    idx = torch.arange(ns, device=q.device)
+    big = torch.finfo(torch.float32).max
+    forced = (idx < sink) | (idx >= full - recent)
+    score = torch.where(idx < full, torch.where(forced, big, score), -big)
+    top = torch.topk(score, k_g, dim=0).indices  # any order: no sort (a [2688] sort is ~2 ms)
+    # Kept groups' blocks, then the table from the incomplete group on (its
+    # blocks, then the chunk's); with at most k_g complete groups, the table head.
+    j = torch.arange(n_sel + group + T // block_size, device=q.device)
+    head = k_g * group
+    src = torch.where(j < head, top[torch.clamp(j // group, max=k_g - 1)] * group + j % group,
+                      full * group + j - head)
+    dense = full <= k_g
+    src = torch.where(dense, j, src)
+    c = torch.where(dense, pb, head + pb - full * group)
+    blocks = t[torch.clamp(src, max=nb - 1)].clamp(min=0)
+    return blocks, (c * block_size).view(1, 1).to(torch.int32)
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+class HYV3RotaryEmbedding(nn.Module):
+    def __init__(self, config: HYV3Config):
+        super().__init__()
+        self.rope_theta = config.rope_theta
+        self.head_dim = config.head_dim
+
+    def forward(
+        self, position_ids: torch.Tensor, device: torch.device, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        inv_freq = 1.0 / (
+            self.rope_theta
+            ** (
+                torch.arange(0, self.head_dim, 2, dtype=torch.float, device=device)
+                / self.head_dim
+            )
+        )
+        freqs = position_ids[:, None].float() * inv_freq[None, :]  # [T, Hd/2]
+        emb = torch.cat((freqs, freqs), dim=-1)  # [T, Hd]
+        return emb.cos().to(dtype=dtype), emb.sin().to(dtype=dtype)
+
+
+# =============================================================================
+# Section 2: Attention (static FP8, QK-norm before RoPE)
+# =============================================================================
+
+
+class HYV3Attention(nn.Module):
+    """GQA attention with TP head sharding and static-FP8 projections.
+
+    >>> PARALLELISM: TP <<<
+    - Q heads sharded across TP; KV heads replicated when TP > num KV heads.
+    - Prefill: RMSNorm (SP) -> all-gather -> attention -> reduce-scatter.
+    - Decode: fused megakernel (input RMSNorm fused) -> all-reduce.
+
+    >>> PARALLELISM: DCP (decode context parallelism) <<<
+    With TP > num_kv_heads every KV head is replicated on TP / num_kv_heads
+    ranks. DCP turns those replicas into a sequence-sharded group: each rank
+    stores only the KV blocks it owns (interleaved by block_size), and
+    attention combines the per-rank partial results with an LSE correction
+    (``segmented_attention_cp`` in prefill, the DCP path of
+    ``attention_decode`` in decode). KV capacity grows by ``dcp_size``.
+
+    <-- MODEL-SPECIFIC: per-head q_norm / k_norm applied before RoPE.
+    """
+
+    def __init__(self, config: HYV3Config, layer_idx: int):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.layer_name = f"layers.{layer_idx}.self_attn"
+        self.head_dim = config.head_dim
+        self.dtype = config.torch_dtype
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.scaling = config.head_dim**-0.5
+        self.rms_norm_eps = config.rms_norm_eps
+        self.rope_theta = config.rope_theta  # sparse decode selection (own RoPE)
+
+        # >>> PARALLELISM: TP group / head sharding <<<
+        self.tp_group = get_tp_group()
+        self.world_size = self.tp_group.world_size
+        self.num_attention_heads_per_rank = self.num_attention_heads // self.world_size
+        if self.world_size >= self.num_key_value_heads:
+            self.num_key_value_heads_per_rank = 1
+            self.num_kv_replicas = self.world_size // self.num_key_value_heads
+        else:
+            self.num_key_value_heads_per_rank = (
+                self.num_key_value_heads // self.world_size
+            )
+            self.num_kv_replicas = 1
+        self.num_key_value_groups = (
+            self.num_attention_heads_per_rank // self.num_key_value_heads_per_rank
+        )
+
+        # >>> PARALLELISM: DCP group = ranks sharing one replicated KV head <<<
+        dcp_group = get_dcp_group()
+        self.dcp_size = dcp_group.world_size
+        self.dcp_group = dcp_group if self.dcp_size > 1 else None
+        if self.dcp_size > 1 and self.num_kv_replicas % self.dcp_size != 0:
+            raise ValueError(
+                f"decode_context_parallel_size={self.dcp_size} must divide the "
+                f"KV replication factor {self.num_kv_replicas} "
+                f"(tensor_parallel_size / num_key_value_heads)."
+            )
+
+        q_size = self.num_attention_heads_per_rank * self.head_dim
+        kv_size = self.num_key_value_heads_per_rank * self.head_dim
+        self.q_size = q_size
+        self.kv_size = kv_size
+        self.qkv_split_indices = [q_size, q_size + kv_size]
+
+        # <-- STATIC-FP8: fp8 weights + [128, 3] / [128, 1] fp32 scales.
+        self.qkv_proj_weight = nn.Parameter(
+            torch.empty(self.hidden_size, q_size + 2 * kv_size, dtype=_FP8_DTYPE),
+            requires_grad=False,
+        )
+        self.o_proj_weight = nn.Parameter(
+            torch.empty(q_size, self.hidden_size, dtype=_FP8_DTYPE),
+            requires_grad=False,
+        )
+        self.qkv_weight_scale = _fp32_param(_PMAX, 3)
+        self.qkv_input_scale = _fp32_param(_PMAX, 1)
+        self.o_weight_scale = _fp32_param(_PMAX, 1)
+        self.o_input_scale = _fp32_param(_PMAX, 1)
+
+        # <-- MODEL-SPECIFIC: per-head QK-norm (head_dim RMSNorm, replicated)
+        self.q_norm = HYV3RMSNorm(self.head_dim, config.rms_norm_eps, self.dtype)
+        self.k_norm = HYV3RMSNorm(self.head_dim, config.rms_norm_eps, self.dtype)
+
+        # KV caches bound externally via bind_kv_cache(): BF16, or FP8 with K in
+        # either the standard [blocks, kvh, block, D] or the packed
+        # [blocks, kvh, block // 2, D, 2] layout (fp8_packed, set at bind time).
+        self.k_cache = None
+        self.v_cache = None
+        self.fp8_packed = False
+        # EXPERIMENTAL sparse decode: per-group K min / max ([blocks, 2, kvh, D]),
+        # allocated with the cache (bind_attention_kv) when HY3_SPARSE_DECODE is set.
+        self.k_sum = None
+        self.k_sum_per_block = False
+        # FP8 KV quantizing scales q = 1 / dequant (cache = fp8(x * q)), set by
+        # load_weights / load_weights_lite (_load_kv_cache_scales); FP8 KV
+        # refuses to bind before they are set (kv_scale_t is None).
+        self.k_scale_float = 1.0
+        self.v_scale_float = 1.0
+        self.kv_scale_t = None
+
+        self._setup_weight_loaders()
+
+    def set_kv_scales(self, q_k: float, q_v: float, device) -> None:
+        """<-- FP8 KV: this layer's quantizing scales (q = 1 / dequant).
+
+        Decode passes them to the megakernel as compile-time values. Prefill
+        reads them from ``kv_scale_t`` ([q_k, q_v, 1/q_k, 1/q_v], a graph input)
+        so that all 80 prefill layers stay structurally identical: with
+        per-layer constants the compiler cannot reuse one layer module for the
+        others, which made the full-model prefill NEFFs 10-16x larger and their
+        cold compile take hours.
+        """
+        self.k_scale_float, self.v_scale_float = q_k, q_v
+        self.kv_scale_t = nn.Parameter(
+            torch.tensor(
+                [q_k, q_v, 1.0 / q_k, 1.0 / q_v], dtype=torch.float32, device=device
+            ),
+            requires_grad=False,
+        )
+
+    def _setup_weight_loaders(self):
+        set_weight_loader(
+            self.qkv_proj_weight,
+            with_fp8_halving(
+                fused_qkv_weight_loader(
+                    q_size=self.q_size,
+                    kv_size=self.kv_size,
+                    shard_dim=1,
+                    num_shards=self.world_size,
+                    is_storage_transposed=True,
+                    num_kv_replicas=self.num_kv_replicas,
+                )
+            ),
+        )
+        set_weight_loader(
+            self.o_proj_weight,
+            with_fp8_halving(
+                sharding_weight_loader(
+                    shard_dim=0,
+                    shard_size=self.q_size,
+                    num_shards=self.world_size,
+                    is_storage_transposed=True,
+                )
+            ),
+        )
+        set_weight_loader(self.qkv_weight_scale, scalar_scale_loader(3, cols=3))
+        set_weight_loader(self.qkv_input_scale, scalar_scale_loader(3, cols=1))
+        set_weight_loader(self.o_weight_scale, scalar_scale_loader())
+        set_weight_loader(self.o_input_scale, scalar_scale_loader())
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attn_metadata: dict,
+        ln_w: torch.Tensor,
+        is_decode: bool,
+        rank: torch.Tensor,
+    ) -> torch.Tensor:
+        # >>> PARALLELISM: DCP rank as a runtime tensor (SPMD-clean) <<<
+        dcp_rank = self.dcp_group.rank_in_group_tensor if self.dcp_size > 1 else None
+        if is_decode:
+            return self.forward_decode(
+                hidden_states,
+                positions,
+                position_embeddings,
+                attn_metadata,
+                ln_w,
+                dcp_rank,
+            )
+
+        # Pre-attention RMSNorm in the SP region; the STATIC qkv kernel needs bf16 input.
+        x = hidden_states.to(torch.float32)
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.rms_norm_eps)
+        hidden_states = (x * ln_w.view(1, -1)).to(self.dtype)
+        # >>> PARALLELISM: All-gather from SP <<<
+        if self.world_size > 1:
+            hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
+        return self.forward_prefill(
+            hidden_states, position_embeddings, attn_metadata, dcp_rank
+        )
+
+    def _qk_norm(self, t: torch.Tensor, norm: HYV3RMSNorm) -> torch.Tensor:
+        tf = t.to(torch.float32)
+        tf = tf * torch.rsqrt(tf.pow(2).mean(-1, keepdim=True) + norm.variance_epsilon)
+        return tf * norm.weight.to(torch.float32)
+
+    def _fp8_prefill_q(self, q: torch.Tensor) -> torch.Tensor:
+        """Q * (1 / q_k): (Q / q_k) . (K * q_k) = Q . K for the cached FP8 K."""
+        return (q.to(torch.float32) * self.kv_scale_t[2]).to(q.dtype)
+
+    def _fp8_prefill_out(self, out: torch.Tensor) -> torch.Tensor:
+        """Attention over V * q_v, times 1 / q_v."""
+        return (out.to(torch.float32) * self.kv_scale_t[3]).to(out.dtype)
+
+    def forward_prefill(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attn_metadata: dict,
+        dcp_rank: torch.Tensor | None,
+    ) -> torch.Tensor:
+        tokens = hidden_states.shape[0]
+        meta = attn_metadata[self.layer_name]
+
+        # Step 1: QKV projection (STATIC fp8)
+        qkv = NF.qkv_proj(
+            hidden=hidden_states.unsqueeze(0),
+            qkv_weights=self.qkv_proj_weight,
+            bias=None,
+            d_head=self.head_dim,
+            quantization_type=QuantizationType.STATIC,
+            qkv_w_scale=self.qkv_weight_scale,
+            qkv_in_scale=self.qkv_input_scale,
+            num_q_heads=self.num_attention_heads_per_rank,
+            num_kv_heads=self.num_key_value_heads_per_rank,
+        ).squeeze(0)
+        q, k, v = torch.tensor_split(qkv, self.qkv_split_indices, dim=-1)
+        q = q.view(tokens, self.num_attention_heads_per_rank, self.head_dim).transpose(
+            0, 1
+        )
+        k = k.view(tokens, self.num_key_value_heads_per_rank, self.head_dim).transpose(
+            0, 1
+        )
+        v = v.view(tokens, self.num_key_value_heads_per_rank, self.head_dim).transpose(
+            0, 1
+        )
+
+        # Step 2: <-- MODEL-SPECIFIC: QK-norm then rotate_half RoPE (fp32)
+        cos, sin = position_embeddings
+        cos = cos.unsqueeze(0).to(torch.float32)
+        sin = sin.unsqueeze(0).to(torch.float32)
+        q = self._qk_norm(q, self.q_norm)
+        k = self._qk_norm(k, self.k_norm)
+        q = (q * cos + _rotate_half(q) * sin).to(self.dtype)
+        k = (k * cos + _rotate_half(k) * sin).to(self.dtype)
+
+        # Step 3: KV cache write. Padding slots (-1) are redirected to the null block.
+        # >>> PARALLELISM: with DCP the slot_mapping is full length; tokens this
+        # rank does not own map to the null block, so the full K/V is written.
+        slot_mapping = meta["slot_mapping"]
+        block_size = meta["block_size"]
+        block_idx, pos_idx = paged_slot_indices(
+            slot_mapping, block_size, self.k_cache.shape[0]
+        )
+        nkh = self.num_key_value_heads_per_rank
+        index = (
+            block_idx.repeat(nkh),
+            torch.arange(nkh, dtype=torch.long, device=q.device).repeat_interleave(
+                slot_mapping.shape[0]
+            ),
+            pos_idx.repeat(nkh),
+        )
+        # <-- FP8 KV: K is quantized after QK-norm + RoPE, V after v_proj, with
+        # a static per-layer scale.
+        kv_fp8 = _is_fp8_kv(self.k_cache)
+        if kv_fp8:
+            k_rows = _quantize_kv(
+                k.reshape(-1, self.head_dim), self.kv_scale_t[0], self.k_cache.dtype
+            )
+            v_rows = _quantize_kv(
+                v.reshape(-1, self.head_dim), self.kv_scale_t[1], self.v_cache.dtype
+            )
+        else:
+            k_rows = k.reshape(-1, self.head_dim).to(self.k_cache.dtype)
+            v_rows = v.reshape(-1, self.head_dim).to(self.v_cache.dtype)
+        self.v_cache.index_put_(index, v_rows)
+        if self.fp8_packed:
+            # Packed K [blocks, kvh, block // 2, D, 2] stores token pairs
+            # (2j, 2j + 1). One prefill per step starting at a block-aligned
+            # (prefix hit) or chunk-aligned position keeps rows pair-aligned.
+            _write_packed_k(self.k_cache, k_rows, *index)
+        else:
+            self.k_cache.index_put_(index, k_rows)
+        if self.k_sum is not None and self.dcp_size > 1:
+            # DCP rank: every rank has the whole chunk's K; it writes the summaries of the
+            # sequence blocks it owns into its local blocks.
+            update_k_summary_prefill_dcp_blocks(
+                self.k_sum, k, meta["cached_seq_len"], slot_mapping >= 0,
+                meta["block_table_tensor"][0], block_size, self.dcp_size, dcp_rank,
+            )
+        elif self.k_sum is not None:
+            update_k_summary_prefill(
+                self.k_sum, k, slot_mapping, meta["block_table_tensor"][0], block_size,
+                1 if self.k_sum_per_block else _SPARSE_GROUP,
+            )
+
+        # Step 4: Attention
+        kv_segment_size = meta.get("kv_segment_size")
+        fp8_direct = False
+        if self.dcp_size > 1 or kv_segment_size:
+            # Segmented prefill over the cache, which now holds this step's tokens.
+            k_attn, v_attn = self.k_cache, self.v_cache
+            block_table = meta["block_table_tensor"]
+            prior_tokens = meta.get("cached_seq_len")
+            if kv_fp8:
+                # <-- FP8 KV: read a BF16 copy of the request's blocks (exact for
+                # FP8 codes). On the installed nkilib (nki 0.7.0) the KV-parallel
+                # (DCP) kernel reads the prior segments of a packed FP8 K cache
+                # wrongly, and a packed read in the segmented kernel makes the
+                # full-model prefill NEFFs 10-16x larger. The copy holds
+                # k * q_k / v * q_v: Q carries the K dequant (_fp8_prefill_q) and
+                # the output the V dequant (linear in V, so after the DCP LSE
+                # combine too; runtime scales, see set_kv_scales).
+                if self.k_sum is not None and _SPARSE_PREFILL > 0 and self.dcp_size == 1:
+                    # >>> EXPERIMENTAL sparse prefill: copy only the kept prior blocks.
+                    nb = block_table.shape[1]
+                    n_sel = sparse_budget_blocks(nb, _SPARSE_PREFILL, _SPARSE_SINK * _SPARSE_GROUP,
+                                                 _SPARSE_RECENT * _SPARSE_GROUP)
+                    if n_sel < nb and nb % _SPARSE_GROUP == 0:
+                        blocks, prior_tokens = sparse_prefill_blocks(
+                            q, self.k_sum, block_table[0], prior_tokens, slot_mapping >= 0, block_size,
+                            _SPARSE_GROUP, n_sel, _SPARSE_SINK, _SPARSE_RECENT,
+                            per_block=self.k_sum_per_block,
+                        )
+                        block_table = blocks.view(1, -1).to(block_table.dtype)
+                fp8_direct = _PREFILL_FP8_DIRECT and self.dcp_size == 1 and block_table is meta["block_table_tensor"]
+                if not fp8_direct:
+                    k_attn, v_attn, block_table = _request_blocks_bf16(
+                        self.k_cache, self.v_cache, block_table, self.fp8_packed, self.dtype
+                    )
+                q = self._fp8_prefill_q(q)
+            if self.dcp_size > 1:
+                # Full Q against this rank's local KV shard, LSE-combined across
+                # the DCP group.
+                cached_seq_len = meta.get("cached_seq_len")
+                attn_output = NF.segmented_attention_cp(
+                    q=q,
+                    k_cache=k_attn,
+                    v_cache=v_attn,
+                    block_tables=block_table,
+                    prior_tokens=(
+                        cached_seq_len // self.dcp_size
+                        if cached_seq_len is not None
+                        else None
+                    ),
+                    block_size=block_size,
+                    cp_rank=dcp_rank.reshape(1, 1).to(torch.int32),
+                    cp_world_size=self.dcp_size,
+                    cp_kv_cache_interleave_size=block_size,
+                    cp_group=self.dcp_group,
+                    scale=self.scaling,
+                    tp_q=True,
+                    tp_out=True,
+                )
+            else:
+                attn_output = NF.segmented_attention(
+                    q,
+                    k_cache=k_attn,
+                    v_cache=v_attn,
+                    block_tables=block_table,
+                    prior_tokens=prior_tokens,
+                    block_size=block_size,
+                    kv_segment_size=kv_segment_size,
+                    scale=self.scaling,
+                    tp_q=True,
+                    tp_out=True,
+                    **({"fp8_packed": self.fp8_packed} if kv_fp8 and fp8_direct else {}),
+                )
+            if kv_fp8:
+                attn_output = self._fp8_prefill_out(attn_output)
+        else:
+            # Full prefill attends over this step's BF16 K/V, not the cache.
+            k = k.repeat_interleave(self.num_key_value_groups, dim=0)
+            v = v.repeat_interleave(self.num_key_value_groups, dim=0)
+            attn_output = NF.flash_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v,
+                scale=self.scaling,
+                tp_q=False,
+                tp_out=True,
+            )
+
+        # Step 5: Output projection (STATIC fp8)
+        attn_output = NF.o_proj(
+            attn_output.unsqueeze(0),
+            self.o_proj_weight,
+            None,
+            quantization_type=QuantizationType.STATIC,
+            weight_scales=self.o_weight_scale,
+            input_scales=self.o_input_scale,
+        ).squeeze(0)
+
+        # >>> PARALLELISM: Reduce-scatter back to SP <<<
+        if self.world_size > 1:
+            attn_output = self.tp_group.reduce_scatter(attn_output, dim=0)
+        return attn_output.contiguous()
+
+    def _sparse_decode_blocks(self, X, positions, slot_mapping, block_table, block_size, n_sel, kvdp_idx=None,
+                              dcp_rank=None, local_filled=None):
+        """EXPERIMENTAL (HY3_SPARSE_DECODE): fold the step's K into the summaries
+        and, when ``n_sel`` is set, select the ``n_sel`` blocks each request
+        attends to.
+
+        Returns ``(block_table [B, n_sel], history tokens [B])`` or None.
+        """
+        B, S, H = X.shape
+        nh, kvh, D = self.num_attention_heads_per_rank, self.num_key_value_heads_per_rank, self.head_dim
+        # Q and K as the decode kernel computes them (RMSNorm, QKV projection,
+        # QK-norm, RoPE), with BF16 activations and the weight copies of
+        # prepare_sparse_decode (not the kernel's own parameters). Without a
+        # selection only K.
+        x = X.to(torch.float32).view(B * S, H)
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.rms_norm_eps)
+        xn = (x * self.sparse_ln_w.view(1, -1)).to(self.dtype)
+        nq = nh if n_sel else 0
+        w = self.sparse_wqk if n_sel else self.sparse_wqk[:, nh * D :]
+        qk = (xn @ w).view(B * S, nq + kvh, D).transpose(0, 1).to(torch.float32)
+        qk = qk * torch.rsqrt(qk.pow(2).mean(-1, keepdim=True) + self.q_norm.variance_epsilon)
+        q = qk[:nq] * self.sparse_qnorm_w
+        k = qk[nq:] * self.sparse_knorm_w
+        # RoPE from the positions, not from position_embeddings: reading the
+        # cos / sin that also feed the decode kernel (cos_kernel / sin_kernel)
+        # in these torch ops gave wrong attention results.
+        inv_freq = 1.0 / (
+            self.rope_theta ** (torch.arange(0, D, 2, dtype=torch.float32, device=X.device) / D)
+        )
+        freqs = positions.view(-1, 1).to(torch.float32) * inv_freq.view(1, -1)
+        emb = torch.cat((freqs, freqs), dim=-1).unsqueeze(0)  # [1, B * S, D]
+        cos, sin = emb.cos(), emb.sin()
+        q = q * cos + _rotate_half(q) * sin  # [nh, B * S, D]
+        k = k * cos + _rotate_half(k) * sin  # [kvh, B * S, D]
+        out = None
+        if self.dcp_size > 1:
+            # >>> DCP: this rank's table holds every dcp-th block; summaries, history and the
+            # selection are in its local positions. One rank attends for all the KV head's query
+            # heads (gathered by the DCP kernel), so score with all of them.
+            W = self.dcp_size
+            lpos, owned = dcp_local_positions(positions, block_size, W, dcp_rank)
+            if n_sel:
+                q_all = self.dcp_group.all_gather(q.contiguous(), dim=0)  # [nh * W, B * S, D]
+                out = sparse_select_blocks(
+                    q_all.view(nh * W, B, S, D), self.k_sum, block_table,
+                    local_filled.view(B).to(torch.long), block_size, _SPARSE_GROUP, n_sel,
+                    _SPARSE_SINK, _SPARSE_RECENT, per_block=True,
+                )
+            update_k_summary_decode(
+                self.k_sum, k.view(kvh, B, S, D).permute(1, 2, 0, 3), lpos,
+                torch.where(owned, 0, -1).to(slot_mapping.dtype), block_table, block_size, 1,
+            )
+            return out
+        if n_sel:
+            # Before this step's K is folded in: the group the step writes is
+            # always kept.
+            if kvdp_idx is not None:
+                out = sparse_select_blocks_kvdp(
+                    q.view(nh, B, S, D), self.k_sum, block_table, positions.view(B, S)[:, 0],
+                    block_size, _SPARSE_GROUP, n_sel, _SPARSE_SINK, _SPARSE_RECENT,
+                    self.tp_group, kvdp_idx[0], kvdp_idx[1],
+                )
+            else:
+                out = sparse_select_blocks(
+                    q.view(nh, B, S, D), self.k_sum, block_table, positions.view(B, S)[:, 0],
+                    block_size, _SPARSE_GROUP, n_sel, _SPARSE_SINK, _SPARSE_RECENT,
+                )
+        update_k_summary_decode(
+            self.k_sum, k.view(kvh, B, S, D).permute(1, 2, 0, 3), positions, slot_mapping,
+            block_table, block_size, _SPARSE_GROUP,
+        )
+        return out
+
+    def _kvdp_indices(self, B, device, kvdp):
+        """(own, mine, kvdp): this rank's batch rows and its KVDP group's TP ranks, as runtime
+        tensors, and the degree. The groups are consecutive ranks: at KVDP=4 the 8 ranks of a KV
+        head form two groups that each serve all B requests."""
+        Ba = B // kvdp
+        rank = self.tp_group.rank_in_group_tensor.reshape(-1)[0:1].to(torch.int64)
+        r = rank % kvdp
+        g = torch.div(rank, kvdp, rounding_mode="floor")
+        own = r * Ba + torch.arange(Ba, dtype=torch.int64, device=device)
+        mine = g * kvdp + torch.arange(kvdp, dtype=torch.int64, device=device)
+        return own, mine, kvdp
+
+    def _forward_decode_kvdp(
+        self, X, cos_kernel, sin_kernel, block_table, positions, slot_mapping, block_size,
+        S_ctx, ln_w, attn_metadata, kvdp_idx, sparse=None,
+    ):
+        """EXPERIMENTAL (HY3_DECODE_KVDP): decode attention in which each of the KVDP ranks that
+        share this KV head attends for B / KVDP of the requests (kvdp_attention.py); sparse:
+        the [table, positions, mask] of a sparse selection. Returns the all-reduced output, or
+        None when the packed kernel cannot take this bucket."""
+        from vllm_neuron.functional.attention.attention_decode_mask import (
+            maybe_transpose_mask_for_qk_swap,
+        )
+        from vllm_neuron.utils.hardware_config import get_logical_nc_config
+
+        kvdp = kvdp_idx[2]
+        B0, S, _ = X.shape
+        Bp = kvdp_idx[0].shape[0] * kvdp
+        if Bp != B0:
+            # >>> KVDP_PAD: Bp - B0 padding rows for the attention only (see _kvdp_plan) <<<
+            assert sparse is None, "KVDP padding is for dense decode"
+            pad = Bp - B0
+            X = torch.cat([X, X.new_zeros(pad, S, X.shape[2])], dim=0)
+            cos_kernel = torch.cat([cos_kernel, cos_kernel[:, :1].expand(-1, pad, -1)], dim=1)
+            sin_kernel = torch.cat([sin_kernel, sin_kernel[:, :1].expand(-1, pad, -1)], dim=1)
+            block_table = torch.cat([block_table, block_table.new_full((pad, block_table.shape[1]), -1)], dim=0)
+            positions = torch.cat([positions.view(B0, S), positions.new_zeros(pad, S)], dim=0).view(-1)
+            slot_mapping = torch.cat([slot_mapping.view(B0, S), slot_mapping.new_full((pad, S), -1)], dim=0).view(-1)
+        B = Bp
+        Ba = B // kvdp
+        nh, D = self.num_attention_heads_per_rank, self.head_dim
+        packed = self.fp8_packed and packed_decode_viable(
+            block_len=block_size, bs=Ba, q_head=nh * kvdp, s_active=S, s_prior=S_ctx
+        )
+        if self.fp8_packed and not packed:
+            return None
+        # >>> PARALLELISM: this rank's slot in its KV head's group, as runtime tensors (SPMD) <<<
+        own, mine, _ = kvdp_idx
+        r = own[0:1] // Ba
+        if sparse is not None:
+            table, pos_own, mask = sparse  # mask: None until built for this selection
+        else:
+            table = block_table.index_select(0, own)
+            mask = attn_metadata.get((_KVDP_MASK_CACHE_KEY, kvdp, Ba, S, S_ctx))
+        kpos = None
+        if _DECODE_POSID and sparse is None:
+            # >>> POSID: prior mask generated in-kernel; only the active [S, Ba, H, S] triu is passed <<<
+            kpos = positions.view(B, S).index_select(0, own).to(torch.float32).contiguous()
+            mask = attn_metadata.get((_KVDP_ACTIVE_MASK_KEY, Ba, S))
+            if mask is None:
+                tri = torch.triu(torch.ones(S, S, dtype=torch.float32, device=X.device))
+                mask = tri[:, None, None, :].expand(S, Ba, nh * kvdp, S).contiguous()
+                attn_metadata[(_KVDP_ACTIVE_MASK_KEY, Ba, S)] = mask
+        if mask is None:
+            if sparse is None:
+                pos_own = positions.view(B, S).index_select(0, own)
+            mask = NF.gen_attention_decode_mask(
+                pos_ids=pos_own.reshape(1, Ba * S).to(torch.float32),
+                bs=Ba,
+                q_head=nh * kvdp,
+                s_active=S,
+                s_prior=S_ctx,
+                start_pos=None,
+                block_len=block_size,
+            )
+            mask = maybe_transpose_mask_for_qk_swap(
+                mask, d_head=D, is_fp8_kv=True, fp8_packed=packed
+            )
+            if sparse is not None:
+                sparse[2] = mask  # reused by the layers that reuse this selection
+            else:
+                attn_metadata[(_KVDP_MASK_CACHE_KEY, kvdp, Ba, S, S_ctx)] = mask
+        o_weight_scale, o_input_scale = self.o_weight_scale, self.o_input_scale
+        if self.v_scale_float != 1.0:
+            o_input_scale = o_input_scale * self.v_scale_float
+            o_weight_scale = o_weight_scale / self.v_scale_float
+        world = self.world_size
+        groups = tuple(tuple(range(i * kvdp, (i + 1) * kvdp)) for i in range(world // kvdp))
+        output, k_new, v_new = wrap_nki(kvdp_attention_block_tkg)[get_logical_nc_config()](
+            X,
+            X_hidden_dim_actual=self.hidden_size,
+            rmsnorm_X_enabled=True,
+            rmsnorm_X_eps=self.rms_norm_eps,
+            rmsnorm_X_gamma=ln_w.view(1, -1),
+            W_qkv=self.qkv_proj_weight,
+            quantization_type_qkv=QuantizationType.STATIC,
+            weight_dequant_scale_qkv=self.qkv_weight_scale,
+            input_dequant_scale_qkv=self.qkv_input_scale,
+            rmsnorm_QK_pre_rope_eps=self.q_norm.variance_epsilon,
+            rmsnorm_QK_pre_rope_W_Q=self.q_norm.weight.view(1, -1),
+            rmsnorm_QK_pre_rope_W_K=self.k_norm.weight.view(1, -1),
+            cos=cos_kernel,
+            sin=sin_kernel,
+            active_blocks_table=table,
+            K_cache=self.k_cache,
+            V_cache=self.v_cache,
+            attention_mask=mask,
+            softmax_scale=self.scaling / self.k_scale_float,
+            k_scale=_scale_column(self.k_scale_float, X.device),
+            v_scale=_scale_column(self.v_scale_float, X.device),
+            fp8_packed=packed,
+            W_out=self.o_proj_weight,
+            quantization_type_out=QuantizationType.STATIC,
+            weight_dequant_scale_out=o_weight_scale,
+            input_dequant_scale_out=o_input_scale,
+            KVDP=kvdp,
+            KVDP_groups=groups,
+            KVDP_rank=r.to(torch.uint32),
+            pos_ids=kpos,
+        )
+        # >>> PARALLELISM: every rank writes every request's new K / V (a request can move to
+        # another rank of the group between steps). The kernel returns its B / KVDP requests'
+        # FP8 K [D, Ba, S] / V [Ba, 1, S, D]; one TP all-gather of their bytes (as bf16 pairs,
+        # flat: no transposes) collects them, keep this group's KVDP rows. <<<
+        n = D * Ba * S
+        both = torch.cat([k_new.reshape(-1), v_new.reshape(-1)]).view(torch.bfloat16)
+        gathered = self.tp_group.all_gather(both, dim=0).view(world, n)
+        sel = gathered.index_select(0, mine).view(self.k_cache.dtype).view(kvdp, 2, n)
+        k_groups = sel[:, 0].reshape(kvdp, D, Ba * S).contiguous()
+        v_all = sel[:, 1].reshape(B * S, D).contiguous()
+        wrap_nki(kvdp_kv_write)[get_logical_nc_config()](
+            self.k_cache, self.v_cache, k_groups, v_all,
+            slot_mapping.view(B, S).to(torch.uint32), fp8_packed=self.fp8_packed,
+        )
+        if Bp != B0:
+            output = output.reshape(Bp * S, -1)[: B0 * S]
+        # >>> PARALLELISM: TP all-reduce of the O projection <<<
+        if self.world_size > 1:
+            output = self.tp_group.all_reduce(output)
+        return output
+
+    def forward_decode(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attn_metadata: dict,
+        ln_w: torch.Tensor,
+        dcp_rank: torch.Tensor | None,
+    ) -> torch.Tensor:
+        meta = attn_metadata[self.layer_name]
+        slot_mapping = meta["slot_mapping"]
+        block_size = meta["block_size"]
+        block_table = meta["block_table_tensor"]
+        S_ctx = meta["max_blocks_per_seq"] * block_size
+
+        B = block_table.shape[0]
+        tokens, hidden = hidden_states.shape
+        S_decode = tokens // B
+        _validate_dcp_decode_sequence_length(self.dcp_size, S_decode)
+        X = hidden_states.to(self.dtype).view(B, S_decode, hidden)
+
+        cos, sin = position_embeddings
+        half_d = self.head_dim // 2
+        cos_kernel = (
+            cos[:, :half_d]
+            .view(B, S_decode, half_d)
+            .permute(2, 0, 1)
+            .contiguous()
+            .to(self.dtype)
+        )
+        sin_kernel = (
+            sin[:, :half_d]
+            .view(B, S_decode, half_d)
+            .permute(2, 0, 1)
+            .contiguous()
+            .to(self.dtype)
+        )
+
+        # >>> PARALLELISM: DCP — the block table is already this rank's shard
+        # (S_ctx is local). Mask the prior tokens this rank owns and let only
+        # the owning rank count each active token, so it is combined once.
+        # With MTP the step has S_decode = 1 + k tokens: the prior (history before
+        # the span) is the same for all of them, from the span's first position;
+        # the owner is per token, since the span can cross a block boundary.
+        local_filled = None
+        dcp_active_mask = None
+        if self.dcp_size > 1:
+            W = self.dcp_size
+            R = dcp_rank.to(torch.float32)
+            n = positions.view(B, S_decode)[:, 0:1].to(torch.float32)
+            vblock = block_size * W
+            full_vblocks = torch.div(n, vblock, rounding_mode="trunc")
+            remaining = n - full_vblocks * vblock
+            local_filled = full_vblocks * block_size + torch.clamp(
+                remaining - R * block_size, min=0, max=block_size
+            )
+            pos_all = positions.view(B, S_decode).to(torch.float32)
+            rem_all = pos_all - torch.div(pos_all, vblock, rounding_mode="trunc") * vblock
+            owner = torch.div(rem_all, block_size, rounding_mode="trunc") % W
+            dcp_active_mask = (owner == R).float()  # [B, S_decode]
+
+        attention_mask = None
+        n_sel = 0
+        kvdp_deg, kvdp_B = (
+            _kvdp_plan(B, _SPARSE_DECODE > 0 and self.k_sum is not None)
+            if self.dcp_size == 1 and _is_fp8_kv(self.k_cache)
+            else (1, B)
+        )
+        kvdp_on = kvdp_deg > 1
+        kvdp_idx = self._kvdp_indices(kvdp_B, X.device, kvdp_deg) if kvdp_on else None
+        if self.k_sum is not None:
+            nb = block_table.shape[1]
+            n_sel = sparse_budget_blocks(
+                nb, _SPARSE_DECODE, _SPARSE_SINK * _SPARSE_GROUP, _SPARSE_RECENT * _SPARSE_GROUP
+            )
+            if _SPARSE_DECODE <= 0 or n_sel >= nb or B < _SPARSE_MIN_BATCH or nb % _SPARSE_GROUP:
+                n_sel = 0  # dense; the summaries are still updated
+            # >>> EXPERIMENTAL sparse decode: the kernel reads n_sel blocks.
+            reuse = None
+            if n_sel and self.layer_idx % _SPARSE_SELECT_EVERY:
+                reuse = attn_metadata.get(_SPARSE_SEL_CACHE_KEY)
+            selected = self._sparse_decode_blocks(
+                X, positions, slot_mapping, block_table, block_size,
+                0 if reuse is not None else n_sel, kvdp_idx if n_sel else None,
+                dcp_rank=dcp_rank, local_filled=local_filled,
+            )
+        if n_sel and kvdp_on:
+            S_ctx = n_sel * block_size
+            if reuse is not None:
+                got = reuse  # [table, positions, mask] of the last selecting layer
+            else:
+                table_own, prior = selected
+                Ba = B // kvdp_deg
+                prior_pos = prior.view(Ba, 1) + torch.arange(S_decode, device=X.device).view(1, -1)
+                got = [table_own, prior_pos, None]
+                if _SPARSE_SELECT_EVERY > 1:
+                    attn_metadata[_SPARSE_SEL_CACHE_KEY] = got
+            out = self._forward_decode_kvdp(
+                X, cos_kernel, sin_kernel, block_table, positions, slot_mapping, block_size,
+                S_ctx, ln_w, attn_metadata, kvdp_idx, sparse=got,
+            )
+            if out is not None:
+                return out.view(tokens, hidden)
+            raise RuntimeError("KVDP sparse decode: the packed kernel cannot take this bucket")
+        if n_sel:
+            S_ctx = n_sel * block_size
+            if reuse is not None:
+                block_table, attention_mask = reuse
+            else:
+                block_table, prior = selected
+                # History tokens: the kept blocks' (repeated per verify token).
+                prior_pos = prior.view(B, 1) + torch.arange(S_decode, device=X.device).view(1, -1)
+                attention_mask = NF.gen_attention_decode_mask(
+                    pos_ids=prior_pos.view(1, B * S_decode).to(torch.float32),
+                    bs=B,
+                    q_head=self.num_attention_heads_per_rank * self.dcp_size,
+                    s_active=S_decode,
+                    s_prior=S_ctx,
+                    start_pos=None,
+                    block_len=block_size,
+                    # DCP: the compacted local table holds `prior` of this rank's history
+                    # tokens; the active tokens are gated by their owner as in dense DCP.
+                    local_filled_slots=prior.to(torch.float32) if self.dcp_size > 1 else None,
+                    dcp_active_mask=dcp_active_mask,
+                )
+                if _SPARSE_SELECT_EVERY > 1:
+                    attn_metadata[_SPARSE_SEL_CACHE_KEY] = (block_table, attention_mask)
+
+        if kvdp_on and not n_sel:
+            out = self._forward_decode_kvdp(
+                X, cos_kernel, sin_kernel, block_table, positions, slot_mapping, block_size,
+                S_ctx, ln_w, attn_metadata, kvdp_idx,
+            )
+            if out is not None:
+                return out.view(tokens, hidden)
+
+        # The decode mask is identical for every layer: build it once per step.
+        if attention_mask is None:
+            attention_mask = attn_metadata.get(_DECODE_MASK_CACHE_KEY)
+        if attention_mask is None:
+            attention_mask = NF.gen_attention_decode_mask(
+                pos_ids=positions.view(1, B * S_decode).to(torch.float32),
+                bs=B,
+                q_head=self.num_attention_heads_per_rank * self.dcp_size,
+                s_active=S_decode,
+                s_prior=S_ctx,
+                start_pos=None,
+                block_len=block_size,
+                local_filled_slots=local_filled,
+                dcp_active_mask=dcp_active_mask,
+            )
+            attn_metadata[_DECODE_MASK_CACHE_KEY] = attention_mask
+
+        # <-- FP8 KV (installed nkilib attention_block_tkg contract):
+        #  * k_scale / v_scale are QUANT multipliers: the kernel writes the
+        #    active token as fp8(clip(x * q)); the history is read undequantized.
+        #  * K: the explicit softmax_scale must carry 1 / q_k.
+        #  * V: the attention output reaches the STATIC O-projection scaled by
+        #    q_v. The O-proj quantizes attn / input_scale and rescales by
+        #    weight_scale * input_scale, so scale input_scale by q_v (the FP8
+        #    input keeps its normal range) and weight_scale by 1 / q_v (their
+        #    product, and so the output, is unchanged). Scaling only the weight
+        #    scale would clip the O-proj input at 240 / q_v of its range.
+        kv_fp8 = _is_fp8_kv(self.k_cache)
+        o_weight_scale, o_input_scale = self.o_weight_scale, self.o_input_scale
+        decode_kv_kwargs = {}
+        packed_fallback = False
+        k_cache_arg = self.k_cache
+        if kv_fp8:
+            if self.v_scale_float != 1.0:
+                o_input_scale = o_input_scale * self.v_scale_float
+                o_weight_scale = o_weight_scale / self.v_scale_float
+            use_packed = (
+                self.fp8_packed
+                and not _FORCE_UNPACKED_DECODE
+                and packed_decode_viable(
+                    block_len=block_size,
+                    bs=B,
+                    # DCP gathers the group's Q heads (as in the decode mask).
+                    q_head=self.num_attention_heads_per_rank * self.dcp_size,
+                    s_active=S_decode,
+                    s_prior=S_ctx,
+                )
+            )
+            # A packed cache on a bucket the packed kernel cannot take is read
+            # (and updated) through a standard-layout copy; the updated copy is
+            # swizzled back below so the next step sees the new token.
+            packed_fallback = self.fp8_packed and not use_packed
+            if packed_fallback:
+                k_cache_arg = unswizzle_packed_k(self.k_cache)
+            decode_kv_kwargs = dict(
+                k_scale=_scale_column(self.k_scale_float, X.device),
+                v_scale=_scale_column(self.v_scale_float, X.device),
+                fp8_packed=use_packed,
+                return_updated_kv=packed_fallback,
+            )
+
+        output = NF.attention_decode(
+            X=X,
+            X_hidden_dim_actual=self.hidden_size,
+            rmsnorm_X_enabled=True,
+            rmsnorm_X_eps=self.rms_norm_eps,
+            rmsnorm_X_gamma=ln_w.view(1, -1),
+            W_qkv=self.qkv_proj_weight,
+            bias_qkv=None,
+            quantization_type_qkv=QuantizationType.STATIC,
+            weight_dequant_scale_qkv=self.qkv_weight_scale,
+            input_dequant_scale_qkv=self.qkv_input_scale,
+            # <-- MODEL-SPECIFIC: pre-RoPE QK-norm with learned gammas
+            rmsnorm_QK_pre_rope_enabled=True,
+            rmsnorm_QK_pre_rope_eps=self.q_norm.variance_epsilon,
+            rmsnorm_QK_pre_rope_W_Q=self.q_norm.weight.view(1, -1),
+            rmsnorm_QK_pre_rope_W_K=self.k_norm.weight.view(1, -1),
+            rmsnorm_QK_post_rope_enabled=False,
+            cos=cos_kernel,
+            sin=sin_kernel,
+            rope_contiguous_layout=True,
+            K_cache_transposed=False,
+            active_blocks_table=block_table,
+            K_cache=k_cache_arg,
+            V_cache=self.v_cache,
+            attention_mask=attention_mask,
+            softmax_scale=self.scaling / self.k_scale_float,
+            sink=None,
+            update_cache=True,
+            kv_cache_update_idx=slot_mapping.view(B, S_decode).to(torch.uint32),
+            W_out=self.o_proj_weight,
+            bias_out=None,
+            quantization_type_out=QuantizationType.STATIC,
+            weight_dequant_scale_out=o_weight_scale,
+            input_dequant_scale_out=o_input_scale,
+            transposed_out=False,
+            out_in_sb=False,
+            dcp_size=self.dcp_size,
+            dcp_group=self.dcp_group,
+            dcp_active_owner=dcp_active_mask,
+            **decode_kv_kwargs,
+        )
+        if packed_fallback:
+            # Use the kernel's RETURNED K (k_cache_arg is the pre-kernel copy).
+            output, k_updated, _ = output
+            self.k_cache.copy_(swizzle_packed_k(k_updated))
+
+        # >>> PARALLELISM: TP all-reduce of the O projection (after the DCP combine) <<<
+        if self.world_size > 1:
+            output = self.tp_group.all_reduce(output)
+        return output.view(tokens, hidden)
+
+
+# =============================================================================
+# Section 3: Static-FP8 gated MLP (dense layer + shared expert)
+# =============================================================================
+
+
+class HYV3StaticFP8MLP(nn.Module):
+    """SiLU-gated MLP with fused RMSNorm + static FP8 activation quant.
+
+    The caller owns the collectives: ``forward`` returns this rank's
+    (possibly partial) result for the tokens it was given.
+
+    ``tp_sharded=True``: intermediate dim sharded across TP (dense layer).
+    ``tp_sharded=False``: full weights on every rank (shared expert); used on
+    SP-local tokens in prefill and on all tokens in decode, so no reduction
+    is needed. ``num_shards`` / ``shard_rank`` instead shard the intermediate
+    dim over a sub-group whose partials the caller combines (decode copy of
+    the shared expert).
+    """
+
+    def __init__(
+        self,
+        config: HYV3Config,
+        intermediate_size: int,
+        tp_sharded: bool,
+        num_shards: int | None = None,
+        shard_rank: int | None = None,
+    ):
+        super().__init__()
+        self.tp_group = get_tp_group()
+        self.world_size = self.tp_group.world_size
+        self.tp_sharded = tp_sharded and self.world_size > 1
+        self.hidden_size = config.hidden_size
+        self.act_dtype = config.torch_dtype
+
+        # ``num_shards`` / ``shard_rank`` shard the intermediate dim over a
+        # sub-group without TP collectives (the caller combines the partials).
+        if num_shards is None:
+            num_shards = self.world_size if self.tp_sharded else 1
+            shard_rank = self.tp_group.rank_in_group if self.tp_sharded else 0
+        shard = -(-intermediate_size // num_shards)
+        self.intermediate_shard = shard
+        self.intermediate_size_per_rank = (
+            -(-shard // _MLP_INTERMEDIATE_ALIGN) * _MLP_INTERMEDIATE_ALIGN
+        )
+        I = self.intermediate_size_per_rank
+
+        self.gate_proj_weight = nn.Parameter(
+            torch.empty(self.hidden_size, I, dtype=_FP8_DTYPE), requires_grad=False
+        )
+        self.up_proj_weight = nn.Parameter(
+            torch.empty(self.hidden_size, I, dtype=_FP8_DTYPE), requires_grad=False
+        )
+        self.down_proj_weight = nn.Parameter(
+            torch.empty(I, self.hidden_size, dtype=_FP8_DTYPE), requires_grad=False
+        )
+        self.gate_weight_scale = _fp32_param(_PMAX, 1)
+        self.up_weight_scale = _fp32_param(_PMAX, 1)
+        self.down_weight_scale = _fp32_param(_PMAX, 1)
+        self.gate_up_input_scale = _fp32_param(_PMAX, 1)
+        self.down_input_scale = _fp32_param(_PMAX, 1)
+
+        tp_rank = shard_rank
+        set_weight_loader(
+            self.gate_proj_weight, padded_mlp_loader(False, shard, I, tp_rank)
+        )
+        set_weight_loader(
+            self.up_proj_weight, padded_mlp_loader(False, shard, I, tp_rank)
+        )
+        set_weight_loader(
+            self.down_proj_weight, padded_mlp_loader(True, shard, I, tp_rank)
+        )
+        for name in ("gate_weight_scale", "up_weight_scale", "down_weight_scale"):
+            set_weight_loader(getattr(self, name), scalar_scale_loader())
+        set_weight_loader(self.gate_up_input_scale, scalar_scale_loader(2, cols=1))
+        set_weight_loader(self.down_input_scale, scalar_scale_loader())
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        ln_w: torch.Tensor,
+        eps: float,
+        is_prefill: bool,
+    ) -> torch.Tensor:
+        # >>> PARALLELISM: SP all-gather (TP-sharded MLP only) <<<
+        gather = is_prefill and self.tp_sharded
+        num_tokens = hidden_states.shape[0] * (self.world_size if gather else 1)
+
+        # The kernel picks CTE vs TKG from its token count. CTE needs fp8 input
+        # (explicit fused RMSNorm + static quant); TKG needs bf16 input and
+        # fuses the RMSNorm itself (it fails to compile on fp8 input).
+        if num_tokens > TKG_BS_SEQLEN_THRESHOLD:
+            hidden_states = NF.rmsnorm_quant(
+                hidden_states,
+                ln_w=ln_w,
+                input_dequant_scale=self.gate_up_input_scale,
+                eps=eps,
+                quantization_type=QuantizationType.STATIC,
+            )
+            norm_type, mlp_ln_w = NormType.NO_NORM, None
+        else:
+            norm_type, mlp_ln_w = NormType.RMS_NORM, ln_w.view(1, -1)
+        if gather:
+            hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
+
+        return NF.mlp(
+            hidden_states,
+            self.gate_proj_weight,
+            self.up_proj_weight,
+            self.down_proj_weight,
+            eps=eps,
+            ln_w=mlp_ln_w,
+            norm_type=norm_type,
+            quantization_type=QuantizationType.STATIC,
+            gate_w_scale=self.gate_weight_scale,
+            up_w_scale=self.up_weight_scale,
+            down_w_scale=self.down_weight_scale,
+            gate_up_in_scale=self.gate_up_input_scale,
+            down_in_scale=self.down_input_scale,
+            output_dtype="bfloat16",
+        )
+
+
+class HYV3DenseMLP(nn.Module):
+    """Dense MLP layer (first_k_dense_replace layers), TP-sharded."""
+
+    def __init__(self, config: HYV3Config):
+        super().__init__()
+        self.mlp = HYV3StaticFP8MLP(config, config.intermediate_size, tp_sharded=True)
+        self.tp_group = self.mlp.tp_group
+        self.world_size = self.mlp.world_size
+
+    def forward(self, hidden_states, ln_w, eps, is_prefill, rank):
+        output = self.mlp(hidden_states, ln_w, eps, is_prefill)
+        # >>> PARALLELISM: combine TP partial sums <<<
+        if self.world_size > 1:
+            if is_prefill:
+                output = self.tp_group.reduce_scatter(output, dim=0)
+            else:
+                output = self.tp_group.all_reduce(output)
+        return output
+
+
+# =============================================================================
+# Section 4: MoE (sigmoid router + shared expert + FP8 routed experts)
+# =============================================================================
+
+
+def hy3_route(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+    expert_bias: torch.Tensor,
+    top_k: int,
+    route_norm: bool,
+    scaling_factor: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """<-- MODEL-SPECIFIC: Hy3 router.
+
+    Returns dense ``[T, E]`` fp32 affinities (zero for unselected experts) and
+    the ``[T, K]`` selected expert indices.
+    """
+    logits = hidden_states.to(torch.float32) @ router_weight.T
+    scores = torch.sigmoid(logits)
+    _, top_k_index = torch.topk(scores + expert_bias, top_k, dim=-1)
+    top_k_weights = scores.gather(1, top_k_index)
+    if route_norm:
+        top_k_weights = top_k_weights / (
+            top_k_weights.sum(dim=-1, keepdim=True) + 1e-20
+        )
+    top_k_weights = top_k_weights * scaling_factor
+    affinities = torch.zeros_like(scores).scatter(1, top_k_index, top_k_weights)
+    return affinities, top_k_index
+
+
+def routed_experts_cte(
+    normed: torch.Tensor,
+    local_affinities: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_scale: torch.Tensor,
+    top_k: int,
+    moe_group,
+    tp_degree: int,
+) -> torch.Tensor:
+    """Routed experts for prefill (``moe_cte``): this rank's partial output.
+
+    ``local_affinities`` is ``[T, L]`` for the ``L`` local experts. Weights are
+    FP8 (``[L, H, 2, I]`` / ``[L, I, H]``) with per-channel dequant scales.
+    """
+    T = normed.shape[0]
+    num_local_experts = gate_up_weight.shape[0]
+    pad = _MOE_MAP_PAD and num_local_experts % 2 == 1 and tp_degree == 1
+    map_affinities = (
+        torch.nn.functional.pad(local_affinities, (0, 1)) if pad else local_affinities
+    )
+    masked, token_position_to_id, block_to_expert, conditions = (
+        NF.build_blockwise_mapping(
+            expert_affinities=map_affinities,
+            num_local_experts=num_local_experts + int(pad),
+            num_experts_per_token=top_k,
+            block_size=_MOE_BLOCK_SIZE,
+            moe_group=moe_group,
+            tp_degree=tp_degree,
+        )
+    )
+    if pad:
+        # The padded expert has no blocks: blocks past the real experts' are empty
+        # (conditions 0). Keep the kernel's per-token affinities in the [T, L] layout.
+        masked = local_affinities.reshape(-1, 1)
+        block_to_expert = torch.clamp(block_to_expert, max=num_local_experts - 1)
+    # shard_on_i_hybrid always runs `num_static_block` blocks and skips the
+    # remaining (worst-case sized) block slots at runtime when they are
+    # empty. With few local experts most of the static worst case is
+    # padding, so this is ~3x faster than shard_on_i at T=2048.
+    # (neuronx-cc 2.27 failed with NCC_ICFG001 when this kernel followed
+    # segmented attention in one graph; fixed in neuronx-cc 2.28.)
+    # HY3_MOE_CTE_IMPL=shard_on_i: neuronx-cc 2.28 fails shard_on_i_hybrid at
+    # ep_degree 8 / 4 (I/tp 192 / 96) with NCC_IGCA108 in bwmm_shard_on_I.py.
+    impl = (
+        MoECTEImplementation.shard_on_i
+        if os.environ.get("HY3_MOE_CTE_IMPL") == "shard_on_i"
+        else MoECTEImplementation.shard_on_i_hybrid
+    )
+    if impl == MoECTEImplementation.shard_on_i_hybrid and _MOE_CTE_FP8W:
+        # nkilib's hybrid kernel copies every FP8 weight tile to BF16 before the
+        # matmul; this copy of it feeds the FP8 tiles to the matmul directly
+        # (same result: the copy is exact and the matmul accumulates in fp32).
+        return wrap_nki(moe_cte_fp8w)[2](
+            conditions=conditions,
+            hidden_states=normed,
+            expert_affinities_masked=masked,
+            gate_up_proj_weight=gate_up_weight,
+            down_proj_weight=down_weight,
+            token_position_to_id=token_position_to_id,
+            block_to_expert=block_to_expert,
+            gate_up_proj_scale=gate_up_scale,
+            down_proj_scale=down_scale,
+            block_size=_MOE_BLOCK_SIZE,
+            num_static_block=num_local_experts,
+            skip_token=True,
+        )[:T]
+    return NF.moe_cte(
+        implementation=impl,
+        num_static_block=num_local_experts,
+        conditions=conditions,
+        hidden_states=normed,
+        expert_affinities_masked=masked,
+        gate_up_proj_weight=gate_up_weight,
+        down_proj_weight=down_weight,
+        gate_up_proj_scale=gate_up_scale,
+        down_proj_scale=down_scale,
+        activation_function=ActFnType.SiLU,
+        block_size=_MOE_BLOCK_SIZE,
+        token_position_to_id=token_position_to_id,
+        block_to_expert=block_to_expert,
+        expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+        skip_token=True,
+        is_tensor_update_accumulating=True,
+        compute_dtype=nl.bfloat16,
+    )[:T]
+
+
+def routed_experts_tkg(
+    normed: torch.Tensor,
+    affinities: torch.Tensor,
+    top_k_index: torch.Tensor,
+    rank_id: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Routed experts for decode (``moe_tkg``, all local experts): partial output.
+
+    ``affinities`` is ``[T, E]`` over all experts; ``rank_id`` (``[1, 1]``
+    int32) selects this rank's ``L`` experts. Scales are per-expert scalars.
+    """
+    num_local_experts = gate_up_weight.shape[0]
+    # moe_tkg selects STATIC from the presence of input scales; on TRN2 the
+    # activations stay BF16 so the values are unused.
+    dummy_in_scale = torch.ones(
+        (num_local_experts, 1), dtype=torch.float32, device=normed.device
+    )
+    # NF.moe_tkg only admits MX / BF16 weights; call its kernel wrapper
+    # directly for plain float8_e4m3fn weights with scalar scales.
+    return wrap_nki(moe_tkg_wrapper)[2](
+        hidden_input=normed,
+        expert_gate_up_weights=gate_up_weight,
+        expert_down_weights=down_weight,
+        expert_affinities=affinities,
+        expert_index=top_k_index.to(torch.int32),
+        is_all_expert=True,
+        rank_id=rank_id,
+        expert_gate_up_weights_scale=gate_up_scale,
+        expert_down_weights_scale=down_scale,
+        expert_gate_up_input_scale=dummy_in_scale,
+        expert_down_input_scale=dummy_in_scale,
+        expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+        activation_fn=ActFnType.SiLU,
+    )
+
+
+def routed_experts_tkg_hits(
+    normed: torch.Tensor,
+    affinities: torch.Tensor,
+    top_k_index: torch.Tensor,
+    rank_id: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Routed experts for a one-token decode (``moe_tkg_hits``): partial output.
+
+    Same contract as ``routed_experts_tkg``, but only the top-k slots whose
+    expert is one of this rank's ``L`` experts are computed: they are packed
+    first and the kernel loops over their count at runtime.
+    """
+    e_l = gate_up_weight.shape[0]
+    k = top_k_index.shape[1]
+    base = rank_id.long().reshape(1, 1) * e_l
+    local_ids = base.reshape(1) + torch.arange(e_l, device=normed.device, dtype=torch.long)
+    local_aff = NF.get_local_expert_affinities(affinities, local_ids)  # [1, L]
+    local_idx = top_k_index.long() - base
+    valid = (local_idx >= 0) & (local_idx < e_l)
+    # Local hits first, in slot order: the kernel runs the first num_hits.
+    slot = torch.arange(k, device=normed.device, dtype=torch.float32).reshape(1, k)
+    order = torch.topk(torch.where(valid, slot, slot + k), k, dim=1, largest=False).indices
+    packed = torch.gather(torch.where(valid, local_idx, 0), 1, order)
+    # int32 explicitly: sum() of an int32 tensor is int64.
+    num_hits = valid.sum(dim=1, keepdim=True, dtype=torch.int32)
+    dummy_in_scale = torch.ones((e_l, 1), dtype=torch.float32, device=normed.device)
+    return wrap_nki(moe_tkg_hits)[2](
+        hidden_input=normed,
+        expert_gate_up_weights=gate_up_weight,
+        expert_down_weights=down_weight,
+        expert_affinities=local_aff.to(torch.float32),
+        expert_index=packed.to(torch.int32),
+        num_hits=num_hits,
+        expert_gate_up_weights_scale=gate_up_scale,
+        expert_down_weights_scale=down_scale,
+        expert_gate_up_input_scale=dummy_in_scale,
+        expert_down_input_scale=dummy_in_scale,
+        activation_fn=ActFnType.SiLU,
+    )
+
+
+
+def routed_experts_tkg_hits_batch(
+    normed: torch.Tensor,
+    affinities: torch.Tensor,
+    top_k_index: torch.Tensor,
+    rank_id: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Routed experts for a few-token decode (``moe_tkg_hits_batch``): partial output.
+
+    Same contract as ``routed_experts_tkg``, but only this rank's experts that
+    at least one token routed to are computed, each once for the whole batch:
+    they are packed first (with their affinity columns) and the kernel loops
+    over their count at runtime.
+    """
+    e_l = gate_up_weight.shape[0]
+    base = rank_id.long().reshape(1, 1) * e_l
+    expert = torch.arange(e_l, device=normed.device, dtype=torch.long)
+    local_aff = NF.get_local_expert_affinities(affinities, base.reshape(1) + expert)  # [T, L]
+    local_idx = top_k_index.long() - base  # [T, K], local if in [0, L)
+    hit = (local_idx.unsqueeze(-1) == expert.view(1, 1, e_l)).any(dim=1).any(dim=0)  # [L]
+    # Hit experts first, in expert order: the kernel runs the first num_hits.
+    key = torch.where(hit, expert, expert + e_l).to(torch.float32).view(1, e_l)
+    order = torch.topk(key, e_l, dim=1, largest=False).indices.view(e_l)
+    packed_aff = torch.index_select(local_aff.to(torch.float32), 1, order)
+    # int32 explicitly: sum() of a bool tensor is int64.
+    num_hits = hit.sum(dtype=torch.int32).view(1, 1)
+    dummy_in_scale = torch.ones((e_l, 1), dtype=torch.float32, device=normed.device)
+    return wrap_nki(moe_tkg_hits_batch)[2](
+        hidden_input=normed,
+        expert_gate_up_weights=gate_up_weight,
+        expert_down_weights=down_weight,
+        expert_affinities=packed_aff,
+        expert_index=order.view(1, e_l).to(torch.int32),
+        num_hits=num_hits,
+        expert_gate_up_weights_scale=gate_up_scale,
+        expert_down_weights_scale=down_scale,
+        expert_gate_up_input_scale=dummy_in_scale,
+        expert_down_input_scale=dummy_in_scale,
+        activation_fn=ActFnType.SiLU,
+    )
+
+class HYV3MoE(nn.Module):
+    """Hy3 sparse MoE block.
+
+    >>> PARALLELISM: EP (+ optional TP within an EP group) for routed experts <<<
+    - Experts are placed linearly: EP rank k owns ``[k*L, (k+1)*L)``.
+    - Router and shared expert are replicated on every rank.
+    - Prefill: router + shared expert on SP-local tokens; tokens and
+      affinities are all-gathered for the routed experts, whose partial
+      outputs are reduce-scattered back to SP.
+    - Decode: tokens are replicated; routed partial outputs are all-reduced.
+
+    <-- MODEL-SPECIFIC routing:
+        scores = sigmoid(x @ W_r^T)                      (fp32)
+        top-k selection on scores + expert_bias          (bias selects only)
+        weights = scores[topk] / sum(scores[topk]) * router_scaling_factor
+    """
+
+    def __init__(self, config: HYV3Config, layer_idx: int | None = None):
+        super().__init__()
+        from vllm.config import get_current_vllm_config
+
+        # Names the routing capture (see forward); None skips it.
+        self.layer_idx = layer_idx
+        self.tp_group = get_tp_group()
+        self.world_size = self.tp_group.world_size
+        self.hidden_size = config.hidden_size
+        self.total_num_experts = config.num_experts
+        self.num_experts_per_token = config.num_experts_per_tok
+        self.router_scaling_factor = config.router_scaling_factor
+        self.route_norm = config.route_norm
+
+        # >>> PARALLELISM: EP configuration <<<
+        vllm_config = get_current_vllm_config()
+        # >>> PARALLELISM: attention DP (vLLM data parallel, one TP group per DP
+        # replica) with the experts spread over every replica (EP = TP x DP).
+        # Routed experts then see the tokens of all replicas: gathered over the
+        # DP group before the MoE, combined over the whole world after it, and
+        # each replica keeps its own rows (shard_select, a runtime offset). <<<
+        self.dp_size = vllm_config.parallel_config.data_parallel_size
+        self.cross_dp_ep = (
+            self.dp_size > 1 and vllm_config.parallel_config.enable_expert_parallel
+        )
+        if self.cross_dp_ep:
+            from vllm.distributed.parallel_state import get_dp_group
+            from vllm_neuron.parallel.neuron_parallel_state import get_wide_ep_group
+
+            self.dp_group = get_dp_group()
+            self.wide_ep_group = get_wide_ep_group()
+        # Ranks that each compute a share of one token's MoE (the combine's world).
+        self.moe_world_size = self.world_size * (self.dp_size if self.cross_dp_ep else 1)
+        if vllm_config.parallel_config.enable_expert_parallel:
+            from vllm_neuron.parallel.neuron_parallel_state import (
+                get_neuron_ep_degree,
+                get_neuron_ep_rank,
+                get_neuron_ep_tp_group,
+            )
+
+            self.ep_degree = get_neuron_ep_degree()
+            self.ep_rank = get_neuron_ep_rank()
+            self.ep_tp_group = get_neuron_ep_tp_group()
+            self.tp_degree = self.ep_tp_group.world_size
+            self.ep_tp_rank = self.ep_tp_group.rank_in_group
+        else:
+            self.ep_degree = 1
+            self.ep_rank = 0
+            self.ep_tp_group = self.tp_group
+            self.tp_degree = self.world_size
+            self.ep_tp_rank = self.tp_group.rank_in_group
+
+        self.num_local_experts = self.total_num_experts // self.ep_degree
+        self.intermediate_size_per_rank = config.moe_intermediate_size // self.tp_degree
+        L, I_tp, H = (
+            self.num_local_experts,
+            self.intermediate_size_per_rank,
+            self.hidden_size,
+        )
+
+        # <-- MODEL-SPECIFIC: router (fp32, replicated) + selection-only bias
+        self.router_weight = _fp32_param(self.total_num_experts, H)
+        self.expert_bias = _fp32_param(self.total_num_experts)
+
+        # <-- STATIC-FP8: routed expert weights (local experts, I sharded by tp_degree)
+        self.gate_up_proj_weight = nn.Parameter(
+            torch.empty(L, H, 2, I_tp, dtype=_FP8_DTYPE), requires_grad=False
+        )
+        self.down_proj_weight = nn.Parameter(
+            torch.empty(L, I_tp, H, dtype=_FP8_DTYPE), requires_grad=False
+        )
+        # Prefill (moe_cte shard_on_i): per-channel dequant scales.
+        self.gate_up_proj_scale = _fp32_param(L, 1, 2 * I_tp)
+        self.down_proj_scale = _fp32_param(L, 1, H)
+        # Decode (moe_tkg STATIC): per-expert scalar dequant scales.
+        self.gate_up_proj_scale_tkg = _fp32_param(L, 2, 1)
+        self.down_proj_scale_tkg = _fp32_param(L, 1)
+        # moe_tkg_fused: the experts' static activation scales (doubled like every input
+        # scale, see weight_loaders.py). The kernel splits I in halves of whole 256-row pairs.
+        self.use_moe_fused = _DECODE_MOE_FUSED and I_tp % 512 == 0
+        if self.use_moe_fused:
+            self.gate_up_in_scale_tkg = _fp32_param(L, 2)
+            self.down_in_scale_tkg = _fp32_param(L, 1)
+
+        # <-- MODEL-SPECIFIC: shared expert(s), full weights on every rank
+        shared_size = config.moe_intermediate_size * config.num_shared_experts
+        self.shared_mlp = HYV3StaticFP8MLP(config, shared_size, tp_sharded=False)
+
+        # >>> PARALLELISM: decode copy of the shared expert sharded over groups
+        # of `_SHARED_DECODE_SHARDS` ranks. Its partial output (scaled by
+        # shards / world_size, since every group computes a full copy) rides
+        # on the routed experts' all-reduce, so decode reads ~1/8 of the
+        # shared weights per rank with no extra collective.
+        self.shared_decode_shards = _SHARED_DECODE_SHARDS
+        if (
+            self.moe_world_size % self.shared_decode_shards == 0
+            and self.moe_world_size > self.shared_decode_shards
+        ):
+            self.shared_mlp_decode = HYV3StaticFP8MLP(
+                config,
+                shared_size,
+                tp_sharded=False,
+                num_shards=self.shared_decode_shards,
+                shard_rank=self.tp_group.rank_in_group % self.shared_decode_shards,
+            )
+            # Every group of `shards` ranks (with DP: every TP group of every
+            # replica, over the gathered tokens) computes a full copy.
+            self.shared_decode_weight = self.shared_decode_shards / self.moe_world_size
+        else:
+            self.shared_mlp_decode = None
+
+        self._setup_weight_loaders()
+
+    def _setup_weight_loaders(self):
+        L, I_tp, H = (
+            self.num_local_experts,
+            self.intermediate_size_per_rank,
+            self.hidden_size,
+        )
+        local_expert_indices = list(range(self.ep_rank * L, (self.ep_rank + 1) * L))
+
+        def ep(loader):
+            return expert_parallel_grouped_loader(
+                local_expert_indices, loader, total_num_experts=self.total_num_experts
+            )
+
+        set_weight_loader(
+            self.gate_up_proj_weight,
+            ep(expert_gate_up_loader(L, I_tp, self.ep_tp_rank)),
+        )
+        set_weight_loader(
+            self.down_proj_weight, ep(expert_down_loader(L, I_tp, self.ep_tp_rank))
+        )
+        set_weight_loader(
+            self.gate_up_proj_scale,
+            ep(
+                expert_scale_loader(
+                    L,
+                    2,
+                    lambda s: (
+                        s.view(L, 2, 1).expand(L, 2, I_tp).reshape(L, 1, 2 * I_tp)
+                    ),
+                )
+            ),
+        )
+        set_weight_loader(
+            self.down_proj_scale,
+            ep(expert_scale_loader(L, 1, lambda s: s.view(L, 1, 1).expand(L, 1, H))),
+        )
+        set_weight_loader(
+            self.gate_up_proj_scale_tkg,
+            ep(expert_scale_loader(L, 2, lambda s: s.view(L, 2, 1))),
+        )
+        set_weight_loader(
+            self.down_proj_scale_tkg,
+            ep(expert_scale_loader(L, 1, lambda s: s.view(L, 1))),
+        )
+        if self.use_moe_fused:
+            set_weight_loader(
+                self.gate_up_in_scale_tkg,
+                ep(expert_scale_loader(L, 2, lambda s: s.view(L, 2))),
+            )
+            set_weight_loader(
+                self.down_in_scale_tkg,
+                ep(expert_scale_loader(L, 1, lambda s: s.view(L, 1))),
+            )
+
+    def _route(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return hy3_route(
+            hidden_states,
+            self.router_weight,
+            self.expert_bias,
+            self.num_experts_per_token,
+            self.route_norm,
+            self.router_scaling_factor,
+        )
+
+    def _ep_row(self, device: torch.device) -> torch.Tensor:
+        """``[1]`` int32 EP partition index of this worker, as a runtime tensor.
+
+        Read from the EP group's stamped ``rank_in_group_tensor`` (not the
+        Python int) so the traced graph is identical on every rank (SPMD).
+        """
+        if self.ep_degree <= 1:
+            return torch.zeros(1, dtype=torch.int32, device=device)
+        from vllm_neuron.parallel.neuron_parallel_state import get_neuron_ep_group
+
+        return get_neuron_ep_group().rank_in_group_tensor.reshape(1).to(torch.int32)
+
+    def _use_fused_decode(self, num_tokens: int) -> bool:
+        """moe_tkg_fused for this decode step: up to 128 tokens, with the sharded shared expert,
+        and not where the hits kernels are chosen (HY3_DECODE_HITS=0 sends every decode size
+        here). Not with attention DP (its tokens are gathered across replicas first)."""
+        return (
+            self.use_moe_fused
+            and self.shared_mlp_decode is not None
+            and not self.cross_dp_ep
+            and num_tokens <= 128
+            and not self._use_hit_batch_decode(num_tokens)
+            and not self._use_hit_decode(num_tokens)
+        )
+
+    def forward(self, hidden_states, ln_w, eps, is_prefill, rank):
+        if not is_prefill and self._use_fused_decode(hidden_states.shape[0]):
+            # <-- EXPERIMENTAL: norm + router + routed + shared decode shard in one kernel
+            sh = self.shared_mlp_decode
+            output = wrap_nki(moe_tkg_fused)[2](
+                hidden_states.to(ln_w.dtype),
+                ln_w.view(1, -1),
+                self.moe_router_wT,
+                self.expert_bias.view(1, -1),
+                self.moe_ebase,
+                self.gate_up_proj_weight,
+                self.down_proj_weight,
+                sh.gate_proj_weight,
+                sh.up_proj_weight,
+                sh.down_proj_weight,
+                self.moe_fused_scales,
+                eps=eps,
+                route_scale=float(self.router_scaling_factor),
+                top_k=self.num_experts_per_token,
+            )
+            # >>> PARALLELISM: combine expert (and sharded shared-expert) partials <<<
+            return self._combine(output)
+        if self.cross_dp_ep and not is_prefill:
+            # >>> PARALLELISM: decode tokens of every DP replica (replicated within
+            # each TP group); the router and the shared-expert shard run on all of
+            # them, and _combine keeps this replica's rows. <<<
+            hidden_states = self._dp_gather(hidden_states)
+        # <-- MODEL-SPECIFIC: post-attention RMSNorm feeds router + routed experts
+        x = hidden_states.to(torch.float32)
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+        normed = (x * ln_w.to(torch.float32)).to(hidden_states.dtype)
+        affinities, top_k_index = self._route(normed)
+        # Expert load statistics (scripts/expert_load.py): with a neuron_config
+        # tensor_capture active, each rank saves its tokens' top-k experts
+        # (prefill: its SP shard; decode: every token). A no-op otherwise.
+        if self.layer_idx is not None:
+            capture_tensor(f"moe_route.{self.layer_idx}", top_k_index)
+
+        if is_prefill:
+            # Shared expert: full weights on SP-local tokens, output complete.
+            shared_output = self.shared_mlp(hidden_states, ln_w, eps, is_prefill)
+            return self._forward_prefill(normed, affinities, rank) + shared_output
+
+        if self.shared_mlp_decode is not None:
+            shared_partial = (
+                self.shared_mlp_decode(hidden_states, ln_w, eps, is_prefill)
+                * self.shared_decode_weight
+            )
+            return self._forward_decode(
+                normed, affinities, top_k_index, rank, shared_partial
+            )
+        assert not self.cross_dp_ep, "DP decode needs the sharded shared expert"
+        shared_output = self.shared_mlp(hidden_states, ln_w, eps, is_prefill)
+        return (
+            self._forward_decode(normed, affinities, top_k_index, rank) + shared_output
+        )
+
+    def _dp_gather(self, x):
+        """Rows of every DP replica, replica-major: ``[dp_size * rows, ...]``.
+
+        Over the world group, not the DP group: on trn2 the runtime has no
+        collective algorithm for the strided cross-DP replica group
+        ([0, 8, ..., 56] at TP 8, "no_hier no_mesh"). ``x`` is replicated within
+        each TP group, so the world gather holds world_size // dp copies of each
+        replica's rows; keep the first (TP rank 0) of each (world rank =
+        dp_rank * tp + tp_rank).
+        """
+        g = self.wide_ep_group.all_gather(x, dim=0)
+        g = g.view(self.dp_size, self.world_size, *x.shape)[:, 0]
+        return g.reshape(self.dp_size * x.shape[0], *x.shape[1:])
+
+    def _combine(self, output):
+        """Sum the decode partials of every rank that shares the tokens.
+
+        DP: all-reduce over the whole world (every replica holds a share of every
+        token's experts), then keep this replica's rows. Else: the TP all-reduce.
+        """
+        if self.cross_dp_ep:
+            output = self.wide_ep_group.all_reduce(output)
+            # SPMD: the replica offset is a runtime input (the group's rank tensor).
+            return shard_select(output, 0, self.dp_group, n_shards=self.dp_size)
+        if self.world_size > 1:
+            output = self.tp_group.all_reduce(output)
+        return output
+
+    def _forward_prefill(self, normed, affinities, rank):
+        # >>> PARALLELISM: All-gather tokens + affinities from SP <<<
+        if self.world_size > 1:
+            affinities = self.tp_group.all_gather(affinities, dim=0)
+            normed = self.tp_group.all_gather(normed, dim=0)
+        if self.cross_dp_ep:
+            affinities = self._dp_gather(affinities)
+            normed = self._dp_gather(normed)
+
+        # >>> PARALLELISM: keep only this rank's experts <<<
+        if self.ep_degree > 1:
+            local_expert_indices = self._ep_row(
+                normed.device
+            ).long() * self.num_local_experts + torch.arange(
+                self.num_local_experts, device=normed.device, dtype=torch.long
+            )
+            affinities = NF.get_local_expert_affinities(
+                affinities, local_expert_indices
+            )
+
+        output = routed_experts_cte(
+            normed,
+            affinities,
+            self.gate_up_proj_weight,
+            self.down_proj_weight,
+            self.gate_up_proj_scale,
+            self.down_proj_scale,
+            top_k=self.num_experts_per_token,
+            moe_group=self.ep_tp_group,
+            tp_degree=self.tp_degree,
+        )
+
+        # >>> PARALLELISM: combine expert partials and return to SP <<<
+        if self.cross_dp_ep:
+            output = self.wide_ep_group.all_reduce(output)
+            output = shard_select(output, 0, self.dp_group, n_shards=self.dp_size)
+            if self.world_size > 1:
+                output = shard_select(output, 0, self.tp_group)
+            return output
+        if self.world_size > 1:
+            output = self.tp_group.reduce_scatter(output, dim=0)
+        return output
+
+    def _use_selective_decode(self, num_tokens: int) -> bool:
+        """moe_tkg selective (only the routed experts' I/tp slices) vs all-expert.
+
+        All-expert reads every local expert each step (all experts / world per
+        rank whatever the EP x TP split); selective reads top_k slices of I/tp,
+        so it wins while tokens x top_k < local experts (the gpt_oss rule).
+        HY3_DECODE_SELECTIVE=1/0 forces it.
+        """
+        forced = os.environ.get("HY3_DECODE_SELECTIVE")
+        if forced in ("0", "1"):
+            return forced == "1"
+        return num_tokens * self.num_experts_per_token < self.num_local_experts
+
+    def _forward_decode_selective(self, normed, affinities, top_k_index):
+        e_l = self.num_local_experts
+        base = self._ep_row(normed.device).long().reshape(1, 1) * e_l
+        local_ids = base.reshape(1) + torch.arange(e_l, device=normed.device, dtype=torch.long)
+        local_aff = NF.get_local_expert_affinities(affinities, local_ids)  # [T, E_L]
+        local_idx = top_k_index.long() - base
+        valid = (local_idx >= 0) & (local_idx < e_l)
+        # A slot whose expert lives in another EP group points at a local expert
+        # this token did not select (affinity 0): it adds exactly nothing.
+        spare = torch.argmin((local_aff > 0).to(torch.int32), dim=1, keepdim=True)
+        local_idx = torch.where(valid, local_idx, spare)
+        dummy_in_scale = torch.ones((e_l, 1), dtype=torch.float32, device=normed.device)
+        return wrap_nki(moe_tkg_wrapper)[2](
+            hidden_input=normed,
+            expert_gate_up_weights=self.gate_up_proj_weight,
+            expert_down_weights=self.down_proj_weight,
+            # fp32: the selective kernel rejects bf16 affinities.
+            expert_affinities=local_aff.to(torch.float32),
+            expert_index=local_idx.to(torch.int32),
+            is_all_expert=False,
+            expert_gate_up_weights_scale=self.gate_up_proj_scale_tkg,
+            expert_down_weights_scale=self.down_proj_scale_tkg,
+            expert_gate_up_input_scale=dummy_in_scale,
+            expert_down_input_scale=dummy_in_scale,
+            expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+            activation_fn=ActFnType.SiLU,
+        )
+
+    def _use_hit_decode(self, num_tokens: int) -> bool:
+        """moe_tkg_hits: one token, only the experts routed to this rank.
+
+        Both moe_tkg modes run a fixed amount of expert work per token: all
+        local experts, or all top_k slots, the non-local ones on a dummy
+        expert. moe_tkg_hits loops over the local hits at runtime, so the
+        layer costs the busiest rank's hits (usually 1 at EP64) instead.
+        HY3_DECODE_HITS=0 turns it off.
+        """
+        return num_tokens == 1 and os.environ.get("HY3_DECODE_HITS", "1") != "0"
+
+    def _forward_decode_hits(self, normed, affinities, top_k_index):
+        return routed_experts_tkg_hits(
+            normed,
+            affinities,
+            top_k_index,
+            self._ep_row(normed.device).view(1, 1),
+            self.gate_up_proj_weight,
+            self.down_proj_weight,
+            self.gate_up_proj_scale_tkg,
+            self.down_proj_scale_tkg,
+        )
+
+    def _use_hit_batch_decode(self, num_tokens: int) -> bool:
+        """moe_tkg_hits_batch: a few tokens, only the local experts any of them routed to.
+
+        Each hit expert is read once for the batch. The busiest rank's hits
+        grow with the batch, and once it hits all its experts the runtime loop
+        is slower than moe_tkg's unrolled all-expert path, so the batch limit
+        is 4 tokens per 3 local experts (EP64: 4, EP32: 8).
+        HY3_DECODE_HITS_MAX_T overrides it; HY3_DECODE_HITS=0 turns it off.
+        """
+        if os.environ.get("HY3_DECODE_HITS", "1") == "0":
+            return False
+        max_t = os.environ.get("HY3_DECODE_HITS_MAX_T")
+        limit = int(max_t) if max_t else (4 * self.num_local_experts) // 3
+        return 1 < num_tokens <= limit
+
+    def _forward_decode(self, normed, affinities, top_k_index, rank, extra=None):
+        if self._use_hit_batch_decode(normed.shape[0]):
+            output = routed_experts_tkg_hits_batch(
+                normed,
+                affinities,
+                top_k_index,
+                self._ep_row(normed.device).view(1, 1),
+                self.gate_up_proj_weight,
+                self.down_proj_weight,
+                self.gate_up_proj_scale_tkg,
+                self.down_proj_scale_tkg,
+            )
+            if extra is not None:
+                output = output + extra
+            return self._combine(output)
+        if self._use_hit_decode(normed.shape[0]):
+            output = self._forward_decode_hits(normed, affinities, top_k_index)
+            if extra is not None:
+                output = output + extra
+            return self._combine(output)
+        if self._use_selective_decode(normed.shape[0]):
+            output = self._forward_decode_selective(normed, affinities, top_k_index)
+            if extra is not None:
+                output = output + extra
+            return self._combine(output)
+        output = routed_experts_tkg(
+            normed,
+            affinities,
+            top_k_index,
+            self._ep_row(normed.device).view(1, 1),
+            self.gate_up_proj_weight,
+            self.down_proj_weight,
+            self.gate_up_proj_scale_tkg,
+            self.down_proj_scale_tkg,
+        )
+        if extra is not None:
+            output = output + extra
+        # >>> PARALLELISM: combine expert (and sharded shared-expert) partials <<<
+        return self._combine(output)
+
+
+# =============================================================================
+# Section 5: Decoder layer / backbone
+# =============================================================================
+
+
+class HYV3DecoderLayer(nn.Module):
+    def __init__(self, config: HYV3Config, layer_idx: int):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.rms_norm_eps = config.rms_norm_eps
+        self.input_layernorm = HYV3RMSNorm(
+            config.hidden_size, config.rms_norm_eps, config.torch_dtype
+        )
+        self.post_attention_layernorm = HYV3RMSNorm(
+            config.hidden_size, config.rms_norm_eps, config.torch_dtype
+        )
+        self.self_attn = HYV3Attention(config, layer_idx)
+        self.mlp = (
+            HYV3MoE(config, layer_idx)
+            if config.is_moe_layer(layer_idx)
+            else HYV3DenseMLP(config)
+        )
+
+    def forward(
+        self,
+        hidden_states,
+        positions,
+        position_embeddings,
+        attn_metadata,
+        is_decode,
+        rank,
+    ):
+        # The norms are fused into the attention / MLP modules.
+        attn_out = self.self_attn(
+            hidden_states,
+            positions,
+            position_embeddings,
+            attn_metadata,
+            ln_w=self.input_layernorm.weight,
+            is_decode=is_decode,
+            rank=rank,
+        )
+        hidden_states = hidden_states + attn_out
+        mlp_out = self.mlp(
+            hidden_states,
+            ln_w=self.post_attention_layernorm.weight,
+            eps=self.rms_norm_eps,
+            is_prefill=not is_decode,
+            rank=rank,
+        )
+        return hidden_states + mlp_out
+
+
+class HYV3Model(nn.Module):
+    """>>> PARALLELISM: SP during prefill — embed -> chunk -> layers -> all-gather. <<<"""
+
+    def __init__(self, config: HYV3Config):
+        super().__init__()
+        self.config = config
+        self.tp_group = get_tp_group()
+        self.world_size = self.tp_group.world_size
+        self.rank = self.tp_group.rank_in_group
+
+        self.embed_tokens = VocabDimShardedEmbedding(
+            vocab_size=config.vocab_size,
+            embed_dim=config.hidden_size,
+            dtype=config.torch_dtype,
+            tp_group=self.tp_group.device_group,
+        )
+        set_weight_loader(
+            self.embed_tokens.weight,
+            sharding_weight_loader(
+                shard_dim=0,
+                shard_size=self.embed_tokens.vocab_size_per_rank,
+                num_shards=self.world_size,
+                is_storage_transposed=False,
+                pad_shard=True,
+            ),
+        )
+        self.layers = nn.ModuleList(
+            [HYV3DecoderLayer(config, i) for i in range(config.num_hidden_layers)]
+        )
+        self.norm = HYV3RMSNorm(
+            config.hidden_size, config.rms_norm_eps, config.torch_dtype
+        )
+        self.rotary_emb = HYV3RotaryEmbedding(config)
+
+        # Hidden states handed to a speculative-decoding draft, set by the
+        # runner via set_aux_hidden_state_layers(). Index i is the input of
+        # layer i; index num_hidden_layers is the last layer's output before
+        # the final norm (the MTP draft applies that norm itself).
+        self.aux_hidden_state_layers: list[int] = []
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        attn_metadata,
+        is_prefill: bool,
+        rank=None,
+        inputs_embeds=None,
+        is_token_ids=None,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        hidden_states = self.embed_tokens(
+            input_ids, scatter_tokens=is_prefill, rank=rank
+        )
+
+        if (
+            is_prefill
+            and self.world_size > 1
+            and inputs_embeds is not None
+            and is_token_ids is not None
+        ):
+            inputs_embeds = shard_select(inputs_embeds, 0, self.tp_group)
+            is_token_ids = shard_select(is_token_ids, 0, self.tp_group)
+        hidden_states = NF.merge_prompt_embeds(
+            hidden_states, inputs_embeds, is_token_ids
+        )
+
+        position_embeddings = self.rotary_emb(
+            positions, device=hidden_states.device, dtype=hidden_states.dtype
+        )
+
+        # >>> PARALLELISM: SP — prefill states are token shards; gather them
+        # so the draft sees every token. <<<
+        def full_rows(t):
+            if is_prefill and self.world_size > 1:
+                return self.tp_group.all_gather(t, dim=0)
+            return t
+
+        aux_hidden_states = []
+        for idx, layer in enumerate(self.layers):
+            if idx in self.aux_hidden_state_layers:
+                aux_hidden_states.append(full_rows(hidden_states))
+            hidden_states = layer(
+                hidden_states,
+                positions,
+                position_embeddings,
+                attn_metadata,
+                is_decode=not is_prefill,
+                rank=rank,
+            )
+        # Returning the post-norm states as an extra graph output corrupts the
+        # lm_head rows of the same graph on Neuron for batch > 1 (seen in MTP
+        # verify steps), so hand over the pre-norm states.
+        if len(self.layers) in self.aux_hidden_state_layers:
+            aux_hidden_states.append(full_rows(hidden_states))
+        hidden_states = full_rows(self.norm(hidden_states))
+        return hidden_states, aux_hidden_states
+
+
+def decoder_layer_weight_mappings(
+    layer: "HYV3DecoderLayer", dst: str, src: str, num_experts: int
+) -> dict[str, str | list[str]]:
+    """<-- MODEL-SPECIFIC: parameter -> checkpoint key(s) for one decoder layer.
+
+    ``dst`` is the layer's parameter prefix in the module tree and ``src`` its
+    checkpoint prefix (they differ for the MTP layer: ``layers.0`` <- ``model.layers.80``).
+    """
+    m: dict[str, str | list[str]] = {}
+    a, sa = f"{dst}.self_attn", f"{src}.self_attn"
+    m[f"{a}.qkv_proj_weight"] = [f"{sa}.{n}_proj.weight" for n in "qkv"]
+    m[f"{a}.qkv_weight_scale"] = [f"{sa}.{n}_proj.weight_scale" for n in "qkv"]
+    m[f"{a}.qkv_input_scale"] = [f"{sa}.{n}_proj.input_scale" for n in "qkv"]
+    m[f"{a}.o_proj_weight"] = f"{sa}.o_proj.weight"
+    m[f"{a}.o_weight_scale"] = f"{sa}.o_proj.weight_scale"
+    m[f"{a}.o_input_scale"] = f"{sa}.o_proj.input_scale"
+    m[f"{a}.q_norm.weight"] = f"{sa}.q_norm.weight"
+    m[f"{a}.k_norm.weight"] = f"{sa}.k_norm.weight"
+    m[f"{dst}.input_layernorm.weight"] = f"{src}.input_layernorm.weight"
+    m[f"{dst}.post_attention_layernorm.weight"] = (
+        f"{src}.post_attention_layernorm.weight"
+    )
+
+    def gated_mlp(d: str, s: str):
+        for n in ("gate", "up", "down"):
+            m[f"{d}.{n}_proj_weight"] = f"{s}.{n}_proj.weight"
+            m[f"{d}.{n}_weight_scale"] = f"{s}.{n}_proj.weight_scale"
+        m[f"{d}.gate_up_input_scale"] = [
+            f"{s}.gate_proj.input_scale",
+            f"{s}.up_proj.input_scale",
+        ]
+        m[f"{d}.down_input_scale"] = f"{s}.down_proj.input_scale"
+
+    if isinstance(layer.mlp, HYV3DenseMLP):
+        gated_mlp(f"{dst}.mlp.mlp", f"{src}.mlp")
+        return m
+
+    mp, smp = f"{dst}.mlp", f"{src}.mlp"
+    m[f"{mp}.router_weight"] = f"{smp}.router.gate.weight"
+    m[f"{mp}.expert_bias"] = f"{smp}.expert_bias"
+
+    def experts(proj: str, suffix: str) -> list[str]:
+        return [f"{smp}.experts.{e}.{proj}.{suffix}" for e in range(num_experts)]
+
+    gate_up_s = experts("gate_proj", "weight_scale") + experts(
+        "up_proj", "weight_scale"
+    )
+    m[f"{mp}.gate_up_proj_weight"] = experts("gate_proj", "weight") + experts(
+        "up_proj", "weight"
+    )
+    m[f"{mp}.down_proj_weight"] = experts("down_proj", "weight")
+    m[f"{mp}.gate_up_proj_scale"] = gate_up_s
+    m[f"{mp}.gate_up_proj_scale_tkg"] = gate_up_s
+    m[f"{mp}.down_proj_scale"] = experts("down_proj", "weight_scale")
+    m[f"{mp}.down_proj_scale_tkg"] = experts("down_proj", "weight_scale")
+    if getattr(layer.mlp, "use_moe_fused", False):
+        m[f"{mp}.gate_up_in_scale_tkg"] = experts("gate_proj", "input_scale") + experts(
+            "up_proj", "input_scale"
+        )
+        m[f"{mp}.down_in_scale_tkg"] = experts("down_proj", "input_scale")
+    gated_mlp(f"{mp}.shared_mlp", f"{smp}.shared_mlp")
+    if layer.mlp.shared_mlp_decode is not None:
+        gated_mlp(f"{mp}.shared_mlp_decode", f"{smp}.shared_mlp")
+    return m
+
+
+# =============================================================================
+# Section 6: Causal LM + weight loading
+# =============================================================================
+
+
+@async_speculative_decoding
+class HYV3ForCausalLM(nn.Module, SupportsEagle3):
+    """Hy3 model with column-parallel LM head.
+
+    As a speculative-decoding target (MTP) it returns the requested auxiliary
+    hidden states with its outputs and verifies drafts with the rejection
+    sampler (same contract as ``llama3/model.py``).
+    """
+
+    def __init__(self, config: HYV3Config):
+        super().__init__()
+        self.config = config
+        self.model = HYV3Model(config)
+
+        self.tp_group = get_tp_group()
+        self.world_size = self.tp_group.world_size
+        self.rank = self.tp_group.rank_in_group
+
+        nc = config.neuron_config
+        self.on_device_sampling_config = nc.on_device_sampling_config if nc else None
+        self._gather_logits = nc is not None and (
+            nc.max_logprobs != 0 or nc.debug_logits_dir is not None
+        )
+
+        self.lm_head = neuron_nn.ColumnParallelLinear(
+            config.hidden_size,
+            config.vocab_size,
+            bias=False,
+            dtype=config.torch_dtype,
+            gather_output=not self.on_device_sampling_config,
+            tp_group=self.tp_group.device_group,
+        )
+        set_weight_loader(
+            self.lm_head.weight,
+            sharding_weight_loader(
+                shard_dim=0,
+                shard_size=config.vocab_size // self.world_size,
+                num_shards=self.world_size,
+                is_storage_transposed=False,
+            ),
+        )
+        if self.on_device_sampling_config is not None:
+            self.sampler = Sampler(
+                self.on_device_sampling_config, process_group=self.tp_group.device_group
+            )
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+        is_token_ids: torch.Tensor | None = None,
+        attn_metadata: dict | None = None,
+        sampling_positions: torch.Tensor | None = None,
+        sampling_params: torch.Tensor | None = None,
+        spec_decode_metadata=None,
+        logit_mask: torch.Tensor | None = None,
+        rank: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        positions = positions.to(torch.int32)
+        first = attn_metadata["layers.0.self_attn"]
+        is_prefill = first["max_query_len"] > first["decode_token_threshold"]
+
+        T = input_ids.shape[0]
+        if is_prefill and ((T <= self.world_size) or (T % self.world_size != 0)):
+            raise ValueError(
+                f"Prompt Length ({T}) must be > world_size ({self.world_size}) for SP."
+            )
+
+        hidden_states, aux_hidden_states = self.model(
+            input_ids,
+            positions,
+            attn_metadata,
+            is_prefill=is_prefill,
+            rank=rank,
+            inputs_embeds=inputs_embeds,
+            is_token_ids=is_token_ids,
+        )
+        # One device tensor for the draft NEFF (the cat stays in this graph).
+        aux = torch.cat(aux_hidden_states, dim=-1) if aux_hidden_states else None
+        hidden_states = torch.index_select(
+            hidden_states, dim=0, index=sampling_positions
+        )
+        logits = self.lm_head(hidden_states)
+
+        if self.on_device_sampling_config is None:
+            return logits if aux is None else (logits, aux)
+
+        sampled_tokens = self.sampler(
+            logits, sampling_params, logit_mask=logit_mask, tp_rank=rank
+        )
+        gathered_logits = (
+            self.tp_group.all_gather(logits, dim=1) if self._gather_logits else None
+        )
+
+        # >>> SPEC DECODE: verify the drafts on device <<<
+        if spec_decode_metadata is not None:
+            from vllm_neuron.nn.rejection_sampler import rejection_sampler
+
+            accepted = rejection_sampler(spec_decode_metadata, sampled_tokens)
+            return accepted if aux is None else (accepted, aux, gathered_logits)
+
+        if aux is not None:
+            return sampled_tokens, aux, gathered_logits
+        return sampled_tokens, gathered_logits
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """Select the hidden states returned for a speculative-decoding draft.
+
+        Index i is the input of layer i; ``num_hidden_layers`` is the last
+        layer's (pre-final-norm) output, which the MTP draft consumes.
+        """
+        if layers is not None:
+            self.model.aux_hidden_state_layers = list(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        # MTP (the only draft Hy3 ships) consumes the final hidden state.
+        return (len(self.model.layers),)
+
+    @classmethod
+    def from_configs(cls, hf_config: PretrainedConfig, neuron_config: NeuronConfig):
+        return cls(HYV3Config.from_configs(hf_config, neuron_config))
+
+    # ── KV cache ──────────────────────────────────────────────────────────
+
+    def get_kv_spec(self) -> KVSpec:
+        return KVSpec(
+            layers=[
+                LayerSpec(
+                    name=f"layers.{i}.self_attn",
+                    num_kv_heads=layer.self_attn.num_key_value_heads_per_rank,
+                    head_size=layer.self_attn.head_dim,
+                    dtype=layer.self_attn.dtype,
+                    sliding_window_size=None,
+                    chunk_size=None,
+                )
+                for i, layer in enumerate(self.model.layers)
+            ]
+        )
+
+    def bind_kv_cache(self, kv_caches: dict[str, list[torch.Tensor]]):
+        for i, layer in enumerate(self.model.layers):
+            name = f"layers.{i}.self_attn"
+            if name not in kv_caches:
+                raise KeyError(f"KV cache for layer {name} not initialized")
+            attn = layer.self_attn
+            k_cache, v_cache = kv_caches[name]
+            bind_attention_kv(attn, name, k_cache, v_cache)
+        # The persistent KV pool of this rank (acceptance: KV bytes per cached token).
+        k0, v0 = kv_caches["layers.0.self_attn"]
+        pool_bytes = sum(
+            t.numel() * t.element_size() for k, v in kv_caches.values() for t in (k, v)
+        )
+        logger.info(
+            "Hy3 KV pool: %d layers, K %s %s, V %s %s, %d bytes on this rank",
+            len(self.model.layers), tuple(k0.shape), k0.dtype, tuple(v0.shape), v0.dtype,
+            pool_bytes,
+        )
+
+    # ── Weight loading ────────────────────────────────────────────────────
+
+    def _weight_mappings(self) -> dict[str, str | list[str]]:
+        """<-- MODEL-SPECIFIC: model parameter name -> checkpoint key(s)."""
+        cfg = self.config
+        m: dict[str, str | list[str]] = {
+            "model.embed_tokens.weight": "model.embed_tokens.weight",
+            "lm_head.weight": (
+                "model.embed_tokens.weight"
+                if cfg.tie_word_embeddings
+                else "lm_head.weight"
+            ),
+            "model.norm.weight": "model.norm.weight",
+        }
+        for i, layer in enumerate(self.model.layers):
+            m.update(
+                decoder_layer_weight_mappings(
+                    layer, f"model.layers.{i}", f"model.layers.{i}", cfg.num_experts
+                )
+            )
+        return m
+
+    def load_weights(
+        self, checkpoint_path: str, device: torch.device, cache_dir: str | None
+    ) -> None:
+        checkpoint = SafetensorsCheckpoint(checkpoint_path, cache_dir)
+        rank_sharded = checkpoint.load_sharded_pipelined(
+            self.rank, self.world_size, self, self._weight_mappings(), device
+        ).state_dict
+        self.load_state_dict(rank_sharded, strict=False, assign=True)
+        for name, param in self.named_parameters():
+            if param.is_meta:
+                raise RuntimeError(
+                    f"Parameter {name} was not loaded from the checkpoint"
+                )
+        self._load_kv_cache_scales(checkpoint_path, device)
+        for layer in self.model.layers:
+            prepare_sparse_decode(layer, device)
+            prepare_moe_fused(layer, device)
+
+    def load_weights_lite(
+        self, checkpoint_path: str, device: torch.device, cache_dir: str | None
+    ) -> None:
+        """CPU compile: only the KV scales (decode uses them as graph constants)."""
+        self._load_kv_cache_scales(checkpoint_path, device)
+        for layer in self.model.layers:
+            prepare_sparse_decode(layer, device, from_weights=False)
+            prepare_moe_fused(layer, device, from_weights=False)
+
+    def _load_kv_cache_scales(self, checkpoint_path: str, device) -> None:
+        """<-- FP8 KV: per-layer K/V cache scales (see ``kv_scales.resolve_kv_scales``).
+
+        No-op for a BF16 KV cache. Otherwise a KV scale profile, else the
+        checkpoint's ``self_attn.k_scale`` / ``v_scale`` (rescaled to this
+        platform's FP8 range), else an error (1.0 with a warning, as in the
+        upstream models, only with ``HY3_KV_SCALE_ALLOW_DEFAULT=1``).
+        """
+        from vllm.config import get_current_vllm_config
+
+        cache_dtype = get_current_vllm_config().cache_config.cache_dtype
+        if cache_dtype not in QUANTIZED_KV_CACHE_DTYPES:
+            return
+        if not os.path.isdir(checkpoint_path):
+            raise ValueError(
+                "Hy3 FP8 KV reads its KV scales from a local checkpoint directory; "
+                f"got {checkpoint_path!r}"
+            )
+        layers = self.model.layers
+        s = kv_scales.resolve_kv_scales(checkpoint_path, len(layers), FP8_CLAMP_MAX)
+        for layer, qk, qv in zip(layers, s.q_k, s.q_v):
+            layer.self_attn.set_kv_scales(qk, qv, device)
+        # scripts/kv_manifest.py parses this line.
+        (logger.warning if s.source == "default" else logger.info)(
+            "Hy3 FP8 KV scales: source=%s layers=%d %s q_k=[%.4g, %.4g] q_v=[%.4g, %.4g]",
+            s.source,
+            len(layers),
+            s.detail,
+            min(s.q_k),
+            max(s.q_k),
+            min(s.q_v),
+            max(s.q_v),
+        )

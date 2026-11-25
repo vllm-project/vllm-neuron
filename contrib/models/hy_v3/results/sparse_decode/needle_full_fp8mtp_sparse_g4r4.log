@@ -1,0 +1,13 @@
+prompt_tokens= 16005 depth=0.1 key=60494 answer='60494' PASS (2.3s)
+prompt_tokens= 16005 depth=0.5 key=65125 answer='65125' PASS (2.3s)
+prompt_tokens= 16005 depth=0.9 key=15306 answer='15306' PASS (1.3s)
+prompt_tokens= 32777 depth=0.1 key=43936 answer='43936' PASS (4.7s)
+prompt_tokens= 32778 depth=0.5 key=77013 answer='77013' PASS (3.3s)
+prompt_tokens= 32778 depth=0.9 key=73691 answer='73691' PASS (3.0s)
+prompt_tokens= 65538 depth=0.1 key=63075 answer='63075' PASS (10.7s)
+prompt_tokens= 65536 depth=0.5 key=49755 answer='49755' PASS (7.3s)
+prompt_tokens= 65536 depth=0.9 key=72468 answer='72468' PASS (6.9s)
+prompt_tokens= 85001 depth=0.1 key=56930 answer='56930' PASS (15.1s)
+prompt_tokens= 85002 depth=0.5 key=86465 answer='86465' PASS (9.6s)
+prompt_tokens= 85001 depth=0.9 key=38631 answer='38631' PASS (6.5s)
+12/12 passed

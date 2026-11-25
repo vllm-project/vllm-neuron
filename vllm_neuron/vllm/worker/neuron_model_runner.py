@@ -96,6 +96,7 @@ from libtorch_neuronx_lite.compile.capture_backend import CaptureComplete
 from vllm_neuron.vllm.sample.rejection_sampler import RejectionSampler
 from vllm_neuron.vllm.spec_decode.dflash import DFlashProposer
 from vllm_neuron.vllm.spec_decode.eagle import EagleProposer
+from vllm_neuron.vllm.spec_decode.mtp import MTPProposer
 from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE
 from vllm_neuron.utils.bucket_utils import (
     SUPPORTED_KV_SEGMENT_SIZES,
@@ -1218,6 +1219,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Set up speculative decoding.
         self.drafter: EagleProposer | DFlashProposer | None = None
         self.is_eagle3_spec = False
+        self.is_mtp_spec = False
         self.is_dflash_spec = False
         self._draft_token_ids = None
         # Async speculative decoding drafts rows by req_id. Only used at
@@ -1230,6 +1232,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             if self.speculative_config.method == "eagle3":
                 self.is_eagle3_spec = True
                 self.drafter = EagleProposer(
+                    self.vllm_config,
+                    self.device,
+                    self.on_device_sampling,
+                )
+            elif self.speculative_config.method == "mtp":
+                # Same fused-draft flow as EAGLE3 (MTPProposer subclasses
+                # EagleProposer); the target hands over its final hidden state.
+                self.is_mtp_spec = True
+                self.drafter = MTPProposer(
                     self.vllm_config,
                     self.device,
                     self.on_device_sampling,
@@ -1534,7 +1545,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
     @property
     def is_spec_decode(self) -> bool:
-        return self.is_eagle3_spec or self.is_dflash_spec
+        return self.is_eagle3_spec or self.is_mtp_spec or self.is_dflash_spec
 
     @property
     def cp_rank(self) -> int:
@@ -1983,10 +1994,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         if self.is_spec_decode:
             if _supports_aux_hidden_states(self.model):
-                if self.is_dflash_spec:
-                    assert isinstance(self.drafter, DFlashProposer)
+                if self.is_dflash_spec or self.is_mtp_spec:
+                    assert isinstance(self.drafter, (DFlashProposer, MTPProposer))
                     aux_layers = self.drafter.get_target_aux_hidden_state_layers()
-                    logger.info("Using DFlash auxiliary layers: %s", aux_layers)
+                    logger.info(
+                        "Using %s auxiliary layers: %s",
+                        self.speculative_config.method,
+                        aux_layers,
+                    )
                 else:
                     aux_layers = self._get_eagle3_aux_layers_from_config()
                     if aux_layers:
@@ -4674,10 +4689,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # NOTE: A request is in prefill if num_computed_tokens < num_prompt_tokens.
         # We cannot use "num_computed_tokens == 0" because prefix caching may have
         # already set num_computed_tokens to a non-zero value for cached tokens.
+        # The scheduler pads every prefill-shaped request (_apply_padding_and_log_stats),
+        # including a preempted request that re-computes only output tokens, whose
+        # num_computed_tokens is already past the prompt: pad wherever it did, or the
+        # step runs at an uncompiled length ("Detected recompile").
+        padded_counts = scheduler_output.num_scheduled_tokens_padded
+        sched_counts = scheduler_output.num_scheduled_tokens
         has_prefill = any(
             req_id in self.requests
-            and self.requests[req_id].num_computed_tokens
-            < self.requests[req_id].num_prompt_tokens
+            and (
+                self.requests[req_id].num_computed_tokens
+                < self.requests[req_id].num_prompt_tokens
+                or padded_counts.get(req_id, 0) > sched_counts.get(req_id, 0)
+            )
             for req_id in req_ids
         )
 
@@ -5780,6 +5804,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             full_max_blocks_per_req = (
                 self.max_model_len + block_size - 1
             ) // block_size
+            if self._dcp_size > 1:
+                # DCP: the runtime full table is this rank's shard (InputBatch width,
+                # ceil(max_model_len / (block_size * dcp)) aligned like above), so the
+                # draft's spec-decode correction must trace that width, not the global one.
+                full_max_blocks_per_req = (
+                    (self.max_model_len + dcp_block_size - 1) // dcp_block_size
+                    + alignment - 1
+                ) // alignment * alignment
 
             swa_kv_pos_offset = None
             # For SWA decode, warmup must match the trimmed shape that
@@ -8584,18 +8616,31 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self,
         req_ids: list[str],
         num_draft_tokens: list[int],
+        input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        if self._missing_async_spec_transition_cache_req_ids(req_ids, num_draft_tokens):
+        new_ids = getattr(self, "_transition_new_req_ids", set()) or set()
+        missing = self._missing_async_spec_transition_cache_req_ids(req_ids, num_draft_tokens)
+        if any(req_id not in new_ids for req_id in missing) or (missing and input_ids is None):
             return None
 
         full_pieces: list[torch.Tensor] = []
         drafts_pieces: list[torch.Tensor] = []
+        cached = [self._async_spec_transition_full_draft_cache[r] for r in req_ids if r not in missing]
+        device = cached[0].device if cached else input_ids.device
+        pad_id = getattr(self.vllm_config.model_config.hf_config, "pad_token_id", None) or 0
 
+        offset = 0
         for req_id, n_draft in zip(req_ids, num_draft_tokens):
-            full_row = self._async_spec_transition_full_draft_cache[req_id]
+            if req_id in missing:
+                first = input_ids[offset : offset + 1].to(device=device, dtype=torch.int32)
+                pads = torch.full((n_draft,), pad_id, dtype=torch.int32, device=device)
+                full_row = torch.cat([first, pads])
+            else:
+                full_row = self._async_spec_transition_full_draft_cache[req_id]
             full_pieces.append(full_row[: 1 + n_draft])
             if n_draft:
                 drafts_pieces.append(full_row[1 : 1 + n_draft])
+            offset += 1 + n_draft
 
         if not full_pieces:
             return None
@@ -8622,6 +8667,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         decode for this one step and let the next proposer output refill
         the cache.
         """
+        self._transition_new_req_ids = set()
         if not (
             self._uses_async_spec_transition_cache()
             and getattr(self, "_batch_composition_changed", False)
@@ -8638,6 +8684,22 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             req_ids, num_draft_tokens
         )
         if not missing_req_ids:
+            return
+        # A request that is new this step (a PD decode node admits it with its KV loaded and
+        # no local prefill) has no cached row, but its CPU-built first token is fresh
+        # (add_request writes its history). Fill its row from that token and pad drafts
+        # instead of stripping spec decode: the stripped step's CPU-built inputs read the
+        # running requests' tokens at the scheduler's optimistic offsets, which are stale.
+        new_req_ids = {
+            r.req_id for r in getattr(scheduler_output, "scheduled_new_reqs", []) or []
+        }
+        if all(req_id in new_req_ids for req_id in missing_req_ids):
+            self._transition_new_req_ids = set(missing_req_ids)
+            logger.debug(
+                "Async spec batch change: new req_ids=%s take their first token from the "
+                "CPU-built inputs and pad drafts.",
+                missing_req_ids,
+            )
             return
 
         logger.warning(
@@ -8676,7 +8738,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         num_reqs = self.input_batch.num_reqs
         req_ids = list(self.input_batch.req_ids)[:num_reqs]
         num_draft_tokens = spec_decode_metadata.num_draft_tokens[:num_reqs]
-        pieces = self._get_cached_transition_draft_pieces(req_ids, num_draft_tokens)
+        pieces = self._get_cached_transition_draft_pieces(
+            req_ids, num_draft_tokens, input_ids
+        )
         if pieces is None:
             # _drop_transition_spec_decode_if_cache_incomplete should already
             # have stripped spec decode before spec metadata was built. If we
@@ -9850,13 +9914,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         Example:
             >>> self._dispatch_dummy_draft(batch_size=4, ctx_bucket=2048)
         """
+        # An MTP draft is a full decoder layer: with expert parallelism over the DP
+        # replicas its MoE combines over the whole world, so the draft NEFF carries
+        # cross-DP collectives whatever the component DP degrees are.
+        parallel = self.vllm_config.parallel_config
+        mtp_cross_dp_moe = (
+            self.is_mtp_spec
+            and parallel.data_parallel_size > 1
+            and parallel.enable_expert_parallel
+        )
         if not (
-            self.is_eagle3_spec
+            (self.is_eagle3_spec or self.is_mtp_spec)
             and self.drafter is not None
             and (
                 self.neuron_config.embedding_dp_size > 1
                 or self.neuron_config.lm_head_dp_size > 1
                 or self.neuron_config.draft_mlp_dp_size > 1
+                or mtp_cross_dp_moe
             )
         ):
             return
@@ -10190,6 +10264,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         """Return request IDs whose current chunked-prefill step is not final."""
         if scheduler_output is None:
             return set()
+
+        # The scheduler's own view (NeuronScheduler.schedule): exact also for a
+        # preempted request re-computing past its prompt, where the prompt-length
+        # test below would sample, and emit, a token on every chunk.
+        sched_partial = getattr(scheduler_output, "_partial_prefill_req_ids", None)
+        if sched_partial is not None:
+            return {req_id for req_id in req_ids if req_id in sched_partial}
 
         partial_prefill_req_ids = set()
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
@@ -11158,7 +11239,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             assert self.drafter.model is not None
             self.drafter.model.bind_kv_cache(kv_caches)
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
-            if isinstance(self.drafter, DFlashProposer):
+            if isinstance(self.drafter, (DFlashProposer, MTPProposer)):
                 self.drafter.alias_target_weights(target_model=self.model)
 
         if has_kv_transfer_group():

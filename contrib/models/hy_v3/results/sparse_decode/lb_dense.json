@@ -1,0 +1,702 @@
+[
+ {
+  "id": "66f37eb9821e116aacb2d295",
+  "tokens": 10297,
+  "answer": "B",
+  "pred": "D",
+  "text": "The correct answer is (D)"
+ },
+ {
+  "id": "66f6bcf3bb02136c067c2703",
+  "tokens": 10703,
+  "answer": "A",
+  "pred": "D",
+  "text": "The correct answer is (D)"
+ },
+ {
+  "id": "66ec356a821e116aacb1c22b",
+  "tokens": 10838,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C)"
+ },
+ {
+  "id": "66fbab85bb02136c067c81dc",
+  "tokens": 11321,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C) the cooperation between various people"
+ },
+ {
+  "id": "66f9625fbb02136c067c5456",
+  "tokens": 12598,
+  "answer": "B",
+  "pred": "A",
+  "text": "The correct answer is (A) Begin audio marking\n\nReasoning: According to the text, section 3.3 \"Audio noise reduction\" states: \"If"
+ },
+ {
+  "id": "66f91f2cbb02136c067c4b1e",
+  "tokens": 12867,
+  "answer": "B",
+  "pred": "D",
+  "text": "The correct answer is (D)"
+ },
+ {
+  "id": "67040276bb02136c067cd8ae",
+  "tokens": 13756,
+  "answer": "B",
+  "pred": "B",
+  "text": "The correct answer is (B)"
+ },
+ {
+  "id": "66eae4de5a08c7b9b35dd12d",
+  "tokens": 14524,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C)"
+ },
+ {
+  "id": "6704a83dbb02136c067cde1b",
+  "tokens": 14939,
+  "answer": "B",
+  "pred": "D",
+  "text": "The correct answer is (D)"
+ },
+ {
+  "id": "66f78ecfbb02136c067c2f12",
+  "tokens": 15000,
+  "answer": "B",
+  "pred": "C",
+  "text": "The correct answer is (C)"
+ },
+ {
+  "id": "66ec09ec821e116aacb19620",
+  "tokens": 15152,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C)"
+ },
+ {
+  "id": "66ebda775a08c7b9b35e0dcb",
+  "tokens": 15377,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C)"
+ },
+ {
+  "id": "66f58d6c821e116aacb33e76",
+  "tokens": 15763,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C)"
+ },
+ {
+  "id": "66f39aa7821e116aacb2da76",
+  "tokens": 16249,
+  "answer": "B",
+  "pred": "B",
+  "text": "The correct answer is (B)"
+ },
+ {
+  "id": "6704a442bb02136c067cdd91",
+  "tokens": 16402,
+  "answer": "C",
+  "pred": "D",
+  "text": "The correct answer is (D)"
+ },
+ {
+  "id": "66ed2c87821e116aacb1f149",
+  "tokens": 16449,
+  "answer": "A",
+  "pred": "D",
+  "text": "The correct answer is (D)"
+ },
+ {
+  "id": "66ec1e3f821e116aacb1ae7d",
+  "tokens": 16720,
+  "answer": "D",
+  "pred": "B",
+  "text": "The correct answer is (B)"
+ },
+ {
+  "id": "66ebe68d5a08c7b9b35e190b",
+  "tokens": 16798,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C)"
+ },
+ {
+  "id": "66ebbe4f5a08c7b9b35de533",
+  "tokens": 17378,
+  "answer": "C",
+  "pred": "B",
+  "text": "The correct answer is (B)"
+ },
+ {
+  "id": "66f120a9821e116aacb26d02",
+  "tokens": 17575,
+  "answer": "A",
+  "pred": null,
+  "text": "The provided text by Fredric Jameson (\"Third-World Literature in the Era of Multinational Capitalism\") does not contain the phrase \"he reduces God to a function"
+ },
+ {
+  "id": "66ebd22e5a08c7b9b35e0126",
+  "tokens": 17709,
+  "answer": "B",
+  "pred": "B",
+  "text": "The correct answer is (B)"
+ },
+ {
+  "id": "66f618f1bb02136c067c16f9",
+  "tokens": 17967,
+  "answer": "D",
+  "pred": "B",
+  "text": "The correct answer is (B)"
+ },
+ {
+  "id": "66f10d67821e116aacb268d0",
+  "tokens": 18629,
+  "answer": "B",
+  "pred": "B",
+  "text": "The correct answer is (B)"
+ },
+ {
+  "id": "66f284ff821e116aacb29763",
+  "tokens": 18927,
+  "answer": "C",
+  "pred": "B",
+  "text": "The correct answer is (B)\n\nExplanation:\n- (A) is wrong: The \"six fronts\" are employment, financial sector, foreign trade, foreign"
+ },
+ {
+  "id": "66ec41d3821e116aacb1c874",
+  "tokens": 19105,
+  "answer": "D",
+  "pred": "D",
+  "text": "The correct answer is (D)"
+ },
+ {
+  "id": "6709d44abb02136c067d1d5d",
+  "tokens": 19260,
+  "answer": "B",
+  "pred": "B",
+  "text": "The correct answer is (B)"
+ },
+ {
+  "id": "6703fc69bb02136c067cd7c2",
+  "tokens": 19834,
+  "answer": "A",
+  "pred": "A",
+  "text": "The correct answer is (A)"
+ },
+ {
+  "id": "67062fbfbb02136c067cf66a",
+  "tokens": 20573,
+  "answer": "D",
+  "pred": "D",
+  "text": "The correct answer is (D)"
+ },
+ {
+  "id": "66fb5f73bb02136c067c7ae7",
+  "tokens": 20865,
+  "answer": "D",
+  "pred": "B",
+  "text": "The correct answer is (B)"
+ },
+ {
+  "id": "66f96115bb02136c067c541c",
+  "tokens": 21913,
+  "answer": "D",
+  "pred": "D",
+  "text": "The correct answer is (D)"
+ },
+ {
+  "id": "66ebce825a08c7b9b35dfc75",
+  "tokens": 22436,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C) 6144\n\nExplanation from text: In Section 2.3 (Training Details), Table 2 shows the batch size"
+ },
+ {
+  "id": "66ebd0825a08c7b9b35dfe9d",
+  "tokens": 22573,
+  "answer": "D",
+  "pred": "B",
+  "text": "The correct answer is (B)"
+ },
+ {
+  "id": "66ed1556821e116aacb1ea14",
+  "tokens": 22983,
+  "answer": "A",
+  "pred": "A",
+  "text": "The correct answer is (A)"
+ },
+ {
+  "id": "6713066fbb02136c067d3214",
+  "tokens": 23254,
+  "answer": "D",
+  "pred": "B",
+  "text": "The correct answer is (B)"
+ },
+ {
+  "id": "66ec21e6821e116aacb1b2d2",
+  "tokens": 23333,
+  "answer": "A",
+  "pred": "B",
+  "text": "The correct answer is (B)"
+ },
+ {
+  "id": "6719bc01bb02136c067d43fa",
+  "tokens": 23355,
+  "answer": "D",
+  "pred": null,
+  "text": "To determine which player wins the most golds, we sum the \"utility\" (golds received) for each player listed in the choices:\n\n- player"
+ },
+ {
+  "id": "66ebcc1e5a08c7b9b35df87d",
+  "tokens": 23524,
+  "answer": "C",
+  "pred": "A",
+  "text": "The correct answer is (A)"
+ },
+ {
+  "id": "66fa6867bb02136c067c6b3b",
+  "tokens": 23854,
+  "answer": "D",
+  "pred": "A",
+  "text": "The correct answer is (A)"
+ },
+ {
+  "id": "66f56c9c821e116aacb33a45",
+  "tokens": 24762,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C) Define different Cathode Loading cases"
+ },
+ {
+  "id": "66ec1db2821e116aacb1ad69",
+  "tokens": 25056,
+  "answer": "C",
+  "pred": "B",
+  "text": "The correct answer is (B)"
+ },
+ {
+  "id": "66ec0f3c821e116aacb19d70",
+  "tokens": 25449,
+  "answer": "A",
+  "pred": "A",
+  "text": "The correct answer is (A)"
+ },
+ {
+  "id": "671b1335bb02136c067d4e88",
+  "tokens": 25626,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C) player_6\n\n**Explanation:**  \nFrom the player_data, we can count the number of wins (where the prompt says"
+ },
+ {
+  "id": "66f0ed5a821e116aacb265ab",
+  "tokens": 25636,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C)"
+ },
+ {
+  "id": "66f578fa821e116aacb33c58",
+  "tokens": 25899,
+  "answer": "D",
+  "pred": "D",
+  "text": "The correct answer is (D)\n\nExplanation:\n- (A) is incorrect: The text says (page 16/17) not to directly touch lens"
+ },
+ {
+  "id": "66ece358821e116aacb1dc08",
+  "tokens": 26266,
+  "answer": "C",
+  "pred": "D",
+  "text": "The correct answer is (D)"
+ },
+ {
+  "id": "66ebc7445a08c7b9b35df155",
+  "tokens": 26401,
+  "answer": "D",
+  "pred": "D",
+  "text": "The correct answer is (D)"
+ },
+ {
+  "id": "66ebc0c95a08c7b9b35de7f3",
+  "tokens": 26705,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C) 4.5%"
+ },
+ {
+  "id": "66ebee0a5a08c7b9b35e1d05",
+  "tokens": 28304,
+  "answer": "D",
+  "pred": "A",
+  "text": "The correct answer is (A)"
+ },
+ {
+  "id": "66eefe85821e116aacb228dc",
+  "tokens": 29218,
+  "answer": "A",
+  "pred": "A",
+  "text": "The correct answer is (A)"
+ },
+ {
+  "id": "66f68b33bb02136c067c2303",
+  "tokens": 29565,
+  "answer": "D",
+  "pred": "D",
+  "text": "The correct answer is (D)"
+ },
+ {
+  "id": "671b3d9fbb02136c067d52b2",
+  "tokens": 30276,
+  "answer": "D",
+  "pred": null,
+  "text": "To determine which players got the second most utility, we sum the utility arrays for each player over the 20 rounds:\n\n- player_0: 0"
+ },
+ {
+  "id": "671b3d1bbb02136c067d5283",
+  "tokens": 30368,
+  "answer": "C",
+  "pred": null,
+  "text": "To determine which players got the most utility, we sum the utility arrays for each player from the provided data:\n\n- player_0: 0+5"
+ },
+ {
+  "id": "66f3ad93821e116aacb2e29f",
+  "tokens": 31669,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C)"
+ },
+ {
+  "id": "66f3b843821e116aacb2e692",
+  "tokens": 32657,
+  "answer": "C",
+  "pred": "A",
+  "text": "The correct answer is (A)"
+ },
+ {
+  "id": "66f95c18bb02136c067c52e1",
+  "tokens": 33373,
+  "answer": "B",
+  "pred": "B",
+  "text": "The correct answer is (B)"
+ },
+ {
+  "id": "6725e2febb02136c067d8717",
+  "tokens": 33581,
+  "answer": "D",
+  "pred": "D",
+  "text": "The correct answer is (D)"
+ },
+ {
+  "id": "6719b96abb02136c067d4358",
+  "tokens": 34273,
+  "answer": "B",
+  "pred": null,
+  "text": "To determine which player wins the most golds, we sum the \"utility\" (golds received) for each player listed in the choices from the provided data"
+ },
+ {
+  "id": "66ebdadd5a08c7b9b35e0e5b",
+  "tokens": 34476,
+  "answer": "B",
+  "pred": "B",
+  "text": "The correct answer is (B)\n\nReason: The text explains that trade secret law as IP reduces overinvestment in *physical* secrecy (like building roofs,"
+ },
+ {
+  "id": "66f36490821e116aacb2cc22",
+  "tokens": 35461,
+  "answer": "D",
+  "pred": "D",
+  "text": "The correct answer is (D)"
+ },
+ {
+  "id": "66ec7ba6821e116aacb1d114",
+  "tokens": 36918,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C)"
+ },
+ {
+  "id": "671b17d5bb02136c067d4f7d",
+  "tokens": 38441,
+  "answer": "D",
+  "pred": "C",
+  "text": "The correct answer is (C) player_7\n\nExplanation: Summing each player's contribution records (from \"records\" arrays) over the 20 rounds"
+ },
+ {
+  "id": "671b2c67bb02136c067d50f7",
+  "tokens": 38453,
+  "answer": "D",
+  "pred": null,
+  "text": "To determine which player contributed the second most tokens in the game, we sum the \"records\" (tokens contributed each round) for each player from the player_data"
+ },
+ {
+  "id": "66ec0f7f821e116aacb19dde",
+  "tokens": 38763,
+  "answer": "B",
+  "pred": "C",
+  "text": "The correct answer is (C)"
+ },
+ {
+  "id": "66f67c1bbb02136c067c21b9",
+  "tokens": 39058,
+  "answer": "D",
+  "pred": "D",
+  "text": "The correct answer is (D)"
+ },
+ {
+  "id": "66f7aa19bb02136c067c327e",
+  "tokens": 40057,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C)"
+ },
+ {
+  "id": "66f53f2b821e116aacb3335a",
+  "tokens": 40805,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C)"
+ },
+ {
+  "id": "66ec18a7821e116aacb1a72e",
+  "tokens": 40989,
+  "answer": "C",
+  "pred": null,
+  "text": "The provided text does not contain any discussion about a carbonyl group enabling transformations at lower temperatures with higher selectivity, nor does it mention coordination to PhCNs, electron"
+ },
+ {
+  "id": "67062a63bb02136c067cf5ac",
+  "tokens": 42990,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C)"
+ },
+ {
+  "id": "66f3edfb821e116aacb2fc91",
+  "tokens": 43681,
+  "answer": "C",
+  "pred": "A",
+  "text": "The correct answer is (A)"
+ },
+ {
+  "id": "66eecc45821e116aacb225c3",
+  "tokens": 43827,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C)"
+ },
+ {
+  "id": "66ed0cb0821e116aacb1e6c1",
+  "tokens": 44182,
+  "answer": "A",
+  "pred": "A",
+  "text": "The correct answer is (A)"
+ },
+ {
+  "id": "67078ecabb02136c067d0b89",
+  "tokens": 46072,
+  "answer": "B",
+  "pred": "B",
+  "text": "The correct answer is (B)"
+ },
+ {
+  "id": "66f3c1ab821e116aacb2ead1",
+  "tokens": 46742,
+  "answer": "D",
+  "pred": "D",
+  "text": "The correct answer is (D)"
+ },
+ {
+  "id": "66f530ce821e116aacb32f09",
+  "tokens": 48944,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C)"
+ },
+ {
+  "id": "66fab090bb02136c067c74e7",
+  "tokens": 49256,
+  "answer": "B",
+  "pred": "A",
+  "text": "Based on the provided texts, let’s evaluate each choice:\n\n- (A) DeepSeekMath extracts math-related web pages from Common Crawl via a"
+ },
+ {
+  "id": "66f2ad2b821e116aacb2ac0f",
+  "tokens": 49848,
+  "answer": "A",
+  "pred": "A",
+  "text": "The correct answer is (A)"
+ },
+ {
+  "id": "66ebf9bf5a08c7b9b35e1f85",
+  "tokens": 50697,
+  "answer": "D",
+  "pred": "D",
+  "text": "The correct answer is (D) DigiRL upgrades the evaluation method from the Autonomous evaluation article as the criterion for trace accuracy of its algorithm.\n\nReasoning:"
+ },
+ {
+  "id": "66ec332a821e116aacb1c042",
+  "tokens": 51426,
+  "answer": "B",
+  "pred": "A",
+  "text": "The correct answer is (A) 5.47\n\nUsing the Black-Scholes formula adjusted for a known dividend: subtract the present value of the dividend ($"
+ },
+ {
+  "id": "66ecf139821e116aacb1e0e1",
+  "tokens": 52751,
+  "answer": "C",
+  "pred": "D",
+  "text": "The correct answer is (D)"
+ },
+ {
+  "id": "66fe81dcbb02136c067ca2de",
+  "tokens": 54717,
+  "answer": "C",
+  "pred": "A",
+  "text": "The correct answer is (A)"
+ },
+ {
+  "id": "66f59d31821e116aacb340f6",
+  "tokens": 56019,
+  "answer": "D",
+  "pred": "D",
+  "text": "The correct answer is (D)"
+ },
+ {
+  "id": "66ee3c6d821e116aacb20f6f",
+  "tokens": 56494,
+  "answer": "B",
+  "pred": "A",
+  "text": "The correct answer is (A)"
+ },
+ {
+  "id": "66f53892821e116aacb33225",
+  "tokens": 58488,
+  "answer": "B",
+  "pred": "B",
+  "text": "The correct answer is (B)"
+ },
+ {
+  "id": "66ec1aef821e116aacb1aa1a",
+  "tokens": 59425,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C)"
+ },
+ {
+  "id": "66ed875e821e116aacb2023e",
+  "tokens": 62244,
+  "answer": "A",
+  "pred": null,
+  "text": "The provided text does not mention Wang Hui at all, so it is impossible to determine any shared view between Wang Hui and Badiou from the given material."
+ },
+ {
+  "id": "66f3cfa5821e116aacb2f096",
+  "tokens": 64082,
+  "answer": "D",
+  "pred": "D",
+  "text": "The correct answer is (D)"
+ },
+ {
+  "id": "66ed3e90821e116aacb1f82f",
+  "tokens": 64638,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C) BertSelfAttention"
+ },
+ {
+  "id": "66f950acbb02136c067c5021",
+  "tokens": 65184,
+  "answer": "A",
+  "pred": "B",
+  "text": "The correct answer is (B)"
+ },
+ {
+  "id": "66f3c806821e116aacb2ed77",
+  "tokens": 67688,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C)"
+ },
+ {
+  "id": "66fc05b6bb02136c067c88e4",
+  "tokens": 68676,
+  "answer": "A",
+  "pred": "B",
+  "text": "The correct answer is (B)"
+ },
+ {
+  "id": "66ef1a4d821e116aacb229d5",
+  "tokens": 71523,
+  "answer": "C",
+  "pred": "C",
+  "text": "The correct answer is (C)"
+ },
+ {
+  "id": "66f8c783bb02136c067c44b8",
+  "tokens": 73057,
+  "answer": "B",
+  "pred": "B",
+  "text": "The correct answer is (B)"
+ },
+ {
+  "id": "66efaf70821e116aacb234bd",
+  "tokens": 74202,
+  "answer": "D",
+  "pred": "C",
+  "text": "The correct answer is (C)"
+ },
+ {
+  "id": "66f4cd2c821e116aacb316ef",
+  "tokens": 75857,
+  "answer": "D",
+  "pred": "D",
+  "text": "The correct answer is (D)"
+ },
+ {
+  "id": "66efa5ea821e116aacb23268",
+  "tokens": 77326,
+  "answer": "D",
+  "pred": "D",
+  "text": "The correct answer is (D) Kodak and Procter & Gamble\n\nReasoning:  \n- Kodak’s original business was film and photography."
+ },
+ {
+  "id": "670fbd96bb02136c067d2d49",
+  "tokens": 77390,
+  "answer": "A",
+  "pred": null,
+  "text": "Based on the evidence in the text:\n\n- The old gymnasium’s right-side stage door (the one without restrooms) opened to the outside"
+ },
+ {
+  "id": "66fa7c81bb02136c067c6e09",
+  "tokens": 77879,
+  "answer": "B",
+  "pred": "B",
+  "text": "The correct answer is (B)"
+ },
+ {
+  "id": "66fa50acbb02136c067c6827",
+  "tokens": 78767,
+  "answer": "B",
+  "pred": "B",
+  "text": "The correct answer is (B)"
+ },
+ {
+  "id": "66ec4370821e116aacb1c905",
+  "tokens": 80063,
+  "answer": "A",
+  "pred": "A",
+  "text": "The correct answer is (A)\n\nExplanation:\n- From the Gifts section, Emily loves: Amethyst, Aquamarine, Cloth, Emer"
+ },
+ {
+  "id": "66ec3352821e116aacb1c085",
+  "tokens": 80663,
+  "answer": "B",
+  "pred": "A",
+  "text": "The correct answer is (A) Bidding pattern is inconsistent with one's usual style\n\n**Explanation from the text:** In Chapter 31, Poirot"
+ }
+]

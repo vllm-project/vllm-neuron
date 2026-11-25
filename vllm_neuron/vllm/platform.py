@@ -1028,7 +1028,8 @@ class NeuronPlatform(Platform):
         # DI is optional: prefill and decode share one layout/semantics, so DCP
         # runs single-node. If a connector IS set (P/D split) it must be Nixl.
         kv_config = vllm_config.kv_transfer_config
-        if kv_config is not None and kv_config.kv_connector != "NeuronNixlConnector":
+        if kv_config is not None and kv_config.kv_connector not in (
+            "NeuronNixlConnector", "NeuronMooncakeConnector"):  # local: #90 supports P DCP 1 -> D DCP D
             raise ValueError(
                 "DCP requires kv_connector='NeuronNixlConnector'. "
                 'Set "kv_connector": "NeuronNixlConnector" in --kv-transfer-config'
@@ -1083,10 +1084,15 @@ class NeuronPlatform(Platform):
         # TEMPORARY: DCP ownership is computed from one active position per request.
         # Lifting this needs that math generalized to a token span, not just this
         # gate deleted (with test_dcp_with_speculative_decoding_rejected).
-        if vllm_config.speculative_config is not None:
+        # VLLM_NEURON_DCP_SPEC_DECODE=1 opts in for models whose decode handles a span of
+        # 1 + k tokens per request under DCP (Hy3: per-token DCP owner gate, causal in-span mask,
+        # DCP-aware on-device slot mapping in spec_decode_correction / the MTP draft).
+        if (vllm_config.speculative_config is not None
+                and os.environ.get("VLLM_NEURON_DCP_SPEC_DECODE", "0") != "1"):
             raise ValueError(
                 "DCP does not support speculative decoding. Disable speculative "
-                "decoding or set decode_context_parallel_size=1."
+                "decoding or set decode_context_parallel_size=1 "
+                "(or VLLM_NEURON_DCP_SPEC_DECODE=1 for a model that supports it)."
             )
 
         # NOTE: whether a DCP prefill can consume an FP8 KV cache is model

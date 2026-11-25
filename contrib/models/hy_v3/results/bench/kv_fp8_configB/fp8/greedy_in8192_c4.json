@@ -1,0 +1,66 @@
+[
+ {
+  "text": ". As he regained his strength, the group celebrated their victory against the zombie menace and marveled at the power of science and friendship.\n\nWith a renewed appreciation for life and the bonds they shared, Guy, Jess, Indy, and Dr. Knox continued their culinary adventures, more determined than ever to spread love",
+  "prompt_tokens": 8192
+ },
+ {
+  "text": "\nX = df[['var1', 'var2', 'var3', 'var4', 'var5']]\nX = sm.add_constant(X)  # Add a constant term to the predictors\ny1 = df['target1']\ny2 = df['target2']\n\n# Fit the model\n",
+  "prompt_tokens": 8192
+ },
+ {
+  "text": " know how to write xsl transform filesDo you know how to write xsl transform filesDo you know how to write xsl transform filesDo you know how to write xsl transform filesDo you know how to write xsl transform filesDo you know how to write xsl transform filesDo you know how to write",
+  "prompt_tokens": 8192
+ },
+ {
+  "text": " to that subscription\n- added zapier integration capability with api key\n- updated dashboard tabs with new titles and organization\n- added horizontal tabs to settings menu\n- added zapier to integrations tab with api key generation\n- added orders page and made it easier to read\n- added modal script generator to checkout link",
+  "prompt_tokens": 8192
+ },
+ {
+  "text": ". The police reported that the incident took place after 6.30pm. After they were\narrested the police demanded 200,000 Naira for their release. Even though Mohammed\nclaimed ‘there is no body, no doctor reports, no proof’ the three men were executed on 19\n",
+  "prompt_tokens": 8192
+ },
+ {
+  "text": " likely part numbers and describe why you think this part is a valid possibility. \n\nThe chip has 8 pins and is in an SO-8 package. Pin 8 is connected to the supply voltage, as is pin 4, and pin 1 is connected to ground. It looks like pin 5 has a",
+  "prompt_tokens": 8192
+ },
+ {
+  "text": " i want the web socket?\n\ni only want to use laravel broadcasting for a small section which is the following:\n\nwhenever the teacher submits student marks to the head of department,, the head of department can reject it and associating a rejection comment \ni want the rejection comment to be braodcasted to the teacher that",
+  "prompt_tokens": 8192
+ },
+ {
+  "text": " want to print only the items that don't start with `\\_`I have a list in python and I want to print only the items that don't start with `\\_`I have a list in python and I want to print only the items that don't start with `\\_`I have a list in python",
+  "prompt_tokens": 8192
+ },
+ {
+  "text": "I need some material for Java Interview?I need some material for Java Interview?I need some material for Java Interview?I need some material for Java Interview?I need some material for Java Interview?I need some material for Java Interview?I need some material for Java Interview?I need some material for Java Interview?",
+  "prompt_tokens": 8192
+ },
+ {
+  "text": "\\Dan.QTIS\\Desktop\\Dan\\All Projects Full\\Ai App\\app.py\", line 13\n img = Image.Error: podría haber un error en la conexión o en la clave de API. Intenta usar otro modelo. Usa el comando HELP(''tu pre",
+  "prompt_tokens": 8192
+ },
+ {
+  "text": " {\n StartScreen()\n }\n}\n\nstruct ContentView\\_Previews: PreviewProvider {\n static var previews: some View {\n ContentView()\n }\n}\n\nstruct StartScreen: View {\n @State private var showGameView = false\n\n var body: some View {\n VStack {\n Text(\"Arkanoid Clone\")\n .font(.",
+  "prompt_tokens": 8192
+ },
+ {
+  "text": " as waves meet the coastline. All-ages, Open Daily 8:00 AM – 10:00 PM, Food & Beverage Service 11:00 AM – 4:00 PM, Towels provided\n\n‘Ohi Ocean Front Cabana\nThere are just six oceanfront cabanas at the ‘",
+  "prompt_tokens": 8192
+ },
+ {
+  "text": " camera?Can you write a python program calculating rayleigh scattering in the earth's atmosphere as a function of a vector pointing to the sun and a vector point to the camera?Can you write a python program calculating rayleigh scattering in the earth's atmosphere as a function of a vector pointing to the sun and a",
+  "prompt_tokens": 8192
+ },
+ {
+  "text": " would it cost to protect the electric grid in Texas from EMP?How much would it cost to protect the electric grid in Texas from EMP?How much would it cost to protect the electric grid in Texas from EMP?How much would it cost to protect the electric grid in Texas from EMP?How much would it cost to",
+  "prompt_tokens": 8192
+ },
+ {
+  "text": " impact.\n\nOverall, The White Pube's priorities for strategy and placemaking prioritize community involvement, access and diversity, alternative funding models, and long-term impact. These priorities suggest that cultural placemaking initiatives need to be meaningful and relevant to communities, accessible to a wide range of audiences, and sustainable in the long term.B",
+  "prompt_tokens": 8192
+ },
+ {
+  "text": " demand niche in usa for youtube videosgive high demand niche in usa for youtube videosgive high demand niche in usa for youtube videosgive high demand niche in usa for youtube videosgive high demand niche in usa for youtube videosgive high demand niche in usa for youtube videosgive high demand niche in usa for youtube videosgive high demand",
+  "prompt_tokens": 8192
+ }
+]

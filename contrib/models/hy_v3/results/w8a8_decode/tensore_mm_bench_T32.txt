@@ -1,0 +1,6 @@
+gu_tiled  N=1024: 0.558 ms  N=8192: 1.115 ms  -> 0.078 us per 128-row contraction
+gu_bf16   N=1024: 0.802 ms  N=8192: 2.498 ms  -> 0.237 us per 128-row contraction
+gu_fp8    N=1024: 0.772 ms  N=8192: 2.511 ms  -> 0.243 us per 128-row contraction
+gu_dr     N=1024: 0.517 ms  N=8192: 1.587 ms  -> 0.149 us per 128-row contraction
+dn_bf16   N=1024: 0.532 ms  N=8192: 0.841 ms  -> 0.043 us per 128-row contraction
+dn_fp8    N=1024: 0.495 ms  N=8192: 0.729 ms  -> 0.033 us per 128-row contraction
