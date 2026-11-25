@@ -25,6 +25,13 @@ from nkilib.core.attention.attention_segmented_cte import (
     attention_segmented_cte,
 )
 
+# head_dim above 128 (Qwen3.5: 256) uses the vendored kernel. The nkilib kernel
+# ignores the keys after position 4096 of a segment when head_dim is 256 (a Q chunk
+# or a KV segment above 4096 tokens). Every other model keeps the nkilib kernel.
+from vllm_neuron.functional.vendored_kernels.attention_segmented_cte import (
+    attention_segmented_cte as _attention_segmented_cte_wide_head,
+)
+
 # Whether the installed nkilib segmented kernel accepts the fp8_packed kwarg.
 # The packed read path is on nkilib mainline but may not be in the consumed
 # version set yet; gate on the live signature so passing fp8_packed never
@@ -46,6 +53,9 @@ _KVP_SEGMENTED_KERNEL_HAS_FP8_PACKED = all(
 )
 _attention_segmented_cte_jit = nki.jit()(attention_segmented_cte)
 _wrapped_attention_segmented_cte = wrap_nki(_attention_segmented_cte_jit)
+_wrapped_attention_segmented_cte_wide_head = wrap_nki(
+    nki.jit()(_attention_segmented_cte_wide_head)
+)
 
 
 @nki.jit
@@ -170,6 +180,9 @@ logging.getLogger(__name__).info(
 
 # Maximum head dimension supported by the NKI kernel (SBUF partition constraint).
 _MAX_HEAD_DIM = 128
+# Maximum head dimension of the vendored kernel, which tiles head_dim over SBUF
+# partitions. segmented_attention takes it for 128 < head_dim <= 256.
+_MAX_WIDE_HEAD_DIM = 256
 
 
 def _decode_packed_to_unpacked(k_cache: Tensor) -> Tensor:
@@ -274,9 +287,10 @@ def _can_use_segmented_kernel(
 
     # The constraints below mirror the kernel_assert checks in the NKI kernel.
 
-    # head_dim must fit in a single SBUF partition (128 elements).
+    # head_dim must fit in a single SBUF partition (128 elements), or in two for
+    # the vendored wide-head kernel.
     d_head = q.shape[2] if tp_q else q.shape[1]
-    if d_head > _MAX_HEAD_DIM:
+    if d_head > _MAX_WIDE_HEAD_DIM:
         return False
 
     # kv_segment_size must be a supported size and must tile the cache blocks.
@@ -971,12 +985,13 @@ def segmented_attention(
             nkilib), not an input the fallback can absorb correctly.
 
     Note:
-        Inputs the NKI kernel cannot take — head_dim > 128, a kv_segment_size
+        Inputs the NKI kernel cannot take — head_dim > 256, a kv_segment_size
         outside SUPPORTED_KV_SEGMENT_SIZES or not divisible by block_size, a
         sliding_window not divisible by block_size, or a Q seqlen that is not a
         multiple of 128 — do not raise. They route to the torch fallback, which
         gathers the full padded prior KV and has no such constraints. See
-        ``_can_use_segmented_kernel``.
+        ``_can_use_segmented_kernel``. A head_dim from 129 to 256 runs the
+        vendored wide-head kernel.
 
         The segmented kernel does not yet support tp_q=False natively; when that
         flag is set, Q is transposed at the boundary. tp_out is passed through
@@ -1041,12 +1056,16 @@ def segmented_attention(
     # Segmented kernel does not yet support tp_q=False natively, so we
     # transpose Q at the boundary.
     q_seg = q.transpose(1, 2) if not tp_q else q
-    # Let the kernel apply the scale: it folds a power-of-two scale into the
-    # tensor_scalar already on the Q load, instead of a separate elementwise pass
-    # over [N, S, d]. A non-power-of-two scale also disables the kernel's
+    # The vendored kernel for 128 < head_dim <= 256 takes scale=1.0 only (its
+    # validation rejects any other scale with prefix caching), so Q is pre-scaled.
+    wide_head = q_seg.shape[2] > _MAX_HEAD_DIM
+    # Otherwise let the kernel apply the scale: it folds a power-of-two scale into
+    # the tensor_scalar already on the Q load, instead of a separate elementwise
+    # pass over [N, S, d]. A non-power-of-two scale also disables the kernel's
     # static-causal range_select path, so pre-scale here in that case.
     _scale_is_pow2 = scale > 0.0 and math.frexp(scale)[0] == 0.5
-    if not _scale_is_pow2:
+    fold_scale = _scale_is_pow2 and not wide_head
+    if not fold_scale:
         q_seg = q_seg * scale
 
     # Only forward fp8_packed when the installed kernel supports it (the packed
@@ -1064,7 +1083,13 @@ def segmented_attention(
             "ships the segmented packed FP8 read path."
         )
 
-    result = _wrapped_attention_segmented_cte[2](
+    if wide_head:
+        # The vendored kernel has no allow_vector_exp parameter.
+        kernel = _wrapped_attention_segmented_cte_wide_head
+    else:
+        kernel = _wrapped_attention_segmented_cte
+        extra_kwargs["allow_vector_exp"] = allow_vector_exp
+    result = kernel[2](
         q=q_seg,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -1072,7 +1097,7 @@ def segmented_attention(
         prior_tokens=prior_tokens,
         block_size=block_size,
         prior_seg_size=kv_segment_size,
-        scale=1.0 if not _scale_is_pow2 else scale,
+        scale=scale if fold_scale else 1.0,
         tp_q=True,
         tp_out=tp_out,
         sliding_window=sliding_window if sliding_window else None,
@@ -1080,7 +1105,6 @@ def segmented_attention(
         num_q_heads=q_seg.shape[0],
         k_scale=k_scale,
         v_scale=v_scale,
-        allow_vector_exp=allow_vector_exp,
         **extra_kwargs,
     )
 

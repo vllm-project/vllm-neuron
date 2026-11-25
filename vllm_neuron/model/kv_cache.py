@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
@@ -183,3 +183,33 @@ def build_per_head_slot_mapping(
     global_slot = global_block * block_size + position.unsqueeze(1)
     # [B*S, kv_heads] -> [B, kv_heads, S_tkg]
     return global_slot.view(batch_size, -1, kv_heads).transpose(1, 2).contiguous()
+
+
+@dataclass
+class HybridKVSpec(KVSpec):
+    """KV cache needs of a model that mixes attention layers and state layers.
+
+    ``layers`` holds the attention layers, which use the paged KV cache.
+    ``stateful_layer_names`` holds the names of the layers that keep a recurrent
+    state instead. The model runner turns each of these names into a
+    ``MambaSpec``, so the framework allocates the state and the KV cache manager
+    knows the state exists.
+
+    The model gives the shape and the dtype of one state row through
+    ``get_mamba_state_shape_from_config`` and
+    ``get_mamba_state_dtype_from_config``. This matches the upstream hybrid model
+    interface, so the state of one row means the same bytes on both sides of a
+    disaggregated transfer.
+
+    The field is additive and the runner tests it with ``hasattr``. A model that
+    returns a plain ``KVSpec`` therefore keeps the attention-only path.
+
+    Example:
+        >>> spec = HybridKVSpec(layers=[], stateful_layer_names=["layers.0.attn"])
+        >>> spec.stateful_layer_names
+        ['layers.0.attn']
+        >>> KVSpec(layers=[]).layers
+        []
+    """
+
+    stateful_layer_names: list[str] = field(default_factory=list)

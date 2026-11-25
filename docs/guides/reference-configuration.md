@@ -78,6 +78,7 @@ For conceptual overview, see [On-device sampling](features-guide.md#on-device-sa
 | Option | Type | Default | Description |
 | ---- | ---- | ---- | ---- |
 | `on_device_sampling_config` | dict or null | null (CPU sampling) | Enable on-device sampling. Supported sub-parameters: `temperature`, `top_k`, `top_p`, `all_greedy`. Required for async scheduling, speculative decoding, and structured output enforcement. |
+| `stochastic_sampling_backend` | `"cpu"` or `"nki"` | `"cpu"` | `"nki"` samples the full vocabulary with an NKI kernel and returns the sampled token's logprob (`logprobs=0`), for RL rollouts. See [Full-vocabulary NKI sampling](#full-vocabulary-nki-sampling). |
 
 ```python
 # Greedy on-device sampling
@@ -86,6 +87,57 @@ For conceptual overview, see [On-device sampling](features-guide.md#on-device-sa
 # Temperature-based
 "on_device_sampling_config": {"temperature": "0.7"}
 ```
+
+### Full-vocabulary NKI sampling
+
+An RL rollout engine needs the logprob of each sampled token, at a
+temperature above 0, with seeds, from the full vocabulary.
+`stochastic_sampling_backend: "nki"` runs
+`vllm_neuron/functional/stochastic_sampling.py` on the device. The kernel
+samples by inverse CDF over the full vocabulary from one host uniform per
+request. A seeded request draws its uniform from its own CPU generator. The
+kernel returns the token, its logprob and its rank. `--logprobs-mode`
+selects `raw_logprobs` (before temperature) or `processed_logprobs` (after).
+
+| `on_device_sampling_config` | Where the kernel runs | Scheduling |
+| ---- | ---- | ---- |
+| set (`{}`) | In the model graph. The model must support it (Qwen3.5). | Async or sync |
+| `null` | In a separate graph after the gathered LM head, on TP rank 0. A batch with `top_k`/`top_p` goes to the vLLM CPU sampler. | Sync only (`--no-async-scheduling`) |
+
+A request that the kernel does not compute gets an HTTP 400 error:
+`logprobs` other than 0, `prompt_logprobs`, penalties, `min_p`,
+`logit_bias`, `allowed_token_ids`, `bad_words`, structured outputs, and
+(in the model graph) `top_k`/`top_p`. Send `top_k: -1` and `top_p: 1.0`, or
+serve with `--generation-config vllm`: a checkpoint's `generation_config.json`
+otherwise sets the default `top_k`/`top_p` of a request that omits them.
+Speculative decoding and custom logits processors are rejected at startup.
+
+For a complete rollout server for RL training, from the instance to the
+trainer's weight refresh, see
+[Set up a Trainium rollout server for RL training](../tutorials/tutorial-qwen3-5-rl-rollout.md).
+
+```bash
+# Qwen3.5/3.6-27B rollout server: TP8, 64K context, 8 sequences, async scheduling
+vllm serve <model> --tensor-parallel-size 8 --max-model-len 65536 \
+    --max-num-seqs 8 --max-num-batched-tokens 2048 --enable-prefix-caching \
+    --logprobs-mode processed_logprobs --generation-config vllm \
+    --additional-config '{"neuron_config": {
+        "num_seqs_buckets": [1, 4, 8],
+        "decode_context_length_buckets": [4096, 8192, 16384, 32768],
+        "on_device_sampling_config": {},
+        "stochastic_sampling_backend": "nki"}}'
+```
+
+With `--data-parallel-size` greater than 1, the API server waits for the
+engine cores for `VLLM_ENGINE_READY_TIMEOUT_S` (600 s by default). The first
+start compiles every graph and takes longer, so raise it, for example
+`VLLM_ENGINE_READY_TIMEOUT_S=14400`.
+
+Each data-parallel engine has its own prefix cache. For agent rollouts, set
+`VLLM_NEURON_DP_PREFIX_AFFINITY=1` and serve with `--api-server-count 1`: the
+next turn of a session and the rollouts of one prompt then go to the engine
+that already holds their prefix. See
+[Data-parallel routing](#data-parallel-routing).
 
 ## Scheduling options
 
@@ -262,6 +314,20 @@ Use the smallest value that passes the validated workload.
 | Variable | Type | Default | Description |
 | ---- | ---- | ---- | ---- |
 | `PROMETHEUS_MULTIPROC_DIR` | str | auto-created tempdir | Directory for prometheus_client multiprocess mode. Wipe between server restarts. |
+
+### Data-parallel routing
+
+With `--data-parallel-size` greater than 1, the server sends each request to
+the least loaded engine. Prefix affinity sends a request to the engine that
+holds the longest prefix of its prompt instead, unless that engine carries
+more requests than the slack allows. It applies to a non-MoE model with
+`--enable-prefix-caching`. It changes routing only, not the compiled graphs.
+For the design, see [DP prefix-affinity routing](../design/vllm/dp-prefix-affinity.md).
+
+| Variable | Type | Default | Description |
+| ---- | ---- | ---- | ---- |
+| `VLLM_NEURON_DP_PREFIX_AFFINITY` | bool | 0 | 1 sends a request to the engine that holds the longest prefix of its prompt. A request with an `X-data-parallel-rank` header still goes to that engine. Each API server keeps its own index, so serve with `--api-server-count 1`. |
+| `VLLM_NEURON_DP_PREFIX_AFFINITY_SLACK` | int | `max_num_seqs // 2` (at least 1) | Largest load difference, in requests, between the prefix engine and the least loaded engine. Above it, the request goes to the least loaded engine. |
 
 ## Complete configuration example
 

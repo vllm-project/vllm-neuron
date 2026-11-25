@@ -356,6 +356,9 @@ def get_neuron_model_runner_v2_policy(
         unsupported.append("GK decode (stacked KV cache)")
     if neuron_cfg.get("enable_structured_outputs", False):
         unsupported.append("structured outputs")
+    # The opt-in NKI stochastic sampler is wired into the V1 runner only.
+    if neuron_cfg.get("stochastic_sampling_backend", "cpu") == "nki":
+        unsupported.append("NKI stochastic sampling")
     if model_config is not None:
         # Device eager is unsupported (the adapter's in-graph gathers are compiled-only). CPU-sim eager
         # is a test-only mode that never selects V2 through this policy.

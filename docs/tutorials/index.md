@@ -82,6 +82,13 @@ Serve the multimodal Qwen3-VL-32B model (BF16 or MXFP8).
 Configure encoder-disaggregated (EPD) multimodal topologies.
 :::
 
+:::{grid-item-card} RL rollout server (Qwen3.5)
+:link: tutorial-qwen3-5-rl-rollout
+:link-type: doc
+
+Set up a Trn2 instance as the rollout server of SkyRL LoRA training, with NKI sampling and ART's weight refresh.
+:::
+
 :::{grid-item-card} Deploy Qwen3-Embedding-8B
 :link: tutorial-qwen3-embedding-8b
 :link-type: doc
@@ -113,6 +120,7 @@ Benchmarking prefix caching (GPT-OSS) <tutorial-prefix-caching-gpt-oss-benchmark
 Deploying dense Qwen3-32B <tutorial-qwen3-32b>
 Deploying Qwen3-VL-32B <tutorial-qwen3-vl-32b>
 Disaggregated encoder (1E1PD and xEyPD) <tutorial-epd-1e-1pd-xeypd>
+RL rollout server (Qwen3.5) <tutorial-qwen3-5-rl-rollout>
 Deploying Qwen3-Embedding-8B <tutorial-qwen3-embedding-8b>
 Deploying Qwen3-ASR-1.7B <tutorial-qwen3-asr-1-7b>
 :::

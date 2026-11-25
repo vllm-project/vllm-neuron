@@ -16,7 +16,7 @@ import threading
 import time
 from collections.abc import Callable, Collection
 from copy import copy, deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from typing import Any, NamedTuple, cast
 
 import numpy as np
@@ -50,11 +50,16 @@ from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     DraftTokenIds,
+    LogprobsTensors,
     ModelRunnerOutput,
     SamplerOutput,
     make_empty_encoder_model_runner_output,
 )
 from vllm.v1.sample.sampler import Sampler
+from vllm_neuron.vllm.sample.nki_sampler import (
+    NeuronNKISampler,
+    has_sampling_filters,
+)
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -69,6 +74,11 @@ from vllm_neuron import envs
 from vllm_neuron.snapshot.runner_hook import SnapshotRunnerHook
 from vllm_neuron.utils.neuron_utils import model_forward_context
 from libtorch_neuronx_lite.compile.compiler_args import scoped_compiler_args
+from vllm_neuron.vllm.worker.deltanet_state_slots import (
+    DeltaNetStateSlots,
+    count_linear_attention_layers,
+    state_pool_rows,
+)
 from vllm_neuron.vllm.worker.neuron_ec_connector_model_runner_mixin import (
     ECLoadFailure,
     EncoderCacheReadError,
@@ -387,6 +397,9 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
         self.model_runner_output = model_runner_output
         self._model_runner = model_runner
         self._partial_prefill_req_ids = partial_prefill_req_ids or set()
+        # In-graph NKI sampling: the (ids, scores, ranks) device futures of this
+        # step. get_output() reads them with the sampled tokens.
+        self.pending_nki_logprobs: tuple[torch.Tensor, ...] | None = None
         # Per-object lock: prevents double-materialization when both the async
         # output thread and the main thread call get_output() on the same object.
         self._lock = threading.Lock()
@@ -447,6 +460,7 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                         [] for _ in range(len(self.model_runner_output.req_ids))
                     ]
                     self.model_runner_output.sampled_token_ids = sampled_token_ids
+                    self.pending_nki_logprobs = None
                     return self.model_runner_output
 
                 # First call: materialize device future to CPU.
@@ -508,8 +522,68 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                     "Skip updating batch state."
                 )
 
+            if self.pending_nki_logprobs is not None:
+                num_reqs = len(self.model_runner_output.req_ids)
+                self.model_runner_output.logprobs = _nki_logprobs_tensors(
+                    *self.pending_nki_logprobs, num_reqs
+                ).tolists()
+                self.pending_nki_logprobs = None
+
         # Logprobs are computed in _sample() when on-device logits are available
         return self.model_runner_output
+
+
+def _nki_logprobs_tensors(
+    ids: torch.Tensor, scores: torch.Tensor, ranks: torch.Tensor, num_reqs: int
+) -> LogprobsTensors:
+    """Selected-token logprobs (``logprobs=0``) from the NKI sampler outputs.
+
+    Rows past ``num_reqs`` are decode padding and are dropped.
+
+    Example:
+        >>> lp = _nki_logprobs_tensors(ids, scores, ranks, 2)  # doctest: +SKIP
+        >>> lp.logprobs.shape  # doctest: +SKIP
+        torch.Size([2, 1])
+    """
+    ids = ids.cpu().reshape(-1, 1)[:num_reqs].int()
+    scores = scores.cpu().reshape(-1, 1)[:num_reqs].float()
+    ranks = ranks.cpu().reshape(-1)[:num_reqs].long()
+    if not torch.isfinite(scores).all():
+        raise ValueError("NKI sampling produced non-finite logprobs")
+    return LogprobsTensors(ids, scores, ranks)
+
+
+def build_nki_sampling_params_tensor(
+    input_batch, num_rows: int, discard_rows: Collection[int] = ()
+) -> torch.Tensor:
+    """Build the ``[num_rows, 3]`` (uniform, temperature, greedy) NKI input.
+
+    The in-graph NKI sampler reads this instead of [top_k, top_p, temperature].
+    It uses host batch state only, so preparing step N+1 never reads a device
+    tensor while step N runs. Each stochastic row draws one uniform from its
+    request's CPU generator (or the global CPU RNG when unseeded); greedy rows
+    draw none and run at temperature 1. Rows past ``num_reqs`` are padding.
+    ``discard_rows`` (a chunked prefill that is not final, whose token is
+    discarded) run greedy and draw none, so a seed does not depend on chunking.
+
+    Example:
+        >>> build_nki_sampling_params_tensor(batch, 4)  # doctest: +SKIP
+        tensor([[0.4963, 0.7000, 0.0000], [0.0000, 1.0000, 1.0000], ...])
+    """
+    num_reqs = input_batch.num_reqs
+    params = torch.zeros((num_rows, 3), dtype=torch.float32)
+    params[:, 1] = 1.0
+    params[:, 2] = 1.0
+    temperatures = torch.from_numpy(input_batch.temperature_cpu[:num_reqs]).float()
+    stochastic = temperatures >= 1e-5
+    for row in discard_rows:
+        if row < num_reqs:
+            stochastic[row] = False
+    params[:num_reqs, 1] = torch.where(stochastic, temperatures, 1.0)
+    params[:num_reqs, 2] = (~stochastic).float()
+    for row in stochastic.nonzero(as_tuple=True)[0].tolist():
+        params[row, 0] = torch.rand((), generator=input_batch.generators.get(row))
+    return params
 
 
 class VeEncoderProducerAsyncOutput(AsyncModelRunnerOutput):
@@ -1029,6 +1103,29 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 self.neuron_config.num_seqs_buckets,
             )
 
+        # DeltaNet state slots. A linear attention layer keeps a recurrent state
+        # and a convolution state for each concurrent request, and the model
+        # indexes both with batch_slot_indices. Build the pool for a hybrid model
+        # only. The extra model input changes the traced graph, so a dense model
+        # must not see it and must keep its compile cache.
+        self._deltanet_state_slots: DeltaNetStateSlots | None = None
+        if count_linear_attention_layers(vllm_config.model_config) > 0:
+            self._deltanet_state_slots = DeltaNetStateSlots(
+                state_pool_rows(self.neuron_config.num_seqs_buckets)
+            )
+            logger.info(
+                "DeltaNet state slots: %d", self._deltanet_state_slots.num_slots
+            )
+        # DeltaNet state snapshots for prefix caching. The model holds the
+        # snapshot rows when neuron_config.deltanet_snapshot_rows is 2 or more
+        # (the platform resolves it), and every prefill graph then takes
+        # `deltanet_snapshot_rows`. The scheduler gives the rows.
+        self._deltanet_snapshot_rows_enabled = (
+            self._deltanet_state_slots is not None
+            and self.neuron_config.deltanet_snapshot_rows >= 2
+        )
+        self._deltanet_snapshot_ops: dict[str, tuple[int, int]] = {}
+
         # Parse decode_context_length_buckets — opt-in feature that compiles a
         # 2D bucket grid (batch, seq). Default None preserves today's
         # behavior of compiling decode at max_model_len.
@@ -1214,6 +1311,28 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # Consumed by ``_maybe_swap_async_input_ids`` as the non-spec
             # step's input_ids without slicing or stride manipulation.
             self._transition_bonus_tensor: torch.Tensor | None = None
+            # A step that only prefills new requests can skip the read of the
+            # previous output (see _can_skip_prefill_readback). The skipped
+            # outputs wait in _unread_async_outputs until a later step reads
+            # them. _batch_mutation_lock keeps the batch state writes of the
+            # async-output thread apart from _update_states on this thread.
+            # Resolved in load_model: the env var, else the model's
+            # supports_async_readback_skip.
+            self._skip_prefill_readback: bool = False
+            self._unread_async_outputs: list[AsyncNeuronModelRunnerOutput] = []
+            self._readback_skipped_this_step: bool = False
+            self._prefill_readback_skips: int = 0
+            # A decode step after a batch change can build its input tokens on
+            # the device (see _can_merge_tokens_on_device). The merge graph is
+            # compiled at decode warmup for each pair of (previous output
+            # length, decode batch size) in _token_merge_shapes.
+            # Resolved in load_model, like _skip_prefill_readback.
+            self._device_token_merge: bool = False
+            self._merge_tokens_this_step: bool = False
+            self._device_token_merges: int = 0
+            self._token_merge_fn: Callable | None = None
+            self._token_merge_shapes: set[tuple[int, int]] = set()
+            self._token_merge_miss_logged: set[tuple[int, int]] = set()
 
         # Set up speculative decoding.
         self.drafter: EagleProposer | DFlashProposer | None = None
@@ -1367,7 +1486,25 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         logprobs_mode = getattr(
             vllm_config.model_config, "logprobs_mode", "raw_logprobs"
         )
-        self.sampler = Sampler(logprobs_mode=logprobs_mode)
+        nki_backend = self.neuron_config.stochastic_sampling_backend == "nki"
+        # Opt-in NKI full-vocabulary sampling. In-graph: the model samples and
+        # returns (ids, scores, ranks), which async scheduling can chain. Else a
+        # separate synchronous NKI graph samples the gathered logits.
+        self.nki_sampling: bool = nki_backend and not self.on_device_sampling
+        self.nki_in_graph_sampling: bool = nki_backend and self.on_device_sampling
+        self._logprobs_mode = logprobs_mode
+        self._on_device_nki_scores: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._pending_nki_logprobs: tuple[torch.Tensor, ...] | None = None
+        # Batch rows whose sampled token is discarded this step (execute_model).
+        self._nki_discard_rows: set[int] = set()
+        # The vLLM sampler. The separate NKI route also uses it for a batch
+        # with top_k/top_p filtering.
+        self.cpu_sampler = Sampler(logprobs_mode=logprobs_mode)
+        self.sampler = (
+            NeuronNKISampler(logprobs_mode=logprobs_mode)
+            if self.nki_sampling
+            else self.cpu_sampler
+        )
 
         # Cache numpy arange for efficient tensor operations
         self.arange_np = np.arange(
@@ -2010,6 +2147,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self._draft_tensor_capture = None
         self._encoder_tensor_capture = None
 
+        if self.nki_in_graph_sampling:
+            if not getattr(self.model, "nki_in_graph_sampling", False):
+                raise ValueError(
+                    "stochastic_sampling_backend='nki' with on_device_sampling_config "
+                    f"set needs a model that samples with NKI in its graph; "
+                    f"{type(self.model).__name__} does not. Set "
+                    "on_device_sampling_config to null and turn async scheduling "
+                    "off to use the separate NKI sampler."
+                )
+            # The scoring distribution is a compile-time choice in the graph.
+            self.model.raw_logprobs = self._logprobs_mode == "raw_logprobs"
+
         # Compile model with vllm_neuron backend for Neuron execution
         # This is where torch.compile uses the registered "vllm_neuron" backend
         logger.info("Compiling model with vllm_neuron backend")
@@ -2228,6 +2377,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self._compiled_encoder_attr = None
 
         logger.info("NeuronModel loading complete (moved to device and compiled)")
+
+        if self.use_async_scheduling:
+            self._resolve_async_readback_skip()
 
         if self.drafter is not None:
             logger.info("Spec decode enabled. Loading draft model ...")
@@ -2834,7 +2986,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 sampling_params
                 and sampling_params.sampling_type == SamplingType.RANDOM_SEED
             ):
-                generator = torch.Generator(device=self.device)
+                # The NKI samplers draw their uniforms on the host.
+                generator = torch.Generator(
+                    device=(
+                        "cpu"
+                        if self.nki_sampling or self.nki_in_graph_sampling
+                        else self.device
+                    )
+                )
                 generator.manual_seed(sampling_params.seed)
             else:
                 generator = None
@@ -3968,12 +4127,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 and self.vllm_config.kv_transfer_config.is_kv_consumer
                 and self._local_step_forces_nonspec(scheduler_output)
             )
-            local_max_decode_ctx_len = (
-                int(self.input_batch.num_computed_tokens_cpu[:padded_num_reqs].max())
-                if padded_num_reqs > 0
-                and self.neuron_config.decode_context_length_buckets is not None
-                else 0
-            )
+            local_max_decode_ctx_len = self._local_max_decode_ctx_len(num_reqs)
             is_spec_decode_step = bool(scheduler_output.scheduled_spec_decode_tokens)
             local_jf = jf_possible and bool(jf_tokens)
             (
@@ -5433,6 +5587,44 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         np.copyto(stage, PAD_SLOT_ID, where=null_mask)
         return torch.from_numpy(stage)
 
+    def _local_max_decode_ctx_len(self, num_reqs: int) -> int:
+        """Return the largest context length over the REAL rows of this step.
+
+        This value selects the decode context bucket, and the bucket sets the
+        `block_table` width. The width is the reduction length of the attention
+        matmuls, so it changes the rounding of the result. Two rules follow.
+
+        Read the real rows only. `InputBatch` does not clear
+        `num_computed_tokens_cpu` when a request leaves, so a padded row holds
+        the context length of a request that already finished. A stale value
+        raises this maximum and selects a wider bucket, and the greedy output
+        then depends on the request history of the server. A padded row needs no
+        context coverage, because the causal mask drops it.
+
+        Return 0 when the step has no request, or when bucketing is off. The
+        caller then falls back to `max_model_len`.
+
+        Args:
+            num_reqs: The real request count of this step, without padding.
+
+        Returns:
+            The largest context length over the real rows, or 0.
+
+        Example:
+            >>> import numpy as np, types
+            >>> from unittest.mock import MagicMock
+            >>> r = MagicMock()
+            >>> r.input_batch.num_computed_tokens_cpu = np.array([100, 4603, 4603])
+            >>> r.neuron_config.decode_context_length_buckets = [4096, 8064]
+            >>> NeuronModelRunner._local_max_decode_ctx_len(r, 1)
+            100
+        """
+        if num_reqs <= 0:
+            return 0
+        if self.neuron_config.decode_context_length_buckets is None:
+            return 0
+        return int(self.input_batch.num_computed_tokens_cpu[:num_reqs].max())
+
     def _decode_ctx_bucket_from_max_decode_ctx_len(
         self,
         max_decode_ctx_len: int,
@@ -5954,6 +6146,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             rank=rank_tensor,
             logit_mask=dummy_logit_mask,
         )
+        # DeltaNet state rows and padding mask. The model folds the token block of
+        # a prefill into one batch row, so the state row input holds one row.
+        warmup_kwargs.update(
+            self._deltanet_warmup_inputs(
+                num_slot_rows=1, num_tokens=num_tokens, device=device
+            )
+        )
+        # Snapshot rows [restore, save] = [0, 0]: no restore, save to the scratch row.
+        if getattr(self, "_deltanet_snapshot_rows_enabled", False):
+            warmup_kwargs["deltanet_snapshot_rows"] = torch.zeros(
+                2, dtype=torch.long, device=device
+            )
         if rotary_position_ids is not None:
             warmup_kwargs["rotary_position_ids"] = rotary_position_ids
         if self.supports_mm_inputs and self.encoder_cache is not None:
@@ -6079,6 +6283,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if previous is not None:
             self._materialize_warmup_output(previous)
 
+    def _warmup_nki_sampler(self, model_output: Any) -> None:
+        """Compile the separate NKI sampler for every batch size, once.
+
+        Only TP rank 0 samples on that route. The warmup draws no random number.
+
+        Example:
+            >>> runner._warmup_nki_sampler(logits)  # doctest: +SKIP
+        """
+        if self.nki_sampling and get_tp_group().rank_in_group == 0:
+            self.sampler.warmup(model_output, self.max_num_reqs)
+
     def _materialize_warmup_output(self, model_output: Any) -> None:
         """Bring a warmup forward's output to CPU to consume the async future.
 
@@ -6132,6 +6347,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 self._tensor_replacer.warmup_context(bucket_size, self.device)
             )
         model_output = self.model(**warmup_kwargs)
+        self._warmup_nki_sampler(model_output)
         if self.use_async_scheduling:
             self._materialize_warmup_output(model_output)
         if self._tensor_replacer is not None:
@@ -6338,6 +6554,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             spec_decode_metadata=spec_decode_metadata,
             rank=rank_tensor,
             logit_mask=dummy_logit_mask,
+        )
+        # DeltaNet state rows and padding mask. A decode step holds one batch row
+        # for each token.
+        decode_warmup_kwargs.update(
+            self._deltanet_warmup_inputs(
+                num_slot_rows=num_tokens, num_tokens=num_tokens, device=device
+            )
         )
         # Always inject prev-step kwargs when the model is decorated. The
         # decorator's prologue calls
@@ -6626,11 +6849,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # scoped_compiler_args(self.resolve_graph_compiler_args(
             # "spec_verify")) and add a branch in the model compiler_args_for.
             model_output = self.model(**kwargs)
+        self._warmup_nki_sampler(model_output)
         if self.use_async_scheduling:
             self._materialize_warmup_output(model_output)
         if self._tensor_replacer is not None:
             set_active_context(None)
         compile_elapsed = time.perf_counter() - compile_start
+        if self.use_async_scheduling and not spec_decode_enabled:
+            self._warmup_token_merge(kwargs["input_ids"].shape[0])
         bucket_name = f"decode_b{batch_size}"
         if kwargs["spec_decode_metadata"] is not None:
             bucket_name += f"_s{1 + self.speculative_config.num_speculative_tokens}"
@@ -6908,6 +7134,288 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self._async_output_materialized_this_step = True
         return True
 
+    def _resolve_async_readback_skip(self) -> None:
+        """Turn the prefill-readback skip and the device token merge on or off.
+
+        Each env var forces its path on (1) or off (0). Unset, a path is on for a model
+        that declares ``supports_async_readback_skip`` (Qwen3.5), the configuration it
+        is measured with. Both paths stay off with speculative decoding, and for a model
+        that consumes the in-graph reorder: the reorder and the device token merge
+        build the same decode input_ids, and the prefill-readback skip assumes the swap
+        path.
+
+        Example:
+            >>> runner._resolve_async_readback_skip()  # doctest: +SKIP
+        """
+        model = getattr(self.model, "_orig_mod", self.model)
+        model_default = getattr(model, "supports_async_readback_skip", False) is True
+        allowed = self.speculative_config is None and not self._use_async_reorder()
+
+        def resolve(flag: bool | None) -> bool:
+            return allowed and (model_default if flag is None else flag)
+
+        self._skip_prefill_readback = resolve(
+            envs.VLLM_NEURON_BACKEND_ASYNC_SKIP_PREFILL_READBACK
+        )
+        self._device_token_merge = resolve(
+            envs.VLLM_NEURON_BACKEND_ASYNC_DEVICE_TOKEN_MERGE
+        )
+        logger.info(
+            "Async scheduling: prefill-readback skip %s, device token merge %s.",
+            "on" if self._skip_prefill_readback else "off",
+            "on" if self._device_token_merge else "off",
+        )
+
+    def _can_skip_prefill_readback(self, scheduler_output: SchedulerOutput) -> bool:
+        """Return True when this step can run without the previous output on the host.
+
+        A step that schedules only new requests is a prefill of prompt tokens.
+        The sampled tokens of the previous step are not inputs of this step. The
+        decode requests that wait during the prefill join the batch again later.
+        At that step, ``_update_states`` takes their token history from the
+        scheduler (``all_token_ids``), not from the output of this runner.
+
+        The skip applies only when all of these conditions are true:
+
+        * Async scheduling is on, and the runner has no speculative decoding.
+        * No KV connector is active.
+        * The step schedules only new requests. No cached request, no resumed
+          request, and no streaming update of a known request is in the step.
+        * A previous output is pending.
+
+        Args:
+            scheduler_output: The scheduler output of this step.
+
+        Returns:
+            True if this step can skip the read of the previous output.
+
+        Example:
+            >>> # A step that schedules only the new request "r7":
+            >>> # runner._can_skip_prefill_readback(scheduler_output)
+            >>> # True
+        """
+        if not self.use_async_scheduling or self.speculative_config is not None:
+            return False
+        if has_kv_transfer_group():
+            return False
+        if self.async_execution_buffer.get("async_output") is None:
+            return False
+        new_reqs = scheduler_output.scheduled_new_reqs
+        if not new_reqs or scheduler_output.scheduled_cached_reqs.req_ids:
+            return False
+        new_req_ids = {req.req_id for req in new_reqs}
+        if any(req_id in self.requests for req_id in new_req_ids):
+            return False
+        return set(scheduler_output.num_scheduled_tokens) == new_req_ids
+
+    def _read_unread_async_outputs(self) -> int:
+        """Read the outputs that earlier prefill steps did not read, in step order.
+
+        Each read copies the sampled tokens to the host and removes the output
+        from the runtime execution queue. Call this function before
+        ``_update_states`` changes the batch. The rows of these outputs are not
+        in the batch at that time, so the read does not change token history.
+        The async-output thread can read the same output. The lock of each
+        output makes sure that only one thread reads it.
+
+        Returns:
+            The number of outputs that this call read.
+
+        Example:
+            >>> # After a skipped read, at the next decode step:
+            >>> # runner._read_unread_async_outputs()
+            >>> # 1
+        """
+        outputs = getattr(self, "_unread_async_outputs", None)
+        if not outputs:
+            return 0
+        count = len(outputs)
+        for async_output in outputs:
+            async_output.get_output()
+        outputs.clear()
+        return count
+
+    def _can_merge_tokens_on_device(self, scheduler_output: SchedulerOutput) -> bool:
+        """Return True when a decode step after a batch change can skip the read.
+
+        At a batch change, the runner usually reads the previous output to the
+        host first. That read waits for the device. A decode step needs only one
+        token for each row:
+
+        * A row that was in the previous step takes the token that the previous
+          step sampled.
+        * A row that was not in the previous step joins the batch again with its
+          full token history from the scheduler. The host token is correct.
+
+        ``_merge_async_tokens_on_device`` builds these tokens on the device, so
+        the worker can submit the step while the previous step runs. This check
+        uses the scheduler output only. The merge does the checks that need the
+        updated batch, and falls back to the read when one of them fails.
+
+        The merge applies only when all of these conditions are true:
+
+        * Async scheduling is on, and the runner has no speculative decoding.
+        * No KV connector is active, and the model has no multimodal inputs.
+        * A previous output is pending, and its sampled tokens are a 1-D future.
+        * The step schedules no new request and no speculative token.
+        * The step schedules one token for each request.
+
+        Args:
+            scheduler_output: The scheduler output of this step.
+
+        Returns:
+            True if this step can take its tokens from the device.
+
+        Example:
+            >>> # Request "r3" finished. The step decodes the other rows:
+            >>> # runner._can_merge_tokens_on_device(scheduler_output)
+            >>> # True
+        """
+        if not self.use_async_scheduling or self.speculative_config is not None:
+            return False
+        if has_kv_transfer_group() or self.supports_mm_inputs:
+            return False
+        async_output = self.async_execution_buffer.get("async_output")
+        if async_output is None or async_output.is_all_partial_prefill():
+            return False
+        future = self.async_execution_buffer.get("futures_sampled_token_ids")
+        if not torch.is_tensor(future) or future.ndim != 1:
+            return False
+        if scheduler_output.scheduled_new_reqs:
+            return False
+        if scheduler_output.scheduled_spec_decode_tokens:
+            return False
+        num_scheduled = scheduler_output.num_scheduled_tokens
+        return bool(num_scheduled) and all(n == 1 for n in num_scheduled.values())
+
+    def _merge_async_tokens_on_device(
+        self, input_ids: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Build the input tokens of this decode step on the device.
+
+        Row ``r`` takes ``future[idx[r]]`` when it was a decode or final prefill
+        row in the previous step. Every other row takes the host token. A
+        compiled graph does the merge. An eager index on a pending output waits
+        for the device, but the compiled graph does not.
+
+        Args:
+            input_ids: The host input tokens of this step, one token per row.
+
+        Returns:
+            The merged device tokens. None if a condition fails. The caller then
+            reads the previous output and uses the host tokens.
+
+        Example:
+            >>> # Rows [a, b] were in the previous step at indices [1, 0]:
+            >>> # runner._merge_async_tokens_on_device(input_ids)
+            >>> # tensor([future[1], future[0], <pad>, ...])
+        """
+        merge_fn = getattr(self, "_token_merge_fn", None)
+        if merge_fn is None or not self._is_decode():
+            return None
+        future = self.async_execution_buffer.get("futures_sampled_token_ids")
+        prev_req_ids = self.async_execution_buffer.get("prev_req_ids_ordered")
+        if not torch.is_tensor(future) or future.ndim != 1 or prev_req_ids is None:
+            return None
+        future = _reinterpret_uint32_as_int32(future, input_ids.dtype)
+        if future.dtype != input_ids.dtype or input_ids.ndim != 1:
+            return None
+        num_reqs = self.input_batch.num_reqs
+        if input_ids.shape[0] < num_reqs:
+            return None
+        shape_key = (int(future.shape[0]), int(input_ids.shape[0]))
+        if shape_key not in self._token_merge_shapes:
+            if shape_key not in self._token_merge_miss_logged:
+                self._token_merge_miss_logged.add(shape_key)
+                logger.warning(
+                    "Async token merge has no compiled graph for (previous "
+                    "output, batch) = %s. The step reads the previous output. "
+                    "Add the shape to the decode warmup to remove the read.",
+                    shape_key,
+                )
+            return None
+
+        async_output = self.async_execution_buffer.get("async_output")
+        partial = getattr(async_output, "_partial_prefill_req_ids", None) or set()
+        prev_index = {req_id: i for i, req_id in enumerate(prev_req_ids)}
+        num_rows = input_ids.shape[0]
+        idx = torch.zeros(num_rows, dtype=torch.long)
+        src = torch.zeros(num_rows, dtype=torch.int32)
+        for row, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            prev_row = prev_index.get(req_id)
+            if prev_row is None or prev_row >= shape_key[0] or req_id in partial:
+                continue
+            idx[row] = prev_row
+            src[row] = 1
+        if not bool(src.any()):
+            # No row needs a token from the device. The host tokens are correct.
+            return input_ids.clone()
+
+        merged = merge_fn(
+            future,
+            input_ids.to(self.device),
+            idx.to(self.device),
+            src.to(self.device),
+        )[0]
+        self._device_token_merges += 1
+        if self._device_token_merges % 1000 == 1:
+            logger.info(
+                "Async scheduling: %d decode steps took their tokens from the "
+                "device after a batch change.",
+                self._device_token_merges,
+            )
+        return merged
+
+    def _warmup_token_merge(self, batch_size: int) -> None:
+        """Compile the token merge graph for a decode batch size.
+
+        The previous output of a decode step has the length of the previous
+        decode batch, or one token for each request of a prefill step. This
+        function compiles each pair of these lengths and the decode batch
+        sizes warmed up so far, in both directions.
+
+        Args:
+            batch_size: The decode batch size that the warmup compiles.
+
+        Example:
+            >>> runner._warmup_token_merge(20)  # doctest: +SKIP
+        """
+        if getattr(self, "_device_token_merge", False) is not True:
+            return
+        if self._token_merge_fn is None:
+
+            def merge(prev, host, idx, src):
+                return (torch.where(src == 1, prev[idx], host),)
+
+            if envs.VLLM_NEURON_CPU_MODE:
+                self._token_merge_fn = merge
+            else:
+                from vllm_neuron.envs import get_compile_backend_name
+
+                self._token_merge_fn = torch.compile(
+                    merge,
+                    backend=get_compile_backend_name(),
+                    fullgraph=True,
+                    dynamic=False,
+                    options=self.compile_options,
+                )
+        batch_sizes = {b for _, b in self._token_merge_shapes} | {batch_size}
+        # NeuronScheduler schedules one prefill in each step, so the output of a
+        # prefill step has one token.
+        prefill_rows = 1
+        pairs = {(length, batch_size) for length in batch_sizes | {prefill_rows}}
+        pairs |= {(batch_size, b) for b in batch_sizes}
+        for prev_len, num_rows in sorted(pairs - self._token_merge_shapes):
+            prev = torch.zeros(prev_len, dtype=torch.int32, device=self.device)
+            host = torch.zeros(num_rows, dtype=torch.int32, device=self.device)
+            idx = torch.zeros(num_rows, dtype=torch.long, device=self.device)
+            src = torch.zeros(num_rows, dtype=torch.int32, device=self.device)
+            self._token_merge_fn(prev, host, idx, src)[0].cpu()
+            self._token_merge_shapes.add((prev_len, num_rows))
+        logger.info(
+            "Async token merge: compiled shapes %s.", sorted(self._token_merge_shapes)
+        )
+
     def _apply_async_fallback_token_fixup(
         self,
         input_ids: torch.Tensor,
@@ -7064,6 +7572,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         if self.use_async_scheduling:
             self._async_output_materialized_this_step = False
+            self._readback_skipped_this_step = False
+            self._merge_tokens_this_step = False
+            if getattr(self, "_device_token_merge", False) is True:
+                # The unread outputs are from two or more steps back. The engine
+                # core already has the output of the step before the previous
+                # step, so these outputs are complete and the read is short.
+                self._read_unread_async_outputs()
 
         logger.debug("=== Starting NeuronModelRunner.execute_model ===")
         logger.debug("scheduler_output=%s", scheduler_output)
@@ -7142,6 +7657,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     has_resumed_request = bool(
                         scheduler_output.scheduled_cached_reqs.resumed_req_ids
                     )
+                    # The prefill-readback skip and the device token merge serve a model
+                    # without the in-graph reorder. load_model turns both off for a model
+                    # with it.
+                    skip_enabled = (
+                        getattr(self, "_skip_prefill_readback", False) is True
+                    )
                     if self._use_async_reorder() and not has_resumed_request:
                         # Skip the device-to-host materialize: the in-graph reorder
                         # assembles the input_ids on the device. Keep the flag False so the
@@ -7151,7 +7672,43 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         # because the reorder needs a non-spec step.
                         self._batch_composition_changed = False
                         self._transition_bonus_tensor = None
+                    elif skip_enabled and self._can_skip_prefill_readback(
+                        scheduler_output
+                    ):
+                        # This step reads prompt tokens only. Keep the previous
+                        # output for a later step, and submit this step now.
+                        self._unread_async_outputs.append(
+                            self.async_execution_buffer["async_output"]
+                        )
+                        self._readback_skipped_this_step = True
+                        self._prefill_readback_skips += 1
+                        if self._prefill_readback_skips % 1000 == 1:
+                            logger.info(
+                                "Async scheduling: %d prefill steps skipped the "
+                                "read of the previous output.",
+                                self._prefill_readback_skips,
+                            )
+                        self._batch_composition_changed = True
+                        self._transition_bonus_tensor = None
+                    elif (
+                        getattr(self, "_device_token_merge", False) is True
+                        and not has_resumed_request
+                        and self._can_merge_tokens_on_device(scheduler_output)
+                    ):
+                        # This decode step takes the tokens of the previous
+                        # step from the device (_merge_async_tokens_on_device).
+                        # A later step reads the previous output.
+                        self._unread_async_outputs.append(
+                            self.async_execution_buffer["async_output"]
+                        )
+                        self._merge_tokens_this_step = True
+                        self._batch_composition_changed = True
+                        self._transition_bonus_tensor = None
                     else:
+                        if skip_enabled:
+                            # Read the skipped outputs first, in step order,
+                            # before _update_states changes the batch.
+                            self._read_unread_async_outputs()
                         self._materialize_pending_async_output(
                             "batch composition changed"
                         )
@@ -7187,6 +7744,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # _update_states is a verbatim copy of upstream, so the lock goes here. It keeps the
         # async-output thread out of the InputBatch for the whole update. See
         # _batch_mutation_lock.
+        # Hybrid models: free the DeltaNet state rows of finished requests, and take the
+        # snapshot rows that this step's prefill restores and saves. Kept out of
+        # _update_states, which stays a verbatim copy of upstream.
+        self._update_deltanet_state_rows(scheduler_output)
+        self._deltanet_snapshot_ops = (
+            getattr(scheduler_output, "deltanet_snapshot_ops", None) or {}
+        )
         with record_function_or_nullcontext("neuron_model_runner: update_states"):
             with self._batch_mutation_lock():
                 self._update_states(scheduler_output)
@@ -7305,8 +7869,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             else:
                 input_ids = self._maybe_swap_async_input_ids(input_ids)
             swap_declined = (not reorder_usable) and input_ids is original_input_ids
-            if swap_declined and not (
-                self.supports_mm_inputs and not self._is_decode()
+            # A step that skipped the read (_can_skip_prefill_readback) reads
+            # prompt tokens only, so its CPU-built input_ids are not stale.
+            readback_skipped = (
+                getattr(self, "_readback_skipped_this_step", False) is True
+            )
+            if (
+                swap_declined
+                and not readback_skipped
+                and not (self.supports_mm_inputs and not self._is_decode())
             ):
                 # The swap rejected the buffered future (shape/dtype mismatch
                 # or no spec-decode match), so we need to use CPU-built
@@ -7320,6 +7891,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 #
                 # Skip on multimodal prefill: input_ids were just built fresh
                 # from the scheduler output — no stale async state to reconcile.
+                #
+                # A declined device merge left the previous output unread. Read
+                # it first, so that the list of unread outputs is empty.
+                self._read_unread_async_outputs()
                 if self._materialize_pending_async_output(
                     "async future shape/dtype mismatch"
                 ):
@@ -7467,6 +8042,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     "Grammar bitmask must be applied to logits before sampling. "
                     "Disable async scheduling with: --no-async-scheduling"
                 )
+
+        # The NKI samplers draw no random number for a row whose chunked prefill
+        # is not final: its token is discarded. A seed then gives the same tokens
+        # however the prompt is chunked or prefix-cached, as on vLLM's GPU runner.
+        if self.nki_sampling or self.nki_in_graph_sampling:
+            index = self.input_batch.req_id_to_index
+            self._nki_discard_rows = {
+                index[req_id]
+                for req_id in self._get_partial_prefill_req_ids(
+                    scheduler_output, self.input_batch.req_ids
+                )
+                if req_id in index
+            }
 
         # Wrap with set_forward_context for DI support
         with (
@@ -7887,6 +8475,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 self, "_async_partial_prefill_req_ids", set()
             ),
         )
+        async_output.pending_nki_logprobs = self._pending_nki_logprobs
+        self._pending_nki_logprobs = None
         self.async_execution_buffer["async_output"] = async_output
         return async_output
 
@@ -8079,6 +8669,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             Either the original ``input_ids`` (sync fallback) or a device
             tensor from the previous step's NEFF output future.
         """
+        # A decode step after a batch change can take its tokens from the
+        # device (see _can_merge_tokens_on_device). None means that a condition
+        # failed. The caller then reads the previous output.
+        if getattr(self, "_merge_tokens_this_step", False) is True:
+            merged = self._merge_async_tokens_on_device(input_ids)
+            if merged is not None:
+                self._async_steps += 1
+                return merged
+            self._merge_tokens_this_step = False
+            self._sync_fallback_steps += 1
+            return input_ids
+
         # spec→non-spec transition: use the device-side bonus tensor
         # extracted from prev_future[:, 0] as this step's input_ids.
         # Scheduler's num_computed_tokens_cpu is one-step stale (doesn't
@@ -8863,6 +9465,146 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         ):
             yield
 
+    def _deltanet_warmup_inputs(
+        self, num_slot_rows: int, num_tokens: int, device: torch.device
+    ) -> dict[str, torch.Tensor]:
+        """The DeltaNet inputs of a warmup step: state rows and padding mask.
+
+        Warmup must give the inputs of a real step, or the traced graph differs
+        from the graph that serves. The values are not important: the trace reads
+        the shapes, and the model reset zeros the row of the first real request.
+        Row 0 keeps every warmup write in range for a spec-decode shape, where
+        the token count is larger than the row count of the state. The mask marks
+        every warmup token as real.
+
+        Args:
+            num_slot_rows: Batch rows of the step (1 for a prefill).
+            num_tokens: Tokens of the step.
+            device: Device of the inputs.
+
+        Returns:
+            ``batch_slot_indices`` and ``deltanet_padding_mask``, or an empty dict
+            for a model without DeltaNet layers, which must not see them.
+        """
+        if getattr(self, "_deltanet_state_slots", None) is None:
+            return {}
+        return {
+            "batch_slot_indices": torch.zeros(
+                num_slot_rows, dtype=torch.long, device=device
+            ),
+            "deltanet_padding_mask": torch.ones(
+                num_tokens, dtype=torch.bfloat16, device=device
+            ),
+        }
+
+    def _deltanet_padding_mask_for(
+        self, positions: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        """The DeltaNet padding mask of a step: 1.0 for a real token, 0.0 for padding.
+
+        Padding positions repeat the last valid position, so real tokens have
+        strictly increasing positions: pos[i] == pos[0] + i. Anchor the expected
+        sequence at pos[0], not 0, or a continuation chunk of a chunked prefill
+        (pos[0] > 0) marks every padding slot as real.
+
+        Args:
+            positions: CPU positions of the step.
+
+        Returns:
+            A bf16 mask of the shape of ``positions``, or None for a model without
+            DeltaNet layers (an extra input would change its traced graph).
+        """
+        if getattr(self, "_deltanet_state_slots", None) is None:
+            return None
+        if positions is None or len(positions) == 0:
+            return None
+        expected_pos = positions[0] + torch.arange(
+            len(positions), dtype=positions.dtype
+        )
+        return (positions >= expected_pos).to(torch.bfloat16)
+
+    def _build_deltanet_slot_indices(
+        self,
+        num_batch_rows: int,
+        is_decode_step: bool,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> torch.Tensor:
+        """Return the DeltaNet state row of each row of the model batch.
+
+        A linear attention layer keeps a recurrent state and a convolution state
+        for each request. The model holds one row for each concurrent request and
+        indexes both states with the tensor that this function builds. A request
+        keeps one row for its whole life, because its position in the batch can
+        change between two steps.
+
+        A decode batch pads up to a compiled bucket. The pool gives each padded
+        row a free row, so a padded row cannot overwrite the state of a request.
+
+        Args:
+            num_batch_rows: The row count that the model sees. Use the length of
+                ``input_ids``. A prefill step ignores this value, because the
+                model folds the whole token block into one batch row.
+            is_decode_step: True for a decode step. False for a prefill step.
+            spec_decode_metadata: The speculative decode metadata of this step.
+
+        Returns:
+            One row index for each batch row, as an int64 tensor on the device.
+
+        Raises:
+            ValueError: A prefill step carries more than one request, or
+                speculative decoding is active.
+
+        Example:
+            Two requests hold row 0 and row 1, and the decode batch pads to a
+            bucket of four rows. The call returns ``tensor([0, 1, 2, 2])``. Row 2
+            is free, so the two padded rows write a row that no request reads.
+        """
+        assert self._deltanet_state_slots is not None
+        req_ids = self.input_batch.req_ids[: self.input_batch.num_reqs]
+        if not is_decode_step:
+            # The model folds the token block of a prefill into one batch row, so
+            # the tensor holds one row. The Neuron platform chunks a prefill at
+            # batch size 1, and it does not mix a prefill with a decode.
+            if len(req_ids) != 1:
+                raise ValueError(
+                    f"A prefill step carries {len(req_ids)} requests, and a "
+                    "DeltaNet model supports one request in a prefill step. The "
+                    "recurrent state of one row cannot hold two sequences. Chunk "
+                    "a prefill at batch size 1."
+                )
+            slots = self._deltanet_state_slots.slots_for_batch(req_ids, 1)
+        else:
+            if spec_decode_metadata is not None:
+                raise ValueError(
+                    "Speculative decoding does not support a DeltaNet model. A "
+                    "decode step then carries more than one token for each "
+                    "request, and one state row holds one token boundary only. "
+                    "Serve this model without a speculative config."
+                )
+            slots = self._deltanet_state_slots.slots_for_batch(req_ids, num_batch_rows)
+        return torch.tensor(slots, dtype=torch.long, device=self.device)
+
+    def _build_deltanet_snapshot_rows(self) -> torch.Tensor:
+        """Return ``[restore_row, save_row]`` of the DeltaNet snapshots of a prefill.
+
+        The scheduler gives the rows in ``SchedulerOutput.deltanet_snapshot_ops``.
+        Row 0 means "none": the step reads the state row of its request, and it
+        writes its final state to the scratch row.
+
+        Returns:
+            An int64 tensor of 2 values on the device.
+
+        Example:
+            >>> # runner._deltanet_snapshot_ops = {"req-0": (3, 0)}
+            >>> # runner._build_deltanet_snapshot_rows()  # tensor([3, 0])
+        """
+        req_ids = self.input_batch.req_ids[: self.input_batch.num_reqs]
+        ops = getattr(self, "_deltanet_snapshot_ops", None) or {}
+        restore_row, save_row = ops.get(req_ids[0], (0, 0)) if req_ids else (0, 0)
+        return torch.tensor(
+            [restore_row, save_row], dtype=torch.long, device=self.device
+        )
+
     def _execute_model_forward(
         self,
         input_ids: torch.Tensor,
@@ -8899,6 +9641,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 positions,
             )
 
+        # DeltaNet padding mask, computed on CPU before the device transfer to
+        # avoid XLA dtype issues. None for a model without DeltaNet layers.
+        _deltanet_padding_mask = self._deltanet_padding_mask_for(positions)
         # Move inputs to Neuron device
         input_ids = input_ids.to(self.device)
         positions = positions.to(self.device)
@@ -8931,9 +9676,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             sampling_metadata = self.input_batch.sampling_metadata
             num_reqs = self.input_batch.num_reqs
 
-            sampling_params_tensor = build_sampling_params_tensor(
-                sampling_metadata, num_reqs, self.device
-            )
+            if self.nki_in_graph_sampling:
+                sampling_params_tensor = build_nki_sampling_params_tensor(
+                    self.input_batch, num_reqs, self._nki_discard_rows
+                )
+            else:
+                sampling_params_tensor = build_sampling_params_tensor(
+                    sampling_metadata, num_reqs, self.device
+                )
 
             # Pad sampling_params to match the decode batch bucket size.
             # block_table rows == padded_num_reqs (1 token per request),
@@ -8943,9 +9693,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 bt_rows = first_meta["block_table_tensor"].shape[0]
                 if sampling_params_tensor.shape[0] < bt_rows:
                     pad_rows = bt_rows - sampling_params_tensor.shape[0]
-                    sampling_params_tensor = torch.nn.functional.pad(
-                        sampling_params_tensor, (0, 0, 0, pad_rows), value=0
-                    )
+                    if self.nki_in_graph_sampling:
+                        # NKI padding rows: greedy at temperature 1, no draw.
+                        pad = torch.tensor([[0.0, 1.0, 1.0]]).expand(pad_rows, 3)
+                        sampling_params_tensor = torch.cat(
+                            [sampling_params_tensor, pad], dim=0
+                        )
+                    else:
+                        sampling_params_tensor = torch.nn.functional.pad(
+                            sampling_params_tensor, (0, 0, 0, pad_rows), value=0
+                        )
 
             # Replicate sampling params for spec-decode verify step
             # (no-op when speculative decoding is not active).
@@ -8969,6 +9726,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if isinstance(self._async_reorder_kwargs, dict):
             model_kwargs.update(self._async_reorder_kwargs)
         model_kwargs["logit_mask"] = logit_mask
+        if _deltanet_padding_mask is not None:
+            model_kwargs["deltanet_padding_mask"] = _deltanet_padding_mask.to(
+                self.device
+            )
         if rotary_position_ids is not None:
             model_kwargs["rotary_position_ids"] = rotary_position_ids.to(self.device)
 
@@ -8984,6 +9745,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             and next(iter(attn_metadata.values()))["max_query_len"]
             <= next(iter(attn_metadata.values()))["decode_token_threshold"]
         )
+        # DeltaNet state rows. Build this for a hybrid model only, because the
+        # extra input changes the traced graph. A dense model keeps its cache.
+        # Read the pool with getattr: __init__ sets it, and a test can build a
+        # runner that skips __init__.
+        if getattr(self, "_deltanet_state_slots", None) is not None:
+            model_kwargs["batch_slot_indices"] = self._build_deltanet_slot_indices(
+                num_batch_rows=input_ids.shape[0],
+                is_decode_step=bool(is_decode_step),
+                spec_decode_metadata=spec_decode_metadata,
+            )
+            if not is_decode_step and getattr(
+                self, "_deltanet_snapshot_rows_enabled", False
+            ):
+                model_kwargs["deltanet_snapshot_rows"] = (
+                    self._build_deltanet_snapshot_rows()
+                )
+
         if self._model_is_async_spec_decoded() and is_decode_step:
             num_reqs_padded = (
                 spec_decode_metadata.bonus_logits_indices.shape[0]
@@ -9114,9 +9892,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         # Parse model output based on on-device sampling and spec decode configuration
         self._on_device_logits = None
+        self._on_device_nki_scores = None
         last_accepted_token: torch.Tensor | None = None
 
-        if self.on_device_sampling:
+        if self.nki_in_graph_sampling:
+            # Token IDs [B], selected logprobs [B, 1], ranks [B, 1].
+            model_output_tensor, scores, ranks = model_output
+            self._on_device_nki_scores = (scores, ranks)
+            aux_hidden_states = None
+        elif self.on_device_sampling:
             if self.is_spec_decode:
                 if spec_decode_metadata is not None:
                     # Eagle3 + spec decode: model returns 4-tuple
@@ -9158,8 +9942,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             if self._debug_logits_dir:
                 self._on_device_logits = model_output_tensor
 
-        # Move model_output_tensor (logits or sampled token ids) back to CPU
-        if not self.use_async_scheduling:
+        # Move model_output_tensor (logits or sampled token ids) back to CPU.
+        # The separate NKI sampler reads the logits on the device.
+        if not self.use_async_scheduling and not self.nki_sampling:
             model_output_tensor = model_output_tensor.to("cpu")
 
         return model_output_tensor, aux_hidden_states, last_accepted_token
@@ -10301,6 +11086,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         sampling_metadata = self.input_batch.sampling_metadata
 
         if self.use_async_scheduling:
+            # In-graph NKI sampling: keep the selected-token logprobs as device
+            # futures. AsyncNeuronModelRunnerOutput.get_output() reads them
+            # with the sampled tokens.
+            self._pending_nki_logprobs = None
+            if (
+                self.nki_in_graph_sampling
+                and self._on_device_nki_scores is not None
+                and sampling_metadata.max_num_logprobs is not None
+            ):
+                self._pending_nki_logprobs = (
+                    model_output_tensor,
+                    *self._on_device_nki_scores,
+                )
             if spec_decode_metadata is not None:
                 # Async spec decode: keep the raw rejection-sampler output
                 # (device tensor [bs, num_spec+1]) as-is. Materialization is
@@ -10329,7 +11127,24 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 sampler_output = SamplerOutput(output_token_ids, None)
                 return sampler_output
 
-            if not self.on_device_sampling:
+            if self.nki_sampling:
+                sampler_output = self._sample_separate_nki(
+                    model_output_tensor, sampling_metadata
+                )
+            elif self.nki_in_graph_sampling:
+                output_token_ids = [[x] for x in model_output_tensor.tolist()]
+                logprobs = None
+                if (
+                    sampling_metadata.max_num_logprobs is not None
+                    and self._on_device_nki_scores is not None
+                ):
+                    logprobs = _nki_logprobs_tensors(
+                        model_output_tensor,
+                        *self._on_device_nki_scores,
+                        len(output_token_ids),
+                    )
+                sampler_output = SamplerOutput(output_token_ids, logprobs)
+            elif not self.on_device_sampling:
                 logger.info("Using vLLM Sampler")
                 sampler_output = self.sampler(
                     logits=model_output_tensor,
@@ -10413,6 +11228,69 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
             sampler_output.sampled_token_ids = output_token_ids
 
+        return sampler_output
+
+    def _sample_separate_nki(
+        self, logits: torch.Tensor, sampling_metadata
+    ) -> SamplerOutput:
+        """Sample the gathered logits with the separate NKI sampler graph.
+
+        TP rank 0 samples and broadcasts the result, so every rank emits the
+        same tokens. A batch with top_k/top_p filtering goes to the vLLM CPU
+        sampler, with the metadata and the logits on the CPU.
+
+        Example:
+            >>> out = runner._sample_separate_nki(logits, runner.input_batch.sampling_metadata)  # doctest: +SKIP
+        """
+        logits = logits[: self.input_batch.num_reqs]
+        use_cpu = has_sampling_filters(sampling_metadata, self.vocab_size)
+        tp_group = get_tp_group()
+        payload = None
+        if tp_group.rank_in_group == 0:
+            try:
+                if logits.ndim != 2 or logits.shape[1] != self.vocab_size:
+                    raise ValueError(
+                        f"Expected full vocabulary width {self.vocab_size}, "
+                        f"received logits shape {tuple(logits.shape)}"
+                    )
+                # A discarded row (a chunked prefill that is not final) must not
+                # advance its seed: restore its generator after the draw.
+                saved = {
+                    row: generator.get_state()
+                    for row, generator in sampling_metadata.generators.items()
+                    if row in getattr(self, "_nki_discard_rows", ())
+                }
+                if use_cpu:
+                    sampling_metadata = replace(
+                        sampling_metadata,
+                        **{
+                            f.name: value.cpu()
+                            for f in fields(sampling_metadata)
+                            if isinstance(
+                                value := getattr(sampling_metadata, f.name),
+                                torch.Tensor,
+                            )
+                        },
+                    )
+                    # The CPU sampler changes the logits in place.
+                    logits = logits.cpu().clone()
+                    sampler = self.cpu_sampler
+                else:
+                    sampler = self.sampler
+                payload = (
+                    sampler(logits=logits, sampling_metadata=sampling_metadata),
+                    None,
+                )
+                for row, state in saved.items():
+                    sampling_metadata.generators[row].set_state(state)
+            except Exception as error:
+                # Send the failure, so the other ranks do not wait for a result.
+                payload = (None, f"{type(error).__name__}: {error}")
+        if tp_group.world_size > 1:
+            payload = tp_group.broadcast_object(payload, src=0)
+        sampler_output, error = payload
+        if error is not None:
+            raise RuntimeError(f"Neuron NKI sampling failed: {error}")
         return sampler_output
 
     def _parse_rejection_sampling_output(
@@ -10803,11 +11681,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self.model.bind_kv_cache(kv_caches)
         self.model.set_kv_cache_buffers(K_list, V_list)
 
-        if has_kv_transfer_group():
-            kv_caches_view = self.get_kv_cache_view_for_connector_registration(
-                kv_caches
-            )
-            get_kv_transfer_group().register_kv_caches(kv_caches_view)
+        self._register_caches_with_connector(kv_caches)
 
         return kv_caches
 
@@ -11161,13 +12035,51 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             if isinstance(self.drafter, DFlashProposer):
                 self.drafter.alias_target_weights(target_model=self.model)
 
-        if has_kv_transfer_group():
-            kv_caches_view = self.get_kv_cache_view_for_connector_registration(
-                kv_caches
-            )
-            get_kv_transfer_group().register_kv_caches(kv_caches_view)
+        self._register_caches_with_connector(kv_caches)
 
         return kv_caches
+
+    def _register_caches_with_connector(self, kv_caches) -> None:
+        """Give the KV cache to the KV transfer connector, after the model binds its caches.
+
+        A hybrid model keeps its DeltaNet recurrent state in model buffers, outside the KV
+        cache, and no connector moves that state. A decode node would then start from an empty
+        state and answer wrongly, so refuse KV transfer for such a model.
+
+        Args:
+            kv_caches: The cache tensors of each layer, from `initialize_kv_cache`.
+
+        Raises:
+            ValueError: KV transfer is on and the model keeps a recurrent state.
+        """
+        if not has_kv_transfer_group():
+            return
+        if self._deltanet_state_slots is not None:
+            raise ValueError(
+                "KV transfer does not move the DeltaNet recurrent state of this model. "
+                "Serve it without a KV connector."
+            )
+        kv_caches_view = self.get_kv_cache_view_for_connector_registration(kv_caches)
+        get_kv_transfer_group().register_kv_caches(kv_caches_view)
+
+    def _update_deltanet_state_rows(self, scheduler_output: "SchedulerOutput") -> None:
+        """Free the DeltaNet state row of each finished request.
+
+        A request that the scheduler did not schedule keeps its row. The scheduler can resume
+        it, and the row still holds the state of its prompt. Do nothing for a model that keeps
+        no recurrent state.
+
+        Args:
+            scheduler_output: The output of the scheduler for this step.
+
+        Example:
+            >>> # runner._update_deltanet_state_rows(scheduler_output)
+        """
+        state_slots = self._deltanet_state_slots
+        if state_slots is None:
+            return
+        for req_id in scheduler_output.finished_req_ids:
+            state_slots.free(req_id)
 
     def get_kv_cache_view_for_connector_registration(self, kv_caches):
         """
