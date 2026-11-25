@@ -238,6 +238,22 @@ class Inkling2ForCausalLM(nn.Module):
         cfg.neuron_config = neuron_config
         return cls(cfg)
 
+    def compiler_args_for(self, graph_type, example_inputs, base):
+        """neuronx-cc arguments a graph (the runner calls this unless ``--optimization-level`` is given).
+
+        The decode graph compiles at ``-O3``: the ``-O1`` modular flow wraps each collective
+        (``PSEUDO_FUNCTION_RETURN`` / ``EVENT_SEMAPHORE``), and a decode step here has 96 all-reduces (two a layer
+        visit). ``INKLING2_DECODE_O`` / ``INKLING2_PREFILL_O`` override the levels (prefill keeps the base level)."""
+        import os
+
+        from vllm_neuron.utils.compiler_args_ctx import with_optimization_level
+
+        base = list(base or [])
+        level = os.environ.get("INKLING2_DECODE_O" if graph_type == "decode" else "INKLING2_PREFILL_O")
+        if graph_type == "decode" and level is None:
+            level = "3"
+        return with_optimization_level(base, int(level)) if level else base
+
     # -- KV cache --
 
     def _capture_block_size(self) -> None:
