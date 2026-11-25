@@ -92,8 +92,21 @@ def params_from_hf(m, cfg):
             for g in ("q", "k", "v", "mlp"):
                 p[f"gate_{g}"] = tuple(s(f"{g}_message_gate.{n}.weight")
                                        for n in ("down_proj", "forget_gate_proj", "message_gate_proj"))
-        out["layers"].append(p)
+        out["layers"].append(to_in_out(p))
     return out
+
+
+def to_in_out(p):
+    """HF's ``[out, in]`` weights in the ``[in, out]`` layout ops.py reads."""
+    for k in ("wq", "wk", "wv", "wo", "wgate", "wsink", "wr", "k_wproj", "v_wproj", "router"):
+        if k in p:
+            p[k] = p[k].t().contiguous()
+    p["gate_up"] = p["gate_up"].transpose(1, 2).contiguous()
+    p["down"] = p["down"].transpose(1, 2).contiguous()
+    for g in ("q", "k", "v", "mlp"):
+        if f"gate_{g}" in p:
+            p[f"gate_{g}"] = tuple(t.t().contiguous() for t in p[f"gate_{g}"])
+    return p
 
 
 class ContiguousIO(ops.LayerIO):
@@ -251,4 +264,15 @@ def test_windowed_context_matches_hf(setup):
         out += [logits_of(params, cfg, ids[:, t:t + 1], io, t, dense=False) for t in range(T - n, T)]
     ours = torch.cat(out, dim=1)
     dmax, agree = _report("windowed chunked prefill + decode", ours, ref)
+    assert agree == 1.0 and dmax < 1e-3
+
+
+def test_fused_projections_match_hf(setup):
+    """The stacked projections (ops.fuse_projections) give the same logits."""
+    m, cfg, params, ids, ref = setup
+    fused = dict(params, layers=[ops.fuse_projections(p) for p in params["layers"]])
+    io = _zero_window_io(ContiguousIO(), 1, cfg, fused)
+    with torch.no_grad():
+        ours = logits_of(fused, cfg, ids, io, 0, dense=True)
+    dmax, agree = _report("fused projections", ours, ref)
     assert agree == 1.0 and dmax < 1e-3

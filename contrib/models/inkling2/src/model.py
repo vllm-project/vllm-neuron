@@ -42,6 +42,13 @@ F32 = torch.float32
 STATE_LAYER = "state.conv"
 
 
+def _nki(kernel):
+    from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+    from vllm_neuron.utils.hardware_config import get_logical_nc_config
+
+    return wrap_nki(kernel)[get_logical_nc_config()]
+
+
 def cache_name(c: int) -> str:
     return f"layers.{c}.self_attn"
 
@@ -54,20 +61,21 @@ class Layer(nn.Module):
         H, d, hq, hkv = cfg.hidden_size, cfg.head_dim, cfg.q_heads_per_rank, cfg.kv_heads_per_rank
         E, I = cfg.num_experts, cfg.inter_per_rank
         P = lambda *shape, dtype=DTYPE: nn.Parameter(torch.empty(*shape, dtype=dtype), requires_grad=False)  # noqa
-        self.wq, self.q_scale = P(hq * d, H), P(hq, d)
-        self.wk, self.wv = P(hkv * d, H), P(hkv * d, H)
-        self.wo, self.wgate, self.wsink = P(H, hq * d), P(hq * d, H), P(hq, H)
-        self.wr, self.r_scale, self.r_proj = P(hq * cfg.d_rel, H), P(hq, cfg.d_rel), P(cfg.d_rel, cfg.rel_extent)
+        # every matrix [in, out] (ops.py)
+        self.wq, self.q_scale = P(H, hq * d), P(hq, d)
+        self.wk, self.wv = P(H, hkv * d), P(H, hkv * d)
+        self.wo, self.wgate, self.wsink = P(hq * d, H), P(H, hq * d), P(H, hq)
+        self.wr, self.r_scale, self.r_proj = P(H, hq * cfg.d_rel), P(hq, cfg.d_rel), P(cfg.d_rel, cfg.rel_extent)
         self.post_norm, self.mlp_query = P(H), P(1, H, dtype=F32)
         self.post_attn_conv, self.post_mlp_conv = P(H, ops.CONV_TAPS, dtype=F32), P(H, ops.CONV_TAPS, dtype=F32)
-        self.router, self.router_bias = P(E, H, dtype=F32), P(E, dtype=F32)
-        self.gate_up, self.down = P(E, 2 * I, H), P(E, H, I)
+        self.router, self.router_bias = P(H, E, dtype=F32), P(E, dtype=F32)
+        self.gate_up, self.down = P(E, H, 2 * I), P(E, I, H)
         self.full = cfg.is_full(L)
         if L > 0:
             self.attn_query = P(3 if self.full else 1, H, dtype=F32)
         if self.full:
             self.k_static, self.v_static = P(ops.CONV_TAPS, hkv * d), P(ops.CONV_TAPS, hkv * d)
-            self.k_wproj, self.v_wproj = P(hkv * ops.CONV_TAPS, H), P(hkv * ops.CONV_TAPS, H)
+            self.k_wproj, self.v_wproj = P(H, hkv * ops.CONV_TAPS), P(H, hkv * ops.CONV_TAPS)
             self.q_norm, self.k_norm, self.v_norm = P(H), P(H), P(H)
         else:
             self.k_conv = P(hkv * d, ops.CONV_TAPS, dtype=F32)
@@ -76,12 +84,13 @@ class Layer(nn.Module):
         self.loop = cfg.loop_start <= L < cfg.loop_end
         if self.loop:
             for g in ("q", "k", "v", "mlp"):
-                setattr(self, f"gate_{g}_down", P(cfg.gate_rank, 2 * H))
-                setattr(self, f"gate_{g}_forget", P(H, cfg.gate_rank, dtype=F32))
-                setattr(self, f"gate_{g}_gain", P(H, cfg.gate_rank, dtype=F32))
+                setattr(self, f"gate_{g}_down", P(2 * H, cfg.gate_rank))
+                setattr(self, f"gate_{g}_forget", P(cfg.gate_rank, H, dtype=F32))
+                setattr(self, f"gate_{g}_gain", P(cfg.gate_rank, H, dtype=F32))
 
     def params(self) -> dict:
         p = {n: t for n, t in self.named_parameters()}
+        p.update(getattr(self, "fused", {}))
         if self.loop:
             for g in ("q", "k", "v", "mlp"):
                 p[f"gate_{g}"] = (p[f"gate_{g}_down"], p[f"gate_{g}_forget"], p[f"gate_{g}_gain"])
@@ -154,6 +163,13 @@ class PagedIO(ops.LayerIO):
     def put_window(self, c, slot, seq):
         self.new[(c, slot)] = ops.next_window(seq, self.valid).to(DTYPE)
 
+    def moe_decode(self, x, idx, w, gate_up, down):
+        """The decode MoE on nkilib's selective-expert kernel with Inkling 2's activation (kernels/moe_decode.py)."""
+        if not self.m.use_moe_kernel:
+            return ops.moe_gather(x, idx, w, gate_up, down, self.m.config.gate_cap, self.m.config.up_cap)
+        from .kernels import moe_decode as K
+        return K.moe_decode(_nki, x, idx, w, gate_up, down)
+
     def all_reduce(self, x):
         tp = self.m.tp_group
         return tp.all_reduce(x) if tp.world_size > 1 else x
@@ -191,7 +207,7 @@ class Inkling2ForCausalLM(nn.Module):
         self.embed_norm, self.norm = P(c.hidden_size), P(c.hidden_size)
         self.final_query = P(1, c.hidden_size, dtype=F32)
         self.message_query = P(c.loop_layers, 4, c.hidden_size, dtype=F32)
-        self.lm_head = P(c.lm_rows_per_rank, c.hidden_size)
+        self.lm_head = P(c.hidden_size, c.lm_rows_per_rank)
         self.layers = nn.ModuleList([Layer(c, L) for L in range(c.num_layers)])
         nc = c.neuron_config if hasattr(c, "neuron_config") else None
         self.on_device_sampling_config = nc.on_device_sampling_config if nc else None
@@ -200,6 +216,16 @@ class Inkling2ForCausalLM(nn.Module):
             self.sampler = Sampler(self.on_device_sampling_config, process_group=self.tp_group.device_group)
         # padded LM-head rows (past the unpadded vocab) never win; filled in load_weights
         self.register_buffer("vocab_mask", torch.zeros(c.lm_rows_per_rank, dtype=F32), persistent=False)
+        # the NKI decode MoE (kernels/moe_decode.py), opt-in with INKLING2_NKI_MOE=1: alone it is faster than the torch
+        # gather (0.267 against 0.339 ms a visit at two rows) but inside the 48-visit decode graph it measured slower
+        # (TPOT 59.6 against 42.6 ms): a kernel call per visit costs more than the fused torch ops around it
+        import os
+
+        self.use_moe_kernel = os.environ.get("INKLING2_NKI_MOE") == "1"
+        if self.use_moe_kernel:
+            from .kernels import moe_decode as K
+
+            K.install()
         self.kv_cache = None
         self.state_layout = None
         self.state_planes = None
@@ -292,7 +318,7 @@ class Inkling2ForCausalLM(nn.Module):
         io.publish()
 
         h = torch.index_select(h.reshape(B * S, -1), 0, sampling_positions)
-        logits = ops.softcap((h @ self.lm_head.t()).float(), c.final_cap) + self.vocab_mask
+        logits = ops.softcap((h @ self.lm_head).float(), c.final_cap) + self.vocab_mask
         if self.on_device_sampling_config is None:
             full = self.tp_group.all_gather(logits, dim=1) if self.world_size > 1 else logits
             return full[:, :c.unpadded_vocab_size]
@@ -308,6 +334,7 @@ class Inkling2ForCausalLM(nn.Module):
         c, tp, r_ = self.config, self.world_size, None
         d, hq, hkv, I = c.head_dim, c.q_heads_per_rank, c.kv_heads_per_rank, c.inter_per_rank
         f32 = lambda t: t.float()  # noqa: E731
+        T_ = lambda t: t.t().contiguous()  # noqa: E731 (checkpoint [out, in] -> ops.py's [in, out])
         m = {}
 
         def add(param, keys, fn):
@@ -325,18 +352,18 @@ class Inkling2ForCausalLM(nn.Module):
         add(self.message_query, [f"{prefix}middle_cycle_cross_pass_queries", f"{prefix}middle_cycle_cross_pass_kv_queries"],
             lambda s, rank: W.message_queries(s[0], s[1]))
         add(self.lm_head, f"{prefix}unembed.weight",
-            lambda s, rank: W.lm_head(s[0], rank, c.lm_rows_per_rank, c.unpadded_vocab_size))
+            lambda s, rank: T_(W.lm_head(s[0], rank, c.lm_rows_per_rank, c.unpadded_vocab_size)))
         for L, lay in enumerate(self.layers):
             a = f"{prefix}layers.{L}.attn."
             g = f"{prefix}layers.{L}."
-            add(lay.wq, a + "wq_du.weight", lambda s, rank: W.rows(s[0], rank, hq * d))
+            add(lay.wq, a + "wq_du.weight", lambda s, rank: T_(W.rows(s[0], rank, hq * d)))
             add(lay.q_scale, a + "q_l2_clip.scale", lambda s, rank: W.rows(s[0], rank, hq))
-            add(lay.wk, a + "wk_dv.weight", lambda s, rank: W.rows(s[0], rank, hkv * d))
-            add(lay.wv, a + "wv_dv.weight", lambda s, rank: W.rows(s[0], rank, hkv * d))
-            add(lay.wo, a + "wo_ud.weight", lambda s, rank: W.cols(s[0], rank, hq * d))
-            add(lay.wgate, a + "gate_attn.weight", lambda s, rank: W.rows(s[0], rank, hq * d))
-            add(lay.wsink, a + "attn_sink_proj.weight", lambda s, rank: W.rows(s[0], rank, hq))
-            add(lay.wr, a + "wr_du.weight", lambda s, rank: W.rows(s[0], rank, hq * c.d_rel))
+            add(lay.wk, a + "wk_dv.weight", lambda s, rank: T_(W.rows(s[0], rank, hkv * d)))
+            add(lay.wv, a + "wv_dv.weight", lambda s, rank: T_(W.rows(s[0], rank, hkv * d)))
+            add(lay.wo, a + "wo_ud.weight", lambda s, rank: T_(W.cols(s[0], rank, hq * d)))
+            add(lay.wgate, a + "gate_attn.weight", lambda s, rank: T_(W.rows(s[0], rank, hq * d)))
+            add(lay.wsink, a + "attn_sink_proj.weight", lambda s, rank: T_(W.rows(s[0], rank, hq)))
+            add(lay.wr, a + "wr_du.weight", lambda s, rank: T_(W.rows(s[0], rank, hq * c.d_rel)))
             add(lay.r_scale, a + "rel_l2_clip.scale", lambda s, rank: W.rows(s[0], rank, hq))
             add(lay.r_proj, a + "rel_logits_proj.proj", lambda s, rank: s[0][:])
             add(lay.post_norm, g + "mlp_norm.weight", lambda s, rank: s[0][:])
@@ -347,7 +374,7 @@ class Inkling2ForCausalLM(nn.Module):
                     lambda s, rank, n=n: f32(s[0][:]).view(n, -1))
             add(lay.post_attn_conv, g + "attn_sconv.weight", lambda s, rank: f32(s[0][:]).squeeze(1))
             add(lay.post_mlp_conv, g + "mlp_sconv.weight", lambda s, rank: f32(s[0][:]).squeeze(1))
-            add(lay.router, g + "mlp.gate.weight", lambda s, rank: f32(s[0][:]))
+            add(lay.router, g + "mlp.gate.weight", lambda s, rank: T_(f32(s[0][:])))
             add(lay.router_bias, g + "mlp.gate.bias", lambda s, rank: f32(s[0][:]))
             e = g + "mlp.experts."
             nv = L < 20  # NVFP4 layers carry amax and the outer denominator; MXFP8 ones do not
@@ -356,15 +383,15 @@ class Inkling2ForCausalLM(nn.Module):
             keys2 = [e + "w2_weight", e + "w2_weight_scale"] + (
                 [e + "w2_weight_amax", e + "w2_weight_outer_scale_denominator"] if nv else [])
             add(lay.gate_up, keys13, lambda s, rank, nv=nv: W.gate_up(
-                s[0], s[1], s[2] if nv else None, s[3] if nv else None, rank, I))
+                s[0], s[1], s[2] if nv else None, s[3] if nv else None, rank, I).transpose(1, 2).contiguous())
             add(lay.down, keys2, lambda s, rank, nv=nv: W.down(
-                s[0], s[1], s[2] if nv else None, s[3] if nv else None, rank, I))
+                s[0], s[1], s[2] if nv else None, s[3] if nv else None, rank, I).transpose(1, 2).contiguous())
             if lay.full:
                 for x in ("k", "v"):
                     add(getattr(lay, f"{x}_static"), a + f"{x}_sconv.static_w",
                         lambda s, rank: W.cols(s[0], rank, hkv * d))
                     add(getattr(lay, f"{x}_wproj"), a + f"{x}_sconv.weight_proj",
-                        lambda s, rank: W.rows(s[0], rank, hkv * ops.CONV_TAPS))
+                        lambda s, rank: T_(W.rows(s[0], rank, hkv * ops.CONV_TAPS)))
                     add(getattr(lay, f"{x}_norm"), g + f"{x}_input_norm.weight", lambda s, rank: s[0][:])
                 add(lay.q_norm, g + "q_input_norm.weight", lambda s, rank: s[0][:])
             else:
@@ -375,9 +402,9 @@ class Inkling2ForCausalLM(nn.Module):
             if lay.loop:
                 for ours, theirs in (("q", "attn"), ("k", "k"), ("v", "v"), ("mlp", "mlp")):
                     cg = g + f"controllers.{theirs}."
-                    add(getattr(lay, f"gate_{ours}_down"), cg + "down_weight", lambda s, rank: s[0][:])
-                    add(getattr(lay, f"gate_{ours}_forget"), cg + "forget_weight", lambda s, rank: f32(s[0][:]))
-                    add(getattr(lay, f"gate_{ours}_gain"), cg + "gain_weight", lambda s, rank: f32(s[0][:]))
+                    add(getattr(lay, f"gate_{ours}_down"), cg + "down_weight", lambda s, rank: T_(s[0][:]))
+                    add(getattr(lay, f"gate_{ours}_forget"), cg + "forget_weight", lambda s, rank: T_(f32(s[0][:])))
+                    add(getattr(lay, f"gate_{ours}_gain"), cg + "gain_weight", lambda s, rank: T_(f32(s[0][:])))
         return m
 
     def load_weights(self, checkpoint_path: str, device: torch.device, cache_dir: str | None) -> None:
@@ -393,6 +420,10 @@ class Inkling2ForCausalLM(nn.Module):
         if missing:
             raise ValueError(f"Inkling 2 weights not loaded: {sorted(missing)[:8]} ({len(missing)} in all)")
         self.load_state_dict(state, strict=False, assign=True)
+        # stacked projections (ops.fuse_projections): fewer, larger matmuls a visit; built once on the device
+        for lay in self.layers:
+            f = ops.fuse_projections({n: t for n, t in lay.named_parameters()})
+            lay.fused = {k: f[k] for k in ("w_qside", "qside_sizes", "w_kv", "gate_qkv", "kv_conv") if k in f}
         # built here: the runner constructs the module on the meta device
         c = self.config
         mask = torch.zeros(c.lm_rows_per_rank, dtype=F32)
