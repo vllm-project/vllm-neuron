@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=77.0.3,<80.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inkling2-neuron"
+version = "0.1.0"
+description = "Inkling 2 Mini (text, looped transformer) for vLLM Neuron (contrib model)"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = []  # runs inside a vllm-neuron environment
+
+# vLLM calls register() in every process (API server, engine, workers).
+[project.entry-points."vllm.general_plugins"]
+inkling2 = "inkling2_neuron:register"
+
+[tool.setuptools]
+package-dir = {"inkling2_neuron" = "src"}
+packages = ["inkling2_neuron"]
