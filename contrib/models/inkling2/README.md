@@ -44,15 +44,19 @@ export NEURON_LOGICAL_NC_CONFIG=1 NEURON_SKIP_EFA_AFFINITY=1
 export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.10
 vllm serve /models/Inkling-2-Mini-bf16 --served-model-name inkling \
   --tensor-parallel-size 8 --max-model-len 16384 --max-num-seqs 2 --max-num-batched-tokens 256 \
-  --block-size 256 --gpu-memory-utilization 0.90 --no-enable-prefix-caching --optimization-level 1 \
+  --block-size 256 --gpu-memory-utilization 0.90 --no-enable-prefix-caching \
   --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [256], "num_seqs_buckets": [2],
                         "on_device_sampling_config": {"all_greedy": true}}}'
 ```
 
 - `--no-enable-prefix-caching` is required (`factory.py` refuses the launch otherwise): the convolution windows live
   in the request's first KV block, which two requests sharing a cached prefix would share.
+- Do not pass `--optimization-level`: the model then compiles its decode graph at `-O3`
+  (`Inkling2ForCausalLM.compiler_args_for`), and the prefill graph at the runner's base level. An explicit level
+  applies to every graph (measured: 42.97 ms a token with `--optimization-level 1`, 31.27 ms with the decode graph at
+  `-O3`).
 - `num_seqs_buckets: [2]` runs a single request padded to two rows, which decodes faster than the one-row graph
-  (61.1 against 111.7 ms a token, see Results).
+  (31.3 against 61.6 ms a token, see Results).
 - The KV cap of 0.10 (1.08 GiB a core, 38,400 tokens) is what fits beside the weights (6.17 GiB a core) and the
   compiled graphs' scratchpad (4.0 GB); see Limitations.
 - The first launch compiles the prefill graph and the decode graphs (about 25 minutes on a trn2.3xlarge); a relaunch
@@ -80,10 +84,10 @@ One trn2.3xlarge, TP=8, bf16, the configuration above, greedy.
 
 **Accuracy.**
 - Teacher-forced against Hugging Face on CPU (transformers 5.24, experts dequantized to bf16), 24 steps on each of
-  four prompts of 5, 759, 2021 and 4863 tokens (the last two past the sliding window): 93 of 96 steps with the same
-  argmax. At each of the 3 others the server's token is Hugging Face's second choice, with a top-1 to top-2 gap of
-  0.000, 0.039 and 0.062.
-- GSM8K, first 100 questions, five-shot completions at temperature 0: 0.890, none unparsed.
+  four prompts of 5, 759, 2021 and 4863 tokens (the last two past the sliding window): 94 of 96 steps with the same
+  argmax. At each of the 2 others the server's token is Hugging Face's second choice, with a top-1 to top-2 gap of
+  0.000 and 0.105.
+- GSM8K, first 100 questions, five-shot completions at temperature 0: 0.880, none unparsed.
 - A code hidden at 10, 50 and 90 percent of filler text is answered exactly at 2147 and at 12122 tokens of prompt
   (6 of 6).
 
@@ -91,13 +95,14 @@ One trn2.3xlarge, TP=8, bf16, the configuration above, greedy.
 
 | Clients | TTFT p50 | TPOT p50 | Output tokens/s |
 | --- | --- | --- | --- |
-| 1 | 1.81 s | 61.1 ms | 15.9 |
-| 2 | 2.71 s | 61.7 ms | 31.1 |
+| 1 | 2.09 s | 31.3 ms | 30.0 |
+| 2 | 3.13 s | 32.1 ms | 57.0 |
 
-With a one-row decode graph (`num_seqs_buckets: [1, 2]`) a single client decodes at 111.7 ms a token (8.8 tokens/s).
+With a one-row decode graph (`num_seqs_buckets: [1, 2]`) a single client decodes at 61.6 ms a token (15.7 tokens/s).
+With `--optimization-level 1` (prefill and decode at `-O1`): TTFT 1.61 s, TPOT 43.0 ms at one client.
 
 **Steadiness.** 64 requests at 2 clients with random lengths (410 to about 7800 prompt tokens, 51 to 972 output
-tokens): 64 completed, none failed; TPOT p50 69.5 ms, p99 134.4 ms (chunks of other requests' prefills run between
+tokens): 64 completed, none failed; TTFT p50 7.85 s, TPOT p50 40.3 ms, p99 115.6 ms (chunks of other requests' prefills run between
 decode steps).
 
 ## Limitations
@@ -106,11 +111,14 @@ decode steps).
   the graphs: the largest graph's scratchpad is 4.0 GB a core. Not investigated further.
 - The cache layers of the sliding-window layers keep the whole context although they read only the window; declaring
   them as sliding-window layers would cut the KV per token about 6 times (longer contexts).
-- The decoder is plain torch: no NKI kernel for the attention or the MoE. On one core, the whole decoder's decode
-  step takes 31.7 ms at one row and 50.6 ms at two (no all-reduce); half of a layer visit at one row is the gather of
-  the experts' weights.
-- The one-row decode graph is slower than the two-row one (111.7 against 61.7 ms a token); not explained. The
+- The decoder is torch. `src/kernels/moe_decode.py` runs the decode MoE on nkilib's `moe_tkg` with Inkling 2's
+  activation (opt-in, `INKLING2_NKI_MOE=1`); inside the 48-visit decode graph it measured slower (35.9 against 31.3
+  ms a token), so it is off by default.
+- The one-row decode graph is slower than the two-row one (61.6 against 31.3 ms a token); not explained. The
   configuration above avoids it.
+- The prefill graph compiles at the runner's base level (`-O2` without `--optimization-level`); at `-O1` the TTFT is
+  1.61 s instead of 2.09 s, but the runner applies a level to the prefill graph only through the flag, which also
+  sets the decode graph.
 - Not served: images, the DSpark speculative decoding draft, prefix caching, sampling other than greedy was not
   tested.
 
