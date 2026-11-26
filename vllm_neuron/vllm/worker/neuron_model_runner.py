@@ -998,6 +998,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 dcp_stride=dcp_stride,
             )
         )
+        # Number of co-admitted prefills the scheduler may dispatch. The prefill
+        # warmup compiles one graph per row count 1..max_prefills_per_batch.
+        self.max_prefills_per_batch = int(
+            neuron_config_dict.get("max_prefills_per_batch", 1)
+        )
 
         if user_set_num_batched_tokens_buckets:
             logger.info(
@@ -5884,6 +5889,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         bucket_size: int,
         kv_segment_size: int,
         device: torch.device | None = None,
+        num_reqs: int = 1,
     ) -> dict:
         """Build synthetic inputs for prefill warmup.
 
@@ -5899,7 +5905,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if device is None:
             device = self.device
         cached_seq_len = 0
-        num_reqs = 1
         num_tokens = bucket_size
 
         # Create synthetic inputs: 1 request with bucket_size tokens
@@ -5915,8 +5920,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         else:
             rotary_position_ids = None
         positions = positions.to(device)
-        # Sample from last token only
-        logits_indices = torch.tensor([num_tokens - 1], dtype=torch.long).to(device)
+        # Sample from the last token of each request.
+        tokens_per_req = num_tokens // num_reqs
+        logits_indices = torch.tensor(
+            [(i + 1) * tokens_per_req - 1 for i in range(num_reqs)],
+            dtype=torch.long,
+        ).to(device)
 
         attn_metadata = self._build_warmup_attention_metadata(
             num_tokens=num_tokens,
@@ -6123,19 +6132,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             bucket_size,
             kv_segment_size,
         )
-        warmup_kwargs = self._build_prefill_synthetic_inputs(
-            bucket_size, kv_segment_size
-        )
-        compile_start = time.perf_counter()
-        if self._tensor_replacer is not None:
-            set_active_context(
-                self._tensor_replacer.warmup_context(bucket_size, self.device)
+        # Warm up one graph per prefill row count so multi-prefill
+        # (max_prefills_per_batch > 1) hits a compiled shape at runtime instead
+        # of triggering a fail_on_recompile guard failure.
+        for num_reqs in range(1, self.max_prefills_per_batch + 1):
+            warmup_kwargs = self._build_prefill_synthetic_inputs(
+                bucket_size, kv_segment_size, num_reqs=num_reqs
             )
-        model_output = self.model(**warmup_kwargs)
-        if self.use_async_scheduling:
-            self._materialize_warmup_output(model_output)
-        if self._tensor_replacer is not None:
-            set_active_context(None)
+            compile_start = time.perf_counter()
+            if self._tensor_replacer is not None:
+                set_active_context(
+                    self._tensor_replacer.warmup_context(bucket_size, self.device)
+                )
+            model_output = self.model(**warmup_kwargs)
+            if self.use_async_scheduling:
+                self._materialize_warmup_output(model_output)
+            if self._tensor_replacer is not None:
+                set_active_context(None)
         compile_elapsed = time.perf_counter() - compile_start
         bucket_name = f"prefill_s{bucket_size}"
         if kv_segment_size > 0:
