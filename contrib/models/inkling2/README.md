@@ -190,3 +190,6 @@ pytest contrib/models/inkling2/test/unit/
   block selection against their brute-force forms.
 - `test_weights_vs_hf.py`: the experts' dequantization and sharding against Hugging Face's load ops on the real
   checkpoint (`INKLING2_CKPT`), one NVFP4 and one MXFP8 layer: bit-identical.
+- `test_kernels_sim.py`: the three NKI kernels in the NKI CPU simulator (`nki.simulate`, logical NeuronCore config
+  1) against `ops.py`: the decode MoE at 1 and 2 rows, with padding rows and with every row padding; the decode
+  attention core for a sliding (window 1024) and a full-attention layer; the grouped prefill MoE.
