@@ -84,8 +84,13 @@ vllm serve /models/Inkling-2-Mini-bf16 --served-model-name inkling \
   an expert's `gate_up` as `[128, 18 x 288]` (one contiguous 10 KB run a partition) and its `down` rows with hardware
   descriptor generation, the expert id in a register; gate/up, the softcapped activation, the routing weight and
   down run in SBUF / PSUM, the token's 8 experts accumulating in PSUM. Rows the runner padded skip their loads.
-- `src/kernels/attn_decode.py` (decode attention core) and `src/kernels/moe_prefill_grouped.py` (prefill MoE grouped
-  by expert) are experimental and off by default; see Limitations.
+- `src/kernels/attn_decode.py` (opt-in, `INKLING2_NKI_ATTN=1`): the decode attention core as one NKI kernel:
+  logits, the relative-position bias row read at a runtime offset, the causal and window mask (`range_select`
+  against per-row bounds), the softmax with the per-token sink, and the value sum. The bias row's DMA uses software
+  descriptors: with hardware ones, this kernel and the MoE kernel in one decode graph hung on the dynamic DMA
+  queues. In the server it is slower than the torch core (see Results), so it is off by default.
+- `src/kernels/moe_prefill_grouped.py` (experimental, off; `INKLING2_NKI_MOE_PREFILL=1`): the prefill MoE grouped by
+  expert (each expert over its routed tokens in tiles of 32, a gather and a scatter-add); see Limitations.
 
 ## Results
 
@@ -120,9 +125,12 @@ decode steps).
   the graphs: the largest graph's scratchpad is 4.0 GB a core. Not investigated further.
 - The cache layers of the sliding-window layers keep the whole context although they read only the window; declaring
   them as sliding-window layers would cut the KV per token about 6 times (longer contexts).
-- The decoder is torch. `src/kernels/moe_decode.py` runs the decode MoE on nkilib's `moe_tkg` with Inkling 2's
-  activation (opt-in, `INKLING2_NKI_MOE=1`); inside the 48-visit decode graph it measured slower (35.9 against 31.3
-  ms a token), so it is off by default.
+- The grouped prefill MoE kernel passes the NKI CPU simulator against `ops.py` but was not measured in the server;
+  the prefill MoE is the torch one by default (every expert on every token of a chunk).
+- Where the decode step's time goes is not fully attributed. On one core at the server's compiler flags, the whole
+  decoder (48 visits, no all-reduce, static caches) takes 21.5 ms at two rows with either MoE (torch or the kernel);
+  the server's step is about 30 ms, so roughly 9 ms is outside that measurement (the 96 all-reduces, the paged KV
+  and convolution-state reads and writes, the LM head and sampling, the runner).
 - The one-row decode graph is slower than the two-row one (61.6 against 31.3 ms a token); not explained. The
   configuration above avoids it.
 - The prefill graph compiles at the runner's base level (`-O2` without `--optimization-level`); at `-O1` the TTFT is

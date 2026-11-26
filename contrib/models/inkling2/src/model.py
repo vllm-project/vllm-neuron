@@ -183,7 +183,7 @@ class PagedIO(ops.LayerIO):
 
     @property
     def attn_decode(self):
-        """The NKI decode attention core (kernels/attn_decode.py) unless INKLING2_NKI_ATTN=0."""
+        """The NKI decode attention core (kernels/attn_decode.py), opt-in with INKLING2_NKI_ATTN=1."""
         if not self.m.attn_kernel:
             return None
         from .kernels import attn_decode as K4
@@ -235,13 +235,13 @@ class Inkling2ForCausalLM(nn.Module):
             self.sampler = Sampler(self.on_device_sampling_config, process_group=self.tp_group.device_group)
         # padded LM-head rows (past the unpadded vocab) never win; filled in load_weights
         self.register_buffer("vocab_mask", torch.zeros(c.lm_rows_per_rank, dtype=F32), persistent=False)
-        # NKI kernels: the decode MoE (kernels/moe_decode_hw.py) and the decode attention core
-        # (kernels/attn_decode.py) by default, INKLING2_NKI_MOE=0 / INKLING2_NKI_ATTN=0 for the torch ones;
-        # experimental, opt-in: the grouped prefill MoE (INKLING2_NKI_MOE_PREFILL=1, kernels/moe_prefill_grouped.py)
+        # NKI kernels: the decode MoE (kernels/moe_decode_hw.py) by default, INKLING2_NKI_MOE=0 for the torch one;
+        # opt-in: the decode attention core (INKLING2_NKI_ATTN=1, kernels/attn_decode.py; slower in the server) and
+        # the grouped prefill MoE (INKLING2_NKI_MOE_PREFILL=1, kernels/moe_prefill_grouped.py; experimental)
         import os
 
         self.moe_kernel = os.environ.get("INKLING2_NKI_MOE", "1") != "0"
-        self.attn_kernel = os.environ.get("INKLING2_NKI_ATTN", "1") != "0"
+        self.attn_kernel = os.environ.get("INKLING2_NKI_ATTN") == "1"
         self.moe_prefill_kernel = os.environ.get("INKLING2_NKI_MOE_PREFILL") == "1"
         self.kv_cache = None
         self.state_layout = None
