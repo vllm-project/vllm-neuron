@@ -3,7 +3,7 @@
 
 The torch prefill MoE (``ops.moe_dense``) multiplies every token of a chunk by all 128 experts (16 times the routed
 work at top 8). Here, per expert ``e`` (a static loop), the expert's weights are loaded once, and a dynamic loop
-runs over its tiles of 32 routed tokens (``ceil(n_e / 32)``, from a table built in torch):
+runs (``nl.fori_loop``) over its tiles of 32 routed tokens (``ceil(n_e / 32)``, from a table built in torch):
 
     x_t   = x[tok[e, tile]]                                  (gather of 32 rows, software DGE)
     a     = r * 4 tanh(g / 4) sigmoid(g) * 25 tanh(u / 25),  [g | u] = x_t @ gate_up[e]
@@ -61,7 +61,7 @@ try:
                 wd.append(t)
             reg = nisa.register_alloc()
             nisa.register_load(reg, nt_sb[0:1, e:e + 1])
-            for ti in nl.dynamic_range(reg):
+            def tile(ti, e=e, wgu=wgu, wd=wd):
                 ids = nl.ndarray((TT, 1), dtype=tok.dtype, buffer=nl.sbuf)
                 nisa.dma_copy(dst=ids, src=tok[e].select(0, ti).reshape((TT, 1)))
                 rw = nl.ndarray((TT, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -105,6 +105,8 @@ try:
                     nisa.tensor_copy(dst=y[:, n0:n0 + nsz], src=ps[:, 0:nsz])
                 dst = out.ap(pattern=[[H, TT], [1, H]], offset=0, vector_offset=ids, indirect_dim=0)
                 nisa.dma_compute(dst=dst, srcs=[dst, y], reduce_op=nl.add, oob_mode=nisa.oob_mode.skip)
+
+            nl.fori_loop(0, reg, tile)
         return out
 except ImportError:  # pragma: no cover
     inkling2_moe_prefill = None
