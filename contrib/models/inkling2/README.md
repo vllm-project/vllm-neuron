@@ -103,7 +103,7 @@ One trn2.3xlarge, TP=8, bf16, the configuration above, greedy.
   0.000 and 0.105.
 - GSM8K, first 100 questions, five-shot completions at temperature 0: 0.890, none unparsed.
 - A code hidden at 10, 50 and 90 percent of filler text is answered exactly at 2147 and at 12122 tokens of prompt
-  (6 of 6).
+  (6 of 6), and, served with `--max-model-len 32768` (otherwise the same flags), at 29972 tokens (3 of 3).
 
 **Speed**, `vllm bench serve` with random prompts of 1024 tokens and 1024 output tokens (`--ignore-eos`):
 
@@ -115,7 +115,8 @@ One trn2.3xlarge, TP=8, bf16, the configuration above, greedy.
 The same with the torch decode MoE (`INKLING2_NKI_MOE=0`): TPOT 31.3 / 32.1 ms, 30.0 / 57.0 tokens/s; with the NKI
 attention core as well (`INKLING2_NKI_ATTN=1`): 32.2 / 33.4 ms, 29.2 / 54.9 tokens/s. With a one-row decode graph
 (`num_seqs_buckets: [1, 2]`, torch MoE) a single client decodes at 61.6 ms a token. With `--optimization-level 1`
-(torch MoE): TTFT 1.61 s, TPOT 43.0 ms at one client.
+(torch MoE): TTFT 1.61 s, TPOT 43.0 ms at one client. At `--max-model-len 32768`, a 16384-token prompt and 512
+output tokens: TTFT 49.6 s, TPOT 37.0 ms.
 
 **Steadiness.** 64 requests at 2 clients with random lengths (410 to about 7800 prompt tokens, 51 to 972 output
 tokens): 64 completed, none failed; TTFT p50 8.10 s, TPOT p50 39.0 ms, p99 114.2 ms (chunks of other requests'
@@ -123,7 +124,7 @@ prefills run between decode steps).
 
 ## Limitations
 
-- Two requests at a 16k context. A 512-token prefill chunk, more rows or a larger KV pool do not leave room to load
+- Two requests at a 16k context, or one at 32k (the KV pool holds 38,400 tokens); longer contexts not tested. A 512-token prefill chunk, more rows or a larger KV pool do not leave room to load
   the graphs: the largest graph's scratchpad is 4.0 GB a core. Not investigated further.
 - The cache layers of the sliding-window layers keep the whole context although they read only the window; declaring
   them as sliding-window layers would cut the KV per token about 6 times (longer contexts).
