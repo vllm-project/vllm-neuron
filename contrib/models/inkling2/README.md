@@ -59,8 +59,8 @@ vllm serve /models/Inkling-2-Mini-bf16 --served-model-name inkling \
   (31.3 against 61.6 ms a token, see Results).
 - The KV cap of 0.10 (1.08 GiB a core, 38,400 tokens) is what fits beside the weights (6.17 GiB a core) and the
   compiled graphs' scratchpad (4.0 GB); see Limitations.
-- The first launch compiles the prefill graph and the decode graphs (about 25 minutes on a trn2.3xlarge); a relaunch
-  with the same flags reuses the compile cache.
+- The first launch compiles the prefill and decode graphs (17 to 30 minutes on a trn2.3xlarge in these runs); a
+  relaunch with the same flags and code reuses the compile cache (about 10 minutes to serve).
 
 ## How it is built
 
@@ -101,7 +101,7 @@ One trn2.3xlarge, TP=8, bf16, the configuration above, greedy.
   four prompts of 5, 759, 2021 and 4863 tokens (the last two past the sliding window): 94 of 96 steps with the same
   argmax. At each of the 2 others the server's token is Hugging Face's second choice, with a top-1 to top-2 gap of
   0.000 and 0.105.
-- GSM8K, first 100 questions, five-shot completions at temperature 0: 0.880, none unparsed.
+- GSM8K, first 100 questions, five-shot completions at temperature 0: 0.890, none unparsed.
 - A code hidden at 10, 50 and 90 percent of filler text is answered exactly at 2147 and at 12122 tokens of prompt
   (6 of 6).
 
@@ -109,15 +109,17 @@ One trn2.3xlarge, TP=8, bf16, the configuration above, greedy.
 
 | Clients | TTFT p50 | TPOT p50 | Output tokens/s |
 | --- | --- | --- | --- |
-| 1 | 2.09 s | 31.3 ms | 30.0 |
-| 2 | 3.13 s | 32.1 ms | 57.0 |
+| 1 | 2.09 s | 29.9 ms | 31.3 |
+| 2 | 3.14 s | 30.8 ms | 59.2 |
 
-With a one-row decode graph (`num_seqs_buckets: [1, 2]`) a single client decodes at 61.6 ms a token (15.7 tokens/s).
-With `--optimization-level 1` (prefill and decode at `-O1`): TTFT 1.61 s, TPOT 43.0 ms at one client.
+The same with the torch decode MoE (`INKLING2_NKI_MOE=0`): TPOT 31.3 / 32.1 ms, 30.0 / 57.0 tokens/s; with the NKI
+attention core as well (`INKLING2_NKI_ATTN=1`): 32.2 / 33.4 ms, 29.2 / 54.9 tokens/s. With a one-row decode graph
+(`num_seqs_buckets: [1, 2]`, torch MoE) a single client decodes at 61.6 ms a token. With `--optimization-level 1`
+(torch MoE): TTFT 1.61 s, TPOT 43.0 ms at one client.
 
 **Steadiness.** 64 requests at 2 clients with random lengths (410 to about 7800 prompt tokens, 51 to 972 output
-tokens): 64 completed, none failed; TTFT p50 7.85 s, TPOT p50 40.3 ms, p99 115.6 ms (chunks of other requests' prefills run between
-decode steps).
+tokens): 64 completed, none failed; TTFT p50 8.10 s, TPOT p50 39.0 ms, p99 114.2 ms (chunks of other requests'
+prefills run between decode steps).
 
 ## Limitations
 
@@ -125,17 +127,17 @@ decode steps).
   the graphs: the largest graph's scratchpad is 4.0 GB a core. Not investigated further.
 - The cache layers of the sliding-window layers keep the whole context although they read only the window; declaring
   them as sliding-window layers would cut the KV per token about 6 times (longer contexts).
-- The grouped prefill MoE kernel passes the NKI CPU simulator against `ops.py` but was not measured in the server;
-  the prefill MoE is the torch one by default (every expert on every token of a chunk).
+- The grouped prefill MoE kernel is correct on the chip (max |diff| 1.8e-3 against the torch MoE, largest value
+  0.44) but slower: 6.07 against 2.65 ms for a 256-token chunk of one layer on one core (compiled at -O1). The
+  prefill MoE is the torch one by default (every expert on every token of a chunk).
 - Where the decode step's time goes is not fully attributed. On one core at the server's compiler flags, the whole
   decoder (48 visits, no all-reduce, static caches) takes 21.5 ms at two rows with either MoE (torch or the kernel);
   the server's step is about 30 ms, so roughly 9 ms is outside that measurement (the 96 all-reduces, the paged KV
   and convolution-state reads and writes, the LM head and sampling, the runner).
-- The one-row decode graph is slower than the two-row one (61.6 against 31.3 ms a token); not explained. The
-  configuration above avoids it.
-- The prefill graph compiles at the runner's base level (`-O2` without `--optimization-level`); at `-O1` the TTFT is
-  1.61 s instead of 2.09 s, but the runner applies a level to the prefill graph only through the flag, which also
-  sets the decode graph.
+- The one-row decode graph is slower than the two-row one (61.6 against 31.3 ms a token, torch MoE); not explained.
+  The configuration above avoids it.
+- The prefill graph is faster at `-O1` (TTFT 1.61 against 2.09 s), the decode graph at `-O3`; the runner applies a
+  level to the prefill graph only through `--optimization-level`, which also sets the decode graph.
 - Not served: images, the DSpark speculative decoding draft, prefix caching, sampling other than greedy was not
   tested.
 
