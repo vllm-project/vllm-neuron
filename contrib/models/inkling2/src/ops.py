@@ -179,21 +179,21 @@ def attention_core(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rel_logits
     bf16 logits scaled by ``d**-0.5``, the relative bias, a causal (and ``window``) mask, the per-token sink logit
     ``sink [B, hq, S]`` in an fp32 softmax. Returns ``[B, hq, S, d]``."""
     B, hq, S, d = q.shape
-    hkv, L = k.shape[1], k.shape[2]
-    g = hq // hkv
+    hkv = k.shape[1]
+    k = k.repeat_interleave(hq // hkv, dim=1)
+    v = v.repeat_interleave(hq // hkv, dim=1)
     dist = q_pos.unsqueeze(-1) - kv_pos.unsqueeze(1)                           # [B, S, L]
-    # the g query heads of a KV head as g * S rows against that head (no repeated copy of the keys and values)
-    logits = torch.matmul(q.reshape(B, hkv, g * S, d), k.transpose(-1, -2)).view(B, hq, S, L) * d ** -0.5
+    logits = torch.matmul(q, k.transpose(-1, -2)) * d ** -0.5
     # the S queries of a row are consecutive positions (one request's chunk, or one decode token), and so are its
     # keys (the whole context, or a sliding layer's window from kv_pos[:, 0])
-    logits = logits + relative_bias_shift(rel_logits, q_pos[:, 0], L, extent, kv_pos[:, 0])
+    logits = logits + relative_bias_shift(rel_logits, q_pos[:, 0], k.shape[2], extent, kv_pos[:, 0])
     keep = dist >= 0
     if window is not None:
         keep = keep & (dist < window)
     neg = torch.finfo(torch.float32).min
     logits = logits.float().masked_fill(~keep.unsqueeze(1), neg)
     p = torch.softmax(torch.cat([logits, sink.float().unsqueeze(-1)], dim=-1), dim=-1)[..., :-1]
-    return torch.matmul(p.to(q.dtype).reshape(B, hkv, g * S, L), v).view(B, hq, S, d)
+    return torch.matmul(p.to(q.dtype), v)
 
 
 def window_blocks(block_table: torch.Tensor, q_start: torch.Tensor, S: int, window: int, block: int):
@@ -342,7 +342,7 @@ def moe(p: dict, cfg, x: torch.Tensor, io: LayerIO, dense: bool) -> torch.Tensor
     B, S, H = x.shape
     flat = x.reshape(B * S, H)
     idx, w = route(flat, p["router"], p["router_bias"], cfg.top_k, cfg.route_scale)
-    kernel = None if dense else getattr(io, "moe_decode", None)   # an NKI decode MoE, when the caller has one
+    kernel = getattr(io, "moe_prefill" if dense else "moe_decode", None)   # an NKI MoE, when the caller has one
     if kernel is not None:
         out = kernel(flat, idx, w, p["gate_up"], p["down"]).float()
     else:

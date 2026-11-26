@@ -177,6 +177,14 @@ class PagedIO(ops.LayerIO):
         return ops.moe_gather(x, idx, w, gate_up, down, self.m.config.gate_cap, self.m.config.up_cap)
 
     @property
+    def moe_prefill(self):
+        """The grouped NKI prefill MoE (kernels/moe_prefill_grouped.py), opt-in with INKLING2_NKI_MOE_PREFILL=1."""
+        if not self.m.moe_prefill_kernel:
+            return None
+        from .kernels import moe_prefill_grouped as K5
+        return lambda x, idx, w, gate_up, down: K5.moe_prefill(_nki, x, idx, w, gate_up, down)
+
+    @property
     def attn_decode(self):
         """The NKI decode attention core (kernels/attn_decode.py), opt-in with INKLING2_NKI_ATTN=1."""
         if not self.m.attn_kernel:
@@ -239,6 +247,7 @@ class Inkling2ForCausalLM(nn.Module):
         # hardware DMA descriptors (kernels/moe_decode_hw.py); unset: torch
         self.moe_kernel = {"1": "tkg", "hw": "hw"}.get(os.environ.get("INKLING2_NKI_MOE", ""), None)
         self.attn_kernel = os.environ.get("INKLING2_NKI_ATTN") == "1"
+        self.moe_prefill_kernel = os.environ.get("INKLING2_NKI_MOE_PREFILL") == "1"
         if self.moe_kernel == "tkg":
             from .kernels import moe_decode as K
 

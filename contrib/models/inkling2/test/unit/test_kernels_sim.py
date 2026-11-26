@@ -68,3 +68,19 @@ def test_attn_decode_matches_core(L, window, q_pos, kv0):
     relp, start, bounds = K4.prepare(rel, qp, ks, L, window)
     out = torch.as_tensor(nki.simulate(K4.inkling2_attn_decode)(q, k, v, relp, start, bounds, sink.float())).float()
     assert (out - ref).abs().max() <= 1e-2 * ref.abs().max()
+
+
+@pytest.mark.parametrize("T,E_", [(64, 16), (256, 128)])
+def test_moe_prefill_grouped_matches_dense(T, E_):
+    from inkling2_neuron.kernels import moe_prefill_grouped as K5
+
+    g = torch.Generator().manual_seed(3)
+    x = (torch.randn(T, H, generator=g) * 0.5).bfloat16()
+    gate_up = (torch.randn(E_, H, 2 * I, generator=g) * 0.03).bfloat16()
+    down = (torch.randn(E_, I, H, generator=g) * 0.03).bfloat16()
+    idx = torch.stack([torch.randperm(E_, generator=g)[:K] for _ in range(T)])
+    w = torch.rand(T, K, generator=g)
+    ref = ops.moe_dense(x, idx, w, gate_up, down, 4.0, 25.0, group=min(E_, 32))
+    tok, wt, nt = K5.tables(idx, w, E_)
+    out = torch.as_tensor(nki.simulate(K5.inkling2_moe_prefill)(x, tok, wt, nt, gate_up, down)).float()
+    assert (out - ref).abs().max() <= 1e-2 * ref.abs().max()
