@@ -51,6 +51,7 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn.sampler import Sampler
 
 import vllm_neuron.nn as neuron_nn
+from ..qwen3_vl.utils.decode_kv import build_per_head_block_table, scatter_new_kv
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.vllm.spec_decode.decorator import async_speculative_decoding
 
@@ -903,6 +904,69 @@ class LlamaAttention(nn.Module):
                 dcp_active_mask=dcp_active_mask if dcp_decode_active else None,
             )
             attn_metadata[_DECODE_MASK_CACHE_KEY] = attention_mask
+
+        # GQA (nkh > 1, e.g. TP=4 on the 8-KV-head 8B model) reaches the fused
+        # decode megakernel only via a per-head 3D block table; a 2D table routes
+        # GQA to the slow torch fallback. Same approach as qwen3/model.py.
+        if (
+            nkh > 1
+            and self.attention_dp_size == 1
+            and not dcp_decode_active
+            and not self.fp8_packed
+        ):
+            active_blocks_table = build_per_head_block_table(block_table, nkh).to(
+                torch.int32
+            )
+
+            output, K_new, V_new = NF.attention_decode(
+                X=X,
+                X_hidden_dim_actual=self.hidden_size,
+                rmsnorm_X_enabled=False,
+                W_qkv=self.qkv_proj_weight,
+                bias_qkv=None,
+                rmsnorm_QK_pre_rope_enabled=False,
+                rmsnorm_QK_post_rope_enabled=False,
+                cos=cos_kernel,
+                sin=sin_kernel,
+                rope_contiguous_layout=True,
+                K_cache_transposed=False,
+                active_blocks_table=active_blocks_table,
+                K_cache=self.k_cache,
+                V_cache=self.v_cache,
+                attention_mask=attention_mask,
+                softmax_scale=self.scaling / self.k_scale_float,
+                sink=None,
+                update_cache=False,
+                W_out=self.o_proj_weight / self.v_scale_float,
+                bias_out=None,
+                transposed_out=False,
+                out_in_sb=False,
+                k_scale=self.k_scale
+                if self.k_cache.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
+                else None,
+                v_scale=self.v_scale
+                if self.v_cache.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
+                else None,
+                attention_dp=1,
+                attention_dp_group=None,
+                attention_dp_rank=0,
+                kv_needs_a2a=False,
+            )
+
+            scatter_new_kv(
+                self.k_cache,
+                self.v_cache,
+                K_new,
+                V_new,
+                slot_mapping,
+                block_size,
+                nkh,
+                self.head_dim,
+            )
+
+            self.attn_tp_group.all_reduce(output)
+
+            return output
 
         active_blocks_table = block_table
 
