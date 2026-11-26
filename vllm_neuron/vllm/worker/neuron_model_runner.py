@@ -5938,9 +5938,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             kv_segment_size=kv_segment_size,
         )
 
-        # Create dummy sampling params for warmup
+        # Create dummy sampling params for warmup — one row per request so the
+        # shape matches the runtime (num_reqs, 3) for multi-prefill.
         dummy_sampling_params = torch.tensor(
-            [[0, 1.0, 1.0]],  # [top_k, top_p, temperature]
+            [[0, 1.0, 1.0]] * num_reqs,  # [num_reqs, 3]: [top_k, top_p, temperature]
             dtype=torch.float32,
             device=device,
         )
@@ -6053,6 +6054,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 bucket_size,
                 kv_segment_size,
             )
+
+        # Capture one prefill graph per row count so multi-prefill
+        # (max_prefills_per_batch > 1) has a compiled shape at runtime.
+        for num_reqs in range(2, self.max_prefills_per_batch + 1):
+            kwargs = self._build_prefill_synthetic_inputs(
+                bucket_size, kv_segment_size, device=device, num_reqs=num_reqs
+            )
+            try:
+                _ = self.capture_backend_model(**kwargs)
+            except CaptureComplete:
+                logger.debug(
+                    "Graph capture for prefill completed: bucket_size=%s, "
+                    "kv_segment_size=%s, num_reqs=%s",
+                    bucket_size,
+                    kv_segment_size,
+                    num_reqs,
+                )
 
         # === Draft model graph capture ===
         if self.drafter is not None:
