@@ -233,8 +233,10 @@ def get_neuron_model_runner_v2_policy(
     # serving features continue to use MRv1.
     if getattr(vllm_config, "ec_transfer_config", None) is not None:
         unsupported.append("EC transfer")
-    if getattr(vllm_config, "weight_transfer_config", None) is not None:
-        unsupported.append("weight transfer")
+    # Weight transfer is served by the "neuron" backend registered in
+    # platform.py (pre_register_and_update). The engine applies weights in place
+    # into the resident model's parameter tensors, so the compiled graph stays
+    # valid across updates — no need to decline MRv2 for it.
     if getattr(vllm_config, "lora_config", None) is not None:
         unsupported.append("LoRA")
     if getattr(vllm_config, "reasoning_config", None) is not None:
@@ -306,6 +308,12 @@ def get_neuron_model_runner_v2_policy(
     neuron_cfg = _neuron_config_dict(vllm_config)
     if neuron_cfg.get("decode_context_length_buckets") is not None:
         unsupported.append("decode context-length bucketing")
+    # MRv2 hard-requires exactly one active prefill row per scheduler step
+    # (neuron_model_runner_v2.py raises otherwise). Multi-prefill batching
+    # (max_prefills_per_batch > 1) therefore routes to MRv1, which supports
+    # multiple co-admitted prefills.
+    if int(neuron_cfg.get("max_prefills_per_batch", 1)) > 1:
+        unsupported.append("multi-prefill batching (max_prefills_per_batch > 1)")
 
     # MRv2 supports dense, non-speculative disaggregated inference with tensor
     # parallelism. Connector compatibility is validated during KV transfer

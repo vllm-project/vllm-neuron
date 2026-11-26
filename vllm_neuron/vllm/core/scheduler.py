@@ -278,8 +278,27 @@ class NeuronScheduler(Scheduler):
                 self.num_batched_tokens_buckets,
             )
 
-        # Prefill batch size limit (currently 1, may expand in future)
-        self.max_prefills_per_batch: int = 1
+        # Prefill batch size limit. Historically 1 because the prefill path was
+        # validated for a single sequence. The input builder and the runner are
+        # sequence-agnostic (array-based), so multiple prefills can be admitted
+        # in one step; the limit is now configurable. Default stays 1 until the
+        # multi-prefill path is validated end-to-end on-device.
+        self.max_prefills_per_batch: int = max(
+            1, int(neuron_config.get("max_prefills_per_batch", 1))
+        )
+        if self.max_prefills_per_batch > self.max_num_seqs:
+            logger.warning(
+                "max_prefills_per_batch (%d) exceeds max_num_seqs (%d); clamping",
+                self.max_prefills_per_batch,
+                self.max_num_seqs,
+            )
+            self.max_prefills_per_batch = self.max_num_seqs
+        if self.max_prefills_per_batch > 1:
+            logger.warning(
+                "max_prefills_per_batch=%d enables multi-prefill batching. This "
+                "path is experimental and not yet validated end-to-end on-device.",
+                self.max_prefills_per_batch,
+            )
 
         # Parse num_seqs_buckets for decode batch size buckets
         if "num_seqs_buckets" in neuron_config:
@@ -903,11 +922,11 @@ class NeuronScheduler(Scheduler):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> "SchedulerOutput":
-        """Apply padding to scheduler output for the prefill request.
+        """Apply padding to scheduler output for the prefill request(s).
 
-        Since max_prefills_per_batch=1, there's at most one prefill request.
-        We determine prefill status from SchedulerOutput data (which has
-        pre-increment num_computed_tokens) rather than request state.
+        There may be more than one prefill request when max_prefills_per_batch
+        is raised above 1. We determine prefill status from SchedulerOutput data
+        (which has pre-increment num_computed_tokens) rather than request state.
 
         Populates num_scheduled_tokens_padded for the prefill request while
         keeping num_scheduled_tokens as actual (unpadded) token counts.
@@ -944,6 +963,12 @@ class NeuronScheduler(Scheduler):
         prefill_count = 0
         decode_count = 0
         total_padding_this_batch = 0
+
+        # Ordered list of (req_id, num_tokens) for the requests in this step
+        # that need prefill padding. Padding is applied after the loop so that
+        # multiple prefills can share a single bucket (batch-total padding)
+        # instead of each rounding up to its own bucket.
+        prefill_entries: list[tuple[str, int]] = []
 
         for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
             request = self.requests.get(req_id)
@@ -989,42 +1014,79 @@ class NeuronScheduler(Scheduler):
                     continue
 
                 prefill_count += 1
-                padded_tokens = self._calculate_padded_count(num_tokens)
-                padding_added = padded_tokens - num_tokens
-
-                # Store padded count separately
-                scheduler_output.num_scheduled_tokens_padded[req_id] = padded_tokens
-
-                # Observe padded token count metric
-                bucket_name = f"prefill_s{padded_tokens}"
-                NUM_BATCHED_TOKENS_PADDING.labels(
-                    model_name=self.model_name,
-                    bucket_name=bucket_name,
-                ).observe(padded_tokens)
-
-                # Track statistics
-                self.total_padding_tokens += padding_added
-                self.total_scheduled_tokens += num_tokens
-                total_padding_this_batch += padding_added
-
-                # Log padding info
-                if num_tokens > 0:
-                    overhead_pct = (padding_added / num_tokens) * 100
-                    logger.debug(
-                        "PADDING: Prefill request %s: %d -> %d tokens "
-                        "(+%d padding, %.1f%% overhead)",
-                        req_id,
-                        num_tokens,
-                        padded_tokens,
-                        padding_added,
-                        overhead_pct,
-                    )
+                prefill_entries.append((req_id, num_tokens))
             else:
                 decode_count += 1
                 scheduler_output.num_scheduled_tokens_padded[req_id] = num_tokens
                 logger.debug(
                     "Decode request %s: %d tokens (no padding)", req_id, num_tokens
                 )
+
+        # Assign padded token counts for the prefills in this step.
+        if len(prefill_entries) == 1:
+            # Single prefill: round this request up to its own bucket (the
+            # historical behavior, unchanged).
+            req_id, num_tokens = prefill_entries[0]
+            padded_tokens = self._calculate_padded_count(num_tokens)
+            padding_added = padded_tokens - num_tokens
+            scheduler_output.num_scheduled_tokens_padded[req_id] = padded_tokens
+
+            bucket_name = f"prefill_s{padded_tokens}"
+            NUM_BATCHED_TOKENS_PADDING.labels(
+                model_name=self.model_name,
+                bucket_name=bucket_name,
+            ).observe(padded_tokens)
+
+            self.total_padding_tokens += padding_added
+            self.total_scheduled_tokens += num_tokens
+            total_padding_this_batch += padding_added
+
+            if num_tokens > 0:
+                overhead_pct = (padding_added / num_tokens) * 100
+                logger.debug(
+                    "PADDING: Prefill request %s: %d -> %d tokens "
+                    "(+%d padding, %.1f%% overhead)",
+                    req_id,
+                    num_tokens,
+                    padded_tokens,
+                    padding_added,
+                    overhead_pct,
+                )
+        elif len(prefill_entries) > 1:
+            # Multiple prefills share one prefill NEFF sized by the SUM of the
+            # per-request padded counts. Round the batch total up to a single
+            # bucket once, and give the slack to the last prefill so the sum
+            # equals exactly the bucket the runner compiled.
+            total_tokens = sum(num_tokens for _, num_tokens in prefill_entries)
+            padded_total = self._calculate_padded_count(total_tokens)
+            padding_added = padded_total - total_tokens
+
+            for i, (req_id, num_tokens) in enumerate(prefill_entries):
+                padded_tokens = (
+                    num_tokens + padding_added
+                    if i == len(prefill_entries) - 1
+                    else num_tokens
+                )
+                scheduler_output.num_scheduled_tokens_padded[req_id] = padded_tokens
+
+            bucket_name = f"prefill_s{padded_total}"
+            NUM_BATCHED_TOKENS_PADDING.labels(
+                model_name=self.model_name,
+                bucket_name=bucket_name,
+            ).observe(padded_total)
+
+            self.total_padding_tokens += padding_added
+            self.total_scheduled_tokens += total_tokens
+            total_padding_this_batch += padding_added
+
+            logger.debug(
+                "PADDING: %d prefill requests totalling %d tokens -> %d "
+                "(+%d padding distributed to the last request)",
+                len(prefill_entries),
+                total_tokens,
+                padded_total,
+                padding_added,
+            )
 
         # Log batch summary
         if prefill_count > 0 and total_padding_this_batch > 0:

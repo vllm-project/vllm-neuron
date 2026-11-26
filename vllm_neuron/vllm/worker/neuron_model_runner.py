@@ -998,6 +998,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 dcp_stride=dcp_stride,
             )
         )
+        # Number of co-admitted prefills the scheduler may dispatch. The prefill
+        # warmup compiles one graph per row count 1..max_prefills_per_batch.
+        self.max_prefills_per_batch = int(
+            neuron_config_dict.get("max_prefills_per_batch", 1)
+        )
 
         if user_set_num_batched_tokens_buckets:
             logger.info(
@@ -5884,6 +5889,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         bucket_size: int,
         kv_segment_size: int,
         device: torch.device | None = None,
+        num_reqs: int = 1,
     ) -> dict:
         """Build synthetic inputs for prefill warmup.
 
@@ -5899,7 +5905,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if device is None:
             device = self.device
         cached_seq_len = 0
-        num_reqs = 1
         num_tokens = bucket_size
 
         # Create synthetic inputs: 1 request with bucket_size tokens
@@ -5915,8 +5920,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         else:
             rotary_position_ids = None
         positions = positions.to(device)
-        # Sample from last token only
-        logits_indices = torch.tensor([num_tokens - 1], dtype=torch.long).to(device)
+        # Sample from the last token of each request.
+        tokens_per_req = num_tokens // num_reqs
+        logits_indices = torch.tensor(
+            [(i + 1) * tokens_per_req - 1 for i in range(num_reqs)],
+            dtype=torch.long,
+        ).to(device)
 
         attn_metadata = self._build_warmup_attention_metadata(
             num_tokens=num_tokens,
@@ -5929,9 +5938,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             kv_segment_size=kv_segment_size,
         )
 
-        # Create dummy sampling params for warmup
+        # Create dummy sampling params for warmup — one row per request so the
+        # shape matches the runtime (num_reqs, 3) for multi-prefill.
         dummy_sampling_params = torch.tensor(
-            [[0, 1.0, 1.0]],  # [top_k, top_p, temperature]
+            [[0, 1.0, 1.0]] * num_reqs,  # [num_reqs, 3]: [top_k, top_p, temperature]
             dtype=torch.float32,
             device=device,
         )
@@ -6045,6 +6055,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 kv_segment_size,
             )
 
+        # Capture one prefill graph per row count so multi-prefill
+        # (max_prefills_per_batch > 1) has a compiled shape at runtime.
+        for num_reqs in range(2, self.max_prefills_per_batch + 1):
+            kwargs = self._build_prefill_synthetic_inputs(
+                bucket_size, kv_segment_size, device=device, num_reqs=num_reqs
+            )
+            try:
+                _ = self.capture_backend_model(**kwargs)
+            except CaptureComplete:
+                logger.debug(
+                    "Graph capture for prefill completed: bucket_size=%s, "
+                    "kv_segment_size=%s, num_reqs=%s",
+                    bucket_size,
+                    kv_segment_size,
+                    num_reqs,
+                )
+
         # === Draft model graph capture ===
         if self.drafter is not None:
             logger.info(
@@ -6123,19 +6150,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             bucket_size,
             kv_segment_size,
         )
-        warmup_kwargs = self._build_prefill_synthetic_inputs(
-            bucket_size, kv_segment_size
-        )
-        compile_start = time.perf_counter()
-        if self._tensor_replacer is not None:
-            set_active_context(
-                self._tensor_replacer.warmup_context(bucket_size, self.device)
+        # Warm up one graph per prefill row count so multi-prefill
+        # (max_prefills_per_batch > 1) hits a compiled shape at runtime instead
+        # of triggering a fail_on_recompile guard failure.
+        for num_reqs in range(1, self.max_prefills_per_batch + 1):
+            warmup_kwargs = self._build_prefill_synthetic_inputs(
+                bucket_size, kv_segment_size, num_reqs=num_reqs
             )
-        model_output = self.model(**warmup_kwargs)
-        if self.use_async_scheduling:
-            self._materialize_warmup_output(model_output)
-        if self._tensor_replacer is not None:
-            set_active_context(None)
+            compile_start = time.perf_counter()
+            if self._tensor_replacer is not None:
+                set_active_context(
+                    self._tensor_replacer.warmup_context(bucket_size, self.device)
+                )
+            model_output = self.model(**warmup_kwargs)
+            if self.use_async_scheduling:
+                self._materialize_warmup_output(model_output)
+            if self._tensor_replacer is not None:
+                set_active_context(None)
         compile_elapsed = time.perf_counter() - compile_start
         bucket_name = f"prefill_s{bucket_size}"
         if kv_segment_size > 0:
@@ -11152,6 +11183,26 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         # This binds the cache tensors to the model
         self.model.bind_kv_cache(kv_caches)
+
+        # Allocate + bind the linear-attention (GDN) recurrent state. This is a
+        # fixed per-sequence buffer, not a paged cache: one conv_state and one
+        # ssm_state per linear-attention layer, indexed by batch row (correct
+        # for a single sequence; a stable slot map is a batch > 1 follow-up).
+        if hasattr(self.model, "get_linear_cache_spec"):
+            linear_caches = {}
+            for spec in self.model.get_linear_cache_spec():
+                conv_state = torch.zeros(
+                    (self.max_num_reqs, *spec["conv_shape"]),
+                    dtype=spec["conv_dtype"],
+                    device=self.device,
+                )
+                ssm_state = torch.zeros(
+                    (self.max_num_reqs, *spec["ssm_shape"]),
+                    dtype=spec["ssm_dtype"],
+                    device=self.device,
+                )
+                linear_caches[spec["layer_name"]] = (conv_state, ssm_state)
+            self.model.bind_linear_cache(linear_caches)
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, (EagleProposer, DFlashProposer))
