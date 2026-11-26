@@ -168,7 +168,9 @@ class PagedIO(ops.LayerIO):
 
     def moe_decode(self, x, idx, w, gate_up, down):
         """The decode MoE: the NKI kernel (kernels/moe_decode_hw.py) unless INKLING2_NKI_MOE=0, else torch."""
-        if self.m.moe_kernel:
+        # the kernel for buckets of up to 2 rows (unrolled over each row's 8 experts, an 8-row decode graph of 48
+        # visits took the compiler past the host's memory); larger buckets run the torch MoE
+        if self.m.moe_kernel and x.shape[0] <= 2:
             from .kernels import moe_decode_hw as K2
             return K2.moe_decode_hw(_nki, x, idx, w, gate_up, down, self.valid_rows)
         return ops.moe_gather(x, idx, w, gate_up, down, self.m.config.gate_cap, self.m.config.up_cap)
