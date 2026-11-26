@@ -34,10 +34,12 @@ try:
     import nki.isa as nisa
     import nki.language as nl
 
-    # the bias row's runtime-offset DMA: hardware descriptors by default; INKLING2_ATTN_BIAS_DGE=sw|auto to compare
-    # (K2 + K4 in one graph hung on the dynamic hardware DMA queues once, see the notes)
-    _BIAS_DGE = {"sw": nisa.dge_mode.swdge, "auto": nisa.dge_mode.unknown}.get(
-        os.environ.get("INKLING2_ATTN_BIAS_DGE", ""), nisa.dge_mode.hwdge)
+    # the bias row's runtime-offset DMA uses software descriptors: with hardware ones, this kernel and
+    # moe_decode_hw.py (whose expert loads use hardware descriptors) in one decode graph hung on the dynamic DMA
+    # queues (one core, whole decoder; with software ones: 19.5 ms against 23.1 with the MoE kernel alone).
+    # INKLING2_ATTN_BIAS_DGE=hw|auto to compare.
+    _BIAS_DGE = {"hw": nisa.dge_mode.hwdge, "auto": nisa.dge_mode.unknown}.get(
+        os.environ.get("INKLING2_ATTN_BIAS_DGE", ""), nisa.dge_mode.swdge)
 
     @nki.jit
     def inkling2_attn_decode(q, k, v, relp, start, bounds, sink):
