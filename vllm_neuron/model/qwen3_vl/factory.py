@@ -5,11 +5,12 @@ import math
 
 import torch.nn as nn
 from transformers import PretrainedConfig
-from vllm.multimodal.inputs import MultiModalKwargsItem
+from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItem
 
 from vllm_neuron.model.interfaces import (
     SupportsDisaggEncoder,
     SupportsEncoderBudget,
+    SupportsEncoderCacheLayout,
     SupportsMaxPixels,
     SupportsSpatialMerge,
 )
@@ -22,6 +23,7 @@ class Qwen3VLForConditionalGeneration(
     SupportsMaxPixels,
     SupportsDisaggEncoder,
     SupportsEncoderBudget,
+    SupportsEncoderCacheLayout,
 ):
     """Factory that validates config and selects the appropriate Qwen3-VL implementation.
 
@@ -116,6 +118,45 @@ class Qwen3VLForConditionalGeneration(
             hf_config, encoder_neuron_config.encoder_attention_block_size
         )
         return math.ceil((max_bucket // merge_factor) / cache_block_size)
+
+    @classmethod
+    def get_encoder_cache_item_blocks(
+        cls,
+        hf_config: PretrainedConfig,
+        encoder_neuron_config: EncoderNeuronConfig,
+        mm_feature: MultiModalFeatureSpec,
+    ) -> int | None:
+        # An image takes one block, the dense layout. A video packs whole frames
+        # per block (video_cache_tokens_per_block, the layout embed_multimodal
+        # allocates), which can take more blocks than the dense layout.
+        from vllm_neuron.model.qwen3_vl.utils.vision_block_packing import (
+            video_cache_tokens_per_block,
+        )
+
+        position = mm_feature.mm_position
+        if mm_feature.modality != "video" or position.is_embed is None:
+            return None
+        # The video placeholder has one run of video tokens per frame (grid t),
+        # between the frame's timestamp and vision start/end tokens, and each run
+        # holds the frame's h * w / merge_factor embeds. The placeholder is read
+        # instead of video_grid_thw because the scheduler always has it: with
+        # mm_processor_cache_type="shm", mm_feature.data holds only an address.
+        frame_embeds = [
+            end - start + 1 for start, end in position.extract_embeds_range()
+        ]
+        if not frame_embeds or len(set(frame_embeds)) != 1:
+            return None
+        merge_factor = cls.get_vision_token_merge_factor(hf_config)
+        frame_tokens = frame_embeds[0] * merge_factor
+        block_size = encoder_neuron_config.encoder_attention_block_size
+        if frame_tokens > block_size:
+            # embed_multimodal rejects a frame larger than one block.
+            return None
+        return len(
+            video_cache_tokens_per_block(
+                len(frame_embeds), frame_tokens, block_size, merge_factor
+            )
+        )
 
     @classmethod
     def get_max_pixels_token_count(

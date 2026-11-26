@@ -342,3 +342,40 @@ def select_vision_bucket(
         f"bucket ({sorted_buckets[-1]}). Increase num_encoder_input_buckets "
         f"or reduce input image size."
     )
+
+
+def video_cache_tokens_per_block(
+    num_frames: int,
+    frame_tokens: int,
+    block_size: int,
+    merge_factor: int,
+) -> list[int]:
+    """Real merged tokens in each encoder-cache block that one video occupies.
+
+    A video packs WHOLE frames per block and never splits a frame, so a block
+    holds ``block_size // frame_tokens`` frames and a non-last block can end in
+    padding. The video can therefore take more blocks than
+    ``ceil(merged_tokens / cache_block_size)``. ``embed_multimodal`` allocates
+    the cache with this layout, and the scheduler charges its length, so both
+    count the same blocks.
+
+    Args:
+        num_frames: Temporal grid size T of the video.
+        frame_tokens: Raw (pre-merge) tokens per frame, H * W. Must not exceed
+            ``block_size``.
+        block_size: Raw tokens per attention block (encoder_attention_block_size).
+        merge_factor: Raw tokens that merge into one embed token.
+
+    Returns:
+        One entry per block: the real merged tokens stored in that block.
+    """
+    per_frame_merged = frame_tokens // merge_factor
+    frames_per_block = block_size // frame_tokens
+    num_item_blocks = math.ceil(num_frames / frames_per_block)
+    tokens_per_block: list[int] = []
+    frames_left = num_frames
+    for _ in range(num_item_blocks):
+        k = min(frames_per_block, frames_left)
+        tokens_per_block.append(k * per_frame_merged)
+        frames_left -= k
+    return tokens_per_block
