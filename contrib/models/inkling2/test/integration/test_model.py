@@ -37,7 +37,7 @@ def llm():
         block_size=256,
         gpu_memory_utilization=0.90,
         enable_prefix_caching=False,
-        optimization_level=1,
+        optimization_level=3,
         additional_config={"neuron_config": {"num_batched_tokens_buckets": [256], "num_seqs_buckets": [2],
                                              "on_device_sampling_config": {"all_greedy": True}}},
     )

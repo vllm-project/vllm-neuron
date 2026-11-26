@@ -167,13 +167,10 @@ class PagedIO(ops.LayerIO):
         self.new[(c, slot)] = ops.next_window(seq, self.valid).to(DTYPE)
 
     def moe_decode(self, x, idx, w, gate_up, down):
-        """The decode MoE on nkilib's selective-expert kernel with Inkling 2's activation (kernels/moe_decode.py)."""
-        if self.m.moe_kernel == "hw":
+        """The decode MoE: the NKI kernel (kernels/moe_decode_hw.py) unless INKLING2_NKI_MOE=0, else torch."""
+        if self.m.moe_kernel:
             from .kernels import moe_decode_hw as K2
             return K2.moe_decode_hw(_nki, x, idx, w, gate_up, down, self.valid_rows)
-        if self.m.moe_kernel == "tkg":
-            from .kernels import moe_decode as K
-            return K.moe_decode(_nki, x, idx, w, gate_up, down)
         return ops.moe_gather(x, idx, w, gate_up, down, self.m.config.gate_cap, self.m.config.up_cap)
 
     @property
@@ -238,20 +235,14 @@ class Inkling2ForCausalLM(nn.Module):
             self.sampler = Sampler(self.on_device_sampling_config, process_group=self.tp_group.device_group)
         # padded LM-head rows (past the unpadded vocab) never win; filled in load_weights
         self.register_buffer("vocab_mask", torch.zeros(c.lm_rows_per_rank, dtype=F32), persistent=False)
-        # the NKI decode MoE (kernels/moe_decode.py), opt-in with INKLING2_NKI_MOE=1: alone it is faster than the torch
-        # gather (0.267 against 0.339 ms a visit at two rows) but inside the 48-visit decode graph it measured slower
-        # (TPOT 59.6 against 42.6 ms): a kernel call per visit costs more than the fused torch ops around it
+        # NKI kernels: the decode MoE (kernels/moe_decode_hw.py) by default, INKLING2_NKI_MOE=0 for the torch one;
+        # experimental, opt-in: the decode attention core (INKLING2_NKI_ATTN=1, kernels/attn_decode.py) and the
+        # grouped prefill MoE (INKLING2_NKI_MOE_PREFILL=1, kernels/moe_prefill_grouped.py)
         import os
 
-        # INKLING2_NKI_MOE: "1" nkilib moe_tkg (kernels/moe_decode.py), "hw" the one-kernel decode MoE with
-        # hardware DMA descriptors (kernels/moe_decode_hw.py); unset: torch
-        self.moe_kernel = {"1": "tkg", "hw": "hw"}.get(os.environ.get("INKLING2_NKI_MOE", ""), None)
+        self.moe_kernel = os.environ.get("INKLING2_NKI_MOE", "1") != "0"
         self.attn_kernel = os.environ.get("INKLING2_NKI_ATTN") == "1"
         self.moe_prefill_kernel = os.environ.get("INKLING2_NKI_MOE_PREFILL") == "1"
-        if self.moe_kernel == "tkg":
-            from .kernels import moe_decode as K
-
-            K.install()
         self.kv_cache = None
         self.state_layout = None
         self.state_planes = None

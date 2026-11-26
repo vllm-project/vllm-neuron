@@ -61,6 +61,13 @@ try:
 
         wgu = [nl.ndarray((P, H1 * I2), dtype=gate_up.dtype, buffer=nl.sbuf) for _ in range(RING)]
         wd = [[nl.ndarray((P, H), dtype=down.dtype, buffer=nl.sbuf) for _ in i_parts] for _ in range(RING)]
+        # a skipped (padding) expert computes on whatever its buffer holds: start them at zero, so a padding row
+        # never yields inf / NaN (it would reach the null block's KV and state, which every request reads past its
+        # length)
+        for r in range(RING):
+            nisa.memset(dst=wgu[r], value=0.0)
+            for t_ in wd[r]:
+                nisa.memset(dst=t_, value=0.0)
 
         for t in range(T):
             for k in range(K):
@@ -125,7 +132,8 @@ def moe_decode_hw(wrap, x: torch.Tensor, idx: torch.Tensor, w: torch.Tensor, gat
     ``valid [T]`` (bool, optional) marks the real rows; ``wrap`` turns the kernel into a callable (the caller's ``wrap_nki(...)[lnc]``). Returns this rank's partial
     ``[T, H]`` fp32."""
     T, k = idx.shape
-    if valid is not None:   # padding rows: no weight traffic
+    if valid is not None:   # padding rows: no weight traffic, zero routing weight
         idx = torch.where(valid.view(T, 1), idx, torch.full_like(idx, gate_up.shape[0]))
+        w = torch.where(valid.view(T, 1), w, torch.zeros_like(w))
     return wrap(inkling2_moe_decode_hw)(x.contiguous(), idx.reshape(1, T * k).to(torch.int32),
                                         w.reshape(1, T * k).float(), gate_up, down)

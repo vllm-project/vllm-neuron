@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """The NKI decode kernels in the NKI CPU simulator (``nki.simulate``) against ``ops.py``, at TP8 per-rank shapes.
 
-Needs the ``nki`` package (Neuron images); skipped elsewhere.
+Needs the ``nki`` package (Neuron images); skipped elsewhere. The model runs one rank per physical core (LNC 1);
+the simulator follows ``NEURON_LOGICAL_NC_CONFIG``, which is set before ``nki`` loads (at LNC 2 a kernel runs on two
+shards, and the grouped prefill MoE's scatter-add would add its output twice).
 """
 
 import os
 
-import pytest
-import torch
+os.environ["NEURON_LOGICAL_NC_CONFIG"] = "1"
+
+import pytest  # noqa: E402
+import torch  # noqa: E402
 
 nki = pytest.importorskip("nki")
-os.environ.setdefault("NEURON_LOGICAL_NC_CONFIG", "1")
 
 from inkling2_neuron import ops  # noqa: E402
 from inkling2_neuron.kernels import attn_decode as K4  # noqa: E402
@@ -37,6 +40,16 @@ def test_moe_decode_hw_matches_gather(T):
         x, idx.reshape(1, -1).to(torch.int32), w.reshape(1, -1).float(), gate_up, down)).float()
     # the kernel rounds the routing-weighted activation to bf16 before the down projection
     assert (out - ref).abs().max() <= 1e-2 * ref.abs().max()
+
+
+def test_moe_decode_hw_all_padding_is_zero():
+    """Warmup decodes rows that are all padding: every expert load is skipped and the output must stay finite (it
+    reaches the null block's caches)."""
+    x, idx, w, gate_up, down = _moe_inputs(2, seed=4)
+    pad = torch.full_like(idx, E)
+    out = torch.as_tensor(nki.simulate(K2.inkling2_moe_decode_hw)(
+        x, pad.reshape(1, -1).to(torch.int32), torch.zeros(1, 2 * K), gate_up, down)).float()
+    assert torch.equal(out, torch.zeros_like(out))
 
 
 def test_moe_decode_hw_skips_padding_rows():

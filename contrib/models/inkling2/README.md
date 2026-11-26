@@ -44,17 +44,17 @@ export NEURON_LOGICAL_NC_CONFIG=1 NEURON_SKIP_EFA_AFFINITY=1
 export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.10
 vllm serve /models/Inkling-2-Mini-bf16 --served-model-name inkling \
   --tensor-parallel-size 8 --max-model-len 16384 --max-num-seqs 2 --max-num-batched-tokens 256 \
-  --block-size 256 --gpu-memory-utilization 0.90 --no-enable-prefix-caching \
+  --block-size 256 --gpu-memory-utilization 0.90 --no-enable-prefix-caching --optimization-level 3 \
   --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [256], "num_seqs_buckets": [2],
                         "on_device_sampling_config": {"all_greedy": true}}}'
 ```
 
 - `--no-enable-prefix-caching` is required (`factory.py` refuses the launch otherwise): the convolution windows live
   in the request's first KV block, which two requests sharing a cached prefix would share.
-- Do not pass `--optimization-level`: the model then compiles its decode graph at `-O3`
-  (`Inkling2ForCausalLM.compiler_args_for`), and the prefill graph at the runner's base level. An explicit level
-  applies to every graph (measured: 42.97 ms a token with `--optimization-level 1`, 31.27 ms with the decode graph at
-  `-O3`).
+- `--optimization-level 3` compiles both graphs at `-O3` (without the flag, `Inkling2ForCausalLM.compiler_args_for`
+  compiles the decode graph at `-O3` and the prefill graph at the runner's base level, `-O2`; measured TTFT 2.09 s
+  either way). At `-O1` the modular flow wraps each of the decode step's 96 all-reduces
+  (measured: 42.97 ms a token with `--optimization-level 1`, 31.27 with the decode graph at `-O3`, both torch).
 - `num_seqs_buckets: [2]` runs a single request padded to two rows, which decodes faster than the one-row graph
   (31.3 against 61.6 ms a token, see Results).
 - The KV cap of 0.10 (1.08 GiB a core, 38,400 tokens) is what fits beside the weights (6.17 GiB a core) and the
@@ -77,6 +77,15 @@ vllm serve /models/Inkling-2-Mini-bf16 --served-model-name inkling \
   de-interleave follow Hugging Face's load ops.
 - The relative-position bias is built with the Transformer-XL relative shift (pad and reshape) rather than an
   element gather, which on Neuron is an indirect copy per element.
+- `src/kernels/moe_decode_hw.py`: the decode MoE as one NKI kernel (on by default; `INKLING2_NKI_MOE=0` runs the
+  torch one). In the torch decode graph the routed experts' weights are gathered with `index_select`, which the
+  compiler lowers to a software-generated DMA with one descriptor per 576-byte row of an expert's `gate_up` slice
+  (a device profile counted 1.9 M descriptors a step, the GpSimd engine generating them for 20 ms). The kernel reads
+  an expert's `gate_up` as `[128, 18 x 288]` (one contiguous 10 KB run a partition) and its `down` rows with hardware
+  descriptor generation, the expert id in a register; gate/up, the softcapped activation, the routing weight and
+  down run in SBUF / PSUM, the token's 8 experts accumulating in PSUM. Rows the runner padded skip their loads.
+- `src/kernels/attn_decode.py` (decode attention core) and `src/kernels/moe_prefill_grouped.py` (prefill MoE grouped
+  by expert) are experimental and off by default; see Limitations.
 
 ## Results
 
