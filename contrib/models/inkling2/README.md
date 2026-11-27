@@ -118,6 +118,12 @@ attention core as well (`INKLING2_NKI_ATTN=1`): 32.2 / 33.4 ms, 29.2 / 54.9 toke
 (torch MoE): TTFT 1.61 s, TPOT 43.0 ms at one client. At `--max-model-len 32768`, a 16384-token prompt and 512
 output tokens: TTFT 49.6 s, TPOT 37.0 ms.
 
+With vLLM's short flag `-O1` in place of `--optimization-level 3`, the prefill graph compiles at `-O1` while the
+decode graph stays at `-O3` (the plugin treats only the long flag as an explicit level, so the model's per-graph
+policy still applies to decode): TTFT 1.61 / 2.42 s, TPOT 29.95 / 30.54 ms, 31.8 / 60.9 tokens/s at 1 / 2 clients;
+teacher-forced 94 of 96, as above. This depends on how the plugin detects an explicit level, so the flags above stay
+the reference configuration.
+
 **More clients at a shorter context.** The KV pool holds 38,400 tokens, so a 16k context leaves room for two
 requests. With `--max-model-len 4096 --max-num-seqs 8` and `num_seqs_buckets: [2, 4, 8]` (otherwise the same flags;
 the 4- and 8-row graphs run the torch decode MoE), same benchmark:
