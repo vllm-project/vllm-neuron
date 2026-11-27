@@ -222,6 +222,27 @@ def _neff_cache_dir() -> str:
         return ""
 
 
+def _speculative_inputs(vllm_config: "VllmConfig") -> dict[str, Any] | None:
+    """Return the speculative decoding settings that vLLM's config hash leaves out.
+
+    On Neuron the token count is a compile-time constant: the target verifies
+    ``1 + num_speculative_tokens`` tokens per request, and the EAGLE3 draft graph
+    unrolls its steps. vLLM's ``SpeculativeConfig.compute_hash()`` covers neither
+    the token count nor the method name (only whether the method returns
+    auxiliary hidden states), so without these inputs every token count shares one
+    directory and one precompile entry, which grows with each count and which
+    every worker loads whole at startup. Returns None without speculative
+    decoding.
+    """
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if speculative_config is None:
+        return None
+    return {
+        "method": speculative_config.method,
+        "num_speculative_tokens": speculative_config.num_speculative_tokens,
+    }
+
+
 def build_fingerprint_inputs(
     vllm_config: "VllmConfig",
     neuron_config: Any,
@@ -232,7 +253,8 @@ def build_fingerprint_inputs(
     The inputs are the vLLM config hash, the resolved bucket sets, the platform
     target, the compiler options, the versions, and the NEFF cache directory. The
     bucket sets cover the Neuron config and the encoder config. The versions cover
-    the framework, the compiler, and the plugin. The result is rank-independent, so
+    the framework, the compiler, and the plugin. With speculative decoding on, they
+    also hold its method and token count. The result is rank-independent, so
     every rank derives the same fingerprint.
 
     Examples:
@@ -241,7 +263,7 @@ def build_fingerprint_inputs(
         ...                  "compiler_options", "versions", "neff_cache_dir"}  # doctest: +SKIP
         True
     """
-    return {
+    inputs: dict[str, Any] = {
         "config_hash": vllm_config.compute_hash(),
         "buckets": _collect_buckets(neuron_config, encoder_neuron_config),
         "platform_target": _platform_target(),
@@ -249,6 +271,12 @@ def build_fingerprint_inputs(
         "versions": _versions(),
         "neff_cache_dir": _neff_cache_dir(),
     }
+    # Add the key only with speculative decoding, so a run without it keeps its
+    # fingerprint and its saved cache.
+    speculative = _speculative_inputs(vllm_config)
+    if speculative is not None:
+        inputs["speculative"] = speculative
+    return inputs
 
 
 def compute_fingerprint(inputs: dict[str, Any]) -> str:
