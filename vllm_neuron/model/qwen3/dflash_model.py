@@ -190,7 +190,14 @@ class DFlashQwen3Model(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Embed the flattened draft block with the target's embedding table."""
-        return self.embed_tokens(input_ids, scatter_tokens=False)
+        # Pass the rank as a tensor, as the target model and the sampler do.
+        # Without it the embedding uses its Python-int vocab offset, so each TP
+        # rank would trace and compile its own draft graph.
+        return self.embed_tokens(
+            input_ids,
+            scatter_tokens=False,
+            rank=get_tp_group().rank_in_group_tensor,
+        )
 
     @torch.no_grad()
     def forward(
