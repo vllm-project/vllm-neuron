@@ -274,7 +274,9 @@ class DFlashProposer:
 
         if self.vllm_config.scheduler_config.async_scheduling:
             for out in draft_output:
-                if torch.is_tensor(out):
+                # A meta output (CPU compile traces the draft on the meta
+                # device) has no data and no future to consume.
+                if torch.is_tensor(out) and out.device.type != "meta":
                     out.cpu()
 
     def graph_extract(

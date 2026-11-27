@@ -253,7 +253,9 @@ class EagleProposer:
                 else (draft_output,)
             )
             for out in outputs:
-                if torch.is_tensor(out):
+                # A meta output (CPU compile traces the draft on the meta
+                # device) has no data and no future to consume.
+                if torch.is_tensor(out) and out.device.type != "meta":
                     out.cpu()
 
     def dummy_draft_dispatch(
