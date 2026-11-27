@@ -38,7 +38,8 @@ def correct_spec_decode_positions_and_slot_mapping(
         positions: Optimistic positions ``[total_scheduled]`` int32,
             computed from the scheduler's pre-increment num_computed_tokens.
         attn_metadata: Per-layer attention metadata dict. Each entry's
-            ``slot_mapping`` is replaced with the corrected one.
+            ``slot_mapping`` is replaced with the corrected one. Rows with
+            no rejection keep the entry's existing ``slot_mapping``.
         prev_sampled_token_ids: Previous step's rejection sampler output
             ``[bs, num_spec+1]`` int32, with ``-1`` for rejected positions.
         prev_num_draft_tokens: Previous step's draft count per request
@@ -95,6 +96,17 @@ def correct_spec_decode_positions_and_slot_mapping(
         slot_mapping = _compute_slot_mapping_per_token(
             positions, block_table_tensor, req_indices_per_token, block_size
         )
+        # Rows that the correction does not move keep the runner's slot.
+        # The runner sends padding rows to the null block or PAD_SLOT_ID but
+        # gives them the last real position, so a slot recomputed from that
+        # position would overwrite the last real token's KV entry.
+        runner_slot_mapping = meta.get("slot_mapping")
+        if runner_slot_mapping is not None:
+            slot_mapping = torch.where(
+                per_token_offset == 0,
+                runner_slot_mapping.to(slot_mapping.dtype),
+                slot_mapping,
+            )
         new_meta = dict(meta)
         new_meta["slot_mapping"] = slot_mapping
         new_attn_metadata[layer_name] = new_meta
