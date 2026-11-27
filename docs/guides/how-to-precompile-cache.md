@@ -127,7 +127,9 @@ The fingerprint changes with:
 - the resolved bucket sets,
 - the platform target,
 - the effective compiler options,
-- the Torch, Lite, compiler, and plugin versions, and
+- the Torch, Lite, compiler, and plugin versions,
+- the speculative decoding method and number of speculative tokens, when
+  speculative decoding is on, and
 - the NEFF cache directory.
 
 Come back to this section after an upgrade. A version change moves the
