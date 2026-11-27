@@ -119,18 +119,19 @@ attention core as well (`INKLING2_NKI_ATTN=1`): 32.2 / 33.4 ms, 29.2 / 54.9 toke
 output tokens: TTFT 49.6 s, TPOT 37.0 ms.
 
 **More clients at a shorter context.** The KV pool holds 38,400 tokens, so a 16k context leaves room for two
-requests. With `--max-model-len 4096 --max-num-seqs 8` and `num_seqs_buckets: [2, 8]` (otherwise the same flags;
-the 8-row graph runs the torch decode MoE), same benchmark:
+requests. With `--max-model-len 4096 --max-num-seqs 8` and `num_seqs_buckets: [2, 4, 8]` (otherwise the same flags;
+the 4- and 8-row graphs run the torch decode MoE), same benchmark:
 
 | Clients | TTFT p50 | TPOT p50 | Output tokens/s |
 | --- | --- | --- | --- |
 | 1 | 2.04 s | 24.6 ms | 37.6 |
-| 2 | 3.05 s | 25.4 ms | 70.4 |
-| 4 | 5.08 s | 64.1 ms | 58.0 |
+| 2 | 3.06 s | 25.4 ms | 70.4 |
+| 4 | 5.08 s | 40.1 ms | 88.9 |
 | 8 | 9.14 s | 67.4 ms | 104.9 |
 
-Four clients run in the 8-row graph. The greedy outputs of the three reference prompts that fit 4k (5, 759 and
-2021 tokens) are the same as with the 16k configuration.
+Without the 4-row bucket (`[2, 8]`), four clients run in the 8-row graph: TPOT 64.1 ms, 58.0 tokens/s. The greedy
+outputs of the three reference prompts that fit 4k (5, 759 and 2021 tokens) are the same as with the 16k
+configuration.
 
 **Steadiness.** 64 requests at 2 clients with random lengths (410 to about 7800 prompt tokens, 51 to 972 output
 tokens): 64 completed, none failed; TTFT p50 8.10 s, TPOT p50 39.0 ms, p99 114.2 ms (chunks of other requests'
