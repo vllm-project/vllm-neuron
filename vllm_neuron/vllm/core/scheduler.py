@@ -1487,7 +1487,35 @@ class NeuronAsyncScheduler(NeuronScheduler, AsyncScheduler):
         NeuronScheduler.schedule() calls this method to delegate to the base scheduler.
         For async scheduling, we need AsyncScheduler's behavior.
         """
+        self._drop_drafts_while_spec_disabled()
         return AsyncScheduler.schedule(self, throttle_prefills)
+
+    def _drop_drafts_while_spec_disabled(self) -> None:
+        """Keep this step all-spec or all-non-spec.
+
+        ``_update_after_schedule`` stops giving draft placeholders to a request
+        near ``max_model_len`` but keeps giving them to the other requests, so
+        the next decode step would schedule 1 token for one request and
+        ``1 + num_spec_tokens`` for the rest. The verify graph runs
+        ``1 + num_spec_tokens`` rows for every request, and outside a KV
+        consumer the runner does not turn such a batch into a non-spec step:
+        the 0-draft request gets no token back, its output placeholder never
+        clears, and vLLM skips it on every later step.
+
+        While a request that this step can schedule has drafts disabled, drop
+        the placeholders of every such request, so the step runs the non-spec
+        decode graph, the same transition a single request takes near
+        ``max_model_len``. ``_update_after_schedule`` gives placeholders back
+        to the other requests once no disabled request is running.
+        """
+        if self.num_spec_tokens <= 0:
+            return
+        if not any(getattr(r, "_async_spec_disabled", False) for r in self.running):
+            return
+        for request in self.running:
+            if request.spec_token_ids:
+                # Assign, never clear(): the placeholder list is shared.
+                request.spec_token_ids = []
 
     def _update_after_schedule(self, scheduler_output: "SchedulerOutput") -> None:
         """Override to suppress spec-token placeholders near max_model_len.

@@ -1225,6 +1225,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Steady-state decode goes through the cross-step future path in
         # async_execution_buffer.
         self._async_spec_transition_full_draft_cache: dict[str, torch.Tensor] = {}
+        # Where the newest token of a cached row's request lives (device tensor
+        # and row index) after a step that emitted it without proposing. Read
+        # only when the row is replayed; see _record_async_spec_transition_bonus.
+        self._async_spec_transition_bonus_source: dict[
+            str, tuple[torch.Tensor, int]
+        ] = {}
 
         if self.speculative_config:
             if self.speculative_config.method == "eagle3":
@@ -6939,7 +6945,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         device future.
 
         Args:
-            input_ids: CPU-built input IDs for this step, one token per row.
+            input_ids: CPU-built input IDs for this step: one token per decode
+                request, plus its drafts on a spec decode step.
             scheduler_output: This step's scheduler output, for per-request
                 scheduled token counts.
 
@@ -6984,27 +6991,35 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if not prev_token_by_req:
             return input_ids
 
-        # Row r of input_ids is request input_batch.req_ids[r] only while every
-        # request occupies exactly one row. That layout is built from
-        # ``num_scheduled_tokens_padded`` (see _create_padded_inputs), not the
-        # unpadded count -- a 1-token prefill pads to a bucket while the unpadded
-        # count stays 1 -- so validate the PADDED layout. Any padded>1 row
-        # (prefill bucket, or spec decode's 1+num_spec) breaks the 1:1 mapping,
-        # so bail on the whole batch rather than misattribute a token.
         req_ids = self.input_batch.req_ids
         num_reqs = self.input_batch.num_reqs
-        if input_ids.shape[0] < num_reqs or any(
-            scheduler_output.num_scheduled_tokens_padded.get(req_id, 0) != 1
+        # A decode request's row is one token, plus its drafts on a spec decode
+        # step, and its first token is the one the previous step sampled. The
+        # layout is built from ``num_scheduled_tokens_padded`` (see
+        # _create_padded_inputs), not the unpadded count -- a 1-token prefill
+        # pads to a bucket while the unpadded count stays 1 -- so validate the
+        # PADDED widths. Any other width (a prefill bucket) breaks the mapping,
+        # so bail on the whole batch rather than misattribute a token.
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens or {}
+        widths = [
+            scheduler_output.num_scheduled_tokens_padded.get(req_id, 0)
             for req_id in req_ids[:num_reqs]
+        ]
+        if input_ids.shape[0] < sum(widths) or any(
+            width != 1 + len(spec_tokens.get(req_id, ()))
+            for req_id, width in zip(req_ids[:num_reqs], widths)
         ):
             logger.debug(
-                "Async fallback token fixup skipped: not a 1-token-per-row step."
+                "Async fallback token fixup skipped: not a decode-row-per-request step."
             )
             return input_ids
 
         fixed = 0
         decode_rows = 0
-        for row, req_id in enumerate(req_ids[:num_reqs]):
+        row_start = 0
+        for row, (req_id, width) in enumerate(zip(req_ids[:num_reqs], widths)):
+            start = row_start
+            row_start += width
             # A one-token row can be a non-decode last-token recompute
             # co-scheduled with real decodes (the bench connector admits a KV
             # consumer at prompt_len-1 as a decode-shaped row). Gate per row so
@@ -7016,9 +7031,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             token = prev_token_by_req.get(req_id)
             if token is None:
                 continue
-            if int(input_ids[row]) != int(token):
+            if int(input_ids[start]) != int(token):
                 fixed += 1
-            input_ids[row] = token
+            input_ids[start] = token
 
         if fixed:
             logger.debug(
@@ -8534,6 +8549,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if not (
             isinstance(full_draft_tokens, torch.Tensor) and full_draft_tokens.ndim == 2
         ):
+            self._record_async_spec_transition_bonus(req_ids_output_copy)
             return
 
         full_draft_tokens = _reinterpret_uint32_as_int32(full_draft_tokens, torch.int32)
@@ -8545,6 +8561,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self._async_spec_transition_full_draft_cache[req_id] = full_draft_tokens[
                 i
             ].detach()
+            self._async_spec_transition_bonus_source.pop(req_id, None)
 
         self._prune_async_spec_transition_cache(req_ids_output_copy)
 
@@ -8553,6 +8570,42 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             req_ids_output_copy[:n_rows],
             tuple(full_draft_tokens.shape),
         )
+
+    def _record_async_spec_transition_bonus(
+        self,
+        req_ids_output_copy: list[str],
+    ) -> None:
+        """Remember where the token this step emitted lives for each cached row.
+
+        A step that emits tokens without proposing (``skip_propose``, or a
+        non-spec decode step) leaves the row from the last proposal, whose
+        column 0 is an older token. A later batch-composition change would feed
+        that token as the request's input (see
+        ``_fill_transition_input_and_spec_metadata_from_cache``), so
+        ``_get_cached_transition_draft_pieces`` puts the recorded token in
+        column 0 when it reads the row. Only the device tensor and the row
+        index are kept here: this step does no device work, and the token is
+        read from the device output, so there is no host sync and every rank
+        reads the same value. The draft columns stay; the verify step rejects
+        them unless the target agrees.
+        """
+        cache = self._async_spec_transition_full_draft_cache
+        if not cache:
+            return
+        sampled = self.async_execution_buffer.get("futures_sampled_token_ids")
+        if not isinstance(sampled, torch.Tensor):
+            return
+        source = sampled
+        if sampled.ndim == 2 and sampled.shape[1] > 1:
+            # A verify step: take each request's last accepted token.
+            source = self.async_execution_buffer.get("futures_last_accepted_token")
+            if not isinstance(source, torch.Tensor):
+                return
+        partial = getattr(self, "_async_partial_prefill_req_ids", None) or set()
+        sources = self._async_spec_transition_bonus_source
+        for i, req_id in enumerate(req_ids_output_copy[: source.numel()]):
+            if req_id in cache and req_id not in partial:
+                sources[req_id] = (source, i)
 
     def _prune_async_spec_transition_cache(
         self, extra_live_req_ids: list[str] | None = None
@@ -8563,6 +8616,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         for req_id in list(self._async_spec_transition_full_draft_cache.keys()):
             if req_id not in live_req_ids:
                 del self._async_spec_transition_full_draft_cache[req_id]
+        for req_id in list(self._async_spec_transition_bonus_source.keys()):
+            if req_id not in live_req_ids:
+                del self._async_spec_transition_bonus_source[req_id]
 
     def _missing_async_spec_transition_cache_req_ids(
         self,
@@ -8593,7 +8649,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         for req_id, n_draft in zip(req_ids, num_draft_tokens):
             full_row = self._async_spec_transition_full_draft_cache[req_id]
-            full_pieces.append(full_row[: 1 + n_draft])
+            bonus_source = self._async_spec_transition_bonus_source.get(req_id)
+            if bonus_source is None:
+                full_pieces.append(full_row[: 1 + n_draft])
+            else:
+                source, index = bonus_source
+                bonus = _reinterpret_uint32_as_int32(source.reshape(-1), torch.int32)
+                full_pieces.append(
+                    torch.cat(
+                        [
+                            bonus[index : index + 1].to(dtype=full_row.dtype),
+                            full_row[1 : 1 + n_draft],
+                        ]
+                    )
+                )
             if n_draft:
                 drafts_pieces.append(full_row[1 : 1 + n_draft])
 
@@ -8659,6 +8728,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     def _consume_async_spec_transition_cache(self, req_ids: list[str]) -> None:
         for req_id in req_ids:
             self._async_spec_transition_full_draft_cache.pop(req_id, None)
+            self._async_spec_transition_bonus_source.pop(req_id, None)
 
     def _fill_transition_input_and_spec_metadata_from_cache(
         self,
