@@ -13,12 +13,18 @@ the text decoder uses standard 1D RoPE.
 
 import torch.nn as nn
 from transformers import PretrainedConfig
+from vllm.multimodal.inputs import MultiModalFeatureSpec
 
-from vllm_neuron.model.interfaces import SupportsEncoderBudget
+from vllm_neuron.model.interfaces import (
+    SupportsEncoderBudget,
+    SupportsEncoderCacheLayout,
+)
 from vllm_neuron.model.neuron_config import NeuronConfig, EncoderNeuronConfig
 
 
-class Qwen3ASRForConditionalGeneration(nn.Module, SupportsEncoderBudget):
+class Qwen3ASRForConditionalGeneration(
+    nn.Module, SupportsEncoderBudget, SupportsEncoderCacheLayout
+):
     """Factory that validates the config and selects the Qwen3-ASR implementation."""
 
     def __init__(
@@ -98,6 +104,36 @@ class Qwen3ASRForConditionalGeneration(nn.Module, SupportsEncoderBudget):
         if not buckets:
             return 0
         return max(buckets)
+
+    @classmethod
+    def get_encoder_cache_item_blocks(
+        cls,
+        hf_config: PretrainedConfig,
+        encoder_neuron_config: EncoderNeuronConfig,
+        mm_feature: MultiModalFeatureSpec,
+    ) -> int | None:
+        # A clip owns a run of whole blocks, and a block holds whole inference
+        # windows plus pad. embed_multimodal sizes that run with
+        # plan_audio_blocks, which depends on the clip only through its post-CNN
+        # length. That length is the clip's placeholder length, which the
+        # scheduler always has: with mm_processor_cache_type="shm",
+        # mm_feature.data holds only an address.
+        from vllm_neuron.model.qwen3_asr.utils.audio_preprocessing import (
+            clip_num_cache_blocks,
+            get_audio_window_tokens,
+        )
+
+        num_tokens = mm_feature.mm_position.get_num_embeds()
+        if num_tokens <= 0:
+            return None
+        audio_config = hf_config.thinker_config.audio_config
+        return clip_num_cache_blocks(
+            num_tokens,
+            block_size=encoder_neuron_config.encoder_attention_block_size,
+            window_tokens=get_audio_window_tokens(hf_config),
+            n_window=audio_config.n_window,
+            n_window_infer=audio_config.n_window_infer,
+        )
 
     @classmethod
     def _validate_config(cls, text_neuron_config: NeuronConfig | None) -> None:

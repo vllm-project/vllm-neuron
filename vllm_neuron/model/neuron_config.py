@@ -381,8 +381,8 @@ class EncoderNeuronConfig:
         encoder_cache_num_blocks: Override for on-device encoder cache block
             count. None (default): auto-derived from scheduler's
             encoder_cache_size budget in NeuronModelRunner. Set explicitly to
-            increase capacity beyond the scheduler budget, e.g. to compensate
-            for per-block padding waste or hold-time backlog under high
+            increase capacity beyond the scheduler budget, e.g. to keep more
+            items cached or to absorb hold-time backlog under high
             concurrency.
             On an encoder-cache producer this count also sets the scheduler's
             encoder-cache budget, so the scheduler retains exactly the items the
@@ -390,13 +390,10 @@ class EncoderNeuronConfig:
             ``NeuronPlatform._resolve_ec_producer_encoder_cache_size``.
             An encoder engine holds each item until a remote consumer pulls it.
             The scheduler's default budget cannot express that hold.
-            TODO: The scheduler's EncoderCacheManager sizes and evicts based
-            on token counts, unaware of block-level padding waste. This
-            mismatch means the scheduler may cache more items than the block
-            allocator can hold (each item uses a full block regardless of
-            token count). A proper fix requires integrating block layout
-            awareness into the scheduler's EncoderCacheManager. Until then,
-            set this field explicitly for workloads with many small items.
+            The scheduler's NeuronEncoderCacheManager uses the same block
+            count as its capacity and charges each item the blocks it
+            occupies, including the padding in its last block, so it evicts
+            before the buffer runs out of blocks.
         encoder_cache_min_hold_time_ms: Minimum time (ms) a cache block stays
             allocated after write before it can be freed. Prevents premature
             reuse when a remote reader (DE/RDMA) hasn't finished pulling the

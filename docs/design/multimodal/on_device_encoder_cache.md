@@ -158,17 +158,24 @@ num_blocks = ceil(encoder_cache_size / cache_block_size) + 1  (scratch)
 
 Where `cache_block_size` is derived from the encoder's attention block size divided by the token merge factor (e.g., 2048 / 4 = 512 post-merger tokens per block for Qwen3-VL), and `encoder_cache_size = max(max_num_batched_tokens, max_tokens_per_mm_item)` — the same token budget the scheduler's `EncoderCacheManager` uses for eviction decisions.
 
-### Known Limitation: Padding Waste Mismatch
+### Scheduler Accounting in Blocks
 
-The scheduler's `EncoderCacheManager` controls cache sizing and eviction at the token level. `EncoderCacheBlocks` translates that into physical blocks. A mismatch occurs because the scheduler does not account for block-level padding: a small image (e.g., 80 tokens) in a larger block (e.g., 256 tokens) consumes one full block of physical capacity, but the scheduler only counts 80 tokens toward its budget. This means the scheduler may allocate without evicting when `EncoderCacheBlocks` does not have enough free blocks — causing inference stalls.
+vLLM's `EncoderCacheManager` sizes the cache and decides when to evict by token count. `EncoderCacheBlocks` stores every item from a fresh block, so a small image (e.g., 80 tokens) in a larger block (e.g., 256 tokens) takes a whole block while a token count charges it 80 tokens. With token accounting the scheduler keeps more finished items cached than the device has blocks for, and `EncoderCacheBlocks.allocate()` fails with "Encoder cache full".
 
-**Current mitigation:** Over-provision the block count via `encoder_cache_num_blocks`. This compensates for padding waste but padding percentage varies at runtime depending on image size distribution.
+`NeuronScheduler` therefore replaces vLLM's manager with `NeuronEncoderCacheManager` (`vllm_neuron/vllm/core/encoder_cache_manager.py`) for every model that builds the on-device cache. It keeps vLLM's caching and eviction logic and counts blocks instead of tokens:
+
+- Its capacity is `num_blocks - 1`, from the same `get_encoder_cache_num_blocks()` call the runner uses, so a larger `encoder_cache_num_blocks` raises both sides.
+- Each item is charged the blocks the encoder allocates for it. That is `ceil(num_embeds / cache_block_size)` by default. A model that pads inside an item reports its own count through `SupportsEncoderCacheLayout`: Qwen3-VL video packs whole frames per block, and Qwen3-ASR packs whole inference windows per block.
+- The encoder compute budget stays in tokens.
+
+A manager set explicitly through `--ec-manager-config` is kept as is, and so is the encoder-decoder manager.
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
 | `vllm_neuron/vllm/worker/encoder_cache_blocks.py` | `EncoderCacheBlocks` class — buffer allocation, free queue, hold-time guard, slot map |
+| `vllm_neuron/vllm/core/encoder_cache_manager.py` | `NeuronEncoderCacheManager` — scheduler-side cache accounting in blocks |
 | `vllm_neuron/functional/merge_multimodal_embeddings.py` | `merge_multimodal_embeddings()` — scatter encoder embeddings into hidden_states inside compiled graph (shared by vision + audio) |
 | `vllm_neuron/vllm/worker/neuron_model_runner.py` | `_init_encoder_cache()`, `_execute_mm_encoder()`, `_gather_mm_embeddings()` — orchestrates write/read paths |
 | `vllm_neuron/model/neuron_config.py` | `EncoderNeuronConfig` — `encoder_cache_num_blocks`, `encoder_cache_min_hold_time_ms` |

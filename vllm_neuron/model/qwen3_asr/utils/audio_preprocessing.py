@@ -356,6 +356,48 @@ class AudioBlockAssignment:
         return torch.tensor(idx, dtype=torch.int64)
 
 
+def clip_num_cache_blocks(
+    num_tokens: int,
+    *,
+    block_size: int,
+    window_tokens: int,
+    n_window: int,
+    n_window_infer: int,
+) -> int:
+    """Return the blocks one clip occupies in ``plan_audio_blocks``.
+
+    Same next-fit as ``plan_audio_blocks(..., one_item_per_block=True)`` for one
+    clip: full windows then a tail, each placed whole, starting on a fresh block.
+    It needs only the clip's post-CNN length, so the scheduler can charge the
+    clip's encoder-cache blocks from its placeholder length.
+
+    Args:
+        num_tokens: post-CNN tokens of the clip
+            (``_get_feat_extract_output_lengths`` of its mel length).
+        block_size: static per-block attention sequence length.
+        window_tokens: post-CNN tokens in one full inference window (segment).
+        n_window: base chunk half-size.
+        n_window_infer: mel frames in one inference window.
+
+    Returns:
+        The clip's block count, ``plan_audio_blocks(...).min_blocks`` for it.
+    """
+    slots_per_block, num_tokens_per_chunk, _ = resolve_block_geometry(
+        block_size, window_tokens, n_window, n_window_infer
+    )
+    num_full, tail = divmod(num_tokens, window_tokens)
+    seg_lens = [window_tokens] * num_full + ([tail] if tail else [])
+    num_blocks = 0
+    used = slots_per_block  # the clip starts a fresh block
+    for seg_len in seg_lens:
+        c = math.ceil(seg_len / num_tokens_per_chunk)
+        if used + c > slots_per_block:
+            num_blocks += 1
+            used = 0
+        used += c
+    return num_blocks
+
+
 def plan_audio_blocks(
     feature_lens: torch.Tensor | Sequence[int],
     *,

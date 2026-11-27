@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
@@ -34,6 +35,7 @@ from vllm_neuron.utils.bucket_utils import (
     resolve_num_batched_tokens_buckets,
     validate_num_seqs_buckets,
 )
+from vllm_neuron.vllm.core.encoder_cache_manager import NeuronEncoderCacheManager
 from vllm_neuron.vllm.patches.jf_grammar_patch import (
     apply_jf_grammar_rollback_patch,
 )
@@ -147,6 +149,7 @@ class NeuronScheduler(Scheduler):
         self.max_model_len = vllm_config.model_config.max_model_len
         self.model_name = vllm_config.model_config.model
 
+        self._count_encoder_cache_in_blocks(vllm_config)
         self._instrument_encoder_cache_manager()
         self._cap_encoder_budget_to_bucket(vllm_config)
 
@@ -480,6 +483,43 @@ class NeuronScheduler(Scheduler):
         params = dict(kv_xfer_params) if kv_xfer_params else {}
         params["ec_locator"] = ec_locator
         return params, ec_xfer_params
+
+    def _count_encoder_cache_in_blocks(self, vllm_config: "VllmConfig") -> None:
+        """Make the scheduler's encoder cache accounting count device blocks.
+
+        The base scheduler builds vLLM's ``EncoderCacheManager``, which sizes the
+        cache and evicts by embed count. The model runner stores encoder outputs
+        in ``EncoderCacheBlocks``, where every item starts on a fresh block, so
+        counting embeds keeps more finished items cached than the device has
+        blocks for, and ``EncoderCacheBlocks.allocate`` raises "Encoder cache
+        full". ``NeuronEncoderCacheManager`` keeps vLLM's logic, takes the
+        device block count as its capacity and charges each item its blocks.
+
+        Applies wherever the runner builds the device cache: a multimodal model
+        (nonzero encoder cache budget) with an ``encoder_neuron_config``. A
+        manager set through ``ec_manager_config`` and the encoder-decoder
+        manager are kept.
+        """
+        ecm = getattr(self, "encoder_cache_manager", None)
+        if not isinstance(ecm, EncoderCacheManager):
+            return
+        # vLLM's default manager only, not a subclass such as
+        # EncoderDecoderCacheManager.
+        if type(ecm) is not EncoderCacheManager or ecm.cache_size <= 0:
+            return
+        if vllm_config.ec_manager_config.encoder_cache_manager_cls is not None:
+            return
+        if vllm_config.additional_config.get("encoder_neuron_config") is None:
+            return
+        self.encoder_cache_manager = NeuronEncoderCacheManager.create_manager(
+            cache_size=ecm.cache_size, vllm_config=vllm_config
+        )
+        logger.info(
+            "Encoder cache accounting in on-device blocks: %d blocks for an "
+            "encoder_cache_size of %d embeds.",
+            self.encoder_cache_manager.cache_size,
+            ecm.cache_size,
+        )
 
     def _instrument_encoder_cache_manager(self) -> None:
         """Wrap ``EncoderCacheManager.check_and_update_cache`` to emit metrics.

@@ -64,6 +64,7 @@ from .utils.vision_block_packing import (
     ffd_pack_images,
     scatter_to_blocks,
     select_vision_bucket,
+    video_cache_tokens_per_block,
 )
 from .utils.vision_preprocessing import (
     compute_position_indices_and_weights,
@@ -622,16 +623,9 @@ class Qwen3VLGenerationMixin:
             raw_tokens = t * h * w
             num_merged = raw_tokens // merge_factor
             if is_video:
-                per_frame_raw = h * w
-                per_frame_merged = per_frame_raw // merge_factor
-                frames_per_block = block_size // per_frame_raw
-                num_item_blocks = math.ceil(t / frames_per_block)
-                tokens_per_block: list[int] = []
-                frames_left = t
-                for _ in range(num_item_blocks):
-                    k = min(frames_per_block, frames_left)
-                    tokens_per_block.append(k * per_frame_merged)
-                    frames_left -= k
+                tokens_per_block = video_cache_tokens_per_block(
+                    t, h * w, block_size, merge_factor
+                )
                 block_ids = cache.allocate(mm_hashes[i], tokens_per_block)
             else:
                 block_ids = cache.allocate(

@@ -3,12 +3,13 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 from transformers import PretrainedConfig
 
 if TYPE_CHECKING:
-    from vllm.multimodal.inputs import MultiModalKwargsItem
+    from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItem
 
     from vllm_neuron.model.neuron_config import EncoderNeuronConfig
 
@@ -68,6 +69,77 @@ def get_encoder_cache_block_size(
             f"must be divisible by merge_factor ({merge_factor})"
         )
     return encoder_attention_block_size // merge_factor
+
+
+def get_encoder_cache_num_blocks(
+    encoder_cache_size: int,
+    cache_block_size: int,
+    encoder_cache_num_blocks: int | None,
+) -> int:
+    """Return the on-device encoder-cache block count, scratch block included.
+
+    The model runner sizes ``EncoderCacheBlocks`` with this count, and the
+    scheduler's ``NeuronEncoderCacheManager`` uses the same count minus the
+    scratch block as its capacity, so both sides hold the same number of blocks.
+
+    Args:
+        encoder_cache_size: The scheduler's encoder cache budget in embeds
+            (``MultiModalBudget.encoder_cache_size``).
+        cache_block_size: Embeds per cache block, from
+            ``get_encoder_cache_block_size``.
+        encoder_cache_num_blocks: The configured block count, or None.
+
+    Returns:
+        ``ceil(encoder_cache_size / cache_block_size) + 1``, or the configured
+        count when it is larger.
+    """
+    min_blocks_needed = math.ceil(encoder_cache_size / cache_block_size) + 1
+    if encoder_cache_num_blocks is None or encoder_cache_num_blocks < min_blocks_needed:
+        return min_blocks_needed
+    return encoder_cache_num_blocks
+
+
+def get_encoder_cache_item_blocks(
+    hf_config: PretrainedConfig,
+    encoder_neuron_config: "EncoderNeuronConfig",
+    mm_feature: "MultiModalFeatureSpec",
+) -> int:
+    """Return the on-device encoder-cache blocks that one mm item occupies.
+
+    Looks up the model class via registry and calls its
+    SupportsEncoderCacheLayout.get_encoder_cache_item_blocks classmethod. When
+    the model does not implement the protocol, or returns None for this item,
+    the item uses the dense layout: ``ceil(num_embeds / cache_block_size)``
+    blocks, as ``EncoderCacheBlocks.dense_tokens_per_block`` lays it out.
+
+    Args:
+        hf_config: HuggingFace PretrainedConfig for the model.
+        encoder_neuron_config: The encoder neuron config.
+        mm_feature: The item, as the scheduler holds it.
+
+    Returns:
+        The number of cache blocks the encoder allocates for the item.
+    """
+    from vllm_neuron.model.interfaces import SupportsEncoderCacheLayout
+    from vllm_neuron.model.registry import get_models
+    from vllm_neuron.vllm.worker.encoder_cache_blocks import EncoderCacheBlocks
+
+    arch = hf_config.architectures[0]
+    model_cls = dict(get_models()).get(arch)
+    if model_cls and issubclass(model_cls, SupportsEncoderCacheLayout):
+        num_blocks = model_cls.get_encoder_cache_item_blocks(
+            hf_config, encoder_neuron_config, mm_feature
+        )
+        if num_blocks is not None:
+            return num_blocks
+    cache_block_size = get_encoder_cache_block_size(
+        hf_config, encoder_neuron_config.encoder_attention_block_size
+    )
+    return len(
+        EncoderCacheBlocks.dense_tokens_per_block(
+            mm_feature.mm_position.get_num_embeds(), cache_block_size
+        )
+    )
 
 
 def get_max_encoder_embed_budget(

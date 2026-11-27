@@ -10,7 +10,6 @@ state management.
 import functools
 import json
 import logging
-import math
 import os
 import threading
 import time
@@ -1428,6 +1427,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         from vllm.multimodal.encoder_budget import MultiModalBudget
         from vllm_neuron.utils.mm_utils import (
             get_encoder_cache_block_size,
+            get_encoder_cache_num_blocks,
             get_max_encoder_blocks_per_request,
         )
         from vllm_neuron.vllm.worker.encoder_cache_blocks import EncoderCacheBlocks
@@ -1464,41 +1464,35 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             hf_config, encoder_neuron_config
         )
 
-        # Derive min_blocks_needed from scheduler's encoder_cache_size:
+        # Derive the block count from scheduler's encoder_cache_size:
         #   encoder_cache_size = max(max_num_batched_tokens, max_single_mm_item_tokens)
         # This is the max merged encoder tokens the scheduler can have cached
         # simultaneously (set in vllm.v1.core.encoder_cache_manager).
-        # We auto-derive from this value to stay in sync with the scheduler's
-        # EncoderCacheManager — both use the same budget so the worker never
-        # runs out of blocks for items the scheduler considers cacheable.
         # We divide by cache_block_size to get blocks, plus one scratch block
         # that absorbs encoder padding writes and is never allocated to real items.
+        # A larger encoder_neuron_config.encoder_cache_num_blocks wins.
         #
-        # TODO: The scheduler's EncoderCacheManager sizes and evicts based on
-        # token counts, unaware of block-level padding waste. This mismatch
-        # means the scheduler may cache more items than the block allocator
-        # can hold (each item uses a full block regardless of token count).
-        # A proper fix requires integrating block layout awareness into the
-        # scheduler's EncoderCacheManager. Until then, set encoder_neuron_config.encoder_cache_num_blocks
-        # explicitly for workloads with many small images.
-        num_blocks = encoder_neuron_config.encoder_cache_num_blocks
+        # Each item starts on a fresh block, so it can occupy more blocks than
+        # its token count suggests. The scheduler's NeuronEncoderCacheManager
+        # (set by NeuronScheduler) calls get_encoder_cache_num_blocks with the
+        # same inputs, uses the allocatable blocks as its capacity, and charges
+        # each item the blocks it takes here, so it evicts before this cache
+        # runs out of blocks.
+        configured_num_blocks = encoder_neuron_config.encoder_cache_num_blocks
         mm_budget = MultiModalBudget(vllm_config, self.mm_registry)
-        min_blocks_needed = (
-            math.ceil(mm_budget.encoder_cache_size / cache_block_size) + 1
+        num_blocks = get_encoder_cache_num_blocks(
+            mm_budget.encoder_cache_size, cache_block_size, configured_num_blocks
         )
-        # Use min_blocks_needed to init encoder cache blocks if user did not specify
-        # or specify smaller value
-        if num_blocks is None or num_blocks < min_blocks_needed:
+        if num_blocks != configured_num_blocks:
             logger.info(
                 "encoder_cache_num_blocks: %s → %d "
                 "(derived from scheduler encoder_cache_size=%d "
                 "merged tokens = %d blocks + 1 scratch)",
+                configured_num_blocks,
                 num_blocks,
-                min_blocks_needed,
                 mm_budget.encoder_cache_size,
-                min_blocks_needed - 1,
+                num_blocks - 1,
             )
-            num_blocks = min_blocks_needed
 
         if self.max_encoder_blocks_per_request > num_blocks - 1:
             raise ValueError(

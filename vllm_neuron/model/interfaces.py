@@ -94,6 +94,45 @@ class SupportsEncoderBudget(Protocol):
 
 
 @runtime_checkable
+class SupportsEncoderCacheLayout(Protocol):
+    """Models that store an item in the on-device encoder cache non-densely.
+
+    By default an item of ``n`` embeds occupies ``ceil(n / block_size)`` cache
+    blocks (``EncoderCacheBlocks.dense_tokens_per_block``). A model whose encoder
+    writes some items with per-block padding, for example whole video frames or
+    whole audio windows per block, reports the real block count here so the
+    scheduler charges the same number of blocks that the encoder allocates.
+    """
+
+    @classmethod
+    def get_encoder_cache_item_blocks(
+        cls,
+        hf_config: PretrainedConfig,
+        encoder_neuron_config: EncoderNeuronConfig,
+        mm_feature: MultiModalFeatureSpec,
+    ) -> int | None:
+        """Return the encoder-cache blocks that one item occupies.
+
+        Must equal ``len(tokens_per_block)`` that the model passes to
+        ``EncoderCacheBlocks.allocate`` for this item.
+
+        Compute it from ``mm_feature.mm_position`` (and ``modality``), not from
+        ``mm_feature.data``. With ``mm_processor_cache_type="shm"`` the
+        scheduler's ``data`` holds only a shared-memory address, not the item's
+        tensors.
+
+        Args:
+            hf_config: HuggingFace PretrainedConfig for the model.
+            encoder_neuron_config: The encoder neuron config.
+            mm_feature: The item, as the scheduler holds it.
+
+        Returns:
+            The block count, or None when the item uses the dense layout.
+        """
+        ...
+
+
+@runtime_checkable
 class SupportsMaxPixels(Protocol):
     """Models whose image processor supports a max_pixels resize cap.
 
